@@ -10,30 +10,12 @@ use std::time::Instant;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
+use crate::mesh::Vertex;
+use crate::voxel::Chunk;
+
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// A single mesh vertex: object-space position and normal.
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
-    position: [f32; 3],
-    normal: [f32; 3],
-}
-
-const VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
-    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
-
-impl Vertex {
-    const fn layout() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &VERTEX_ATTRS,
-        }
-    }
-}
-
-/// Uniform block shared with `cube.wgsl` (`std140`-compatible: two column-major mat4).
+/// Uniform block shared with `mesh.wgsl` (`std140`-compatible: two column-major mat4).
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
@@ -116,17 +98,27 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        // Geometry.
+        // Build the chunk mesh (naive baseline — see `voxel`).
+        let chunk = Chunk::generate_sphere();
+        let mesh = chunk.build_mesh();
+        log::info!(
+            "chunk: {} solid blocks, {} vertices, {} triangles",
+            chunk.solid_count(),
+            mesh.vertices.len(),
+            mesh.triangle_count(),
+        );
+
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("cube-vertices"),
-            contents: bytemuck::cast_slice(CUBE_VERTICES),
+            label: Some("chunk-vertices"),
+            contents: bytemuck::cast_slice(&mesh.vertices),
             usage: wgpu::BufferUsages::VERTEX,
         });
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("cube-indices"),
-            contents: bytemuck::cast_slice(CUBE_INDICES),
+            label: Some("chunk-indices"),
+            contents: bytemuck::cast_slice(&mesh.indices),
             usage: wgpu::BufferUsages::INDEX,
         });
+        let index_count = mesh.indices.len() as u32;
 
         // Camera uniform + bind group.
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -169,7 +161,7 @@ impl Renderer {
             pipeline,
             vertex_buffer,
             index_buffer,
-            index_count: CUBE_INDICES.len() as u32,
+            index_count,
             camera_buffer,
             camera_bind_group,
             depth_view,
@@ -245,7 +237,7 @@ impl Renderer {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..self.index_count, 0, 0..1);
         }
 
@@ -260,10 +252,10 @@ impl Renderer {
         let t = self.start.elapsed().as_secs_f32();
         let aspect = self.config.width as f32 / self.config.height as f32;
 
-        let proj = glam::Mat4::perspective_rh(60f32.to_radians(), aspect, 0.1, 100.0);
+        let proj = glam::Mat4::perspective_rh(55f32.to_radians(), aspect, 0.1, 300.0);
         let view =
-            glam::Mat4::look_at_rh(glam::vec3(0.0, 1.2, 3.0), glam::Vec3::ZERO, glam::Vec3::Y);
-        let model = glam::Mat4::from_rotation_y(t * 0.8) * glam::Mat4::from_rotation_x(t * 0.4);
+            glam::Mat4::look_at_rh(glam::vec3(0.0, 12.0, 30.0), glam::Vec3::ZERO, glam::Vec3::Y);
+        let model = glam::Mat4::from_rotation_y(t * 0.4);
 
         let uniform = CameraUniform {
             view_proj: (proj * view).to_cols_array_2d(),
@@ -313,18 +305,18 @@ fn build_pipeline(
     camera_bgl: &wgpu::BindGroupLayout,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("cube-shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/cube.wgsl").into()),
+        label: Some("mesh-shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/mesh.wgsl").into()),
     });
 
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("cube-layout"),
+        label: Some("mesh-layout"),
         bind_group_layouts: &[camera_bgl],
         push_constant_ranges: &[],
     });
 
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("cube-pipeline"),
+        label: Some("mesh-pipeline"),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
@@ -360,48 +352,3 @@ fn build_pipeline(
         cache: None,
     })
 }
-
-/// A unit cube centered on the origin: 6 faces × 4 corners, with per-face normals.
-#[rustfmt::skip]
-const CUBE_VERTICES: &[Vertex] = &[
-    // +X
-    Vertex { position: [ 0.5, -0.5,  0.5], normal: [ 1.0,  0.0,  0.0] },
-    Vertex { position: [ 0.5, -0.5, -0.5], normal: [ 1.0,  0.0,  0.0] },
-    Vertex { position: [ 0.5,  0.5, -0.5], normal: [ 1.0,  0.0,  0.0] },
-    Vertex { position: [ 0.5,  0.5,  0.5], normal: [ 1.0,  0.0,  0.0] },
-    // -X
-    Vertex { position: [-0.5, -0.5, -0.5], normal: [-1.0,  0.0,  0.0] },
-    Vertex { position: [-0.5, -0.5,  0.5], normal: [-1.0,  0.0,  0.0] },
-    Vertex { position: [-0.5,  0.5,  0.5], normal: [-1.0,  0.0,  0.0] },
-    Vertex { position: [-0.5,  0.5, -0.5], normal: [-1.0,  0.0,  0.0] },
-    // +Y
-    Vertex { position: [-0.5,  0.5,  0.5], normal: [ 0.0,  1.0,  0.0] },
-    Vertex { position: [ 0.5,  0.5,  0.5], normal: [ 0.0,  1.0,  0.0] },
-    Vertex { position: [ 0.5,  0.5, -0.5], normal: [ 0.0,  1.0,  0.0] },
-    Vertex { position: [-0.5,  0.5, -0.5], normal: [ 0.0,  1.0,  0.0] },
-    // -Y
-    Vertex { position: [-0.5, -0.5, -0.5], normal: [ 0.0, -1.0,  0.0] },
-    Vertex { position: [ 0.5, -0.5, -0.5], normal: [ 0.0, -1.0,  0.0] },
-    Vertex { position: [ 0.5, -0.5,  0.5], normal: [ 0.0, -1.0,  0.0] },
-    Vertex { position: [-0.5, -0.5,  0.5], normal: [ 0.0, -1.0,  0.0] },
-    // +Z
-    Vertex { position: [-0.5, -0.5,  0.5], normal: [ 0.0,  0.0,  1.0] },
-    Vertex { position: [ 0.5, -0.5,  0.5], normal: [ 0.0,  0.0,  1.0] },
-    Vertex { position: [ 0.5,  0.5,  0.5], normal: [ 0.0,  0.0,  1.0] },
-    Vertex { position: [-0.5,  0.5,  0.5], normal: [ 0.0,  0.0,  1.0] },
-    // -Z
-    Vertex { position: [ 0.5, -0.5, -0.5], normal: [ 0.0,  0.0, -1.0] },
-    Vertex { position: [-0.5, -0.5, -0.5], normal: [ 0.0,  0.0, -1.0] },
-    Vertex { position: [-0.5,  0.5, -0.5], normal: [ 0.0,  0.0, -1.0] },
-    Vertex { position: [ 0.5,  0.5, -0.5], normal: [ 0.0,  0.0, -1.0] },
-];
-
-#[rustfmt::skip]
-const CUBE_INDICES: &[u16] = &[
-     0,  1,  2,  0,  2,  3, // +X
-     4,  5,  6,  4,  6,  7, // -X
-     8,  9, 10,  8, 10, 11, // +Y
-    12, 13, 14, 12, 14, 15, // -Y
-    16, 17, 18, 16, 18, 19, // +Z
-    20, 21, 22, 20, 22, 23, // -Z
-];

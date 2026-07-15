@@ -3,7 +3,9 @@
 //! Owns the window and event loop; all GPU work lives in [`render`]. Milestone M1
 //! grows this from a validation triangle into a chunk of cubes rendered at 1000+ FPS.
 
+mod mesh;
 mod render;
+mod voxel;
 
 use std::sync::Arc;
 
