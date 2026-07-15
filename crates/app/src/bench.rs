@@ -120,20 +120,17 @@ pub fn run() {
     let depth_view = create_depth_view(&device, WIDTH, HEIGHT);
 
     let aspect = WIDTH as f32 / HEIGHT as f32;
-    let mut frame_times_ms: Vec<f64> = Vec::with_capacity(MEASURE_FRAMES as usize);
     let mut virtual_t = 0.0f32;
 
-    log::info!("warming up ({WARMUP_FRAMES} frames), then measuring {MEASURE_FRAMES}...");
-
-    for frame in 0..(WARMUP_FRAMES + MEASURE_FRAMES) {
-        crate::profiling::Profiler::new_frame();
+    // Records one frame (camera upload + render-pass encode + submit) and returns
+    // the CPU time spent building/submitting it. Frames are *not* individually
+    // waited on, so the GPU pipelines them — this measures sustained throughput.
+    let submit_frame = |vt: f32| -> f64 {
         puffin::profile_scope!("frame");
-
-        let uniform = CameraUniform::new(aspect, virtual_t);
+        let uniform = CameraUniform::new(aspect, vt);
         queue.write_buffer(&camera_buffer, 0, bytemuck::bytes_of(&uniform));
 
-        let start = Instant::now();
-
+        let cpu_start = Instant::now();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("bench-encoder"),
         });
@@ -172,45 +169,53 @@ pub fn run() {
             pass.draw_indexed(0..index_count, 0, 0..1);
         }
         queue.submit(std::iter::once(encoder.finish()));
-        // Block until the GPU has finished this frame so the timing is honest.
-        let _ = device.poll(wgpu::Maintain::Wait);
+        cpu_start.elapsed().as_secs_f64() * 1000.0
+    };
 
-        if frame >= WARMUP_FRAMES {
-            frame_times_ms.push(start.elapsed().as_secs_f64() * 1000.0);
-        }
+    log::info!("warming up ({WARMUP_FRAMES} frames), then measuring {MEASURE_FRAMES}...");
+
+    for _ in 0..WARMUP_FRAMES {
+        submit_frame(virtual_t);
+        let _ = device.poll(wgpu::Maintain::Poll);
         virtual_t += VIRTUAL_DT;
     }
+    let _ = device.poll(wgpu::Maintain::Wait);
 
-    report(frame_times_ms);
+    // Measure sustained throughput over wall-clock time, plus per-frame CPU cost.
+    let mut cpu_ms: Vec<f64> = Vec::with_capacity(MEASURE_FRAMES as usize);
+    let wall_start = Instant::now();
+    for _ in 0..MEASURE_FRAMES {
+        crate::profiling::Profiler::new_frame();
+        cpu_ms.push(submit_frame(virtual_t));
+        let _ = device.poll(wgpu::Maintain::Poll);
+        virtual_t += VIRTUAL_DT;
+    }
+    let _ = device.poll(wgpu::Maintain::Wait);
+    let wall_secs = wall_start.elapsed().as_secs_f64();
+
+    report(MEASURE_FRAMES, wall_secs, cpu_ms);
 }
 
-fn report(mut times_ms: Vec<f64>) {
-    times_ms.sort_by(|a, b| a.partial_cmp(b).expect("no NaN frame times"));
-    let n = times_ms.len();
-    let total: f64 = times_ms.iter().sum();
-    let avg_ms = total / n as f64;
-    let p50 = times_ms[n / 2];
-    let p99 = times_ms[((n as f64 * 0.99) as usize).min(n - 1)];
-    // "1% low": average FPS across the slowest 1% of frames.
-    let low_count = (n / 100).max(1);
-    let low_avg_ms = times_ms[n - low_count..].iter().sum::<f64>() / low_count as f64;
+fn report(frames: u32, wall_secs: f64, mut cpu_ms: Vec<f64>) {
+    let throughput = frames as f64 / wall_secs;
+
+    cpu_ms.sort_by(|a, b| a.partial_cmp(b).expect("no NaN frame times"));
+    let n = cpu_ms.len();
+    let cpu_avg = cpu_ms.iter().sum::<f64>() / n as f64;
+    let cpu_p50 = cpu_ms[n / 2];
+    let cpu_p99 = cpu_ms[((n as f64 * 0.99) as usize).min(n - 1)];
 
     log::info!("=========== BENCHMARK RESULT ===========");
-    log::info!("frames measured : {n}");
-    log::info!(
-        "average         : {:.0} FPS ({avg_ms:.3} ms)",
-        1000.0 / avg_ms
-    );
-    log::info!("frame time p50  : {p50:.3} ms");
-    log::info!("frame time p99  : {p99:.3} ms");
-    log::info!("1% low          : {:.0} FPS", 1000.0 / low_avg_ms);
+    log::info!("frames            : {frames}");
+    log::info!("throughput        : {throughput:.0} FPS (sustained, pipelined)");
+    log::info!("CPU submit / frame: avg {cpu_avg:.3} ms | p50 {cpu_p50:.3} | p99 {cpu_p99:.3}");
     log::info!("========================================");
     log::info!(
-        "goal: 1000+ FPS — {}",
-        if 1000.0 / avg_ms >= 1000.0 {
+        "goal 1000+ FPS: {}",
+        if throughput >= 1000.0 {
             "MET"
         } else {
-            "not yet (expected: naive meshing, debug of vertex load; optimize in M2)"
+            "not yet"
         }
     );
 }

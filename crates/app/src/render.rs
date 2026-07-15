@@ -348,8 +348,9 @@ pub(crate) fn build_pipeline(
         }),
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
-            // Draw both faces for now; back-face culling comes with meshing (M2).
-            cull_mode: None,
+            // Faces are wound CCW/outward, so cull the back faces.
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: Some(wgpu::Face::Back),
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
