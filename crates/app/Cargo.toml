@@ -1,0 +1,20 @@
+[package]
+name = "cubara"
+description = "Cubara — a high-performance voxel engine and game."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "cubara"
+path = "src/main.rs"
+
+[dependencies]
+winit.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+log.workspace = true
+env_logger.workspace = true

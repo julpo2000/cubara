@@ -7,8 +7,8 @@
 *.exe
 *.pdb
 
-# Rust (if we go Rust)
-Cargo.lock  # keep for the final binary crate; remove this line once app/ exists
+# Rust
+# Cargo.lock is committed on purpose: this workspace produces a binary.
 **/*.rs.bk
 
 # C++ (if we go C++)
