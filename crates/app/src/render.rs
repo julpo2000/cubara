@@ -7,7 +7,39 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use wgpu::util::DeviceExt;
 use winit::window::Window;
+
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// A single mesh vertex: object-space position and normal.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    position: [f32; 3],
+    normal: [f32; 3],
+}
+
+const VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
+    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+
+impl Vertex {
+    const fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &VERTEX_ATTRS,
+        }
+    }
+}
+
+/// Uniform block shared with `cube.wgsl` (`std140`-compatible: two column-major mat4).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct CameraUniform {
+    view_proj: [[f32; 4]; 4],
+    model: [[f32; 4]; 4],
+}
 
 /// All GPU + window state. Created once the event loop has `resumed`.
 pub struct Renderer {
@@ -16,8 +48,16 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    triangle_pipeline: wgpu::RenderPipeline,
-    /// Simple frame counter so we can watch performance from the console.
+
+    pipeline: wgpu::RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+    camera_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
+    depth_view: wgpu::TextureView,
+
+    start: Instant,
     frames: u32,
     last_report: Instant,
 }
@@ -76,7 +116,49 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let triangle_pipeline = build_triangle_pipeline(&device, format);
+        // Geometry.
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("cube-vertices"),
+            contents: bytemuck::cast_slice(CUBE_VERTICES),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("cube-indices"),
+            contents: bytemuck::cast_slice(CUBE_INDICES),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        // Camera uniform + bind group.
+        let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("camera-uniform"),
+            size: std::mem::size_of::<CameraUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let camera_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("camera-bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("camera-bind-group"),
+            layout: &camera_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+        });
+
+        let pipeline = build_pipeline(&device, format, &camera_bgl);
+        let depth_view = create_depth_view(&device, &config);
 
         Self {
             window,
@@ -84,7 +166,14 @@ impl Renderer {
             device,
             queue,
             config,
-            triangle_pipeline,
+            pipeline,
+            vertex_buffer,
+            index_buffer,
+            index_count: CUBE_INDICES.len() as u32,
+            camera_buffer,
+            camera_bind_group,
+            depth_view,
+            start: Instant::now(),
             frames: 0,
             last_report: Instant::now(),
         }
@@ -99,10 +188,13 @@ impl Renderer {
             self.config.width = width;
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
+            self.depth_view = create_depth_view(&self.device, &self.config);
         }
     }
 
     pub fn render(&mut self) {
+        self.update_camera();
+
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             // Surface lost/outdated (e.g. during resize) — reconfigure and skip.
@@ -138,19 +230,47 @@ impl Renderer {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
 
-            pass.set_pipeline(&self.triangle_pipeline);
-            pass.draw(0..3, 0..1);
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            pass.draw_indexed(0..self.index_count, 0, 0..1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
 
         self.report_fps();
+    }
+
+    /// Recompute the view/projection and model matrices and upload them.
+    fn update_camera(&mut self) {
+        let t = self.start.elapsed().as_secs_f32();
+        let aspect = self.config.width as f32 / self.config.height as f32;
+
+        let proj = glam::Mat4::perspective_rh(60f32.to_radians(), aspect, 0.1, 100.0);
+        let view =
+            glam::Mat4::look_at_rh(glam::vec3(0.0, 1.2, 3.0), glam::Vec3::ZERO, glam::Vec3::Y);
+        let model = glam::Mat4::from_rotation_y(t * 0.8) * glam::Mat4::from_rotation_x(t * 0.4);
+
+        let uniform = CameraUniform {
+            view_proj: (proj * view).to_cols_array_2d(),
+            model: model.to_cols_array_2d(),
+        };
+        self.queue
+            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 
     /// Report frames-per-second roughly once per second.
@@ -166,28 +286,50 @@ impl Renderer {
     }
 }
 
-fn build_triangle_pipeline(
+fn create_depth_view(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("depth-texture"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+fn build_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
+    camera_bgl: &wgpu::BindGroupLayout,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("triangle-shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/triangle.wgsl").into()),
+        label: Some("cube-shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/cube.wgsl").into()),
     });
 
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("triangle-layout"),
-        bind_group_layouts: &[],
+        label: Some("cube-layout"),
+        bind_group_layouts: &[camera_bgl],
         push_constant_ranges: &[],
     });
 
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("triangle-pipeline"),
+        label: Some("cube-pipeline"),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_main"),
-            buffers: &[],
+            buffers: &[Vertex::layout()],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -202,11 +344,64 @@ fn build_triangle_pipeline(
         }),
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
+            // Draw both faces for now; back-face culling comes with meshing (M2).
+            cull_mode: None,
             ..Default::default()
         },
-        depth_stencil: None,
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
         multisample: wgpu::MultisampleState::default(),
         multiview: None,
         cache: None,
     })
 }
+
+/// A unit cube centered on the origin: 6 faces × 4 corners, with per-face normals.
+#[rustfmt::skip]
+const CUBE_VERTICES: &[Vertex] = &[
+    // +X
+    Vertex { position: [ 0.5, -0.5,  0.5], normal: [ 1.0,  0.0,  0.0] },
+    Vertex { position: [ 0.5, -0.5, -0.5], normal: [ 1.0,  0.0,  0.0] },
+    Vertex { position: [ 0.5,  0.5, -0.5], normal: [ 1.0,  0.0,  0.0] },
+    Vertex { position: [ 0.5,  0.5,  0.5], normal: [ 1.0,  0.0,  0.0] },
+    // -X
+    Vertex { position: [-0.5, -0.5, -0.5], normal: [-1.0,  0.0,  0.0] },
+    Vertex { position: [-0.5, -0.5,  0.5], normal: [-1.0,  0.0,  0.0] },
+    Vertex { position: [-0.5,  0.5,  0.5], normal: [-1.0,  0.0,  0.0] },
+    Vertex { position: [-0.5,  0.5, -0.5], normal: [-1.0,  0.0,  0.0] },
+    // +Y
+    Vertex { position: [-0.5,  0.5,  0.5], normal: [ 0.0,  1.0,  0.0] },
+    Vertex { position: [ 0.5,  0.5,  0.5], normal: [ 0.0,  1.0,  0.0] },
+    Vertex { position: [ 0.5,  0.5, -0.5], normal: [ 0.0,  1.0,  0.0] },
+    Vertex { position: [-0.5,  0.5, -0.5], normal: [ 0.0,  1.0,  0.0] },
+    // -Y
+    Vertex { position: [-0.5, -0.5, -0.5], normal: [ 0.0, -1.0,  0.0] },
+    Vertex { position: [ 0.5, -0.5, -0.5], normal: [ 0.0, -1.0,  0.0] },
+    Vertex { position: [ 0.5, -0.5,  0.5], normal: [ 0.0, -1.0,  0.0] },
+    Vertex { position: [-0.5, -0.5,  0.5], normal: [ 0.0, -1.0,  0.0] },
+    // +Z
+    Vertex { position: [-0.5, -0.5,  0.5], normal: [ 0.0,  0.0,  1.0] },
+    Vertex { position: [ 0.5, -0.5,  0.5], normal: [ 0.0,  0.0,  1.0] },
+    Vertex { position: [ 0.5,  0.5,  0.5], normal: [ 0.0,  0.0,  1.0] },
+    Vertex { position: [-0.5,  0.5,  0.5], normal: [ 0.0,  0.0,  1.0] },
+    // -Z
+    Vertex { position: [ 0.5, -0.5, -0.5], normal: [ 0.0,  0.0, -1.0] },
+    Vertex { position: [-0.5, -0.5, -0.5], normal: [ 0.0,  0.0, -1.0] },
+    Vertex { position: [-0.5,  0.5, -0.5], normal: [ 0.0,  0.0, -1.0] },
+    Vertex { position: [ 0.5,  0.5, -0.5], normal: [ 0.0,  0.0, -1.0] },
+];
+
+#[rustfmt::skip]
+const CUBE_INDICES: &[u16] = &[
+     0,  1,  2,  0,  2,  3, // +X
+     4,  5,  6,  4,  6,  7, // -X
+     8,  9, 10,  8, 10, 11, // +Y
+    12, 13, 14, 12, 14, 15, // -Y
+    16, 17, 18, 16, 18, 19, // +Z
+    20, 21, 22, 20, 22, 23, // -Z
+];
