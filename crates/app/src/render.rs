@@ -202,6 +202,8 @@ impl Renderer {
     }
 
     pub fn render(&mut self) {
+        crate::profiling::Profiler::new_frame();
+        puffin::profile_function!();
         self.update_camera();
 
         let frame = match self.surface.get_current_texture() {
@@ -224,6 +226,7 @@ impl Renderer {
             });
 
         {
+            puffin::profile_scope!("encode-pass");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
