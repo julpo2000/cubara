@@ -18,9 +18,25 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Uniform block shared with `mesh.wgsl` (`std140`-compatible: two column-major mat4).
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct CameraUniform {
+pub(crate) struct CameraUniform {
     view_proj: [[f32; 4]; 4],
     model: [[f32; 4]; 4],
+}
+
+impl CameraUniform {
+    /// The shared scene camera: a fixed viewpoint with the chunk rotating over
+    /// time `t` (seconds). Used by both the live renderer and the benchmark so
+    /// they measure the same thing.
+    pub(crate) fn new(aspect: f32, t: f32) -> Self {
+        let proj = glam::Mat4::perspective_rh(55f32.to_radians(), aspect, 0.1, 300.0);
+        let view =
+            glam::Mat4::look_at_rh(glam::vec3(0.0, 12.0, 30.0), glam::Vec3::ZERO, glam::Vec3::Y);
+        let model = glam::Mat4::from_rotation_y(t * 0.4);
+        Self {
+            view_proj: (proj * view).to_cols_array_2d(),
+            model: model.to_cols_array_2d(),
+        }
+    }
 }
 
 /// All GPU + window state. Created once the event loop has `resumed`.
@@ -150,7 +166,7 @@ impl Renderer {
         });
 
         let pipeline = build_pipeline(&device, format, &camera_bgl);
-        let depth_view = create_depth_view(&device, &config);
+        let depth_view = create_depth_view(&device, config.width, config.height);
 
         Self {
             window,
@@ -180,7 +196,8 @@ impl Renderer {
             self.config.width = width;
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
-            self.depth_view = create_depth_view(&self.device, &self.config);
+            self.depth_view =
+                create_depth_view(&self.device, self.config.width, self.config.height);
         }
     }
 
@@ -251,16 +268,7 @@ impl Renderer {
     fn update_camera(&mut self) {
         let t = self.start.elapsed().as_secs_f32();
         let aspect = self.config.width as f32 / self.config.height as f32;
-
-        let proj = glam::Mat4::perspective_rh(55f32.to_radians(), aspect, 0.1, 300.0);
-        let view =
-            glam::Mat4::look_at_rh(glam::vec3(0.0, 12.0, 30.0), glam::Vec3::ZERO, glam::Vec3::Y);
-        let model = glam::Mat4::from_rotation_y(t * 0.4);
-
-        let uniform = CameraUniform {
-            view_proj: (proj * view).to_cols_array_2d(),
-            model: model.to_cols_array_2d(),
-        };
+        let uniform = CameraUniform::new(aspect, t);
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
     }
@@ -278,15 +286,16 @@ impl Renderer {
     }
 }
 
-fn create_depth_view(
+pub(crate) fn create_depth_view(
     device: &wgpu::Device,
-    config: &wgpu::SurfaceConfiguration,
+    width: u32,
+    height: u32,
 ) -> wgpu::TextureView {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth-texture"),
         size: wgpu::Extent3d {
-            width: config.width,
-            height: config.height,
+            width,
+            height,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -299,7 +308,7 @@ fn create_depth_view(
     texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
-fn build_pipeline(
+pub(crate) fn build_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
     camera_bgl: &wgpu::BindGroupLayout,
