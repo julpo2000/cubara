@@ -23,5 +23,15 @@ vision, architecture, and roadmap.
 
 ## Build & run
 
-Not applicable yet — the stack is being finalized in `PLAN.md` (§ Tech stack).
-This section will be filled in once the project skeleton exists.
+Requires the [Rust toolchain](https://rustup.rs) (stable). Then, from the repo root:
+
+```bash
+# Run the app — opens a window rendering the current scene
+cargo run --release
+
+# Headless FPS benchmark — renders offscreen with no vsync, prints avg/p50/p99/1%-low
+cargo run --release -- --bench
+```
+
+Stack: Rust + [`wgpu`](https://wgpu.rs) (Metal on macOS, DX12/Vulkan on Windows) +
+`winit`. See `PLAN.md` for architecture and the milestone roadmap.
