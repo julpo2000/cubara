@@ -1,27 +1,28 @@
-//! Voxel data and (for now) naive meshing.
+//! Voxel data and meshing.
 //!
-//! This is the M1 baseline: a single 16³ chunk, meshed by emitting all six faces
-//! of every solid block regardless of neighbours. It is deliberately unoptimized —
-//! greedy meshing and hidden-face culling land in M2 and will be measured against
-//! the triangle count this produces.
+//! A single 16³ chunk with hidden-face culling: a block face is only emitted when
+//! the neighbour in that direction is empty, so buried interior faces cost nothing.
+//! Greedy meshing (merging coplanar faces) lands next in M2.
 
 use crate::mesh::{Mesh, Vertex};
 
-/// A description of one cube face: its outward normal and four corner offsets
-/// (in unit-cube space, 0..1) wound so `[0,1,2, 0,2,3]` forms the quad.
+/// A description of one cube face: its outward normal, the integer offset to the
+/// neighbour that would hide it, and four corner offsets (unit-cube space, 0..1)
+/// wound so `[0,1,2, 0,2,3]` forms an outward-facing (CCW) quad.
 struct Face {
     normal: [f32; 3],
+    dir: [i32; 3],
     corners: [[f32; 3]; 4],
 }
 
 #[rustfmt::skip]
 const FACES: [Face; 6] = [
-    Face { normal: [ 1.0,  0.0,  0.0], corners: [[1.0, 0.0, 1.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0]] }, // +X
-    Face { normal: [-1.0,  0.0,  0.0], corners: [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 1.0], [0.0, 1.0, 0.0]] }, // -X
-    Face { normal: [ 0.0,  1.0,  0.0], corners: [[0.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]] }, // +Y
-    Face { normal: [ 0.0, -1.0,  0.0], corners: [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 0.0, 1.0]] }, // -Y
-    Face { normal: [ 0.0,  0.0,  1.0], corners: [[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0], [0.0, 1.0, 1.0]] }, // +Z
-    Face { normal: [ 0.0,  0.0, -1.0], corners: [[1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]] }, // -Z
+    Face { normal: [ 1.0,  0.0,  0.0], dir: [ 1,  0,  0], corners: [[1.0, 0.0, 1.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0]] }, // +X
+    Face { normal: [-1.0,  0.0,  0.0], dir: [-1,  0,  0], corners: [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 1.0], [0.0, 1.0, 0.0]] }, // -X
+    Face { normal: [ 0.0,  1.0,  0.0], dir: [ 0,  1,  0], corners: [[0.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]] }, // +Y
+    Face { normal: [ 0.0, -1.0,  0.0], dir: [ 0, -1,  0], corners: [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 0.0, 1.0]] }, // -Y
+    Face { normal: [ 0.0,  0.0,  1.0], dir: [ 0,  0,  1], corners: [[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0], [0.0, 1.0, 1.0]] }, // +Z
+    Face { normal: [ 0.0,  0.0, -1.0], dir: [ 0,  0, -1], corners: [[1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]] }, // -Z
 ];
 
 /// A cubic chunk of `SIZE³` blocks. Blocks are solid/empty for now.
@@ -39,6 +40,19 @@ impl Chunk {
 
     pub fn is_solid(&self, x: usize, y: usize, z: usize) -> bool {
         self.solid[Self::index(x, y, z)]
+    }
+
+    /// Solidity with bounds handling: anything outside the chunk counts as empty,
+    /// so the chunk's outer shell is always meshed.
+    fn solid_at(&self, x: i32, y: i32, z: i32) -> bool {
+        if x < 0 || y < 0 || z < 0 {
+            return false;
+        }
+        let (x, y, z) = (x as usize, y as usize, z as usize);
+        if x >= Self::SIZE || y >= Self::SIZE || z >= Self::SIZE {
+            return false;
+        }
+        self.is_solid(x, y, z)
     }
 
     pub fn solid_count(&self) -> usize {
@@ -65,8 +79,9 @@ impl Chunk {
         Self { solid }
     }
 
-    /// Naive mesher: emit all six faces of every solid block. The chunk is centered
-    /// on the origin so a model rotation spins it in place.
+    /// Mesh the chunk, emitting a face only when the neighbour in that direction is
+    /// empty (hidden-face culling). The chunk is centered on the origin so a model
+    /// rotation spins it in place.
     pub fn build_mesh(&self) -> Mesh {
         let mut mesh = Mesh::default();
         let half = Self::SIZE as f32 * 0.5;
@@ -82,6 +97,16 @@ impl Chunk {
                     let bz = z as f32 - half;
 
                     for face in &FACES {
+                        // Skip faces buried against a solid neighbour.
+                        let (nx, ny, nz) = (
+                            x as i32 + face.dir[0],
+                            y as i32 + face.dir[1],
+                            z as i32 + face.dir[2],
+                        );
+                        if self.solid_at(nx, ny, nz) {
+                            continue;
+                        }
+
                         let start = mesh.vertices.len() as u32;
                         for corner in &face.corners {
                             mesh.vertices.push(Vertex {
