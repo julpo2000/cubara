@@ -1,0 +1,35 @@
+# Build output
+/target/
+/build/
+/dist/
+*.o
+*.obj
+*.exe
+*.pdb
+
+# Rust (if we go Rust)
+Cargo.lock  # keep for the final binary crate; remove this line once app/ exists
+**/*.rs.bk
+
+# C++ (if we go C++)
+/cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs / profiling
+*.log
+/profiling/
+
+# Local worlds / saves (dev)
+/saves/
+/worlds/

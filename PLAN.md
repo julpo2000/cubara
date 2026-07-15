@@ -1,0 +1,205 @@
+# Cubara — Project Plan
+
+This document is the single source of truth for the vision, architecture, and
+roadmap. It grows over time; decisions are recorded here so we don't have to
+re-litigate them.
+
+See [`REQUIREMENTS.md`](REQUIREMENTS.md) for the founding wishes that drive this
+plan.
+
+---
+
+## 1. Vision
+
+A voxel game with the gameplay depth of the mainstream voxel game, but built on an
+engine designed from the ground up for:
+
+1. **Performance** — practically infinite render distance with LOD, stable frame
+   times, no GC stutter. Benchmark: **1000+ FPS in a simple world** before we
+   seriously start on gameplay.
+2. **A solid, well-considered foundation** — the engine is the basis of everything.
+3. **Extensibility & modding** — data-driven content, clear module boundaries,
+   later a scripting/mod API.
+4. **Multi-platform** — Windows + macOS now, more later (incl. possibly browser).
+5. **Professional process** — git, issues, PRs, CI.
+
+Core gameplay philosophy: **progression and synergy**. Features hang together
+instead of sitting loosely side by side (the weakness of the current market leader).
+
+### Copyright
+The name is **Cubara**. We never brand the project as a sequel to or clone of an
+existing game. Textures, names, and content are our own. Mechanics may be inspired;
+assets and branding are original.
+
+---
+
+## 2. Decisions (log)
+
+| Topic | Choice | Status |
+|---|---|---|
+| Project name | **Cubara** | ✅ locked |
+| Render approach | Rasterization + greedy meshing → GPU-driven | ✅ locked |
+| Chunk format | 16×16×16 (cubic chunks) | ✅ locked |
+| Dormant-chunk simulation | Deterministic "catch-up" (Factorio-style) | ✅ concept |
+| **Tech stack (language + libs)** | Recommendation: **Rust + wgpu** | ⏳ **to confirm** |
+
+See §8 for the open language decision.
+
+---
+
+## 3. Render approach (why rasterization is the solid base)
+
+You want the approach that is best long-term for thousands of blocks, processes,
+and shaders. That is **rasterization with greedy meshing**, not experimental
+ray-marching through a sparse voxel octree. Reasons:
+
+- **Proven and predictable** — every major voxel game uses this; easy to debug and
+  profile.
+- **Scales to GPU-driven rendering** — the path to "infinite" render distance runs
+  via *indirect draw* + chunk data in GPU buffers, so thousands of chunks go out
+  in a handful of draw calls. We build that on top of the rasterizer.
+- **Shaders fit naturally** — a material/shader system (WGSL) plugs directly into a
+  rasterizer pipeline. A ray-march SVO makes custom shaders much harder.
+- **Moddability** — data-driven meshes + a texture atlas make thousands of block
+  types trivial to add.
+
+Ray-marching is kept as an *optional* future technique for extreme distance (e.g.
+an SVO representation purely for far LOD), but not as the foundation.
+
+### Render techniques (roadmap)
+- **Greedy meshing** — merge coplanar faces → far fewer triangles.
+- **Hidden-face culling** — no faces between two solid blocks.
+- **Frustum culling** — only chunks in view.
+- **LOD** — distant chunks at lower resolution (merge voxels 2³/4³…), managed via a
+  chunk-region octree.
+- **Occlusion culling** — later (e.g. GPU hi-Z).
+- **GPU-driven rendering** — indirect draw, per-chunk data on the GPU. This is the
+  key to huge render distance.
+- **Texture array/atlas** — for thousands of block textures.
+
+---
+
+## 4. Architecture
+
+Designed as a **workspace of separate modules** (crates/libraries), so boundaries
+stay sharp and modding/multiplayer plug in cleanly later.
+
+```
+cubara/
+├─ core        # math, base types, ids, time, logging
+├─ platform    # window, input, timing (event loop)
+├─ render      # GPU renderer, pipelines, shaders, meshing, LOD
+├─ voxel       # block definitions, chunk data structure (16³), palette compression
+├─ world       # chunk storage, streaming, worldgen, save/load
+├─ sim         # simulation tick, dormant-chunk catch-up (Factorio timers)
+├─ game        # actual gameplay (player, items, crafting) — later
+├─ modding     # scripting/mod API — later
+├─ net         # multiplayer — later
+└─ app         # ties everything together; the executable
+```
+
+### Data-driven design
+Blocks, items, and recipes are defined in **data files** (e.g. RON/TOML/JSON), not
+hardcoded. This makes "thousands of blocks" and modding feasible without touching
+the engine.
+
+### Entities via ECS
+For entities (mobs, items, players) we use an **ECS library** (e.g. `hecs` /
+`bevy_ecs` as a standalone library, not a whole engine). ECS keeps features
+decoupled yet cooperating — exactly the "synergy without loose features" goal.
+
+### Threading
+- Worldgen + meshing on **worker threads** (thread pool).
+- The main thread does almost nothing but render → stable frame times.
+- Communication via message queues/channels; no locks on the hot path.
+
+---
+
+## 5. Chunk system (16×16×16 cubic chunks)
+
+Your proposal of 16³ is the right call: **cubic chunks** instead of the traditional
+16×16×256 columns. Benefits: true 3D infinity (up/down too), cleaner LOD, and
+fine-grained loading/unloading.
+
+- **Palette compression per chunk** — store a palette of used block types + compact
+  indices per chunk. Memory-efficient, scales to thousands of types.
+- **Chunk states**: `Ungenerated → Generated → Meshed → Active ⇄ Dormant → Unloaded`.
+- **Persistent loaded regions** — specific areas can stay loaded (think Factorio-
+  style "active" regions around machines/players).
+
+### Dormant-chunk simulation (the "Factorio timers")
+Don't simulate every chunk every tick. Instead:
+
+- Every chunk (or process within it) remembers the **last simulated tick**.
+- When a dormant chunk is activated, we compute the **elapsed time** and do a
+  **deterministic catch-up**: crops keep growing, furnaces finish smelting, etc.,
+  as if you had been there.
+- Requires block updates to be **deterministic** and **time-parameterizable**
+  (given start state + Δt → end state), without iterating tick-by-tick where
+  avoidable (closed-form where possible, otherwise bounded batch simulation).
+
+This is a foundational design principle, not an add-on: we design the simulation
+system around it from the start.
+
+---
+
+## 6. Performance discipline
+
+- **Profiling from day one** (e.g. `tracy` / `puffin`) — we never guess, we measure.
+- **Benchmark scene** — a standardized simple world in which we measure FPS; the M1
+  gate is 1000+ FPS in it.
+- **Frame-budget thinking** — every ms counts; avoid allocations on the hot path.
+- **No GC** — a key reason the recommended stack is not a managed language.
+
+---
+
+## 7. Roadmap & milestones
+
+Each milestone = a GitHub milestone with issues. The **M1 gate** is your hard
+condition: only after 1000+ FPS do we build gameplay.
+
+| # | Milestone | Result |
+|---|---|---|
+| M0 | **Setup** | Repo, project skeleton, window + clear screen, CI green |
+| M1 | **First chunk** | Render one chunk of cubes; **1000+ FPS** in benchmark ← *gate* |
+| M2 | **Meshing & culling** | Greedy meshing, hidden-face + frustum culling, multiple chunks, simple worldgen |
+| M3 | **Streaming** | Load/unload chunks around the player; "infinite" flat world |
+| M4 | **LOD** | Distant chunks at lower resolution; large render distance |
+| M5 | **Player & interaction** | Camera/controller, raycasting, place/break blocks |
+| M6 | **Data-driven content** | Block registry from data files, texture atlas, base block set |
+| M7 | **Simulation** | Tick system + dormant-chunk catch-up; trees/crops grow |
+| M8 | **Persistence** | Save/load the world |
+| **Alpha** | **Playable survival** | Chop trees, mine iron — a real small world |
+
+**After alpha** (planned separately, with synergy first): inventory/crafting,
+items, mobs, shaders, multiplayer (`net`), expanded mod API (`modding`), more
+biomes and content toward a full modern voxel game.
+
+---
+
+## 8. Open decision: tech stack (language)
+
+This is *the* foundational, hard-to-reverse choice. See the separate discussion in
+chat. In short:
+
+- **Recommendation: Rust + wgpu + winit.** No GC (stable frame times), memory-safe
+  (great for a large codebase + netcode), strong concurrency for parallel worldgen/
+  meshing, and `wgpu` targets Metal (Mac), DX12/Vulkan (Windows), and WebGPU
+  (browser) from one codebase. Downside: learning curve + compile times.
+- **Alternative: C++ + Vulkan.** Maximum control, partly familiar to you, but manual
+  memory management and messier cross-platform.
+
+Once this is locked, we fill in: exact crates/libraries, build system, CI config,
+and the `app` skeleton (M0).
+
+---
+
+## 9. Development process (professional)
+
+- **Git from day one**, `main` as the main branch, feature branches (`feature/…`).
+- **Conventional Commits** (e.g. `feat:`, `fix:`, `perf:`, `docs:`).
+- **GitHub**: features via **issues**, changes via **PRs**, milestones per phase.
+- **CI** (GitHub Actions): build + tests + lint/format on every push/PR.
+- **Multi-platform CI**: build on Windows and macOS.
+- **Semantic versioning** + changelog.
+- Later: `CONTRIBUTING.md`, issue/PR templates, branch protection on `main`.
