@@ -37,13 +37,11 @@ impl Renderer {
             .create_surface(window.clone())
             .expect("create surface");
 
-        let adapter = pollster::block_on(instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            },
-        ))
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        }))
         .expect("no suitable GPU adapter");
 
         log::info!("GPU: {:?}", adapter.get_info());
@@ -167,20 +165,11 @@ impl ApplicationHandler for App {
             return;
         }
         let attrs = Window::default_attributes().with_title("Cubara");
-        let window = Arc::new(
-            event_loop
-                .create_window(attrs)
-                .expect("create window"),
-        );
+        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         self.renderer = Some(Renderer::new(window));
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
