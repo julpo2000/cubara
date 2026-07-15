@@ -47,6 +47,9 @@ pub fn run() {
     ))
     .expect("request device");
 
+    // Held for the duration of the benchmark when built with `--features profile`.
+    let _profiler = crate::profiling::Profiler::init();
+
     // Scene geometry (same naive chunk as the live app).
     let chunk = Chunk::generate_sphere();
     let mesh = chunk.build_mesh();
@@ -123,6 +126,9 @@ pub fn run() {
     log::info!("warming up ({WARMUP_FRAMES} frames), then measuring {MEASURE_FRAMES}...");
 
     for frame in 0..(WARMUP_FRAMES + MEASURE_FRAMES) {
+        crate::profiling::Profiler::new_frame();
+        puffin::profile_scope!("frame");
+
         let uniform = CameraUniform::new(aspect, virtual_t);
         queue.write_buffer(&camera_buffer, 0, bytemuck::bytes_of(&uniform));
 

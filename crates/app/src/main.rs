@@ -5,10 +5,13 @@
 
 mod bench;
 mod mesh;
+mod profiling;
 mod render;
 mod voxel;
 
 use std::sync::Arc;
+
+use profiling::Profiler;
 
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -20,6 +23,8 @@ use render::Renderer;
 #[derive(Default)]
 struct App {
     renderer: Option<Renderer>,
+    /// Kept alive for the program's lifetime when built with `--features profile`.
+    _profiler: Option<Profiler>,
 }
 
 impl ApplicationHandler for App {
@@ -63,6 +68,9 @@ fn main() {
     // Poll continuously rather than waiting for OS events — we want max FPS.
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::default();
+    let mut app = App {
+        _profiler: Profiler::init(),
+        ..App::default()
+    };
     event_loop.run_app(&mut app).expect("run app");
 }

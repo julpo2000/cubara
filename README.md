@@ -31,6 +31,9 @@ cargo run --release
 
 # Headless FPS benchmark — renders offscreen with no vsync, prints avg/p50/p99/1%-low
 cargo run --release -- --bench
+
+# With CPU profiling (puffin) — then connect the puffin_viewer app to 127.0.0.1:8585
+cargo run --release --features profile -- --bench
 ```
 
 Stack: Rust + [`wgpu`](https://wgpu.rs) (Metal on macOS, DX12/Vulkan on Windows) +

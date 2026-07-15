@@ -10,6 +10,10 @@ authors.workspace = true
 name = "cubara"
 path = "src/main.rs"
 
+[features]
+# Enable in-process CPU profiling served over puffin_http (off by default).
+profile = ["dep:puffin_http"]
+
 [dependencies]
 winit.workspace = true
 wgpu.workspace = true
@@ -18,3 +22,6 @@ bytemuck.workspace = true
 glam.workspace = true
 log.workspace = true
 env_logger.workspace = true
+# puffin scope macros compile to near-nothing unless scopes are enabled at runtime.
+puffin.workspace = true
+puffin_http = { workspace = true, optional = true }
