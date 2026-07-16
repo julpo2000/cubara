@@ -1,8 +1,9 @@
 //! GPU bring-up and per-frame rendering.
 //!
-//! Owns the wgpu surface/device/queue and the render pipeline(s). Kept separate
-//! from the windowing/event-loop code in `main.rs` so the renderer can grow into
-//! the real engine without turning `main` into a monolith.
+//! Owns the wgpu surface/device/queue and the render pipeline. Chunks are uploaded
+//! as individual vertex/index buffers (one draw call each) so we can cull them
+//! independently later. Shared building blocks (pipeline, depth view, camera,
+//! world upload) are exposed to the benchmark so both paths measure the same thing.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -11,32 +12,78 @@ use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 use crate::mesh::Vertex;
-use crate::voxel::Chunk;
+use crate::world::World;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// Uniform block shared with `mesh.wgsl` (`std140`-compatible: two column-major mat4).
+/// Uniform block shared with `mesh.wgsl`: one column-major view*projection matrix.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct CameraUniform {
     view_proj: [[f32; 4]; 4],
-    model: [[f32; 4]; 4],
 }
 
 impl CameraUniform {
-    /// The shared scene camera: a fixed viewpoint with the chunk rotating over
-    /// time `t` (seconds). Used by both the live renderer and the benchmark so
-    /// they measure the same thing.
-    pub(crate) fn new(aspect: f32, t: f32) -> Self {
-        let proj = glam::Mat4::perspective_rh(55f32.to_radians(), aspect, 0.1, 300.0);
-        let view =
-            glam::Mat4::look_at_rh(glam::vec3(0.0, 12.0, 30.0), glam::Vec3::ZERO, glam::Vec3::Y);
-        let model = glam::Mat4::from_rotation_y(t * 0.4);
+    /// Orbit `center` at `radius`, framerate-independent via virtual time `t`.
+    pub(crate) fn new(aspect: f32, t: f32, center: [f32; 3], radius: f32) -> Self {
+        let center = glam::Vec3::from(center);
+        let angle = t * 0.15;
+        let eye = center + glam::vec3(radius * angle.cos(), radius * 0.45, radius * angle.sin());
+        let proj = glam::Mat4::perspective_rh(60f32.to_radians(), aspect, 0.1, 2000.0);
+        let view = glam::Mat4::look_at_rh(eye, center, glam::Vec3::Y);
         Self {
             view_proj: (proj * view).to_cols_array_2d(),
-            model: model.to_cols_array_2d(),
         }
     }
+}
+
+/// A single chunk's mesh uploaded to the GPU.
+pub(crate) struct ChunkGpu {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+}
+
+impl ChunkGpu {
+    pub(crate) fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..self.index_count, 0, 0..1);
+    }
+}
+
+/// Mesh every chunk, bake its world offset into the vertices, and upload it.
+pub(crate) fn upload_world(device: &wgpu::Device, world: &World) -> Vec<ChunkGpu> {
+    let mut gpu = Vec::with_capacity(world.chunks.len());
+    let mut total_tris = 0usize;
+
+    for placed in &world.chunks {
+        let mut mesh = placed.chunk.build_mesh();
+        mesh.translate(World::chunk_offset(placed.coord));
+        if mesh.indices.is_empty() {
+            continue;
+        }
+        total_tris += mesh.triangle_count();
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("chunk-vertices"),
+            contents: bytemuck::cast_slice(&mesh.vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("chunk-indices"),
+            contents: bytemuck::cast_slice(&mesh.indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        gpu.push(ChunkGpu {
+            vertex_buffer,
+            index_buffer,
+            index_count: mesh.indices.len() as u32,
+        });
+    }
+
+    log::info!("world: {} chunks meshed, {total_tris} triangles", gpu.len());
+    gpu
 }
 
 /// All GPU + window state. Created once the event loop has `resumed`.
@@ -48,13 +95,13 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
 
     pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    index_count: u32,
+    chunks: Vec<ChunkGpu>,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
 
+    look_target: [f32; 3],
+    view_radius: f32,
     start: Instant,
     frames: u32,
     last_report: Instant,
@@ -114,27 +161,8 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        // Build the chunk mesh (naive baseline — see `voxel`).
-        let chunk = Chunk::generate_sphere();
-        let mesh = chunk.build_mesh();
-        log::info!(
-            "chunk: {} solid blocks, {} vertices, {} triangles",
-            chunk.solid_count(),
-            mesh.vertices.len(),
-            mesh.triangle_count(),
-        );
-
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("chunk-vertices"),
-            contents: bytemuck::cast_slice(&mesh.vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("chunk-indices"),
-            contents: bytemuck::cast_slice(&mesh.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        let index_count = mesh.indices.len() as u32;
+        let world = World::generate();
+        let chunks = upload_world(&device, &world);
 
         // Camera uniform + bind group.
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -143,19 +171,7 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let camera_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("camera-bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
+        let camera_bgl = camera_bind_group_layout(&device);
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("camera-bind-group"),
             layout: &camera_bgl,
@@ -175,12 +191,12 @@ impl Renderer {
             queue,
             config,
             pipeline,
-            vertex_buffer,
-            index_buffer,
-            index_count,
+            chunks,
             camera_buffer,
             camera_bind_group,
             depth_view,
+            look_target: world.look_target(),
+            view_radius: world.view_radius(),
             start: Instant::now(),
             frames: 0,
             last_report: Instant::now(),
@@ -234,9 +250,9 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05,
-                            g: 0.08,
-                            b: 0.13,
+                            r: 0.45,
+                            g: 0.62,
+                            b: 0.80,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -256,9 +272,9 @@ impl Renderer {
 
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.index_count, 0, 0..1);
+            for chunk in &self.chunks {
+                chunk.draw(&mut pass);
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -267,11 +283,10 @@ impl Renderer {
         self.report_fps();
     }
 
-    /// Recompute the view/projection and model matrices and upload them.
     fn update_camera(&mut self) {
         let t = self.start.elapsed().as_secs_f32();
         let aspect = self.config.width as f32 / self.config.height as f32;
-        let uniform = CameraUniform::new(aspect, t);
+        let uniform = CameraUniform::new(aspect, t, self.look_target, self.view_radius);
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
     }
@@ -287,6 +302,22 @@ impl Renderer {
             self.last_report = Instant::now();
         }
     }
+}
+
+pub(crate) fn camera_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("camera-bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    })
 }
 
 pub(crate) fn create_depth_view(

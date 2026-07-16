@@ -1,19 +1,18 @@
 //! Headless FPS benchmark.
 //!
-//! Renders the M1 chunk scene to an offscreen target in a tight loop — no window,
-//! no surface, no vsync — so we measure the engine's real throughput against the
-//! 1000-FPS goal instead of the compositor-throttled numbers a visible window
-//! reports. A fixed virtual time step keeps the camera path identical regardless
-//! of how fast the machine runs.
+//! Renders the multi-chunk world to an offscreen target with no window and no
+//! vsync, submitting frames pipelined (not waited on per-frame) so we measure real
+//! sustained throughput against the 1000-FPS goal. A fixed virtual time step keeps
+//! the camera orbit identical regardless of how fast the machine runs.
 //!
 //! Run with: `cargo run --release -- --bench`
 
 use std::time::Instant;
 
-use wgpu::util::DeviceExt;
-
-use crate::render::{build_pipeline, create_depth_view, CameraUniform};
-use crate::voxel::Chunk;
+use crate::render::{
+    build_pipeline, camera_bind_group_layout, create_depth_view, upload_world, CameraUniform,
+};
+use crate::world::World;
 
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
@@ -50,25 +49,15 @@ pub fn run() {
     // Held for the duration of the benchmark when built with `--features profile`.
     let _profiler = crate::profiling::Profiler::init();
 
-    // Scene geometry (same naive chunk as the live app).
-    let chunk = Chunk::generate_sphere();
-    let mesh = chunk.build_mesh();
+    // Scene: the same world the live app renders.
+    let world = World::generate();
+    let chunks = upload_world(&device, &world);
+    let look_target = world.look_target();
+    let view_radius = world.view_radius();
     log::info!(
-        "scene: {} solid blocks, {} triangles @ {WIDTH}x{HEIGHT}",
-        chunk.solid_count(),
-        mesh.triangle_count(),
+        "rendering {WIDTH}x{HEIGHT}, {} chunk draw calls",
+        chunks.len()
     );
-    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("bench-vertices"),
-        contents: bytemuck::cast_slice(&mesh.vertices),
-        usage: wgpu::BufferUsages::VERTEX,
-    });
-    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("bench-indices"),
-        contents: bytemuck::cast_slice(&mesh.indices),
-        usage: wgpu::BufferUsages::INDEX,
-    });
-    let index_count = mesh.indices.len() as u32;
 
     // Camera uniform + bind group.
     let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -77,19 +66,7 @@ pub fn run() {
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let camera_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("bench-camera-bgl"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
-    });
+    let camera_bgl = camera_bind_group_layout(&device);
     let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("bench-camera-bind-group"),
         layout: &camera_bgl,
@@ -123,11 +100,11 @@ pub fn run() {
     let mut virtual_t = 0.0f32;
 
     // Records one frame (camera upload + render-pass encode + submit) and returns
-    // the CPU time spent building/submitting it. Frames are *not* individually
-    // waited on, so the GPU pipelines them — this measures sustained throughput.
+    // the CPU time spent building/submitting it. Frames are not individually waited
+    // on, so the GPU pipelines them — this measures sustained throughput.
     let submit_frame = |vt: f32| -> f64 {
         puffin::profile_scope!("frame");
-        let uniform = CameraUniform::new(aspect, vt);
+        let uniform = CameraUniform::new(aspect, vt, look_target, view_radius);
         queue.write_buffer(&camera_buffer, 0, bytemuck::bytes_of(&uniform));
 
         let cpu_start = Instant::now();
@@ -142,9 +119,9 @@ pub fn run() {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05,
-                            g: 0.08,
-                            b: 0.13,
+                            r: 0.45,
+                            g: 0.62,
+                            b: 0.80,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -164,9 +141,9 @@ pub fn run() {
 
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &camera_bind_group, &[]);
-            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..index_count, 0, 0..1);
+            for chunk in &chunks {
+                chunk.draw(&mut pass);
+            }
         }
         queue.submit(std::iter::once(encoder.finish()));
         cpu_start.elapsed().as_secs_f64() * 1000.0

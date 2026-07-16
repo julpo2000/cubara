@@ -32,4 +32,13 @@ impl Mesh {
     pub fn triangle_count(&self) -> usize {
         self.indices.len() / 3
     }
+
+    /// Shift every vertex by `offset` (used to place a chunk in the world).
+    pub fn translate(&mut self, offset: [f32; 3]) {
+        for v in &mut self.vertices {
+            v.position[0] += offset[0];
+            v.position[1] += offset[1];
+            v.position[2] += offset[2];
+        }
+    }
 }

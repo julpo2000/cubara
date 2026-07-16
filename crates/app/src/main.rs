@@ -7,7 +7,9 @@ mod bench;
 mod mesh;
 mod profiling;
 mod render;
+mod screenshot;
 mod voxel;
+mod world;
 
 use std::sync::Arc;
 
@@ -58,9 +60,18 @@ impl ApplicationHandler for App {
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    let args: Vec<String> = std::env::args().collect();
+
     // Headless benchmark mode: `cargo run --release -- --bench`.
-    if std::env::args().any(|arg| arg == "--bench") {
+    if args.iter().any(|a| a == "--bench") {
         bench::run();
+        return;
+    }
+
+    // Headless screenshot mode: `cargo run --release -- --screenshot [path]`.
+    if let Some(i) = args.iter().position(|a| a == "--screenshot") {
+        let path = args.get(i + 1).map(String::as_str).unwrap_or("cubara.png");
+        screenshot::run(path);
         return;
     }
 
