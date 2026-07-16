@@ -9,6 +9,7 @@
 
 use std::time::Instant;
 
+use crate::culling::Frustum;
 use crate::render::{
     build_pipeline, camera_bind_group_layout, create_depth_view, upload_world, CameraUniform,
 };
@@ -99,18 +100,22 @@ pub fn run() {
     let aspect = WIDTH as f32 / HEIGHT as f32;
     let mut virtual_t = 0.0f32;
 
-    // Records one frame (camera upload + render-pass encode + submit) and returns
-    // the CPU time spent building/submitting it. Frames are not individually waited
-    // on, so the GPU pipelines them — this measures sustained throughput.
-    let submit_frame = |vt: f32| -> f64 {
+    // Records one frame (camera upload + frustum cull + render-pass encode +
+    // submit) and returns the CPU time spent plus how many chunks were drawn.
+    // Frames are not individually waited on, so the GPU pipelines them — this
+    // measures sustained throughput.
+    let submit_frame = |vt: f32| -> (f64, usize) {
         puffin::profile_scope!("frame");
-        let uniform = CameraUniform::new(aspect, vt, look_target, view_radius);
+        let vp = CameraUniform::view_proj_matrix(aspect, vt, look_target, view_radius);
+        let uniform = CameraUniform::from_matrix(vp);
         queue.write_buffer(&camera_buffer, 0, bytemuck::bytes_of(&uniform));
+        let frustum = Frustum::from_view_proj(vp);
 
         let cpu_start = Instant::now();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("bench-encoder"),
         });
+        let mut visible = 0usize;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("bench-pass"),
@@ -142,11 +147,14 @@ pub fn run() {
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &camera_bind_group, &[]);
             for chunk in &chunks {
-                chunk.draw(&mut pass);
+                if frustum.intersects_aabb(&chunk.aabb) {
+                    chunk.draw(&mut pass);
+                    visible += 1;
+                }
             }
         }
         queue.submit(std::iter::once(encoder.finish()));
-        cpu_start.elapsed().as_secs_f64() * 1000.0
+        (cpu_start.elapsed().as_secs_f64() * 1000.0, visible)
     };
 
     log::info!("warming up ({WARMUP_FRAMES} frames), then measuring {MEASURE_FRAMES}...");
@@ -160,20 +168,30 @@ pub fn run() {
 
     // Measure sustained throughput over wall-clock time, plus per-frame CPU cost.
     let mut cpu_ms: Vec<f64> = Vec::with_capacity(MEASURE_FRAMES as usize);
+    let mut visible_sum = 0u64;
     let wall_start = Instant::now();
     for _ in 0..MEASURE_FRAMES {
         crate::profiling::Profiler::new_frame();
-        cpu_ms.push(submit_frame(virtual_t));
+        let (ms, visible) = submit_frame(virtual_t);
+        cpu_ms.push(ms);
+        visible_sum += visible as u64;
         let _ = device.poll(wgpu::Maintain::Poll);
         virtual_t += VIRTUAL_DT;
     }
     let _ = device.poll(wgpu::Maintain::Wait);
     let wall_secs = wall_start.elapsed().as_secs_f64();
+    let avg_visible = visible_sum as f64 / MEASURE_FRAMES as f64;
 
-    report(MEASURE_FRAMES, wall_secs, cpu_ms);
+    report(MEASURE_FRAMES, wall_secs, cpu_ms, avg_visible, chunks.len());
 }
 
-fn report(frames: u32, wall_secs: f64, mut cpu_ms: Vec<f64>) {
+fn report(
+    frames: u32,
+    wall_secs: f64,
+    mut cpu_ms: Vec<f64>,
+    avg_visible: f64,
+    total_chunks: usize,
+) {
     let throughput = frames as f64 / wall_secs;
 
     cpu_ms.sort_by(|a, b| a.partial_cmp(b).expect("no NaN frame times"));
@@ -186,6 +204,7 @@ fn report(frames: u32, wall_secs: f64, mut cpu_ms: Vec<f64>) {
     log::info!("frames            : {frames}");
     log::info!("throughput        : {throughput:.0} FPS (sustained, pipelined)");
     log::info!("CPU submit / frame: avg {cpu_avg:.3} ms | p50 {cpu_p50:.3} | p99 {cpu_p99:.3}");
+    log::info!("chunks drawn      : avg {avg_visible:.1} / {total_chunks} (frustum-culled)");
     log::info!("========================================");
     log::info!(
         "goal 1000+ FPS: {}",
