@@ -11,6 +11,7 @@ use std::time::Instant;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
+use crate::culling::{Aabb, Frustum};
 use crate::mesh::Vertex;
 use crate::world::World;
 
@@ -26,22 +27,39 @@ pub(crate) struct CameraUniform {
 impl CameraUniform {
     /// Orbit `center` at `radius`, framerate-independent via virtual time `t`.
     pub(crate) fn new(aspect: f32, t: f32, center: [f32; 3], radius: f32) -> Self {
+        Self::from_matrix(Self::view_proj_matrix(aspect, t, center, radius))
+    }
+
+    /// The raw view*projection matrix, exposed so callers can also build a
+    /// [`Frustum`] from the exact same camera used for the uniform.
+    pub(crate) fn view_proj_matrix(
+        aspect: f32,
+        t: f32,
+        center: [f32; 3],
+        radius: f32,
+    ) -> glam::Mat4 {
         let center = glam::Vec3::from(center);
         let angle = t * 0.15;
         let eye = center + glam::vec3(radius * angle.cos(), radius * 0.45, radius * angle.sin());
         let proj = glam::Mat4::perspective_rh(60f32.to_radians(), aspect, 0.1, 2000.0);
         let view = glam::Mat4::look_at_rh(eye, center, glam::Vec3::Y);
+        proj * view
+    }
+
+    pub(crate) fn from_matrix(m: glam::Mat4) -> Self {
         Self {
-            view_proj: (proj * view).to_cols_array_2d(),
+            view_proj: m.to_cols_array_2d(),
         }
     }
 }
 
-/// A single chunk's mesh uploaded to the GPU.
+/// A single chunk's mesh uploaded to the GPU, with its world-space bounds for
+/// frustum culling.
 pub(crate) struct ChunkGpu {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
+    pub(crate) aabb: Aabb,
 }
 
 impl ChunkGpu {
@@ -65,6 +83,14 @@ pub(crate) fn upload_world(device: &wgpu::Device, world: &World) -> Vec<ChunkGpu
         }
         total_tris += mesh.triangle_count();
 
+        let mut min = glam::Vec3::splat(f32::MAX);
+        let mut max = glam::Vec3::splat(f32::MIN);
+        for v in &mesh.vertices {
+            let p = glam::Vec3::from(v.position);
+            min = min.min(p);
+            max = max.max(p);
+        }
+
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("chunk-vertices"),
             contents: bytemuck::cast_slice(&mesh.vertices),
@@ -79,6 +105,7 @@ pub(crate) fn upload_world(device: &wgpu::Device, world: &World) -> Vec<ChunkGpu
             vertex_buffer,
             index_buffer,
             index_count: mesh.indices.len() as u32,
+            aabb: Aabb::new(min, max),
         });
     }
 
@@ -99,9 +126,11 @@ pub struct Renderer {
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
+    frustum: Frustum,
 
     look_target: [f32; 3],
     view_radius: f32,
+    visible_chunks: usize,
     start: Instant,
     frames: u32,
     last_report: Instant,
@@ -184,6 +213,16 @@ impl Renderer {
         let pipeline = build_pipeline(&device, format, &camera_bgl);
         let depth_view = create_depth_view(&device, config.width, config.height);
 
+        let look_target = world.look_target();
+        let view_radius = world.view_radius();
+        let aspect = config.width as f32 / config.height as f32;
+        let frustum = Frustum::from_view_proj(CameraUniform::view_proj_matrix(
+            aspect,
+            0.0,
+            look_target,
+            view_radius,
+        ));
+
         Self {
             window,
             surface,
@@ -195,8 +234,10 @@ impl Renderer {
             camera_buffer,
             camera_bind_group,
             depth_view,
-            look_target: world.look_target(),
-            view_radius: world.view_radius(),
+            frustum,
+            look_target,
+            view_radius,
+            visible_chunks: 0,
             start: Instant::now(),
             frames: 0,
             last_report: Instant::now(),
@@ -272,9 +313,14 @@ impl Renderer {
 
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            let mut visible = 0usize;
             for chunk in &self.chunks {
-                chunk.draw(&mut pass);
+                if self.frustum.intersects_aabb(&chunk.aabb) {
+                    chunk.draw(&mut pass);
+                    visible += 1;
+                }
             }
+            self.visible_chunks = visible;
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -286,7 +332,9 @@ impl Renderer {
     fn update_camera(&mut self) {
         let t = self.start.elapsed().as_secs_f32();
         let aspect = self.config.width as f32 / self.config.height as f32;
-        let uniform = CameraUniform::new(aspect, t, self.look_target, self.view_radius);
+        let vp = CameraUniform::view_proj_matrix(aspect, t, self.look_target, self.view_radius);
+        self.frustum = Frustum::from_view_proj(vp);
+        let uniform = CameraUniform::from_matrix(vp);
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
     }
@@ -297,7 +345,11 @@ impl Renderer {
         let elapsed = self.last_report.elapsed();
         if elapsed.as_secs_f32() >= 1.0 {
             let fps = self.frames as f32 / elapsed.as_secs_f32();
-            log::info!("{fps:.0} FPS");
+            log::info!(
+                "{fps:.0} FPS | chunks {}/{}",
+                self.visible_chunks,
+                self.chunks.len()
+            );
             self.frames = 0;
             self.last_report = Instant::now();
         }
