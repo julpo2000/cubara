@@ -37,22 +37,13 @@ impl Chunk {
         self.is_solid(x, y, z)
     }
 
-    pub fn solid_count(&self) -> usize {
-        self.solid.iter().filter(|&&s| s).count()
-    }
-
-    /// Fill the chunk with a solid sphere so the 3D structure is clearly visible.
-    pub fn generate_sphere() -> Self {
+    /// Build a chunk by asking `f` whether each local block is solid.
+    pub fn from_solid_fn(mut f: impl FnMut(usize, usize, usize) -> bool) -> Self {
         let mut solid = vec![false; Self::VOLUME];
-        let center = (Self::SIZE as f32 - 1.0) * 0.5;
-        let radius = Self::SIZE as f32 * 0.47;
         for z in 0..Self::SIZE {
             for y in 0..Self::SIZE {
                 for x in 0..Self::SIZE {
-                    let dx = x as f32 - center;
-                    let dy = y as f32 - center;
-                    let dz = z as f32 - center;
-                    if dx * dx + dy * dy + dz * dz <= radius * radius {
+                    if f(x, y, z) {
                         solid[Self::index(x, y, z)] = true;
                     }
                 }
@@ -61,13 +52,18 @@ impl Chunk {
         Self { solid }
     }
 
+    /// Whether the chunk has no solid blocks (nothing to mesh).
+    pub fn is_empty(&self) -> bool {
+        !self.solid.iter().any(|&s| s)
+    }
+
     /// Greedy mesher. Sweeps slices along each axis, builds a per-slice mask of
     /// visible faces (signed by which side is solid), and merges equal-mask cells
-    /// into the largest possible quads. The chunk is centered on the origin.
+    /// into the largest possible quads. Vertices are in local chunk space (0..SIZE);
+    /// callers place the chunk in the world by offsetting positions.
     pub fn build_mesh(&self) -> Mesh {
         let mut mesh = Mesh::default();
         let n = Self::SIZE as i32;
-        let half = Self::SIZE as f32 * 0.5;
         // `mask[v * n + u]`: 0 = no face, +1 = face toward +axis, -1 = toward -axis.
         let mut mask = vec![0i8; (n * n) as usize];
 
@@ -128,7 +124,7 @@ impl Chunk {
                             h += 1;
                         }
 
-                        self.push_quad(&mut mesh, d, u, v, pos[d], i, j, w, h, m, half);
+                        self.push_quad(&mut mesh, d, u, v, pos[d], i, j, w, h, m);
 
                         // Consume the merged cells.
                         for l in 0..h {
@@ -160,7 +156,6 @@ impl Chunk {
         w: i32,
         h: i32,
         m: i8,
-        half: f32,
     ) {
         let mut base = [0i32; 3];
         base[d] = plane;
@@ -174,9 +169,7 @@ impl Chunk {
         let mut normal = [0.0f32; 3];
         normal[d] = m as f32;
 
-        let corner = |c: [i32; 3]| -> [f32; 3] {
-            [c[0] as f32 - half, c[1] as f32 - half, c[2] as f32 - half]
-        };
+        let corner = |c: [i32; 3]| -> [f32; 3] { [c[0] as f32, c[1] as f32, c[2] as f32] };
         let c0 = base;
         let c1 = [base[0] + du[0], base[1] + du[1], base[2] + du[2]];
         let c2 = [
