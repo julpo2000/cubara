@@ -11,33 +11,29 @@ use std::time::Instant;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
+use cubara_voxel::Vertex;
+use cubara_world::World;
+
 use crate::culling::{Aabb, Frustum};
-use crate::mesh::Vertex;
-use crate::world::World;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// Uniform block shared with `mesh.wgsl`: one column-major view*projection matrix.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-pub(crate) struct CameraUniform {
+pub struct CameraUniform {
     view_proj: [[f32; 4]; 4],
 }
 
 impl CameraUniform {
     /// Orbit `center` at `radius`, framerate-independent via virtual time `t`.
-    pub(crate) fn new(aspect: f32, t: f32, center: [f32; 3], radius: f32) -> Self {
+    pub fn new(aspect: f32, t: f32, center: [f32; 3], radius: f32) -> Self {
         Self::from_matrix(Self::view_proj_matrix(aspect, t, center, radius))
     }
 
     /// The raw view*projection matrix, exposed so callers can also build a
     /// [`Frustum`] from the exact same camera used for the uniform.
-    pub(crate) fn view_proj_matrix(
-        aspect: f32,
-        t: f32,
-        center: [f32; 3],
-        radius: f32,
-    ) -> glam::Mat4 {
+    pub fn view_proj_matrix(aspect: f32, t: f32, center: [f32; 3], radius: f32) -> glam::Mat4 {
         let center = glam::Vec3::from(center);
         let angle = t * 0.15;
         let eye = center + glam::vec3(radius * angle.cos(), radius * 0.45, radius * angle.sin());
@@ -46,7 +42,7 @@ impl CameraUniform {
         proj * view
     }
 
-    pub(crate) fn from_matrix(m: glam::Mat4) -> Self {
+    pub fn from_matrix(m: glam::Mat4) -> Self {
         Self {
             view_proj: m.to_cols_array_2d(),
         }
@@ -55,15 +51,15 @@ impl CameraUniform {
 
 /// A single chunk's mesh uploaded to the GPU, with its world-space bounds for
 /// frustum culling.
-pub(crate) struct ChunkGpu {
+pub struct ChunkGpu {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
-    pub(crate) aabb: Aabb,
+    pub aabb: Aabb,
 }
 
 impl ChunkGpu {
-    pub(crate) fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..self.index_count, 0, 0..1);
@@ -71,7 +67,7 @@ impl ChunkGpu {
 }
 
 /// Mesh every chunk, bake its world offset into the vertices, and upload it.
-pub(crate) fn upload_world(device: &wgpu::Device, world: &World) -> Vec<ChunkGpu> {
+pub fn upload_world(device: &wgpu::Device, world: &World) -> Vec<ChunkGpu> {
     let mut gpu = Vec::with_capacity(world.chunks.len());
     let mut total_tris = 0usize;
 
@@ -356,7 +352,7 @@ impl Renderer {
     }
 }
 
-pub(crate) fn camera_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+pub fn camera_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("camera-bgl"),
         entries: &[wgpu::BindGroupLayoutEntry {
@@ -372,11 +368,7 @@ pub(crate) fn camera_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroup
     })
 }
 
-pub(crate) fn create_depth_view(
-    device: &wgpu::Device,
-    width: u32,
-    height: u32,
-) -> wgpu::TextureView {
+pub fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth-texture"),
         size: wgpu::Extent3d {
@@ -394,7 +386,7 @@ pub(crate) fn create_depth_view(
     texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
-pub(crate) fn build_pipeline(
+pub fn build_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
     camera_bgl: &wgpu::BindGroupLayout,

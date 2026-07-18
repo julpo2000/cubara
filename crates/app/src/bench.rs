@@ -9,11 +9,11 @@
 
 use std::time::Instant;
 
-use crate::culling::Frustum;
-use crate::render::{
+use cubara_render::{
     build_pipeline, camera_bind_group_layout, create_depth_view, upload_world, CameraUniform,
+    Frustum,
 };
-use crate::world::World;
+use cubara_world::World;
 
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
@@ -48,7 +48,7 @@ pub fn run() {
     .expect("request device");
 
     // Held for the duration of the benchmark when built with `--features profile`.
-    let _profiler = crate::profiling::Profiler::init();
+    let _profiler = cubara_render::Profiler::init();
 
     // Scene: the same world the live app renders.
     let world = World::generate();
@@ -171,7 +171,7 @@ pub fn run() {
     let mut visible_sum = 0u64;
     let wall_start = Instant::now();
     for _ in 0..MEASURE_FRAMES {
-        crate::profiling::Profiler::new_frame();
+        cubara_render::Profiler::new_frame();
         let (ms, visible) = submit_frame(virtual_t);
         cpu_ms.push(ms);
         visible_sum += visible as u64;

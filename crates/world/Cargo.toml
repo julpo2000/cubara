@@ -1,0 +1,10 @@
+[package]
+name = "cubara-world"
+description = "Cubara — world generation and chunk storage."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+cubara-voxel = { path = "../voxel" }

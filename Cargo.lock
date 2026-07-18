@@ -427,15 +427,46 @@ name = "cubara"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
+ "cubara-render",
+ "cubara-world",
  "env_logger",
- "glam",
  "image",
+ "log",
+ "pollster",
+ "puffin",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
+name = "cubara-render"
+version = "0.0.1"
+dependencies = [
+ "bytemuck",
+ "cubara-voxel",
+ "cubara-world",
+ "glam",
  "log",
  "pollster",
  "puffin",
  "puffin_http",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "cubara-voxel"
+version = "0.0.1"
+dependencies = [
+ "bytemuck",
+ "wgpu",
+]
+
+[[package]]
+name = "cubara-world"
+version = "0.0.1"
+dependencies = [
+ "cubara-voxel",
 ]
 
 [[package]]
