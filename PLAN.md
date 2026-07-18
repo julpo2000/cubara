@@ -164,6 +164,7 @@ condition: only after 1000+ FPS do we build gameplay.
 | M1 | **First chunk** | Render one chunk of cubes; **1000+ FPS** in benchmark ← *gate* |
 | M2 | **Meshing & culling** | Greedy meshing, hidden-face + frustum culling, multiple chunks, simple worldgen |
 | M3 | **Streaming** | Load/unload chunks around the player; "infinite" flat world |
+| M3.5 | **GPU-driven rendering** | Shared buffers + `multi_draw_indirect`, then GPU compute culling — see §10 |
 | M4 | **LOD** | Distant chunks at lower resolution; large render distance |
 | M5 | **Player & interaction** | Camera/controller, raycasting, place/break blocks |
 | M6 | **Data-driven content** | Block registry from data files, texture atlas, base block set |
@@ -203,3 +204,56 @@ and the `app` skeleton (M0).
 - **Multi-platform CI**: build on Windows and macOS.
 - **Semantic versioning** + changelog.
 - Later: `CONTRIBUTING.md`, issue/PR templates, branch protection on `main`.
+
+---
+
+## 10. GPU-driven rendering (milestone M3.5)
+
+Recorded plan for the render-performance arc between M3 (streaming) and M4 (LOD).
+Tracked in GitHub milestone **M3.5** — issues #26 (spike), #27 (step 1), #28
+(step 2), #29 (tracking).
+
+### The problem
+
+After M3, the renderer draws **one chunk per draw call**. The benchmark scene is
+~1,350 chunks, so ~1,350 draw calls per frame, and we are **CPU-submit-bound** at
+~0.5 ms/frame (see [`BENCHMARKS.md`](BENCHMARKS.md)). The draw-call count is the
+bottleneck, and cutting it is the road to practically infinite render distance
+(§3).
+
+### Batching and GPU-driven are one arc, not two options
+
+Reducing draw calls ("batching", *A*) and moving the whole cull+draw to the GPU
+("GPU-driven", *B*) are **not alternatives**. *B* is the destination, and the core
+of *A* — putting all chunk geometry in **shared GPU buffers** with **per-chunk
+metadata** — is the foundation *B* is built on. You cannot draw many chunks from
+one indirect submit unless their geometry lives in shared buffers, so that work is
+done once and reused. Sequenced so nothing is thrown away:
+
+1. **Step 1 — shared buffer arena + `multi_draw_indirect` (CPU culling) [#27].**
+   All resident chunk geometry moves into a pooled vertex/index buffer with
+   per-chunk sub-allocations (a slab/free-list allocator, since streaming frees and
+   reuses slots constantly). A per-chunk metadata array holds buffer offsets, index
+   count, and AABB. Each frame the CPU frustum-culls, writes an indirect-args
+   buffer, and issues **one** `multi_draw_indirect` instead of ~1,350 draws.
+
+2. **Step 2 — GPU compute frustum culling [#28].** The per-chunk metadata goes to a
+   storage buffer; a compute shader reads the frustum + AABBs and writes the visible
+   draws' indirect args + count, drawn via `multi_draw_indirect_count`. CPU per-frame
+   cost then goes **flat regardless of chunk count** — the endgame from §3.
+
+   Step 2 reuses everything from Step 1; only the cull moves from CPU to compute.
+
+### The cross-platform gate
+
+`multi_draw_indirect` and especially `..._COUNT` are wgpu features that **may not
+be available on Metal** (macOS), which we target alongside Vulkan (Windows). The
+**capability spike [#26]** checks this on both machines (`cargo run --release --
+--caps`) *before* the buffer refactor. If Metal lacks a feature, that backend keeps
+a batched-but-CPU-recorded draw path as a fallback — still a large win over
+one-draw-per-chunk.
+
+### Out of scope (separate track)
+
+**Async chunk meshing on worker threads** (§4) fixes streaming *hitches*, not the
+draw-call count. Orthogonal; tracked separately.

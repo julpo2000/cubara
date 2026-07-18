@@ -4,6 +4,7 @@
 //! grows this from a validation triangle into a chunk of cubes rendered at 1000+ FPS.
 
 mod bench;
+mod caps;
 mod screenshot;
 
 use std::sync::Arc;
@@ -54,6 +55,12 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args: Vec<String> = std::env::args().collect();
+
+    // GPU capability report: `cargo run --release -- --caps`.
+    if args.iter().any(|a| a == "--caps") {
+        caps::run();
+        return;
+    }
 
     // Headless benchmark mode: `cargo run --release -- --bench`.
     if args.iter().any(|a| a == "--bench") {
