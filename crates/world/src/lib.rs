@@ -4,6 +4,7 @@
 //! world. For now it's a small fixed grid with simple heightmap terrain; streaming
 //! and persistence layer on top of this later.
 
+pub mod streaming;
 mod world;
 
 pub use world::{PlacedChunk, World};

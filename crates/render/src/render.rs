@@ -73,7 +73,7 @@ pub fn upload_world(device: &wgpu::Device, world: &World) -> Vec<ChunkGpu> {
 
     for placed in &world.chunks {
         let mut mesh = placed.chunk.build_mesh();
-        mesh.translate(World::chunk_offset(placed.coord));
+        mesh.translate(placed.coord.world_offset());
         if mesh.indices.is_empty() {
             continue;
         }
