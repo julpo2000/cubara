@@ -1,9 +1,11 @@
-//! A small grid of chunks with simple heightmap terrain.
+//! Terrain generation and the current (fixed) world grid.
 //!
-//! Enough of a world for meshing, greedy merging and (next) frustum culling to act
-//! on. Empty chunks (fully above the terrain) are dropped so we don't mesh air.
+//! Terrain is a deterministic function of world position, so any chunk can be
+//! generated on demand from its [`ChunkCoord`] alone — [`World::chunk_at`] is the
+//! primitive the streaming layer builds on. [`World::generate`] still bakes a small
+//! fixed grid for the window/bench/screenshot paths until the renderer streams.
 
-use cubara_voxel::Chunk;
+use cubara_voxel::{Chunk, ChunkCoord};
 
 const CHUNKS_X: i32 = 8;
 const CHUNKS_Y: i32 = 3;
@@ -11,7 +13,7 @@ const CHUNKS_Z: i32 = 8;
 
 /// A chunk together with its position in the chunk grid.
 pub struct PlacedChunk {
-    pub coord: [i32; 3],
+    pub coord: ChunkCoord,
     pub chunk: Chunk,
 }
 
@@ -33,45 +35,41 @@ fn terrain_height(x: i32, z: i32) -> i32 {
 }
 
 impl World {
-    pub fn generate() -> Self {
+    /// Generate the chunk at `coord` straight from the terrain function, or `None`
+    /// if it contains no solid blocks (nothing to mesh — e.g. fully above ground).
+    /// Deterministic and self-contained: no [`World`] instance required, so the
+    /// streaming layer can call it for any coordinate.
+    pub fn chunk_at(coord: ChunkCoord) -> Option<Chunk> {
         let size = Chunk::SIZE as i32;
-        let mut chunks = Vec::new();
+        let chunk = Chunk::from_solid_fn(|lx, ly, lz| {
+            let wx = coord.x * size + lx as i32;
+            let wy = coord.y * size + ly as i32;
+            let wz = coord.z * size + lz as i32;
+            wy <= terrain_height(wx, wz)
+        });
+        (!chunk.is_empty()).then_some(chunk)
+    }
 
+    pub fn generate() -> Self {
+        let mut chunks = Vec::new();
         for cz in 0..CHUNKS_Z {
             for cy in 0..CHUNKS_Y {
                 for cx in 0..CHUNKS_X {
-                    let chunk = Chunk::from_solid_fn(|lx, ly, lz| {
-                        let wx = cx * size + lx as i32;
-                        let wy = cy * size + ly as i32;
-                        let wz = cz * size + lz as i32;
-                        wy <= terrain_height(wx, wz)
-                    });
-                    if !chunk.is_empty() {
-                        chunks.push(PlacedChunk {
-                            coord: [cx, cy, cz],
-                            chunk,
-                        });
+                    let coord = ChunkCoord::new(cx, cy, cz);
+                    if let Some(chunk) = Self::chunk_at(coord) {
+                        chunks.push(PlacedChunk { coord, chunk });
                     }
                 }
             }
         }
 
+        let size = Chunk::SIZE as i32;
         let extent = [
             (CHUNKS_X * size) as f32,
             (CHUNKS_Y * size) as f32,
             (CHUNKS_Z * size) as f32,
         ];
         Self { chunks, extent }
-    }
-
-    /// World-space block offset of a chunk's origin corner.
-    pub fn chunk_offset(coord: [i32; 3]) -> [f32; 3] {
-        let size = Chunk::SIZE as f32;
-        [
-            coord[0] as f32 * size,
-            coord[1] as f32 * size,
-            coord[2] as f32 * size,
-        ]
     }
 
     /// A pleasant point to aim the camera at (slightly below vertical middle).

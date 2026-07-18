@@ -5,8 +5,10 @@
 //! It knows nothing about the GPU beyond the vertex-buffer layout, so worldgen and
 //! the renderer can share these types without depending on each other.
 
+pub mod coord;
 pub mod mesh;
 pub mod voxel;
 
+pub use coord::ChunkCoord;
 pub use mesh::{Mesh, Vertex};
 pub use voxel::Chunk;
