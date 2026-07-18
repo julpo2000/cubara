@@ -213,6 +213,11 @@ Recorded plan for the render-performance arc between M3 (streaming) and M4 (LOD)
 Tracked in GitHub milestone **M3.5** — issues #26 (spike), #27 (step 1), #28
 (step 2), #29 (tracking).
 
+**Status:** #26 spike ✅ done, #27 step 1 ✅ done. On the heavy bench scene (1,349
+chunks) the arena + one `multi_draw_indirect` cut M3 CPU/frame from **0.317 ms to
+0.199 ms** (~37%) and 1,349 draws to **one** — see [`BENCHMARKS.md`](BENCHMARKS.md).
+Next: #28 (GPU compute cull), which needs a Metal fallback (see the gate below).
+
 ### The problem
 
 After M3, the renderer draws **one chunk per draw call**. The benchmark scene is
@@ -230,12 +235,15 @@ metadata** — is the foundation *B* is built on. You cannot draw many chunks fr
 one indirect submit unless their geometry lives in shared buffers, so that work is
 done once and reused. Sequenced so nothing is thrown away:
 
-1. **Step 1 — shared buffer arena + `multi_draw_indirect` (CPU culling) [#27].**
+1. **Step 1 — shared buffer arena + `multi_draw_indirect` (CPU culling) [#27]. ✅**
    All resident chunk geometry moves into a pooled vertex/index buffer with
-   per-chunk sub-allocations (a slab/free-list allocator, since streaming frees and
-   reuses slots constantly). A per-chunk metadata array holds buffer offsets, index
-   count, and AABB. Each frame the CPU frustum-culls, writes an indirect-args
-   buffer, and issues **one** `multi_draw_indirect` instead of ~1,350 draws.
+   per-chunk sub-allocations (a first-fit, coalescing free-list allocator, since
+   streaming frees and reuses slots constantly). A per-chunk metadata array holds
+   buffer offsets, index count, and AABB. Each frame the CPU frustum-culls, writes
+   an indirect-args buffer, and issues **one** `multi_draw_indexed_indirect` instead
+   of ~1,350 draws. Backends without `MULTI_DRAW_INDIRECT` fall back to a
+   `draw_indexed` loop over the *same* shared buffers, so there's no second geometry
+   path. (Implemented in `crates/render/src/arena.rs`.)
 
 2. **Step 2 — GPU compute frustum culling [#28].** The per-chunk metadata goes to a
    storage buffer; a compute shader reads the frustum + AABBs and writes the visible
@@ -248,10 +256,19 @@ done once and reused. Sequenced so nothing is thrown away:
 
 `multi_draw_indirect` and especially `..._COUNT` are wgpu features that **may not
 be available on Metal** (macOS), which we target alongside Vulkan (Windows). The
-**capability spike [#26]** checks this on both machines (`cargo run --release --
---caps`) *before* the buffer refactor. If Metal lacks a feature, that backend keeps
-a batched-but-CPU-recorded draw path as a fallback — still a large win over
-one-draw-per-chunk.
+**capability spike [#26]** checked this on both machines (`cargo run --release --
+--caps`). Result:
+
+| feature | Windows / Vulkan (RTX 4060) | macOS / Metal (Apple M3) |
+|---|---|---|
+| `MULTI_DRAW_INDIRECT` | ✅ | ✅ |
+| `MULTI_DRAW_INDIRECT_COUNT` | ✅ | ❌ |
+| `INDIRECT_FIRST_INSTANCE` | ✅ | ✅ |
+
+So **Step 1 works on both backends** (both have `MULTI_DRAW_INDIRECT`). **Step 2's
+GPU-decided draw count needs a Metal fallback**: run the compute cull to build the
+args buffer, but issue `multi_draw_indirect` with a conservative max count (zeroing
+culled entries) instead of `..._count`. Vulkan keeps the true count path.
 
 ### Out of scope (separate track)
 

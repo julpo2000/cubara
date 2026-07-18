@@ -6,8 +6,8 @@
 use wgpu::util::DeviceExt;
 
 use cubara_render::{
-    build_pipeline, camera_bind_group_layout, chunks_bounds, create_depth_view, upload_region,
-    CameraUniform,
+    build_pipeline, camera_bind_group_layout, create_depth_view, gpu_driven_features,
+    CameraUniform, ChunkArena, Frustum,
 };
 use cubara_voxel::ChunkCoord;
 
@@ -29,10 +29,12 @@ pub fn run(path: &str) {
     }))
     .expect("no suitable GPU adapter");
 
+    let (features, multi_draw) = gpu_driven_features(&adapter);
+
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: Some("cubara-screenshot-device"),
-            required_features: wgpu::Features::empty(),
+            required_features: features,
             required_limits: wgpu::Limits::default(),
             memory_hints: wgpu::MemoryHints::Performance,
         },
@@ -41,8 +43,17 @@ pub fn run(path: &str) {
     .expect("request device");
 
     // Scene: a streamed region, same path the live renderer and bench use.
-    let chunks = upload_region(&device, ChunkCoord::new(0, 0, 0), REGION_RADIUS, 0..=2);
-    let (min, max) = chunks_bounds(&chunks);
+    let mut arena = ChunkArena::from_region(
+        &device,
+        &queue,
+        multi_draw,
+        ChunkCoord::new(0, 0, 0),
+        REGION_RADIUS,
+        0..=2,
+    );
+    let (min, max) = arena
+        .bounds()
+        .expect("screenshot region produced no geometry");
     let look_target = [
         (min[0] + max[0]) * 0.5,
         (min[1] + max[1]) * 0.5,
@@ -51,7 +62,15 @@ pub fn run(path: &str) {
     let view_radius = (max[0] - min[0]).max(max[2] - min[2]) * 0.75;
 
     // Camera fixed at a pleasant orbit angle.
-    let uniform = CameraUniform::new(WIDTH as f32 / HEIGHT as f32, 6.0, look_target, view_radius);
+    let vp = CameraUniform::view_proj_matrix(
+        WIDTH as f32 / HEIGHT as f32,
+        6.0,
+        look_target,
+        view_radius,
+    );
+    let frustum = Frustum::from_view_proj(vp);
+    let draw_count = arena.prepare(&queue, &frustum);
+    let uniform = CameraUniform::from_matrix(vp);
     let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("screenshot-camera"),
         contents: bytemuck::bytes_of(&uniform),
@@ -128,9 +147,7 @@ pub fn run(path: &str) {
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &camera_bind_group, &[]);
-        for chunk in &chunks {
-            chunk.draw(&mut pass);
-        }
+        arena.encode(&mut pass, draw_count);
     }
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
@@ -178,8 +195,5 @@ pub fn run(path: &str) {
         image::ExtendedColorType::Rgba8,
     )
     .expect("write png");
-    log::info!(
-        "screenshot written to {path} ({WIDTH}x{HEIGHT}, {} chunks)",
-        chunks.len()
-    );
+    log::info!("screenshot written to {path} ({WIDTH}x{HEIGHT}, {draw_count} chunks drawn)");
 }
