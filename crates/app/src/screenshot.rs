@@ -6,13 +6,16 @@
 use wgpu::util::DeviceExt;
 
 use cubara_render::{
-    build_pipeline, camera_bind_group_layout, create_depth_view, upload_world, CameraUniform,
+    build_pipeline, camera_bind_group_layout, chunks_bounds, create_depth_view, upload_region,
+    CameraUniform,
 };
-use cubara_world::World;
+use cubara_voxel::ChunkCoord;
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+/// Square chunk radius of the region to frame in the screenshot.
+const REGION_RADIUS: i32 = 6;
 
 pub fn run(path: &str) {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -37,16 +40,18 @@ pub fn run(path: &str) {
     ))
     .expect("request device");
 
-    let world = World::generate();
-    let chunks = upload_world(&device, &world);
+    // Scene: a streamed region, same path the live renderer and bench use.
+    let chunks = upload_region(&device, ChunkCoord::new(0, 0, 0), REGION_RADIUS, 0..=2);
+    let (min, max) = chunks_bounds(&chunks);
+    let look_target = [
+        (min[0] + max[0]) * 0.5,
+        (min[1] + max[1]) * 0.5,
+        (min[2] + max[2]) * 0.5,
+    ];
+    let view_radius = (max[0] - min[0]).max(max[2] - min[2]) * 0.75;
 
     // Camera fixed at a pleasant orbit angle.
-    let uniform = CameraUniform::new(
-        WIDTH as f32 / HEIGHT as f32,
-        6.0,
-        world.look_target(),
-        world.view_radius(),
-    );
+    let uniform = CameraUniform::new(WIDTH as f32 / HEIGHT as f32, 6.0, look_target, view_radius);
     let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("screenshot-camera"),
         contents: bytemuck::bytes_of(&uniform),

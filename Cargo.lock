@@ -428,6 +428,7 @@ version = "0.0.1"
 dependencies = [
  "bytemuck",
  "cubara-render",
+ "cubara-voxel",
  "cubara-world",
  "env_logger",
  "image",

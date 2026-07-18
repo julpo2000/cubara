@@ -15,6 +15,7 @@ path = "src/main.rs"
 profile = ["cubara-render/profile"]
 
 [dependencies]
+cubara-voxel = { path = "../voxel" }
 cubara-render = { path = "../render" }
 cubara-world = { path = "../world" }
 winit.workspace = true
