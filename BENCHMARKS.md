@@ -36,6 +36,7 @@ frames after 200 warmup.
 |---|---|---|---|---|---|---|---|
 | 2026-07-18 | M2 — frustum culling (baseline) | 137 | 22,788 | 8097 | 0.083 ms | 0.350 ms | `0ab6034` |
 | 2026-07-18 | M3 — streaming foundation (no scene change) | 137 | 22,788 | ~11,100¹ | 0.077 ms | ~0.29 ms | `7a249d2` |
+| 2026-07-19 | M3 — streaming renderer (heavy scene) | 1,349 | 217,550 | ~1,980² | ~0.49 ms | ~1.16 ms | `ae0ebea` |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -52,6 +53,16 @@ last, so successive runs aren't independent samples. CPU/frame stayed tight at
 137-chunk scene), so this is a same-scene re-baseline, not a real speedup; treat
 CPU/frame as the comparable number, and take first-run-after-idle FPS over a
 warmed-up burst when comparing across features.
+
+² **First meaningful FPS number.** The streaming renderer measures a ~1,350-chunk
+region (10× the old grid), which pushes the frame into being **CPU-submit-bound**:
+one draw call per chunk (~1,322 drawn after culling) dominates at ~0.5 ms/frame.
+Because it's now bound by real work rather than pipeline overhead, FPS is far
+tighter — 4 runs spanned **1,836–2,082 FPS** (±~6% vs the ±40% of the 137-chunk
+rows). This is *not* comparable to the rows above (different, much heavier scene) —
+it's the new baseline to optimize down from. The obvious next lever is the draw-call
+count: batching chunks into fewer draws (instanced / indirect / GPU-driven) should
+move this number, and it'll show up right here.
 
 ## Detailed run logs
 
