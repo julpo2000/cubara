@@ -206,12 +206,15 @@ fn report(
     log::info!("CPU submit / frame: avg {cpu_avg:.3} ms | p50 {cpu_p50:.3} | p99 {cpu_p99:.3}");
     log::info!("chunks drawn      : avg {avg_visible:.1} / {total_chunks} (frustum-culled)");
     log::info!("========================================");
+    // Lead with the numbers so every run is a data point for the performance
+    // history in BENCHMARKS.md; the 1000-FPS gate is just a trailing tag now.
+    let gate = if throughput >= 1000.0 {
+        "MET"
+    } else {
+        "NOT MET"
+    };
     log::info!(
-        "goal 1000+ FPS: {}",
-        if throughput >= 1000.0 {
-            "MET"
-        } else {
-            "not yet"
-        }
+        "SUMMARY: {throughput:.0} FPS | CPU/frame avg {cpu_avg:.3} ms (p99 {cpu_p99:.3}) | \
+         {avg_visible:.0}/{total_chunks} chunks | 1000-FPS gate {gate}"
     );
 }
