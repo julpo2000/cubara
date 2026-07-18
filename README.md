@@ -37,6 +37,9 @@ cargo run --release --features profile -- --bench
 
 # Render a single frame to a PNG (headless, no window)
 cargo run --release -- --screenshot world.png
+
+# Print GPU adapter capabilities (feature support for GPU-driven rendering)
+cargo run --release -- --caps
 ```
 
 Stack: Rust + [`wgpu`](https://wgpu.rs) (Metal on macOS, DX12/Vulkan on Windows) +
