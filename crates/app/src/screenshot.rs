@@ -5,10 +5,10 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::render::{
+use cubara_render::{
     build_pipeline, camera_bind_group_layout, create_depth_view, upload_world, CameraUniform,
 };
-use crate::world::World;
+use cubara_world::World;
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;

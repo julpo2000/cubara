@@ -3,7 +3,7 @@
 //! Enough of a world for meshing, greedy merging and (next) frustum culling to act
 //! on. Empty chunks (fully above the terrain) are dropped so we don't mesh air.
 
-use crate::voxel::Chunk;
+use cubara_voxel::Chunk;
 
 const CHUNKS_X: i32 = 8;
 const CHUNKS_Y: i32 = 3;
