@@ -1,10 +1,11 @@
-//! World generation and chunk storage.
+//! World generation and streaming policy.
 //!
-//! Builds and holds the grid of [`Chunk`](cubara_voxel::Chunk)s that make up the
-//! world. For now it's a small fixed grid with simple heightmap terrain; streaming
-//! and persistence layer on top of this later.
+//! [`World`] is a stateless source of [`Chunk`](cubara_voxel::Chunk)s generated on
+//! demand from deterministic heightmap terrain; [`streaming`] decides which chunks
+//! should be resident around the camera. There is no stored world grid yet —
+//! persistence layers on top of this later.
 
 pub mod streaming;
 mod world;
 
-pub use world::{PlacedChunk, World};
+pub use world::World;

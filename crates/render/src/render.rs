@@ -1,22 +1,33 @@
 //! GPU bring-up and per-frame rendering.
 //!
-//! Owns the wgpu surface/device/queue and the render pipeline. Chunks are uploaded
-//! as individual vertex/index buffers (one draw call each) so we can cull them
-//! independently later. Shared building blocks (pipeline, depth view, camera,
-//! world upload) are exposed to the benchmark so both paths measure the same thing.
+//! Owns the wgpu surface/device/queue and the render pipeline. Each chunk is its
+//! own vertex/index buffer (one draw call), held in a map keyed by [`ChunkCoord`]
+//! so the world can stream: as the camera flies, chunks that come into range are
+//! generated + uploaded and ones that fall out are dropped. The shared building
+//! blocks (pipeline, depth view, camera, chunk upload) are public so the headless
+//! bench/screenshot paths build the same scene.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-use cubara_voxel::Vertex;
-use cubara_world::World;
+use cubara_voxel::{Chunk, ChunkCoord, Vertex};
+use cubara_world::{streaming, World};
 
 use crate::culling::{Aabb, Frustum};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// How many chunks out (square radius) to keep resident around the camera.
+const STREAM_RADIUS: i32 = 8;
+/// Vertical chunk band to stream — the terrain sits comfortably inside it.
+const STREAM_Y_MIN: i32 = 0;
+const STREAM_Y_MAX: i32 = 2;
+/// Camera fly speed through the world, in blocks per second.
+const FLY_SPEED: f32 = 24.0;
 
 /// Uniform block shared with `mesh.wgsl`: one column-major view*projection matrix.
 #[repr(C)]
@@ -31,14 +42,19 @@ impl CameraUniform {
         Self::from_matrix(Self::view_proj_matrix(aspect, t, center, radius))
     }
 
-    /// The raw view*projection matrix, exposed so callers can also build a
+    /// The raw orbit view*projection matrix, exposed so callers can also build a
     /// [`Frustum`] from the exact same camera used for the uniform.
     pub fn view_proj_matrix(aspect: f32, t: f32, center: [f32; 3], radius: f32) -> glam::Mat4 {
         let center = glam::Vec3::from(center);
         let angle = t * 0.15;
         let eye = center + glam::vec3(radius * angle.cos(), radius * 0.45, radius * angle.sin());
+        Self::look_view_proj(aspect, eye, center - eye)
+    }
+
+    /// View*projection for a camera at `eye` looking along `look_dir`.
+    pub fn look_view_proj(aspect: f32, eye: glam::Vec3, look_dir: glam::Vec3) -> glam::Mat4 {
         let proj = glam::Mat4::perspective_rh(60f32.to_radians(), aspect, 0.1, 2000.0);
-        let view = glam::Mat4::look_at_rh(eye, center, glam::Vec3::Y);
+        let view = glam::Mat4::look_at_rh(eye, eye + look_dir, glam::Vec3::Y);
         proj * view
     }
 
@@ -59,6 +75,10 @@ pub struct ChunkGpu {
 }
 
 impl ChunkGpu {
+    pub fn triangle_count(&self) -> u32 {
+        self.index_count / 3
+    }
+
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -66,47 +86,94 @@ impl ChunkGpu {
     }
 }
 
-/// Mesh every chunk, bake its world offset into the vertices, and upload it.
-pub fn upload_world(device: &wgpu::Device, world: &World) -> Vec<ChunkGpu> {
-    let mut gpu = Vec::with_capacity(world.chunks.len());
-    let mut total_tris = 0usize;
-
-    for placed in &world.chunks {
-        let mut mesh = placed.chunk.build_mesh();
-        mesh.translate(placed.coord.world_offset());
-        if mesh.indices.is_empty() {
-            continue;
-        }
-        total_tris += mesh.triangle_count();
-
-        let mut min = glam::Vec3::splat(f32::MAX);
-        let mut max = glam::Vec3::splat(f32::MIN);
-        for v in &mesh.vertices {
-            let p = glam::Vec3::from(v.position);
-            min = min.min(p);
-            max = max.max(p);
-        }
-
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("chunk-vertices"),
-            contents: bytemuck::cast_slice(&mesh.vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("chunk-indices"),
-            contents: bytemuck::cast_slice(&mesh.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        gpu.push(ChunkGpu {
-            vertex_buffer,
-            index_buffer,
-            index_count: mesh.indices.len() as u32,
-            aabb: Aabb::new(min, max),
-        });
+/// Mesh one chunk (baking in its world-space offset) and upload it, or `None` if
+/// the chunk produced no geometry.
+pub fn upload_chunk(device: &wgpu::Device, coord: ChunkCoord, chunk: &Chunk) -> Option<ChunkGpu> {
+    let mut mesh = chunk.build_mesh();
+    mesh.translate(coord.world_offset());
+    if mesh.indices.is_empty() {
+        return None;
     }
 
-    log::info!("world: {} chunks meshed, {total_tris} triangles", gpu.len());
+    let mut min = glam::Vec3::splat(f32::MAX);
+    let mut max = glam::Vec3::splat(f32::MIN);
+    for v in &mesh.vertices {
+        let p = glam::Vec3::from(v.position);
+        min = min.min(p);
+        max = max.max(p);
+    }
+
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("chunk-vertices"),
+        contents: bytemuck::cast_slice(&mesh.vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("chunk-indices"),
+        contents: bytemuck::cast_slice(&mesh.indices),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+    Some(ChunkGpu {
+        vertex_buffer,
+        index_buffer,
+        index_count: mesh.indices.len() as u32,
+        aabb: Aabb::new(min, max),
+    })
+}
+
+/// Build and upload every non-empty chunk in a square region — the same streaming
+/// path the live renderer uses, exposed so the headless bench/screenshot measure
+/// and draw the same scene.
+pub fn upload_region(
+    device: &wgpu::Device,
+    center: ChunkCoord,
+    radius: i32,
+    y_range: std::ops::RangeInclusive<i32>,
+) -> Vec<ChunkGpu> {
+    let mut gpu = Vec::new();
+    let mut total_tris = 0u32;
+    for coord in streaming::desired_chunks(center, radius, y_range) {
+        if let Some(chunk) = World::chunk_at(coord) {
+            if let Some(chunk_gpu) = upload_chunk(device, coord, &chunk) {
+                total_tris += chunk_gpu.triangle_count();
+                gpu.push(chunk_gpu);
+            }
+        }
+    }
+    log::info!(
+        "region radius {radius}: {} chunks meshed, {total_tris} triangles",
+        gpu.len()
+    );
     gpu
+}
+
+/// World-space axis-aligned bounds (`[min]`, `[max]`) over a set of chunks, for
+/// framing a camera on them.
+pub fn chunks_bounds(chunks: &[ChunkGpu]) -> ([f32; 3], [f32; 3]) {
+    let mut min = [f32::MAX; 3];
+    let mut max = [f32::MIN; 3];
+    for c in chunks {
+        let lo = [c.aabb.min.x, c.aabb.min.y, c.aabb.min.z];
+        let hi = [c.aabb.max.x, c.aabb.max.y, c.aabb.max.z];
+        for (m, v) in min.iter_mut().zip(lo) {
+            *m = m.min(v);
+        }
+        for (m, v) in max.iter_mut().zip(hi) {
+            *m = m.max(v);
+        }
+    }
+    (min, max)
+}
+
+/// The unit direction the camera flies along (a gentle horizontal diagonal so it
+/// keeps crossing chunk boundaries in both x and z).
+fn fly_dir() -> glam::Vec3 {
+    glam::vec3(1.0, 0.0, 0.35).normalize()
+}
+
+/// The camera's look direction: the fly heading pitched down a little.
+fn look_dir() -> glam::Vec3 {
+    (fly_dir() + glam::vec3(0.0, -0.35, 0.0)).normalize()
 }
 
 /// All GPU + window state. Created once the event loop has `resumed`.
@@ -118,16 +185,22 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
 
     pipeline: wgpu::RenderPipeline,
-    chunks: Vec<ChunkGpu>,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
     frustum: Frustum,
 
-    look_target: [f32; 3],
-    view_radius: f32,
+    /// Uploaded, drawable chunks, keyed by grid position.
+    chunks: HashMap<ChunkCoord, ChunkGpu>,
+    /// Every coord we've streamed in, including ones that produced no geometry —
+    /// so empty chunks aren't re-generated every frame.
+    resident: HashSet<ChunkCoord>,
+    /// Chunk the camera is currently in; streaming re-runs when this changes.
+    center: ChunkCoord,
+
+    cam_pos: glam::Vec3,
+    last_frame: Instant,
     visible_chunks: usize,
-    start: Instant,
     frames: u32,
     last_report: Instant,
 }
@@ -186,9 +259,6 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let world = World::generate();
-        let chunks = upload_world(&device, &world);
-
         // Camera uniform + bind group.
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("camera-uniform"),
@@ -209,35 +279,36 @@ impl Renderer {
         let pipeline = build_pipeline(&device, format, &camera_bgl);
         let depth_view = create_depth_view(&device, config.width, config.height);
 
-        let look_target = world.look_target();
-        let view_radius = world.view_radius();
+        // Start above the terrain near the origin, looking along the fly heading.
+        let cam_pos = glam::vec3(0.0, 48.0, 0.0);
         let aspect = config.width as f32 / config.height as f32;
-        let frustum = Frustum::from_view_proj(CameraUniform::view_proj_matrix(
-            aspect,
-            0.0,
-            look_target,
-            view_radius,
-        ));
+        let frustum =
+            Frustum::from_view_proj(CameraUniform::look_view_proj(aspect, cam_pos, look_dir()));
+        let center = ChunkCoord::from_world_pos(cam_pos.to_array());
 
-        Self {
+        let mut renderer = Self {
             window,
             surface,
             device,
             queue,
             config,
             pipeline,
-            chunks,
             camera_buffer,
             camera_bind_group,
             depth_view,
             frustum,
-            look_target,
-            view_radius,
+            chunks: HashMap::new(),
+            resident: HashSet::new(),
+            center,
+            cam_pos,
+            last_frame: Instant::now(),
             visible_chunks: 0,
-            start: Instant::now(),
             frames: 0,
             last_report: Instant::now(),
-        }
+        };
+        // Prime the initial region so the first frame has something to draw.
+        renderer.stream_around(center);
+        renderer
     }
 
     pub fn window(&self) -> &Window {
@@ -254,10 +325,36 @@ impl Renderer {
         }
     }
 
+    /// Bring the resident set in line with `center`: drop chunks that fell outside
+    /// the radius, then generate + upload newly desired ones.
+    fn stream_around(&mut self, center: ChunkCoord) {
+        puffin::profile_function!();
+        let updates = streaming::plan_updates(
+            &self.resident,
+            center,
+            STREAM_RADIUS,
+            STREAM_Y_MIN..=STREAM_Y_MAX,
+        );
+
+        for coord in updates.to_unload {
+            self.chunks.remove(&coord);
+            self.resident.remove(&coord);
+        }
+        for coord in updates.to_load {
+            self.resident.insert(coord);
+            if let Some(chunk) = World::chunk_at(coord) {
+                if let Some(gpu) = upload_chunk(&self.device, coord, &chunk) {
+                    self.chunks.insert(coord, gpu);
+                }
+            }
+        }
+        self.center = center;
+    }
+
     pub fn render(&mut self) {
         crate::profiling::Profiler::new_frame();
         puffin::profile_function!();
-        self.update_camera();
+        self.update();
 
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
@@ -310,7 +407,7 @@ impl Renderer {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             let mut visible = 0usize;
-            for chunk in &self.chunks {
+            for chunk in self.chunks.values() {
                 if self.frustum.intersects_aabb(&chunk.aabb) {
                     chunk.draw(&mut pass);
                     visible += 1;
@@ -325,10 +422,21 @@ impl Renderer {
         self.report_fps();
     }
 
-    fn update_camera(&mut self) {
-        let t = self.start.elapsed().as_secs_f32();
+    /// Advance the flying camera, stream if we crossed a chunk boundary, and upload
+    /// the new camera matrix + frustum.
+    fn update(&mut self) {
+        let now = Instant::now();
+        let dt = (now - self.last_frame).as_secs_f32();
+        self.last_frame = now;
+        self.cam_pos += fly_dir() * FLY_SPEED * dt;
+
+        let center = ChunkCoord::from_world_pos(self.cam_pos.to_array());
+        if center != self.center {
+            self.stream_around(center);
+        }
+
         let aspect = self.config.width as f32 / self.config.height as f32;
-        let vp = CameraUniform::view_proj_matrix(aspect, t, self.look_target, self.view_radius);
+        let vp = CameraUniform::look_view_proj(aspect, self.cam_pos, look_dir());
         self.frustum = Frustum::from_view_proj(vp);
         let uniform = CameraUniform::from_matrix(vp);
         self.queue
@@ -342,7 +450,7 @@ impl Renderer {
         if elapsed.as_secs_f32() >= 1.0 {
             let fps = self.frames as f32 / elapsed.as_secs_f32();
             log::info!(
-                "{fps:.0} FPS | chunks {}/{}",
+                "{fps:.0} FPS | drawn {}/{} resident chunks",
                 self.visible_chunks,
                 self.chunks.len()
             );

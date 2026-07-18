@@ -10,10 +10,10 @@
 use std::time::Instant;
 
 use cubara_render::{
-    build_pipeline, camera_bind_group_layout, create_depth_view, upload_world, CameraUniform,
-    Frustum,
+    build_pipeline, camera_bind_group_layout, chunks_bounds, create_depth_view, upload_region,
+    CameraUniform, Frustum,
 };
-use cubara_world::World;
+use cubara_voxel::ChunkCoord;
 
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
@@ -22,6 +22,9 @@ const MEASURE_FRAMES: u32 = 2000;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// Fixed camera advance per frame, so the path is framerate-independent.
 const VIRTUAL_DT: f32 = 1.0 / 240.0;
+/// Square chunk radius of the streamed benchmark region — large enough that the
+/// scene is a realistically heavy world (hundreds of chunks), not the tiny grid.
+const BENCH_RADIUS: i32 = 12;
 
 pub fn run() {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -50,11 +53,16 @@ pub fn run() {
     // Held for the duration of the benchmark when built with `--features profile`.
     let _profiler = cubara_render::Profiler::init();
 
-    // Scene: the same world the live app renders.
-    let world = World::generate();
-    let chunks = upload_world(&device, &world);
-    let look_target = world.look_target();
-    let view_radius = world.view_radius();
+    // Scene: a streamed square region (the same path the live renderer uses), so
+    // we measure a realistically heavy world instead of the tiny fixed grid.
+    let chunks = upload_region(&device, ChunkCoord::new(0, 0, 0), BENCH_RADIUS, 0..=2);
+    let (min, max) = chunks_bounds(&chunks);
+    let look_target = [
+        (min[0] + max[0]) * 0.5,
+        (min[1] + max[1]) * 0.5,
+        (min[2] + max[2]) * 0.5,
+    ];
+    let view_radius = (max[0] - min[0]).max(max[2] - min[2]) * 0.75;
     log::info!(
         "rendering {WIDTH}x{HEIGHT}, {} chunk draw calls",
         chunks.len()

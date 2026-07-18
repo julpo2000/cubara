@@ -1,27 +1,15 @@
-//! Terrain generation and the current (fixed) world grid.
+//! Terrain generation.
 //!
-//! Terrain is a deterministic function of world position, so any chunk can be
-//! generated on demand from its [`ChunkCoord`] alone — [`World::chunk_at`] is the
-//! primitive the streaming layer builds on. [`World::generate`] still bakes a small
-//! fixed grid for the window/bench/screenshot paths until the renderer streams.
+//! Terrain is a deterministic function of world position, so any chunk is
+//! generated on demand from its [`ChunkCoord`] alone. [`World::chunk_at`] is the
+//! primitive the streaming layer builds on — there is no persistent world grid;
+//! the renderer streams chunks in and out around the camera (see the
+//! [`streaming`](crate::streaming) policy).
 
 use cubara_voxel::{Chunk, ChunkCoord};
 
-const CHUNKS_X: i32 = 8;
-const CHUNKS_Y: i32 = 3;
-const CHUNKS_Z: i32 = 8;
-
-/// A chunk together with its position in the chunk grid.
-pub struct PlacedChunk {
-    pub coord: ChunkCoord,
-    pub chunk: Chunk,
-}
-
-pub struct World {
-    pub chunks: Vec<PlacedChunk>,
-    /// World size in blocks along each axis.
-    pub extent: [f32; 3],
-}
+/// Stateless terrain source: chunks are generated on demand, nothing is stored.
+pub struct World;
 
 /// Deterministic rolling-hills height (in blocks) for a world column.
 fn terrain_height(x: i32, z: i32) -> i32 {
@@ -37,8 +25,8 @@ fn terrain_height(x: i32, z: i32) -> i32 {
 impl World {
     /// Generate the chunk at `coord` straight from the terrain function, or `None`
     /// if it contains no solid blocks (nothing to mesh — e.g. fully above ground).
-    /// Deterministic and self-contained: no [`World`] instance required, so the
-    /// streaming layer can call it for any coordinate.
+    /// Deterministic and self-contained, so the streaming layer can call it for any
+    /// coordinate without any world state.
     pub fn chunk_at(coord: ChunkCoord) -> Option<Chunk> {
         let size = Chunk::SIZE as i32;
         let chunk = Chunk::from_solid_fn(|lx, ly, lz| {
@@ -49,40 +37,28 @@ impl World {
         });
         (!chunk.is_empty()).then_some(chunk)
     }
+}
 
-    pub fn generate() -> Self {
-        let mut chunks = Vec::new();
-        for cz in 0..CHUNKS_Z {
-            for cy in 0..CHUNKS_Y {
-                for cx in 0..CHUNKS_X {
-                    let coord = ChunkCoord::new(cx, cy, cz);
-                    if let Some(chunk) = Self::chunk_at(coord) {
-                        chunks.push(PlacedChunk { coord, chunk });
-                    }
-                }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::streaming;
+
+    #[test]
+    fn region_mesh_output_is_stable() {
+        // Deterministic regression guard (runs in CI, no GPU): worldgen + greedy
+        // meshing over a fixed region must keep producing exactly this many chunks
+        // and triangles. A change here means terrain or the mesher changed — fine
+        // if intended, but it should never move by accident.
+        let coords = streaming::desired_chunks(ChunkCoord::new(0, 0, 0), 2, 0..=2);
+        let mut chunks = 0usize;
+        let mut tris = 0usize;
+        for coord in coords {
+            if let Some(chunk) = World::chunk_at(coord) {
+                chunks += 1;
+                tris += chunk.build_mesh().triangle_count();
             }
         }
-
-        let size = Chunk::SIZE as i32;
-        let extent = [
-            (CHUNKS_X * size) as f32,
-            (CHUNKS_Y * size) as f32,
-            (CHUNKS_Z * size) as f32,
-        ];
-        Self { chunks, extent }
-    }
-
-    /// A pleasant point to aim the camera at (slightly below vertical middle).
-    pub fn look_target(&self) -> [f32; 3] {
-        [
-            self.extent[0] * 0.5,
-            self.extent[1] * 0.35,
-            self.extent[2] * 0.5,
-        ]
-    }
-
-    /// Camera orbit radius that frames the whole world.
-    pub fn view_radius(&self) -> f32 {
-        self.extent[0].max(self.extent[2]) * 0.9
+        assert_eq!((chunks, tris), (52, 8482));
     }
 }

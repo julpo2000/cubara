@@ -13,6 +13,6 @@ mod render;
 pub use culling::{Aabb, Frustum};
 pub use profiling::Profiler;
 pub use render::{
-    build_pipeline, camera_bind_group_layout, create_depth_view, upload_world, CameraUniform,
-    ChunkGpu, Renderer,
+    build_pipeline, camera_bind_group_layout, chunks_bounds, create_depth_view, upload_chunk,
+    upload_region, CameraUniform, ChunkGpu, Renderer,
 };
