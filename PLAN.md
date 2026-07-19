@@ -284,10 +284,27 @@ But that makes the flat-CPU win **Vulkan-only today**, and chasing it now would
 either regress Metal or fork the draw path per-backend. We deliberately keep **one
 uniform renderer** (Step 1) instead.
 
-**Decision:** park Step 2. Revisit when wgpu ships native Metal multi-draw (on their
-roadmap) — at which point the same compute-cull design becomes a clean cross-platform
-win with no fork. Step 1's shared arena + per-chunk metadata is exactly the
-foundation it will reuse, so nothing here is wasted.
+**Decision:** park Step 2. Step 1's shared arena + per-chunk metadata is exactly the
+foundation a GPU cull would reuse, so nothing here is wasted.
+
+**Do not depend on wgpu fixing this.** Native Metal multi-draw is *not* a scheduled
+wgpu release — it's a long-open issue ([gfx-rs/wgpu#2148], open since Nov 2021) with
+no timeline, and it's genuinely hard: Metal has no draw-count-buffer concept, so a
+native path needs Indirect Command Buffers (and a `gl_DrawID`-style WGSL builtin,
+[wgpu#6823], to index per-chunk data) — a different encoding model, not a flag flip.
+So treat Step 2 as unblocked by one of *our* choices, not by waiting:
+
+- we make Vulkan the primary perf/benchmark backend and let Metal keep the CPU-cull
+  path as an accepted second-class path, or
+- we deliberately accept one backend branch and build the Vulkan-gated cull ourselves.
+
+**Re-check periodically** (say each time we touch render perf, or bump wgpu) that the
+uniform CPU-cull arena is still the most sensible method — if wgpu gains ICB-based
+GPU-driven encoding, or our own priorities shift toward Vulkan-first, revisit this
+decision then.
+
+[gfx-rs/wgpu#2148]: https://github.com/gfx-rs/wgpu/issues/2148
+[wgpu#6823]: https://github.com/gfx-rs/wgpu/issues/6823
 
 ### Out of scope (separate track)
 
