@@ -23,7 +23,14 @@ vision, architecture, and roadmap.
 
 ## Build & run
 
-Requires the [Rust toolchain](https://rustup.rs) (stable). Then, from the repo root:
+Requires the [Rust toolchain](https://rustup.rs) (stable).
+
+**Quick launch** — **double-click `run.command` (macOS) or `run.bat` (Windows)** in
+your file explorer to build in release and start the game. Both also work from a
+shell and pass any extra arguments straight through, so `./run.command --caps`,
+`./run.command --bench 20`, `run.bat --screenshot out.png` all work too.
+
+For the full set of modes, from the repo root:
 
 ```bash
 # Run the app — opens a window rendering the current scene
