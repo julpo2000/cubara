@@ -20,10 +20,29 @@
 
 use std::collections::HashMap;
 
-use cubara_voxel::{Chunk, ChunkCoord, Vertex};
+use cubara_voxel::{Chunk, ChunkCoord, Mesh, Vertex};
 use cubara_world::{streaming, World};
 
 use crate::culling::{Aabb, Frustum};
+
+/// Mesh a chunk into world space and compute its bounds — the CPU-heavy part of
+/// getting a chunk on screen, split out so it can run on a worker thread (see
+/// [`crate::mesher`]). Returns `None` for a chunk that produces no geometry.
+pub(crate) fn build_chunk_mesh(coord: ChunkCoord, chunk: &Chunk) -> Option<(Mesh, Aabb)> {
+    let mut mesh = chunk.build_mesh();
+    mesh.translate(coord.world_offset());
+    if mesh.indices.is_empty() {
+        return None;
+    }
+    let mut min = glam::Vec3::splat(f32::MAX);
+    let mut max = glam::Vec3::splat(f32::MIN);
+    for v in &mesh.vertices {
+        let p = glam::Vec3::from(v.position);
+        min = min.min(p);
+        max = max.max(p);
+    }
+    Some((mesh, Aabb::new(min, max)))
+}
 
 /// Vertex-arena capacity, in vertices (~112 MiB at 28 bytes/vertex). The heaviest
 /// current scene — the radius-12 bench — peaks well under this, leaving ample
@@ -197,19 +216,31 @@ impl ChunkArena {
         }
     }
 
-    /// Mesh `chunk`, place its world-space offset, and sub-allocate its geometry
-    /// into the shared arenas. No-op if the chunk is already resident or produced
-    /// no geometry. Returns whether geometry was added.
+    /// Mesh `chunk` and upload it — the synchronous path used by the headless
+    /// bench/screenshot. The live renderer instead meshes on a worker thread (via
+    /// [`build_chunk_mesh`]) and calls [`insert`](Self::insert) with the result.
+    /// No-op if the chunk is already resident or produced no geometry.
     pub fn upload_chunk(&mut self, queue: &wgpu::Queue, coord: ChunkCoord, chunk: &Chunk) -> bool {
+        match build_chunk_mesh(coord, chunk) {
+            Some((mesh, aabb)) => self.insert(queue, coord, &mesh, aabb),
+            None => false,
+        }
+    }
+
+    /// Sub-allocate an already-built world-space `mesh` (with precomputed `aabb`)
+    /// into the shared arenas and upload it. No-op if `coord` is already resident.
+    /// Returns whether the geometry was added. This is the GPU-side step, kept off
+    /// the meshing so the latter can run on worker threads.
+    pub(crate) fn insert(
+        &mut self,
+        queue: &wgpu::Queue,
+        coord: ChunkCoord,
+        mesh: &Mesh,
+        aabb: Aabb,
+    ) -> bool {
         if self.slots.contains_key(&coord) {
             return false;
         }
-        let mut mesh = chunk.build_mesh();
-        mesh.translate(coord.world_offset());
-        if mesh.indices.is_empty() {
-            return false;
-        }
-
         let vertex_len = mesh.vertices.len() as u32;
         let index_count = mesh.indices.len() as u32;
         let (Some(base_vertex), Some(first_index)) = (
@@ -233,14 +264,6 @@ impl ChunkArena {
             return false;
         };
 
-        let mut min = glam::Vec3::splat(f32::MAX);
-        let mut max = glam::Vec3::splat(f32::MIN);
-        for v in &mesh.vertices {
-            let p = glam::Vec3::from(v.position);
-            min = min.min(p);
-            max = max.max(p);
-        }
-
         queue.write_buffer(
             &self.vertex_buffer,
             base_vertex as u64 * std::mem::size_of::<Vertex>() as u64,
@@ -259,7 +282,7 @@ impl ChunkArena {
                 vertex_len,
                 first_index,
                 index_count,
-                aabb: Aabb::new(min, max),
+                aabb,
             },
         );
         true

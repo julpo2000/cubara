@@ -9,6 +9,7 @@
 
 mod arena;
 pub mod culling;
+mod mesher;
 pub mod profiling;
 mod render;
 
