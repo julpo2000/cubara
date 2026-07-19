@@ -5,7 +5,9 @@
 //! should be resident around the camera. There is no stored world grid yet —
 //! persistence layers on top of this later.
 
+pub mod raycast;
 pub mod streaming;
 mod world;
 
+pub use raycast::{raycast, RayHit};
 pub use world::World;
