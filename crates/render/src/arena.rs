@@ -25,11 +25,17 @@ use cubara_world::{streaming, World};
 
 use crate::culling::{Aabb, Frustum};
 
-/// Mesh a chunk into world space and compute its bounds — the CPU-heavy part of
-/// getting a chunk on screen, split out so it can run on a worker thread (see
-/// [`crate::mesher`]). Returns `None` for a chunk that produces no geometry.
-pub(crate) fn build_chunk_mesh(coord: ChunkCoord, chunk: &Chunk) -> Option<(Mesh, Aabb)> {
-    let mut mesh = chunk.build_mesh();
+/// Mesh a chunk into world space at LOD `level` and compute its bounds — the
+/// CPU-heavy part of getting a chunk on screen, split out so it can run on a worker
+/// thread (see [`crate::mesher`]). Returns `None` for a chunk that produces no
+/// geometry. `level` 0 is full resolution; higher is coarser (see
+/// [`build_mesh_lod`](cubara_voxel::Chunk::build_mesh_lod)).
+pub(crate) fn build_chunk_mesh(
+    coord: ChunkCoord,
+    chunk: &Chunk,
+    level: u32,
+) -> Option<(Mesh, Aabb)> {
+    let mut mesh = chunk.build_mesh_lod(level);
     mesh.translate(coord.world_offset());
     if mesh.indices.is_empty() {
         return None;
@@ -216,12 +222,18 @@ impl ChunkArena {
         }
     }
 
-    /// Mesh `chunk` and upload it — the synchronous path used by the headless
-    /// bench/screenshot. The live renderer instead meshes on a worker thread (via
-    /// [`build_chunk_mesh`]) and calls [`insert`](Self::insert) with the result.
+    /// Mesh `chunk` at LOD `level` and upload it — the synchronous path used by the
+    /// headless bench/screenshot. The live renderer instead meshes on a worker thread
+    /// (via [`build_chunk_mesh`]) and calls [`insert`](Self::insert) with the result.
     /// No-op if the chunk is already resident or produced no geometry.
-    pub fn upload_chunk(&mut self, queue: &wgpu::Queue, coord: ChunkCoord, chunk: &Chunk) -> bool {
-        match build_chunk_mesh(coord, chunk) {
+    pub fn upload_chunk(
+        &mut self,
+        queue: &wgpu::Queue,
+        coord: ChunkCoord,
+        chunk: &Chunk,
+        level: u32,
+    ) -> bool {
+        match build_chunk_mesh(coord, chunk, level) {
             Some((mesh, aabb)) => self.insert(queue, coord, &mesh, aabb),
             None => false,
         }
@@ -374,9 +386,10 @@ impl ChunkArena {
         }
     }
 
-    /// Build and upload every non-empty chunk in a square region — the streaming
-    /// path the live renderer uses, exposed so the headless bench/screenshot build
-    /// and draw the same scene.
+    /// Build and upload every non-empty chunk in a square region, each at its
+    /// distance-based LOD ([`streaming::lod_for`]) — the same scene and detail
+    /// falloff the live renderer streams, exposed so the headless bench/screenshot
+    /// build and draw it too.
     pub fn from_region(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -389,7 +402,8 @@ impl ChunkArena {
         let mut total_tris = 0u32;
         for coord in streaming::desired_chunks(center, radius, y_range) {
             if let Some(chunk) = World::chunk_at(coord) {
-                if arena.upload_chunk(queue, coord, &chunk) {
+                let level = streaming::lod_for(coord, center);
+                if arena.upload_chunk(queue, coord, &chunk, level) {
                     if let Some(slot) = arena.slots.get(&coord) {
                         total_tris += slot.index_count / 3;
                     }
@@ -397,7 +411,7 @@ impl ChunkArena {
             }
         }
         log::info!(
-            "region radius {radius}: {} chunks meshed, {total_tris} triangles \
+            "region radius {radius}: {} chunks meshed (distance LOD), {total_tris} triangles \
              (arena v {}/{}, i {}/{})",
             arena.slots.len(),
             arena.vertices.high_water,

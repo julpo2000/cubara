@@ -62,9 +62,10 @@ fn main() {
         return;
     }
 
-    // Headless benchmark mode: `cargo run --release -- --bench`.
-    if args.iter().any(|a| a == "--bench") {
-        bench::run();
+    // Headless benchmark mode: `cargo run --release -- --bench [radius]`.
+    if let Some(i) = args.iter().position(|a| a == "--bench") {
+        let radius = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(12);
+        bench::run(radius);
         return;
     }
 
