@@ -13,10 +13,11 @@ use std::time::Instant;
 use winit::window::Window;
 
 use cubara_voxel::{ChunkCoord, Vertex};
-use cubara_world::{streaming, World};
+use cubara_world::streaming;
 
 use crate::arena::ChunkArena;
 use crate::culling::Frustum;
+use crate::mesher::MeshPool;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -102,8 +103,10 @@ pub struct Renderer {
 
     /// All resident chunk geometry in shared buffers, drawn with one indirect submit.
     arena: ChunkArena,
-    /// Every coord we've streamed in, including ones that produced no geometry —
-    /// so empty chunks aren't re-generated every frame.
+    /// Background worker pool that generates + meshes chunks off the main thread.
+    mesh_pool: MeshPool,
+    /// Coords that are meshed and uploaded (or known empty) — as opposed to still
+    /// in flight in the pool. So empty chunks aren't re-generated every frame.
     resident: HashSet<ChunkCoord>,
     /// Chunk the camera is currently in; streaming re-runs when this changes.
     center: ChunkCoord,
@@ -213,6 +216,7 @@ impl Renderer {
             depth_view,
             frustum,
             arena,
+            mesh_pool: MeshPool::new(),
             resident: HashSet::new(),
             center,
             cam_pos,
@@ -240,28 +244,44 @@ impl Renderer {
         }
     }
 
-    /// Bring the resident set in line with `center`: drop chunks that fell outside
-    /// the radius, then generate + upload newly desired ones.
+    /// Bring the streamed set in line with `center`: drop chunks that fell outside
+    /// the radius, and *request* newly desired ones from the worker pool (they're
+    /// uploaded later in [`drain_meshes`](Self::drain_meshes) as they finish, so
+    /// this never meshes on the main thread).
     fn stream_around(&mut self, center: ChunkCoord) {
         puffin::profile_function!();
-        let updates = streaming::plan_updates(
-            &self.resident,
-            center,
-            STREAM_RADIUS,
-            STREAM_Y_MIN..=STREAM_Y_MAX,
-        );
+        // A chunk is "known" once it's resident or already in flight — don't
+        // re-request either.
+        let mut known = self.resident.clone();
+        known.extend(self.mesh_pool.in_flight().iter().copied());
+
+        let updates =
+            streaming::plan_updates(&known, center, STREAM_RADIUS, STREAM_Y_MIN..=STREAM_Y_MAX);
 
         for coord in updates.to_unload {
-            self.arena.remove(coord);
-            self.resident.remove(&coord);
+            // Could be an uploaded chunk or one still in flight — handle both.
+            if self.resident.remove(&coord) {
+                self.arena.remove(coord);
+            }
+            self.mesh_pool.cancel(coord);
         }
         for coord in updates.to_load {
-            self.resident.insert(coord);
-            if let Some(chunk) = World::chunk_at(coord) {
-                self.arena.upload_chunk(&self.queue, coord, &chunk);
-            }
+            self.mesh_pool.request(coord);
         }
         self.center = center;
+    }
+
+    /// Upload any chunks the worker pool finished meshing this frame (the only step
+    /// that must run on the main thread). Cheap and bounded by what actually
+    /// completed, so it never causes the streaming hitch synchronous meshing did.
+    fn drain_meshes(&mut self) {
+        puffin::profile_function!();
+        for built in self.mesh_pool.poll() {
+            self.resident.insert(built.coord);
+            if let Some((mesh, aabb)) = built.geometry {
+                self.arena.insert(&self.queue, built.coord, &mesh, aabb);
+            }
+        }
     }
 
     pub fn render(&mut self) {
@@ -344,6 +364,8 @@ impl Renderer {
         if center != self.center {
             self.stream_around(center);
         }
+        // Take whatever the workers finished meshing since last frame.
+        self.drain_meshes();
 
         let aspect = self.config.width as f32 / self.config.height as f32;
         let vp = CameraUniform::look_view_proj(aspect, self.cam_pos, look_dir());
