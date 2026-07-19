@@ -85,126 +85,193 @@ impl Chunk {
         !self.solid.iter().any(|&s| s)
     }
 
-    /// Greedy mesher. Sweeps slices along each axis, builds a per-slice mask of
-    /// visible faces (signed by which side is solid), and merges equal-mask cells
-    /// into the largest possible quads. Vertices are in local chunk space (0..SIZE);
-    /// callers place the chunk in the world by offsetting positions.
+    /// Greedy-mesh the chunk at full resolution (LOD 0). Vertices are in local chunk
+    /// space (0..SIZE); callers offset them into the world.
     pub fn build_mesh(&self) -> Mesh {
-        let mut mesh = Mesh::default();
-        let n = Self::SIZE as i32;
-        // `mask[v * n + u]`: the face (orientation + per-corner AO) at each slice cell.
-        let mut mask = vec![NO_FACE; (n * n) as usize];
+        greedy_mesh(Self::SIZE as i32, 1.0, |x, y, z| self.solid_at(x, y, z))
+    }
 
-        for d in 0..3usize {
-            let u = (d + 1) % 3;
-            let v = (d + 2) % 3;
-            let mut pos = [0i32; 3];
-            let mut step = [0i32; 3];
-            step[d] = 1;
+    /// Greedy-mesh a downsampled copy for distant LOD. `level` halves the resolution
+    /// each step (0 = full 16³, 1 = 8³, 2 = 4³, …), capped so the grid stays ≥ 1³. A
+    /// coarse cell is solid when at least half the fine cells it covers are solid
+    /// (majority, ties solid). Vertices still span 0..SIZE, so a coarse chunk keeps
+    /// the same world footprint as the full one — just with far fewer triangles.
+    pub fn build_mesh_lod(&self, level: u32) -> Mesh {
+        let level = level.min(Self::SIZE.trailing_zeros()); // log2(SIZE)
+        if level == 0 {
+            return self.build_mesh();
+        }
+        let factor = 1i32 << level;
+        let n = Self::SIZE as i32 / factor;
+        let coarse = self.downsample(level);
+        greedy_mesh(n, factor as f32, |x, y, z| {
+            if x < 0 || y < 0 || z < 0 || x >= n || y >= n || z >= n {
+                return false;
+            }
+            coarse[((z * n + y) * n + x) as usize]
+        })
+    }
 
-            // Sweep the slice boundaries from -1 to n-1; the face plane is at pos[d]+1.
-            pos[d] = -1;
-            while pos[d] < n {
-                // Build the mask for this slice boundary.
-                let mut idx = 0usize;
-                for vv in 0..n {
-                    pos[v] = vv;
-                    for uu in 0..n {
-                        pos[u] = uu;
-                        let a = self.solid_at(pos[0], pos[1], pos[2]);
-                        let b = self.solid_at(pos[0] + step[0], pos[1] + step[1], pos[2] + step[2]);
-                        let sign = if a == b {
-                            0
-                        } else if a {
-                            1
-                        } else {
-                            -1
-                        };
-                        mask[idx] = if sign == 0 {
-                            NO_FACE
-                        } else {
-                            // Occluders sit on the empty side of the face plane. pos[d]
-                            // is still the pre-advance boundary here.
-                            let air_d = if sign == 1 { pos[d] + 1 } else { pos[d] };
-                            Face {
-                                sign,
-                                ao: self.face_ao(d, u, v, air_d, uu, vv),
-                            }
-                        };
-                        idx += 1;
-                    }
-                }
-
-                pos[d] += 1; // advance to the face plane
-
-                // Greedily merge the mask into quads.
-                let mut j = 0i32;
-                while j < n {
-                    let mut i = 0i32;
-                    while i < n {
-                        let m = mask[(j * n + i) as usize];
-                        if m.sign == 0 {
-                            i += 1;
-                            continue;
-                        }
-
-                        // Grow the quad width along u, then height along v — only over
-                        // cells with an identical face (same orientation *and* AO).
-                        let mut w = 1i32;
-                        while i + w < n && mask[(j * n + i + w) as usize] == m {
-                            w += 1;
-                        }
-                        let mut h = 1i32;
-                        'height: while j + h < n {
-                            for k in 0..w {
-                                if mask[((j + h) * n + i + k) as usize] != m {
-                                    break 'height;
+    /// Majority-downsampled solidity grid at `level` (side `SIZE >> level`): each
+    /// coarse cell is solid when ≥ half of the `factor³` fine cells it covers are.
+    fn downsample(&self, level: u32) -> Vec<bool> {
+        let factor = 1usize << level;
+        let n = Self::SIZE / factor;
+        let threshold = (factor * factor * factor).div_ceil(2); // ≥ half ⇒ solid
+        let mut coarse = vec![false; n * n * n];
+        for cz in 0..n {
+            for cy in 0..n {
+                for cx in 0..n {
+                    let mut count = 0usize;
+                    for dz in 0..factor {
+                        for dy in 0..factor {
+                            for dx in 0..factor {
+                                if self.is_solid(
+                                    cx * factor + dx,
+                                    cy * factor + dy,
+                                    cz * factor + dz,
+                                ) {
+                                    count += 1;
                                 }
                             }
-                            h += 1;
                         }
-
-                        push_quad(&mut mesh, d, u, v, pos[d], i, j, w, h, m.sign, m.ao);
-
-                        // Consume the merged cells.
-                        for l in 0..h {
-                            for k in 0..w {
-                                mask[((j + l) * n + i + k) as usize] = NO_FACE;
-                            }
-                        }
-                        i += w;
                     }
-                    j += 1;
+                    coarse[(cz * n + cy) * n + cx] = count >= threshold;
                 }
             }
         }
-        mesh
+        coarse
     }
+}
 
-    /// The four corners' AO for the face cell at (`uu`,`vv`) whose empty side is the
-    /// `air_d` layer along axis `d`. Corner order matches `push_quad`'s c0..c3:
-    /// (0,0), (1,0), (1,1), (0,1) in the (`u`,`v`) axes.
-    fn face_ao(&self, d: usize, u: usize, v: usize, air_d: i32, uu: i32, vv: i32) -> [u8; 4] {
-        let occluded = |du: i32, dv: i32| -> bool {
-            let mut p = [0i32; 3];
-            p[d] = air_d;
-            p[u] = uu + du;
-            p[v] = vv + dv;
-            self.solid_at(p[0], p[1], p[2])
-        };
-        let mut ao = [3u8; 4];
-        for (k, (cu, cv)) in [(0, 0), (1, 0), (1, 1), (0, 1)].iter().enumerate() {
-            let su = if *cu == 1 { 1 } else { -1 };
-            let sv = if *cv == 1 { 1 } else { -1 };
-            ao[k] = vertex_ao(occluded(su, 0), occluded(0, sv), occluded(su, sv));
+/// Greedy mesher over any cubic grid. Sweeps slices along each axis, builds a
+/// per-slice mask of visible faces (orientation + per-corner AO), and merges equal
+/// cells into the largest quads. `is_solid` answers solidity in grid space (out of
+/// bounds = empty); `scale` multiplies vertex positions (1 for full res, `factor`
+/// for a downsampled LOD), keeping the world footprint constant.
+fn greedy_mesh(n: i32, scale: f32, is_solid: impl Fn(i32, i32, i32) -> bool) -> Mesh {
+    let mut mesh = Mesh::default();
+    // `mask[v * n + u]`: the face at each slice cell.
+    let mut mask = vec![NO_FACE; (n * n) as usize];
+
+    for d in 0..3usize {
+        let u = (d + 1) % 3;
+        let v = (d + 2) % 3;
+        let mut pos = [0i32; 3];
+        let mut step = [0i32; 3];
+        step[d] = 1;
+
+        // Sweep the slice boundaries from -1 to n-1; the face plane is at pos[d]+1.
+        pos[d] = -1;
+        while pos[d] < n {
+            // Build the mask for this slice boundary.
+            let mut idx = 0usize;
+            for vv in 0..n {
+                pos[v] = vv;
+                for uu in 0..n {
+                    pos[u] = uu;
+                    let a = is_solid(pos[0], pos[1], pos[2]);
+                    let b = is_solid(pos[0] + step[0], pos[1] + step[1], pos[2] + step[2]);
+                    let sign = if a == b {
+                        0
+                    } else if a {
+                        1
+                    } else {
+                        -1
+                    };
+                    mask[idx] = if sign == 0 {
+                        NO_FACE
+                    } else {
+                        // Occluders sit on the empty side of the face plane. pos[d]
+                        // is still the pre-advance boundary here.
+                        let air_d = if sign == 1 { pos[d] + 1 } else { pos[d] };
+                        Face {
+                            sign,
+                            ao: face_ao(&is_solid, d, u, v, air_d, uu, vv),
+                        }
+                    };
+                    idx += 1;
+                }
+            }
+
+            pos[d] += 1; // advance to the face plane
+
+            // Greedily merge the mask into quads.
+            let mut j = 0i32;
+            while j < n {
+                let mut i = 0i32;
+                while i < n {
+                    let m = mask[(j * n + i) as usize];
+                    if m.sign == 0 {
+                        i += 1;
+                        continue;
+                    }
+
+                    // Grow the quad width along u, then height along v — only over
+                    // cells with an identical face (same orientation *and* AO).
+                    let mut w = 1i32;
+                    while i + w < n && mask[(j * n + i + w) as usize] == m {
+                        w += 1;
+                    }
+                    let mut h = 1i32;
+                    'height: while j + h < n {
+                        for k in 0..w {
+                            if mask[((j + h) * n + i + k) as usize] != m {
+                                break 'height;
+                            }
+                        }
+                        h += 1;
+                    }
+
+                    push_quad(&mut mesh, d, u, v, pos[d], i, j, w, h, m.sign, m.ao, scale);
+
+                    // Consume the merged cells.
+                    for l in 0..h {
+                        for k in 0..w {
+                            mask[((j + l) * n + i + k) as usize] = NO_FACE;
+                        }
+                    }
+                    i += w;
+                }
+                j += 1;
+            }
         }
-        ao
     }
+    mesh
+}
+
+/// The four corners' AO for the face cell at (`uu`,`vv`) whose empty side is the
+/// `air_d` layer along axis `d`. Corner order matches `push_quad`'s c0..c3:
+/// (0,0), (1,0), (1,1), (0,1) in the (`u`,`v`) axes.
+fn face_ao(
+    is_solid: &impl Fn(i32, i32, i32) -> bool,
+    d: usize,
+    u: usize,
+    v: usize,
+    air_d: i32,
+    uu: i32,
+    vv: i32,
+) -> [u8; 4] {
+    let occluded = |du: i32, dv: i32| -> bool {
+        let mut p = [0i32; 3];
+        p[d] = air_d;
+        p[u] = uu + du;
+        p[v] = vv + dv;
+        is_solid(p[0], p[1], p[2])
+    };
+    let mut ao = [3u8; 4];
+    for (k, (cu, cv)) in [(0, 0), (1, 0), (1, 1), (0, 1)].iter().enumerate() {
+        let su = if *cu == 1 { 1 } else { -1 };
+        let sv = if *cv == 1 { 1 } else { -1 };
+        ao[k] = vertex_ao(occluded(su, 0), occluded(0, sv), occluded(su, sv));
+    }
+    ao
 }
 
 /// Emit one merged quad on the plane `plane` along axis `d`, spanning `w`×`h` cells
 /// in the (`u`,`v`) axes starting at (`i`,`j`), with orientation `sign` (±1) and
-/// per-corner AO `ao` (levels 0..=3, corner order c0..c3).
+/// per-corner AO `ao` (levels 0..=3, corner order c0..c3). `scale` multiplies grid
+/// coordinates into local space (>1 for downsampled LOD meshes).
 #[allow(clippy::too_many_arguments)]
 fn push_quad(
     mesh: &mut Mesh,
@@ -218,6 +285,7 @@ fn push_quad(
     h: i32,
     sign: i8,
     ao: [u8; 4],
+    scale: f32,
 ) {
     let mut base = [0i32; 3];
     base[d] = plane;
@@ -231,7 +299,13 @@ fn push_quad(
     let mut normal = [0.0f32; 3];
     normal[d] = sign as f32;
 
-    let corner = |c: [i32; 3]| -> [f32; 3] { [c[0] as f32, c[1] as f32, c[2] as f32] };
+    let corner = |c: [i32; 3]| -> [f32; 3] {
+        [
+            c[0] as f32 * scale,
+            c[1] as f32 * scale,
+            c[2] as f32 * scale,
+        ]
+    };
     let c0 = base;
     let c1 = [base[0] + du[0], base[1] + du[1], base[2] + du[2]];
     let c2 = [
@@ -368,6 +442,74 @@ mod tests {
             mesh.vertices.iter().any(|v| v.ao < 1.0),
             "a diagonal neighbour should occlude at least one corner"
         );
+    }
+
+    /// World-space bounds over a mesh's vertices.
+    fn bounds(mesh: &Mesh) -> ([f32; 3], [f32; 3]) {
+        let mut min = [f32::MAX; 3];
+        let mut max = [f32::MIN; 3];
+        for v in &mesh.vertices {
+            for a in 0..3 {
+                min[a] = min[a].min(v.position[a]);
+                max[a] = max[a].max(v.position[a]);
+            }
+        }
+        (min, max)
+    }
+
+    #[test]
+    fn lod_keeps_footprint_and_merges_full_chunk() {
+        // A full chunk downsamples to a full coarse chunk: still six merged faces,
+        // and it must occupy the same 0..16 world footprint (scale compensates).
+        let chunk = Chunk {
+            solid: vec![true; Chunk::VOLUME],
+        };
+        for level in 1..=4 {
+            let mesh = chunk.build_mesh_lod(level);
+            assert_eq!(
+                mesh.triangle_count(),
+                12,
+                "level {level}: one quad per face"
+            );
+            assert_eq!(
+                bounds(&mesh),
+                ([0.0; 3], [16.0; 3]),
+                "level {level} footprint"
+            );
+        }
+    }
+
+    #[test]
+    fn lod_downsamples_a_slab_cleanly() {
+        // Bottom half solid (fine y < 8) → at LOD 1 the coarse cells for y 0..4 are
+        // fully solid and 4..8 empty, so it's a clean slab whose top sits at world y=8.
+        let chunk = Chunk::from_solid_fn(|_, y, _| y < 8);
+        let mesh = chunk.build_mesh_lod(1);
+        assert_eq!(mesh.triangle_count(), 12, "slab = six merged faces");
+        let (min, max) = bounds(&mesh);
+        assert_eq!((min[1], max[1]), (0.0, 8.0), "slab spans world y 0..8");
+    }
+
+    #[test]
+    fn lod_reduces_triangles_on_stepped_terrain() {
+        // A diagonal staircase has many stair-step faces at full res; downsampling
+        // merges the steps into coarser ones, so LOD 1 has strictly fewer triangles.
+        let chunk = Chunk::from_solid_fn(|x, y, _| (y as i32) <= x as i32);
+        let full = chunk.build_mesh().triangle_count();
+        let lod1 = chunk.build_mesh_lod(1).triangle_count();
+        assert!(
+            lod1 < full,
+            "LOD 1 ({lod1}) should have fewer tris than LOD 0 ({full})"
+        );
+    }
+
+    #[test]
+    fn lod_level_is_capped_not_panicking() {
+        // An absurd level clamps to log2(SIZE) rather than producing an empty grid.
+        let chunk = Chunk {
+            solid: vec![true; Chunk::VOLUME],
+        };
+        assert_eq!(chunk.build_mesh_lod(99).triangle_count(), 12);
     }
 
     #[test]
