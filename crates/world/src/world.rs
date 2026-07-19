@@ -23,6 +23,21 @@ fn terrain_height(x: i32, z: i32) -> i32 {
 }
 
 impl World {
+    /// Whether the block at world coordinates `(x, y, z)` is solid — the terrain
+    /// function sampled at a single block, without generating a whole chunk. The
+    /// primitive [`raycast`](crate::raycast) queries the world through this.
+    pub fn is_solid_at(x: i32, y: i32, z: i32) -> bool {
+        y <= terrain_height(x, z)
+    }
+
+    /// Cast a ray through the terrain and return the first solid block hit (see
+    /// [`raycast`](crate::raycast)) — the basis for targeting a block to break/place.
+    pub fn raycast(origin: [f32; 3], dir: [f32; 3], max_dist: f32) -> Option<crate::RayHit> {
+        crate::raycast(origin, dir, max_dist, |b| {
+            Self::is_solid_at(b[0], b[1], b[2])
+        })
+    }
+
     /// Generate the chunk at `coord` straight from the terrain function, or `None`
     /// if it contains no solid blocks (nothing to mesh — e.g. fully above ground).
     /// Deterministic and self-contained, so the streaming layer can call it for any
@@ -64,5 +79,29 @@ mod tests {
             }
         }
         assert_eq!((chunks, tris), (52, 14716));
+    }
+
+    #[test]
+    fn raycast_down_hits_the_terrain_surface() {
+        // Straight down from high above (0,0): the first solid block is the surface,
+        // entered through its top face.
+        let hit = World::raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0)
+            .expect("a downward ray must hit the ground");
+        assert_eq!(hit.normal, [0, 1, 0], "entered through the top face");
+        let [x, y, z] = hit.block;
+        assert!(World::is_solid_at(x, y, z), "hit block is solid");
+        assert!(
+            !World::is_solid_at(x, y + 1, z),
+            "the block above it is air"
+        );
+    }
+
+    #[test]
+    fn raycast_up_from_underground_returns_the_containing_block() {
+        // Starting inside the terrain reports that block immediately (distance 0).
+        let hit = World::raycast([0.5, 0.0, 0.5], [0.0, 1.0, 0.0], 100.0)
+            .expect("underground origin is inside a solid block");
+        assert_eq!(hit.distance, 0.0);
+        assert_eq!(hit.block, [0, 0, 0]);
     }
 }
