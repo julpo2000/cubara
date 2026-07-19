@@ -50,6 +50,10 @@ mod tests {
         // meshing over a fixed region must keep producing exactly this many chunks
         // and triangles. A change here means terrain or the mesher changed — fine
         // if intended, but it should never move by accident.
+        //
+        // Triangle count jumped from 8,482 with per-vertex ambient occlusion (#45):
+        // AO-varying cells can no longer merge into the same quad, so bumpy terrain
+        // splits into more, smaller quads. Expected and accepted for the AO quality.
         let coords = streaming::desired_chunks(ChunkCoord::new(0, 0, 0), 2, 0..=2);
         let mut chunks = 0usize;
         let mut tris = 0usize;
@@ -59,6 +63,6 @@ mod tests {
                 tris += chunk.build_mesh().triangle_count();
             }
         }
-        assert_eq!((chunks, tris), (52, 8482));
+        assert_eq!((chunks, tris), (52, 14716));
     }
 }

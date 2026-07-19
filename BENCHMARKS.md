@@ -45,6 +45,7 @@ frames after 200 warmup.
 | 2026-07-18 | M2 — frustum culling (baseline) | 137 | 22,788 | 9242 | 0.070 ms | 0.246 ms | `c6921e9` |
 | 2026-07-19 | M3 — streaming renderer (heavy scene) | 1,349 | 217,550 | ~2,860³ | 0.317 ms | 0.599 ms | `8b5467e` |
 | 2026-07-19 | **M3.5 — chunk arena + `multi_draw_indirect`** [#27] | 1,349 | 217,550 | ~3,330³ | **0.199 ms** | 0.535 ms | `41e38f5` |
+| 2026-07-19 | M4 — ambient occlusion [#45] | 1,349 | 361,326 | ~1,900⁴ | 0.363 ms | ~0.78 ms | `4086db1` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -67,6 +68,15 @@ indirect list), which is exactly what **#28** moves onto the GPU next. Both figu
 are tight (±<1% and ±~3%) because the scene is bound by real work, not pipeline
 noise. The arena's high-water mark on this scene is 435k/4M vertices and 653k/6M
 indices — ample headroom, negligible fragmentation.
+
+⁴ **Ambient occlusion — a visual feature, not a perf one.** Baking per-vertex AO
+means AO-varying cells can no longer greedy-merge, so the same 1,349-chunk scene
+goes **217,550 → 361,326 triangles (~+66%)** and vertices grow 24→28 bytes. The
+frame is now **GPU-bound** on that heavier mesh, so FPS drops ~3,330 → ~1,900 (3
+runs 1,849–1,940) — still ~1.9× the 1000-FPS gate. CPU/frame rises to ~0.36 ms too,
+but that's mostly back-pressure (the CPU stalls in `submit` once the GPU is the
+bottleneck), not extra CPU work. A worthwhile trade for the depth AO adds; triangle
+count is a lever LOD (#37–#40) and denser-mesh optimizations can pull back later.
 
 ² **First meaningful FPS number.** The streaming renderer measures a ~1,350-chunk
 region (10× the old grid), which pushes the frame into being **CPU-submit-bound**:

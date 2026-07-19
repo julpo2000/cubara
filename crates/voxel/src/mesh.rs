@@ -1,15 +1,18 @@
 //! CPU-side mesh data shared between world generation and the renderer.
 
-/// A single mesh vertex: object-space position and normal.
+/// A single mesh vertex: object-space position, normal, and an ambient-occlusion
+/// term in `0.0..=1.0` (1 = fully lit, 0 = fully occluded), baked per vertex by the
+/// mesher and interpolated across each face.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
+    pub ao: f32,
 }
 
-const VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
-    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+const VERTEX_ATTRS: [wgpu::VertexAttribute; 3] =
+    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32];
 
 impl Vertex {
     pub const fn layout() -> wgpu::VertexBufferLayout<'static> {
