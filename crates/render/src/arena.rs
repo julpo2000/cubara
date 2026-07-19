@@ -25,8 +25,8 @@ use cubara_world::{streaming, World};
 
 use crate::culling::{Aabb, Frustum};
 
-/// Vertex-arena capacity, in vertices (~96 MiB at 24 bytes/vertex). The heaviest
-/// current scene — the radius-12 bench — peaks at ~435k vertices, so this is ~9×
+/// Vertex-arena capacity, in vertices (~112 MiB at 28 bytes/vertex). The heaviest
+/// current scene — the radius-12 bench — peaks well under this, leaving ample
 /// headroom for streaming fragmentation and the denser terrain still to come.
 const VERTEX_CAPACITY: u32 = 4_000_000;
 /// Index-arena capacity, in indices (~24 MiB at 4 bytes/index). Same ~9× headroom
