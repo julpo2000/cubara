@@ -213,10 +213,12 @@ Recorded plan for the render-performance arc between M3 (streaming) and M4 (LOD)
 Tracked in GitHub milestone **M3.5** — issues #26 (spike), #27 (step 1), #28
 (step 2), #29 (tracking).
 
-**Status:** #26 spike ✅ done, #27 step 1 ✅ done. On the heavy bench scene (1,349
-chunks) the arena + one `multi_draw_indirect` cut M3 CPU/frame from **0.317 ms to
-0.199 ms** (~37%) and 1,349 draws to **one** — see [`BENCHMARKS.md`](BENCHMARKS.md).
-Next: #28 (GPU compute cull), which needs a Metal fallback (see the gate below).
+**Status:** #26 spike ✅ done, #27 step 1 ✅ done (the portable win). On the heavy
+bench scene (1,349 chunks) the arena + one `multi_draw_indirect` cut M3 CPU/frame
+from **0.317 ms to 0.199 ms** (~37%) and 1,349 draws to **one** — see
+[`BENCHMARKS.md`](BENCHMARKS.md). **Step 2 (GPU compute cull, #28/#32/#33) is
+parked** — a prototype showed it doesn't pay off portably today; see *Finding: GPU
+culling is Vulkan-only under wgpu right now* below.
 
 ### The problem
 
@@ -245,19 +247,16 @@ done once and reused. Sequenced so nothing is thrown away:
    `draw_indexed` loop over the *same* shared buffers, so there's no second geometry
    path. (Implemented in `crates/render/src/arena.rs`.)
 
-2. **Step 2 — GPU compute frustum culling [#28].** The per-chunk metadata goes to a
-   storage buffer; a compute shader reads the frustum + AABBs and writes the visible
-   draws' indirect args + count, drawn via `multi_draw_indirect_count`. CPU per-frame
-   cost then goes **flat regardless of chunk count** — the endgame from §3.
+2. **Step 2 — GPU compute frustum culling [#28]. ⏸ parked.** The intent: per-chunk
+   metadata to a storage buffer; a compute shader reads the frustum + AABBs and
+   writes the visible draws' indirect args, so CPU per-frame cost goes **flat
+   regardless of chunk count** — the endgame from §3. Still the right destination,
+   but **parked** for now — see the finding below.
 
-   Step 2 reuses everything from Step 1; only the cull moves from CPU to compute.
+### Finding: GPU culling is Vulkan-only under wgpu right now
 
-### The cross-platform gate
-
-`multi_draw_indirect` and especially `..._COUNT` are wgpu features that **may not
-be available on Metal** (macOS), which we target alongside Vulkan (Windows). The
-**capability spike [#26]** checked this on both machines (`cargo run --release --
---caps`). Result:
+The #26 spike checked feature support on both machines (`cargo run --release --
+--caps`):
 
 | feature | Windows / Vulkan (RTX 4060) | macOS / Metal (Apple M3) |
 |---|---|---|
@@ -265,10 +264,30 @@ be available on Metal** (macOS), which we target alongside Vulkan (Windows). The
 | `MULTI_DRAW_INDIRECT_COUNT` | ✅ | ❌ |
 | `INDIRECT_FIRST_INSTANCE` | ✅ | ✅ |
 
-So **Step 1 works on both backends** (both have `MULTI_DRAW_INDIRECT`). **Step 2's
-GPU-decided draw count needs a Metal fallback**: run the compute cull to build the
-args buffer, but issue `multi_draw_indirect` with a conservative max count (zeroing
-culled entries) instead of `..._count`. Vulkan keeps the true count path.
+A GPU-compute-cull prototype (2026-07-19) then exposed the real blocker, which
+isn't the missing `_COUNT` feature — it's that **wgpu has no native multi-draw on
+Metal and emulates `multi_draw_indirect` as a CPU loop of `count` draws.** So on
+Metal the per-frame CPU cost is proportional to the number of draws *submitted*,
+and a GPU cull can't lower that: the CPU still records every draw. With the only
+count the CPU knows being the *conservative* one (all resident chunks, culled ones
+drawn as zero-index no-ops), GPU culling is actually a **small regression** vs the
+Step 1 CPU cull, which submits only the visible set. Measured on M3, radius-20 scene:
+
+| path | draws submitted | CPU/frame |
+|---|---|---|
+| Step 1 CPU cull (#27) | 3,540 (visible) | **0.439 ms** |
+| GPU cull, conservative count | 3,634 (all resident) | 0.520 ms |
+
+On **Vulkan** it's the opposite: `multi_draw_indirect` (even without `_COUNT`) is a
+single native command, so CPU/frame is already flat there — GPU culling would help.
+But that makes the flat-CPU win **Vulkan-only today**, and chasing it now would
+either regress Metal or fork the draw path per-backend. We deliberately keep **one
+uniform renderer** (Step 1) instead.
+
+**Decision:** park Step 2. Revisit when wgpu ships native Metal multi-draw (on their
+roadmap) — at which point the same compute-cull design becomes a clean cross-platform
+win with no fork. Step 1's shared arena + per-chunk metadata is exactly the
+foundation it will reuse, so nothing here is wasted.
 
 ### Out of scope (separate track)
 
