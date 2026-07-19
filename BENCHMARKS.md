@@ -46,6 +46,7 @@ frames after 200 warmup.
 | 2026-07-19 | M3 — streaming renderer (heavy scene) | 1,349 | 217,550 | ~2,860³ | 0.317 ms | 0.599 ms | `8b5467e` |
 | 2026-07-19 | **M3.5 — chunk arena + `multi_draw_indirect`** [#27] | 1,349 | 217,550 | ~3,330³ | **0.199 ms** | 0.535 ms | `41e38f5` |
 | 2026-07-19 | M4 — ambient occlusion [#45] | 1,349 | 361,326 | ~1,900⁴ | 0.363 ms | ~0.78 ms | `4086db1` |
+| 2026-07-19 | **M4 — distance LOD streaming** [#39] | 1,182 | 46,920 | ~8,500⁵ | 0.083 ms | 0.23 ms | `4229513` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -77,6 +78,23 @@ runs 1,849–1,940) — still ~1.9× the 1000-FPS gate. CPU/frame rises to ~0.36
 but that's mostly back-pressure (the CPU stalls in `submit` once the GPU is the
 bottleneck), not extra CPU work. A worthwhile trade for the depth AO adds; triangle
 count is a lever LOD (#37–#40) and denser-mesh optimizations can pull back later.
+
+⁵ **Distance LOD — render distance for cheap.** Each chunk is now meshed at a LOD
+chosen by its distance from the camera (`streaming::lod_for`), so at radius 12 most
+chunks are coarse: **361,326 → 46,920 triangles (~87% fewer)** and FPS jumps ~1,900
+→ ~8,500. The real point is scaling — with LOD the same M3 sustains far larger
+radii (via `--bench <radius>`):
+
+| radius | chunks | tris | FPS | CPU/frame |
+|---|---|---|---|---|
+| 12 | 1,182 | 46,920 | ~8,500 | 0.083 ms |
+| 24 | 3,627 | — | ~5,900 | 0.149 ms |
+| 32 | 6,094 | — | ~3,685 | 0.234 ms |
+
+Radius 32 draws **5× the chunks** of the full-res radius-12 scene yet still runs
+~2× faster than it did (~1,900 FPS). Chunk count dips vs full-res (1,349 → 1,182 at
+r12) because majority-downsampling drops sparse far features. LOD boundaries show
+small cracks for now — seam fixing is #40.
 
 ² **First meaningful FPS number.** The streaming renderer measures a ~1,350-chunk
 region (10× the old grid), which pushes the frame into being **CPU-submit-bound**:

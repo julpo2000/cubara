@@ -22,11 +22,12 @@ const MEASURE_FRAMES: u32 = 2000;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// Fixed camera advance per frame, so the path is framerate-independent.
 const VIRTUAL_DT: f32 = 1.0 / 240.0;
-/// Square chunk radius of the streamed benchmark region — large enough that the
-/// scene is a realistically heavy world (hundreds of chunks), not the tiny grid.
-const BENCH_RADIUS: i32 = 12;
 
-pub fn run() {
+/// Run the benchmark over a streamed square region of the given chunk `radius`
+/// (default 12 = a realistically heavy world). Chunks are streamed at their
+/// distance LOD, so a larger radius shows how far render distance can grow without
+/// the triangle cost exploding.
+pub fn run(radius: i32) {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         ..Default::default()
@@ -64,7 +65,7 @@ pub fn run() {
         &queue,
         multi_draw,
         ChunkCoord::new(0, 0, 0),
-        BENCH_RADIUS,
+        radius,
         0..=2,
     );
     let total_chunks = arena.len();

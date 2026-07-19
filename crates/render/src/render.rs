@@ -6,7 +6,7 @@
 //! ones that fall out are freed). The shared building blocks (pipeline, depth view,
 //! camera) are public so the headless bench/screenshot paths build the same scene.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,8 +21,10 @@ use crate::mesher::MeshPool;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// How many chunks out (square radius) to keep resident around the camera.
-const STREAM_RADIUS: i32 = 8;
+/// How many chunks out (square radius) to keep resident around the camera. Distant
+/// chunks are streamed at a coarser LOD (see [`streaming::lod_for`]), so this can be
+/// large without the triangle/upload cost a full-resolution radius would carry.
+const STREAM_RADIUS: i32 = 16;
 /// Vertical chunk band to stream — the terrain sits comfortably inside it.
 const STREAM_Y_MIN: i32 = 0;
 const STREAM_Y_MAX: i32 = 2;
@@ -105,9 +107,9 @@ pub struct Renderer {
     arena: ChunkArena,
     /// Background worker pool that generates + meshes chunks off the main thread.
     mesh_pool: MeshPool,
-    /// Coords that are meshed and uploaded (or known empty) — as opposed to still
-    /// in flight in the pool. So empty chunks aren't re-generated every frame.
-    resident: HashSet<ChunkCoord>,
+    /// Coords that are meshed and uploaded (or known empty), mapped to the LOD level
+    /// they're currently at — so we only re-mesh when a chunk's desired LOD changes.
+    resident: HashMap<ChunkCoord, u32>,
     /// Chunk the camera is currently in; streaming re-runs when this changes.
     center: ChunkCoord,
 
@@ -217,7 +219,7 @@ impl Renderer {
             frustum,
             arena,
             mesh_pool: MeshPool::new(),
-            resident: HashSet::new(),
+            resident: HashMap::new(),
             center,
             cam_pos,
             last_frame: Instant::now(),
@@ -245,42 +247,59 @@ impl Renderer {
     }
 
     /// Bring the streamed set in line with `center`: drop chunks that fell outside
-    /// the radius, and *request* newly desired ones from the worker pool (they're
-    /// uploaded later in [`drain_meshes`](Self::drain_meshes) as they finish, so
-    /// this never meshes on the main thread).
+    /// the radius, and *request* each desired chunk at its distance-based LOD — new
+    /// ones, and resident ones whose LOD changed as the camera moved. Meshing happens
+    /// on the worker pool; results are uploaded in [`drain_meshes`](Self::drain_meshes),
+    /// so this never meshes on the main thread.
     fn stream_around(&mut self, center: ChunkCoord) {
         puffin::profile_function!();
-        // A chunk is "known" once it's resident or already in flight — don't
-        // re-request either.
-        let mut known = self.resident.clone();
-        known.extend(self.mesh_pool.in_flight().iter().copied());
+        let mut desired =
+            streaming::desired_chunks(center, STREAM_RADIUS, STREAM_Y_MIN..=STREAM_Y_MAX);
+        let desired_set: HashSet<ChunkCoord> = desired.iter().copied().collect();
 
-        let updates =
-            streaming::plan_updates(&known, center, STREAM_RADIUS, STREAM_Y_MIN..=STREAM_Y_MAX);
-
-        for coord in updates.to_unload {
-            // Could be an uploaded chunk or one still in flight — handle both.
-            if self.resident.remove(&coord) {
+        // Unload anything no longer desired — uploaded or still in flight.
+        let stale: Vec<ChunkCoord> = self
+            .resident
+            .keys()
+            .chain(self.mesh_pool.in_flight().keys())
+            .filter(|c| !desired_set.contains(c))
+            .copied()
+            .collect();
+        for coord in stale {
+            if self.resident.remove(&coord).is_some() {
                 self.arena.remove(coord);
             }
             self.mesh_pool.cancel(coord);
         }
-        for coord in updates.to_load {
-            self.mesh_pool.request(coord);
+
+        // Request each desired chunk at its LOD unless it's already there. Nearest
+        // first so detail around the camera streams in before the fringe.
+        desired.sort_by_key(|c| (c.x - center.x).pow(2) + (c.z - center.z).pow(2));
+        for coord in desired {
+            let level = streaming::lod_for(coord, center);
+            if self.resident.get(&coord) == Some(&level)
+                || self.mesh_pool.is_in_flight(coord, level)
+            {
+                continue;
+            }
+            self.mesh_pool.request(coord, level);
         }
         self.center = center;
     }
 
     /// Upload any chunks the worker pool finished meshing this frame (the only step
-    /// that must run on the main thread). Cheap and bounded by what actually
+    /// that must run on the main thread), replacing any existing geometry for the
+    /// coord (its LOD may have changed). Cheap and bounded by what actually
     /// completed, so it never causes the streaming hitch synchronous meshing did.
     fn drain_meshes(&mut self) {
         puffin::profile_function!();
         for built in self.mesh_pool.poll() {
-            self.resident.insert(built.coord);
+            // Free any prior geometry (e.g. a coarser LOD being replaced) first.
+            self.arena.remove(built.coord);
             if let Some((mesh, aabb)) = built.geometry {
                 self.arena.insert(&self.queue, built.coord, &mesh, aabb);
             }
+            self.resident.insert(built.coord, built.level);
         }
     }
 

@@ -75,6 +75,23 @@ fn horizontal_dist_sq(a: ChunkCoord, b: ChunkCoord) -> i64 {
     dx * dx + dz * dz
 }
 
+/// Chunks per LOD ring: every `RING` chunks of horizontal distance from the camera
+/// drops the detail one level. Tuned so the nearest few rings stay full-res.
+const RING: i32 = 3;
+/// Coarsest LOD we ever pick (caps at `Chunk::SIZE`'s log2 anyway, but this keeps
+/// distant terrain from collapsing to single blocks too early).
+const MAX_LOD: u32 = 4;
+
+/// The LOD level to mesh the chunk at `coord` at, given the camera is in `center`:
+/// full detail (0) nearby, one level coarser every [`RING`] chunks of horizontal
+/// (Chebyshev) distance out, capped at [`MAX_LOD`]. This is the policy that turns
+/// the [`build_mesh_lod`](cubara_voxel::Chunk::build_mesh_lod) primitive into a
+/// render-distance win: distant chunks cost a fraction of the triangles.
+pub fn lod_for(coord: ChunkCoord, center: ChunkCoord) -> u32 {
+    let dist = (coord.x - center.x).abs().max((coord.z - center.z).abs());
+    ((dist / RING) as u32).min(MAX_LOD)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +142,20 @@ mod tests {
         assert_eq!(updates.to_unload.len(), 3);
         assert!(updates.to_load.iter().all(|c| c.x == 2));
         assert!(updates.to_unload.iter().all(|c| c.x == -1));
+    }
+
+    #[test]
+    fn lod_rises_with_distance_and_caps() {
+        let c = ChunkCoord::new(0, 0, 0);
+        // Nearest RING chunks are full detail, then one level coarser per RING.
+        assert_eq!(lod_for(ChunkCoord::new(0, 0, 0), c), 0);
+        assert_eq!(lod_for(ChunkCoord::new(2, 0, 0), c), 0);
+        assert_eq!(lod_for(ChunkCoord::new(3, 0, 0), c), 1);
+        assert_eq!(lod_for(ChunkCoord::new(0, 0, 7), c), 2);
+        // Chebyshev distance: the larger of |dx|,|dz| decides.
+        assert_eq!(lod_for(ChunkCoord::new(1, 0, 6), c), 2);
+        // Caps at MAX_LOD however far out.
+        assert_eq!(lod_for(ChunkCoord::new(1000, 0, 0), c), 4);
     }
 
     #[test]
