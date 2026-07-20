@@ -6,7 +6,7 @@
 //! ones that fall out are freed). The shared building blocks (pipeline, depth view,
 //! camera) are public so the headless bench/screenshot paths build the same scene.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -19,7 +19,7 @@ use cubara_world::{streaming, World};
 use crate::arena::ChunkArena;
 use crate::camera::FlyCamera;
 use crate::culling::Frustum;
-use crate::mesher::MeshPool;
+use crate::mesher::{BuiltChunk, MeshPool};
 use crate::text::TextRenderer;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -34,6 +34,10 @@ const STREAM_Y_MIN: i32 = 0;
 const STREAM_Y_MAX: i32 = 2;
 /// How far the block-editing ray reaches, in blocks.
 const EDIT_REACH: f32 = 6.0;
+/// Cap on chunk geometry uploads per frame. Crossing a chunk boundary re-LODs a
+/// whole ring at once; spreading the GPU uploads over a few frames avoids the
+/// resulting frame-time spike (chunks pop in a hair later, imperceptibly).
+const MAX_UPLOADS_PER_FRAME: usize = 32;
 
 /// Uniform block shared with `mesh.wgsl`: one column-major view*projection matrix.
 #[repr(C)]
@@ -100,6 +104,9 @@ pub struct Renderer {
     arena: ChunkArena,
     /// Background worker pool that generates + meshes chunks off the main thread.
     mesh_pool: MeshPool,
+    /// Finished meshes waiting to be uploaded, drained at most
+    /// [`MAX_UPLOADS_PER_FRAME`] per frame to avoid upload spikes.
+    upload_queue: VecDeque<BuiltChunk>,
     /// Coords that are meshed and uploaded (or known empty), mapped to the LOD level
     /// they're currently at — so we only re-mesh when a chunk's desired LOD changes.
     resident: HashMap<ChunkCoord, u32>,
@@ -224,6 +231,7 @@ impl Renderer {
             frustum,
             arena,
             mesh_pool: MeshPool::new(),
+            upload_queue: VecDeque::new(),
             resident: HashMap::new(),
             center,
             camera,
@@ -341,19 +349,33 @@ impl Renderer {
         self.center = center;
     }
 
-    /// Upload any chunks the worker pool finished meshing this frame (the only step
-    /// that must run on the main thread), replacing any existing geometry for the
-    /// coord (its LOD may have changed). Cheap and bounded by what actually
-    /// completed, so it never causes the streaming hitch synchronous meshing did.
+    /// Take finished meshes from the worker pool and upload them — but at most
+    /// [`MAX_UPLOADS_PER_FRAME`] per frame, so a boundary crossing (which re-LODs a
+    /// whole ring at once) doesn't spike the frame time. Completed chunks are marked
+    /// resident immediately (so they aren't re-requested) and their old geometry
+    /// stays drawn until the new upload swaps it in.
     fn drain_meshes(&mut self) {
         puffin::profile_function!();
+        // Claim everything finished; mark resident now, upload over the next frames.
         for built in self.mesh_pool.poll() {
-            // Free any prior geometry (e.g. a coarser LOD being replaced) first.
-            self.arena.remove(built.coord);
+            self.resident.insert(built.coord, built.level);
+            self.upload_queue.push_back(built);
+        }
+
+        let mut uploaded = 0;
+        while uploaded < MAX_UPLOADS_PER_FRAME {
+            let Some(built) = self.upload_queue.pop_front() else {
+                break;
+            };
+            // Skip if superseded/unloaded while it waited (its LOD is no longer wanted).
+            if self.resident.get(&built.coord) != Some(&built.level) {
+                continue;
+            }
+            self.arena.remove(built.coord); // free any prior (coarser) LOD first
             if let Some((mesh, aabb)) = built.geometry {
                 self.arena.insert(&self.queue, built.coord, &mesh, aabb);
             }
-            self.resident.insert(built.coord, built.level);
+            uploaded += 1;
         }
     }
 
