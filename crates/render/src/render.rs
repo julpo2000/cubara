@@ -23,10 +23,11 @@ use crate::mesher::MeshPool;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// How many chunks out (square radius) to keep resident around the camera. Distant
-/// chunks are streamed at a coarser LOD (see [`streaming::lod_for`]), so this can be
-/// large without the triangle/upload cost a full-resolution radius would carry.
-const STREAM_RADIUS: i32 = 16;
+/// How many chunks out (square radius) to keep resident around the camera. The inner
+/// core is full resolution and only the far rings drop to a coarser LOD (see
+/// [`streaming::lod_for`]), so this reaches well past the detailed core for a distant
+/// horizon without the triangle/upload cost a fully full-resolution radius would carry.
+const STREAM_RADIUS: i32 = 28;
 /// Vertical chunk band to stream — the terrain sits comfortably inside it.
 const STREAM_Y_MIN: i32 = 0;
 const STREAM_Y_MAX: i32 = 2;

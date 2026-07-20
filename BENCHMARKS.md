@@ -47,6 +47,7 @@ frames after 200 warmup.
 | 2026-07-19 | **M3.5 — chunk arena + `multi_draw_indirect`** [#27] | 1,349 | 217,550 | ~3,330³ | **0.199 ms** | 0.535 ms | `41e38f5` |
 | 2026-07-19 | M4 — ambient occlusion [#45] | 1,349 | 361,326 | ~1,900⁴ | 0.363 ms | ~0.78 ms | `4086db1` |
 | 2026-07-19 | **M4 — distance LOD streaming** [#39] | 1,182 | 46,920 | ~8,500⁵ | 0.083 ms | 0.23 ms | `4229513` |
+| 2026-07-20 | M4 — LOD retuned: 12-chunk full-res core, radius 28⁶ | 6,561 | 538,846 | ~1,450 | 0.49 ms | ~1.0 ms | `0f65a49` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -95,6 +96,14 @@ Radius 32 draws **5× the chunks** of the full-res radius-12 scene yet still run
 ~2× faster than it did (~1,900 FPS). Chunk count dips vs full-res (1,349 → 1,182 at
 r12) because majority-downsampling drops sparse far features. LOD boundaries show
 small cracks for now — seam fixing is #40.
+
+⁶ **LOD retuned for looks.** The first pass coarsened after 3 chunks (48 blocks),
+so detail visibly popped up close. Reworked so the whole 12-chunk (192-block) core
+stays full-resolution and LOD only kicks in beyond it, with STREAM_RADIUS pushed to
+28 (448-block horizon) for the rings to fill. This row is the live-representative
+scene (radius 28): 6,561 chunks / 539k tris at ~1,450 FPS on M3 — heavier than the
+aggressive-LOD row above (the core is now genuinely full-res), still above the gate,
+and the detailed core follows the camera so nearby pop-in is gone.
 
 ² **First meaningful FPS number.** The streaming renderer measures a ~1,350-chunk
 region (10× the old grid), which pushes the frame into being **CPU-submit-bound**:
