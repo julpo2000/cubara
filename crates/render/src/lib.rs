@@ -13,6 +13,7 @@ pub mod culling;
 mod mesher;
 pub mod profiling;
 mod render;
+mod text;
 
 pub use arena::ChunkArena;
 pub use camera::FlyCamera;
@@ -22,3 +23,4 @@ pub use render::{
     build_pipeline, camera_bind_group_layout, create_depth_view, gpu_driven_features,
     CameraUniform, Renderer,
 };
+pub use text::TextRenderer;
