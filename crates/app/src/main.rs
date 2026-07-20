@@ -53,6 +53,8 @@ impl ApplicationHandler for App {
                     if code == KeyCode::Escape && pressed {
                         self.cursor_captured = !self.cursor_captured;
                         renderer.set_cursor_captured(self.cursor_captured);
+                    } else if code == KeyCode::F3 && pressed {
+                        renderer.toggle_debug();
                     } else {
                         renderer.key_input(code, pressed);
                     }

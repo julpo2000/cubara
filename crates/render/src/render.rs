@@ -20,6 +20,7 @@ use crate::arena::ChunkArena;
 use crate::camera::FlyCamera;
 use crate::culling::Frustum;
 use crate::mesher::MeshPool;
+use crate::text::TextRenderer;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -111,6 +112,13 @@ pub struct Renderer {
     visible_chunks: usize,
     frames: u32,
     last_report: Instant,
+
+    /// Screen-space text for the debug overlay.
+    text: TextRenderer,
+    /// Whether the F3 debug overlay is shown.
+    show_debug: bool,
+    /// Smoothed frame time in ms, for a stable on-screen FPS reading.
+    frame_ms: f32,
 }
 
 impl Renderer {
@@ -198,6 +206,7 @@ impl Renderer {
         let center = ChunkCoord::from_world_pos(camera.pos.to_array());
 
         let arena = ChunkArena::new(&device, multi_draw);
+        let text = TextRenderer::new(&device, &queue, format);
 
         // Capture the mouse for first-person look (Esc releases it — see the app).
         grab_cursor(&window, true);
@@ -222,6 +231,9 @@ impl Renderer {
             visible_chunks: 0,
             frames: 0,
             last_report: Instant::now(),
+            text,
+            show_debug: true,
+            frame_ms: 0.0,
         };
         // Prime the initial region so the first frame has something to draw.
         renderer.stream_around(center);
@@ -407,10 +419,83 @@ impl Renderer {
             self.arena.encode(&mut pass, draw_count);
         }
 
+        // Debug overlay: a second pass over the same colour target (loaded, no depth).
+        if self.show_debug {
+            self.queue_debug_text();
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("overlay-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.text.flush(
+                &self.queue,
+                &mut pass,
+                self.config.width as f32,
+                self.config.height as f32,
+            );
+        }
+
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
 
         self.report_fps();
+    }
+
+    /// Toggle the F3 debug overlay.
+    pub fn toggle_debug(&mut self) {
+        self.show_debug = !self.show_debug;
+    }
+
+    /// Build this frame's debug text (with a drop shadow for readability).
+    fn queue_debug_text(&mut self) {
+        let p = self.camera.pos;
+        let d = self.camera.look_dir();
+        let facing = if d.x.abs() > d.z.abs() {
+            if d.x > 0.0 {
+                "east (+x)"
+            } else {
+                "west (-x)"
+            }
+        } else if d.z > 0.0 {
+            "south (+z)"
+        } else {
+            "north (-z)"
+        };
+        let fps = if self.frame_ms > 0.0 {
+            1000.0 / self.frame_ms
+        } else {
+            0.0
+        };
+        let text = format!(
+            "Cubara  (F3)\n\
+             {fps:.0} fps  ({ms:.2} ms)\n\
+             xyz  {x:.1} / {y:.1} / {z:.1}\n\
+             chunk  {cx} {cy} {cz}\n\
+             facing  {facing}\n\
+             chunks  {vis} drawn / {res} resident",
+            ms = self.frame_ms,
+            x = p.x,
+            y = p.y,
+            z = p.z,
+            cx = self.center.x,
+            cy = self.center.y,
+            cz = self.center.z,
+            vis = self.visible_chunks,
+            res = self.arena.len(),
+        );
+        const SCALE: f32 = 2.0;
+        // Shadow first (dark, offset), then the white text on top.
+        self.text.queue(&text, 10.0, 10.0, SCALE, [0.0, 0.0, 0.0]);
+        self.text.queue(&text, 8.0, 8.0, SCALE, [1.0, 1.0, 1.0]);
     }
 
     /// Advance the flying camera, stream if we crossed a chunk boundary, and upload
@@ -419,6 +504,13 @@ impl Renderer {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
+        // Exponentially-smoothed frame time for a steady on-screen FPS reading.
+        let ms = dt * 1000.0;
+        self.frame_ms = if self.frame_ms == 0.0 {
+            ms
+        } else {
+            self.frame_ms * 0.9 + ms * 0.1
+        };
         self.camera.update(dt);
 
         let center = ChunkCoord::from_world_pos(self.camera.pos.to_array());
