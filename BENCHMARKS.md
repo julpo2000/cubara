@@ -37,6 +37,7 @@ frames after 200 warmup.
 | 2026-07-18 | M2 — frustum culling (baseline) | 137 | 22,788 | 8097 | 0.083 ms | 0.350 ms | `0ab6034` |
 | 2026-07-18 | M3 — streaming foundation (no scene change) | 137 | 22,788 | ~11,100¹ | 0.077 ms | ~0.29 ms | `7a249d2` |
 | 2026-07-19 | M3 — streaming renderer (heavy scene) | 1,349 | 217,550 | ~1,980² | ~0.49 ms | ~1.16 ms | `ae0ebea` |
+| 2026-07-21 | M3.5 — shared arena + indirect multi-draw (Step 1) | 1,349 | 217,550 | ~4,711³ | 0.177 ms | 1.017 ms | `1869300` |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -63,6 +64,17 @@ rows). This is *not* comparable to the rows above (different, much heavier scene
 it's the new baseline to optimize down from. The obvious next lever is the draw-call
 count: batching chunks into fewer draws (instanced / indirect / GPU-driven) should
 move this number, and it'll show up right here.
+
+³ **The draw-call lever, pulled.** Same 1,349-chunk scene as the M3 heavy row —
+directly comparable — but all chunk geometry now lives in one shared vertex/index
+buffer and the ~1,322 visible chunks draw in a **single `multi_draw_indexed_indirect`**
+instead of ~1,322 separate draw calls. First-run-after-idle: **4,711 FPS** (vs M3's
+~1,980, **+138%**) at **0.177 ms/frame** avg (vs ~0.49 ms, **−64%**). As always at
+this submit-bound scene the warmed burst ramps on clock boost — the three
+back-to-back runs went 4,711 → 6,645 → 8,246 FPS with CPU/frame settling to
+**~0.08 ms** (p50 was already 0.051 ms on the cold run), so the steady-state CPU cost
+is ~6× below M3. CPU frustum culling stays on the CPU here; moving it to a compute
+shader (Step 2, #28) is what should make CPU/frame flat regardless of chunk count.
 
 ## Detailed run logs
 
