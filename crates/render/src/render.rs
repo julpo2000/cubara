@@ -10,12 +10,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use winit::window::Window;
+use winit::keyboard::KeyCode;
+use winit::window::{CursorGrabMode, Window};
 
 use cubara_voxel::{ChunkCoord, Vertex};
 use cubara_world::streaming;
 
 use crate::arena::ChunkArena;
+use crate::camera::FlyCamera;
 use crate::culling::Frustum;
 use crate::mesher::MeshPool;
 
@@ -28,8 +30,6 @@ const STREAM_RADIUS: i32 = 16;
 /// Vertical chunk band to stream — the terrain sits comfortably inside it.
 const STREAM_Y_MIN: i32 = 0;
 const STREAM_Y_MAX: i32 = 2;
-/// Camera fly speed through the world, in blocks per second.
-const FLY_SPEED: f32 = 24.0;
 
 /// Uniform block shared with `mesh.wgsl`: one column-major view*projection matrix.
 #[repr(C)]
@@ -78,17 +78,6 @@ pub fn gpu_driven_features(adapter: &wgpu::Adapter) -> (wgpu::Features, bool) {
     (features, multi_draw)
 }
 
-/// The unit direction the camera flies along (a gentle horizontal diagonal so it
-/// keeps crossing chunk boundaries in both x and z).
-fn fly_dir() -> glam::Vec3 {
-    glam::vec3(1.0, 0.0, 0.35).normalize()
-}
-
-/// The camera's look direction: the fly heading pitched down a little.
-fn look_dir() -> glam::Vec3 {
-    (fly_dir() + glam::vec3(0.0, -0.35, 0.0)).normalize()
-}
-
 /// All GPU + window state. Created once the event loop has `resumed`.
 pub struct Renderer {
     window: Arc<Window>,
@@ -113,7 +102,8 @@ pub struct Renderer {
     /// Chunk the camera is currently in; streaming re-runs when this changes.
     center: ChunkCoord,
 
-    cam_pos: glam::Vec3,
+    /// First-person camera, driven by keyboard + mouse input.
+    camera: FlyCamera,
     last_frame: Instant,
     visible_chunks: usize,
     frames: u32,
@@ -197,14 +187,17 @@ impl Renderer {
         let pipeline = build_pipeline(&device, format, &camera_bgl);
         let depth_view = create_depth_view(&device, config.width, config.height);
 
-        // Start above the terrain near the origin, looking along the fly heading.
-        let cam_pos = glam::vec3(0.0, 48.0, 0.0);
+        // Start above the terrain near the origin, looking out over it and slightly
+        // down (yaw ~35°, gentle downward pitch).
+        let camera = FlyCamera::new(glam::vec3(0.0, 48.0, 0.0), 0.6, -0.3);
         let aspect = config.width as f32 / config.height as f32;
-        let frustum =
-            Frustum::from_view_proj(CameraUniform::look_view_proj(aspect, cam_pos, look_dir()));
-        let center = ChunkCoord::from_world_pos(cam_pos.to_array());
+        let frustum = Frustum::from_view_proj(camera.view_proj(aspect));
+        let center = ChunkCoord::from_world_pos(camera.pos.to_array());
 
         let arena = ChunkArena::new(&device, multi_draw);
+
+        // Capture the mouse for first-person look (Esc releases it — see the app).
+        grab_cursor(&window, true);
 
         let mut renderer = Self {
             window,
@@ -221,7 +214,7 @@ impl Renderer {
             mesh_pool: MeshPool::new(),
             resident: HashMap::new(),
             center,
-            cam_pos,
+            camera,
             last_frame: Instant::now(),
             visible_chunks: 0,
             frames: 0,
@@ -230,6 +223,21 @@ impl Renderer {
         // Prime the initial region so the first frame has something to draw.
         renderer.stream_around(center);
         renderer
+    }
+
+    /// Feed a key press/release to the camera. Returns whether it was consumed.
+    pub fn key_input(&mut self, key: KeyCode, pressed: bool) -> bool {
+        self.camera.key(key, pressed)
+    }
+
+    /// Feed a raw mouse-motion delta (pixels) to the camera's look.
+    pub fn mouse_look(&mut self, dx: f32, dy: f32) {
+        self.camera.mouse_look(dx, dy);
+    }
+
+    /// Grab (or release) the mouse cursor for first-person look.
+    pub fn set_cursor_captured(&self, captured: bool) {
+        grab_cursor(&self.window, captured);
     }
 
     pub fn window(&self) -> &Window {
@@ -377,9 +385,9 @@ impl Renderer {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
-        self.cam_pos += fly_dir() * FLY_SPEED * dt;
+        self.camera.update(dt);
 
-        let center = ChunkCoord::from_world_pos(self.cam_pos.to_array());
+        let center = ChunkCoord::from_world_pos(self.camera.pos.to_array());
         if center != self.center {
             self.stream_around(center);
         }
@@ -387,7 +395,7 @@ impl Renderer {
         self.drain_meshes();
 
         let aspect = self.config.width as f32 / self.config.height as f32;
-        let vp = CameraUniform::look_view_proj(aspect, self.cam_pos, look_dir());
+        let vp = self.camera.view_proj(aspect);
         self.frustum = Frustum::from_view_proj(vp);
         let uniform = CameraUniform::from_matrix(vp);
         self.queue
@@ -408,6 +416,21 @@ impl Renderer {
             self.frames = 0;
             self.last_report = Instant::now();
         }
+    }
+}
+
+/// Grab + hide the cursor for first-person look, or release it. Best-effort:
+/// `Locked` isn't supported on every platform, so fall back to `Confined`, and
+/// never panic if the platform refuses.
+fn grab_cursor(window: &Window, grab: bool) {
+    if grab {
+        if window.set_cursor_grab(CursorGrabMode::Locked).is_err() {
+            let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+        }
+        window.set_cursor_visible(false);
+    } else {
+        let _ = window.set_cursor_grab(CursorGrabMode::None);
+        window.set_cursor_visible(true);
     }
 }
 

@@ -8,12 +8,14 @@
 //! does.
 
 mod arena;
+mod camera;
 pub mod culling;
 mod mesher;
 pub mod profiling;
 mod render;
 
 pub use arena::ChunkArena;
+pub use camera::FlyCamera;
 pub use culling::{Aabb, Frustum};
 pub use profiling::Profiler;
 pub use render::{
