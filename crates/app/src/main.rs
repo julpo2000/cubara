@@ -1,7 +1,8 @@
 //! Cubara — entry point.
 //!
-//! Owns the window and event loop; all GPU work lives in [`render`]. Milestone M1
-//! grows this from a validation triangle into a chunk of cubes rendered at 1000+ FPS.
+//! Owns the window and event loop; all GPU work lives in `cubara_render`. Forwards
+//! keyboard + mouse input to the renderer's first-person camera (WASD to move,
+//! Space/Shift up/down, mouse to look, Esc to release the cursor).
 
 mod bench;
 mod caps;
@@ -12,13 +13,16 @@ use std::sync::Arc;
 use cubara_render::{Profiler, Renderer};
 
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 #[derive(Default)]
 struct App {
     renderer: Option<Renderer>,
+    /// Whether the mouse is captured for first-person look (toggled with Escape).
+    cursor_captured: bool,
     /// Kept alive for the program's lifetime when built with `--features profile`.
     _profiler: Option<Profiler>,
 }
@@ -31,6 +35,7 @@ impl ApplicationHandler for App {
         let attrs = Window::default_attributes().with_title("Cubara");
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         self.renderer = Some(Renderer::new(window));
+        self.cursor_captured = true; // Renderer::new grabs the cursor
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -41,12 +46,35 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => renderer.resize(size.width, size.height),
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    let pressed = event.state == ElementState::Pressed;
+                    // Escape toggles mouse capture so you can leave the window.
+                    if code == KeyCode::Escape && pressed {
+                        self.cursor_captured = !self.cursor_captured;
+                        renderer.set_cursor_captured(self.cursor_captured);
+                    } else {
+                        renderer.key_input(code, pressed);
+                    }
+                }
+            }
             WindowEvent::RedrawRequested => {
                 renderer.render();
                 // Immediately queue the next frame — we render continuously.
                 renderer.window().request_redraw();
             }
             _ => {}
+        }
+    }
+
+    fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+        // Raw mouse motion drives first-person look, but only while captured.
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            if self.cursor_captured {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.mouse_look(dx as f32, dy as f32);
+                }
+            }
         }
     }
 }
