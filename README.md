@@ -51,3 +51,9 @@ cargo run --release -- --caps
 
 Stack: Rust + [`wgpu`](https://wgpu.rs) (Metal on macOS, DX12/Vulkan on Windows) +
 `winit`. See `PLAN.md` for architecture and the milestone roadmap.
+
+## Contributing
+
+Work lands via issues and CI-green PRs off `main`. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the branch/commit/PR flow, the required
+checks, and the performance-tracking discipline.
