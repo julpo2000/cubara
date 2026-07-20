@@ -14,7 +14,7 @@ use winit::keyboard::KeyCode;
 use winit::window::{CursorGrabMode, Window};
 
 use cubara_voxel::{ChunkCoord, Vertex};
-use cubara_world::streaming;
+use cubara_world::{streaming, World};
 
 use crate::arena::ChunkArena;
 use crate::camera::FlyCamera;
@@ -30,6 +30,8 @@ const STREAM_RADIUS: i32 = 16;
 /// Vertical chunk band to stream — the terrain sits comfortably inside it.
 const STREAM_Y_MIN: i32 = 0;
 const STREAM_Y_MAX: i32 = 2;
+/// How far the block-editing ray reaches, in blocks.
+const EDIT_REACH: f32 = 6.0;
 
 /// Uniform block shared with `mesh.wgsl`: one column-major view*projection matrix.
 #[repr(C)]
@@ -238,6 +240,37 @@ impl Renderer {
     /// Grab (or release) the mouse cursor for first-person look.
     pub fn set_cursor_captured(&self, captured: bool) {
         grab_cursor(&self.window, captured);
+    }
+
+    /// Break (`place = false`) or place (`true`) the block the camera is looking at,
+    /// within [`EDIT_REACH`], and re-mesh the affected chunk. No-op if nothing is in
+    /// reach. Placing puts the block against the hit face.
+    pub fn edit_block(&mut self, place: bool) {
+        let origin = self.camera.pos.to_array();
+        let dir = self.camera.look_dir().to_array();
+        let Some(hit) = World::raycast(origin, dir, EDIT_REACH) else {
+            return;
+        };
+        let target = if place {
+            [
+                hit.block[0] + hit.normal[0],
+                hit.block[1] + hit.normal[1],
+                hit.block[2] + hit.normal[2],
+            ]
+        } else {
+            hit.block
+        };
+        let cc = World::set_block(target[0], target[1], target[2], place);
+        self.invalidate(cc);
+    }
+
+    /// Force a re-mesh of `cc` (e.g. after an edit): the worker re-reads the edit
+    /// overlay, and [`drain_meshes`](Self::drain_meshes) swaps the geometry in
+    /// atomically, so there's no gap.
+    fn invalidate(&mut self, cc: ChunkCoord) {
+        self.mesh_pool.cancel(cc);
+        self.mesh_pool
+            .request(cc, streaming::lod_for(cc, self.center));
     }
 
     pub fn window(&self) -> &Window {
