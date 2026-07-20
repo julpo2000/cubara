@@ -6,8 +6,8 @@
 use wgpu::util::DeviceExt;
 
 use cubara_render::{
-    build_pipeline, camera_bind_group_layout, chunks_bounds, create_depth_view, upload_region,
-    CameraUniform,
+    build_pipeline, build_region, camera_bind_group_layout, create_depth_view,
+    request_render_device, CameraUniform,
 };
 use cubara_voxel::ChunkCoord;
 
@@ -29,20 +29,18 @@ pub fn run(path: &str) {
     }))
     .expect("no suitable GPU adapter");
 
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("cubara-screenshot-device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            memory_hints: wgpu::MemoryHints::Performance,
-        },
-        None,
-    ))
-    .expect("request device");
+    let (device, queue, multi_draw) = request_render_device(&adapter);
 
     // Scene: a streamed region, same path the live renderer and bench use.
-    let chunks = upload_region(&device, ChunkCoord::new(0, 0, 0), REGION_RADIUS, 0..=2);
-    let (min, max) = chunks_bounds(&chunks);
+    let mut arena = build_region(
+        &device,
+        &queue,
+        ChunkCoord::new(0, 0, 0),
+        REGION_RADIUS,
+        0..=2,
+        multi_draw,
+    );
+    let (min, max) = arena.bounds();
     let look_target = [
         (min[0] + max[0]) * 0.5,
         (min[1] + max[1]) * 0.5,
@@ -96,6 +94,9 @@ pub fn run(path: &str) {
         mapped_at_creation: false,
     });
 
+    // Stage every chunk (the camera frames the whole region — no culling).
+    arena.prepare_all(&queue);
+
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("screenshot-encoder"),
     });
@@ -128,9 +129,7 @@ pub fn run(path: &str) {
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &camera_bind_group, &[]);
-        for chunk in &chunks {
-            chunk.draw(&mut pass);
-        }
+        arena.encode(&mut pass);
     }
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
@@ -180,6 +179,6 @@ pub fn run(path: &str) {
     .expect("write png");
     log::info!(
         "screenshot written to {path} ({WIDTH}x{HEIGHT}, {} chunks)",
-        chunks.len()
+        arena.chunk_count()
     );
 }

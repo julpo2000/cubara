@@ -1,23 +1,23 @@
 //! GPU bring-up and per-frame rendering.
 //!
-//! Owns the wgpu surface/device/queue and the render pipeline. Each chunk is its
-//! own vertex/index buffer (one draw call), held in a map keyed by [`ChunkCoord`]
-//! so the world can stream: as the camera flies, chunks that come into range are
-//! generated + uploaded and ones that fall out are dropped. The shared building
-//! blocks (pipeline, depth view, camera, chunk upload) are public so the headless
-//! bench/screenshot paths build the same scene.
+//! Owns the wgpu surface/device/queue and the render pipeline. All resident chunk
+//! geometry lives in a shared [`ChunkArena`], drawn with a single indirect submit;
+//! as the camera flies, chunks that come into range are generated + uploaded into
+//! the arena and ones that fall out are freed. The shared building blocks (pipeline,
+//! depth view, camera, device setup) are public so the headless bench/screenshot
+//! paths build the same scene.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
-use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-use cubara_voxel::{Chunk, ChunkCoord, Vertex};
+use cubara_voxel::{ChunkCoord, Vertex};
 use cubara_world::{streaming, World};
 
-use crate::culling::{Aabb, Frustum};
+use crate::arena::ChunkArena;
+use crate::culling::Frustum;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -65,104 +65,37 @@ impl CameraUniform {
     }
 }
 
-/// A single chunk's mesh uploaded to the GPU, with its world-space bounds for
-/// frustum culling.
-pub struct ChunkGpu {
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    index_count: u32,
-    pub aabb: Aabb,
-}
-
-impl ChunkGpu {
-    pub fn triangle_count(&self) -> u32 {
-        self.index_count / 3
+/// Request a device from `adapter`, enabling `MULTI_DRAW_INDIRECT` where the adapter
+/// supports it. Returns the device, queue, and whether the feature is on — the arena
+/// uses that flag to pick the indirect draw path or the `draw_indexed` fallback.
+/// Shared by the live renderer and the headless bench/screenshot paths.
+pub fn request_render_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue, bool) {
+    // `CUBARA_NO_MDI=1` forces the per-chunk `draw_indexed` fallback even where the
+    // adapter supports indirect draws — for exercising that path on any machine.
+    let force_cpu = std::env::var_os("CUBARA_NO_MDI").is_some();
+    let multi_draw = !force_cpu
+        && adapter
+            .features()
+            .contains(wgpu::Features::MULTI_DRAW_INDIRECT);
+    let required_features = if multi_draw {
+        wgpu::Features::MULTI_DRAW_INDIRECT
+    } else {
+        wgpu::Features::empty()
+    };
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("cubara-device"),
+            required_features,
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+        },
+        None,
+    ))
+    .expect("request device");
+    if !multi_draw {
+        log::warn!("MULTI_DRAW_INDIRECT unavailable — falling back to per-chunk draw_indexed");
     }
-
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
-        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..self.index_count, 0, 0..1);
-    }
-}
-
-/// Mesh one chunk (baking in its world-space offset) and upload it, or `None` if
-/// the chunk produced no geometry.
-pub fn upload_chunk(device: &wgpu::Device, coord: ChunkCoord, chunk: &Chunk) -> Option<ChunkGpu> {
-    let mut mesh = chunk.build_mesh();
-    mesh.translate(coord.world_offset());
-    if mesh.indices.is_empty() {
-        return None;
-    }
-
-    let mut min = glam::Vec3::splat(f32::MAX);
-    let mut max = glam::Vec3::splat(f32::MIN);
-    for v in &mesh.vertices {
-        let p = glam::Vec3::from(v.position);
-        min = min.min(p);
-        max = max.max(p);
-    }
-
-    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("chunk-vertices"),
-        contents: bytemuck::cast_slice(&mesh.vertices),
-        usage: wgpu::BufferUsages::VERTEX,
-    });
-    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("chunk-indices"),
-        contents: bytemuck::cast_slice(&mesh.indices),
-        usage: wgpu::BufferUsages::INDEX,
-    });
-    Some(ChunkGpu {
-        vertex_buffer,
-        index_buffer,
-        index_count: mesh.indices.len() as u32,
-        aabb: Aabb::new(min, max),
-    })
-}
-
-/// Build and upload every non-empty chunk in a square region — the same streaming
-/// path the live renderer uses, exposed so the headless bench/screenshot measure
-/// and draw the same scene.
-pub fn upload_region(
-    device: &wgpu::Device,
-    center: ChunkCoord,
-    radius: i32,
-    y_range: std::ops::RangeInclusive<i32>,
-) -> Vec<ChunkGpu> {
-    let mut gpu = Vec::new();
-    let mut total_tris = 0u32;
-    for coord in streaming::desired_chunks(center, radius, y_range) {
-        if let Some(chunk) = World::chunk_at(coord) {
-            if let Some(chunk_gpu) = upload_chunk(device, coord, &chunk) {
-                total_tris += chunk_gpu.triangle_count();
-                gpu.push(chunk_gpu);
-            }
-        }
-    }
-    log::info!(
-        "region radius {radius}: {} chunks meshed, {total_tris} triangles",
-        gpu.len()
-    );
-    gpu
-}
-
-/// World-space axis-aligned bounds (`[min]`, `[max]`) over a set of chunks, for
-/// framing a camera on them.
-pub fn chunks_bounds(chunks: &[ChunkGpu]) -> ([f32; 3], [f32; 3]) {
-    let mut min = [f32::MAX; 3];
-    let mut max = [f32::MIN; 3];
-    for c in chunks {
-        let lo = [c.aabb.min.x, c.aabb.min.y, c.aabb.min.z];
-        let hi = [c.aabb.max.x, c.aabb.max.y, c.aabb.max.z];
-        for (m, v) in min.iter_mut().zip(lo) {
-            *m = m.min(v);
-        }
-        for (m, v) in max.iter_mut().zip(hi) {
-            *m = m.max(v);
-        }
-    }
-    (min, max)
+    (device, queue, multi_draw)
 }
 
 /// The unit direction the camera flies along (a gentle horizontal diagonal so it
@@ -190,8 +123,8 @@ pub struct Renderer {
     depth_view: wgpu::TextureView,
     frustum: Frustum,
 
-    /// Uploaded, drawable chunks, keyed by grid position.
-    chunks: HashMap<ChunkCoord, ChunkGpu>,
+    /// All resident chunk geometry in shared buffers, drawn with one indirect submit.
+    arena: ChunkArena,
     /// Every coord we've streamed in, including ones that produced no geometry —
     /// so empty chunks aren't re-generated every frame.
     resident: HashSet<ChunkCoord>,
@@ -227,16 +160,7 @@ impl Renderer {
 
         log::info!("GPU: {:?}", adapter.get_info());
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("cubara-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
-        .expect("request device");
+        let (device, queue, multi_draw) = request_render_device(&adapter);
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -285,6 +209,7 @@ impl Renderer {
         let frustum =
             Frustum::from_view_proj(CameraUniform::look_view_proj(aspect, cam_pos, look_dir()));
         let center = ChunkCoord::from_world_pos(cam_pos.to_array());
+        let arena = ChunkArena::new(&device, multi_draw);
 
         let mut renderer = Self {
             window,
@@ -297,7 +222,7 @@ impl Renderer {
             camera_bind_group,
             depth_view,
             frustum,
-            chunks: HashMap::new(),
+            arena,
             resident: HashSet::new(),
             center,
             cam_pos,
@@ -337,15 +262,13 @@ impl Renderer {
         );
 
         for coord in updates.to_unload {
-            self.chunks.remove(&coord);
+            self.arena.remove(coord);
             self.resident.remove(&coord);
         }
         for coord in updates.to_load {
             self.resident.insert(coord);
             if let Some(chunk) = World::chunk_at(coord) {
-                if let Some(gpu) = upload_chunk(&self.device, coord, &chunk) {
-                    self.chunks.insert(coord, gpu);
-                }
+                self.arena.insert(&self.device, &self.queue, coord, &chunk);
             }
         }
         self.center = center;
@@ -368,6 +291,9 @@ impl Renderer {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Frustum-cull and stage the visible draw list before opening the pass.
+        self.visible_chunks = self.arena.prepare(&self.queue, &self.frustum) as usize;
 
         let mut encoder = self
             .device
@@ -406,14 +332,7 @@ impl Renderer {
 
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            let mut visible = 0usize;
-            for chunk in self.chunks.values() {
-                if self.frustum.intersects_aabb(&chunk.aabb) {
-                    chunk.draw(&mut pass);
-                    visible += 1;
-                }
-            }
-            self.visible_chunks = visible;
+            self.arena.encode(&mut pass);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -452,7 +371,7 @@ impl Renderer {
             log::info!(
                 "{fps:.0} FPS | drawn {}/{} resident chunks",
                 self.visible_chunks,
-                self.chunks.len()
+                self.arena.chunk_count()
             );
             self.frames = 0;
             self.last_report = Instant::now();

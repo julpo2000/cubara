@@ -10,8 +10,8 @@
 use std::time::Instant;
 
 use cubara_render::{
-    build_pipeline, camera_bind_group_layout, chunks_bounds, create_depth_view, upload_region,
-    CameraUniform, Frustum,
+    build_pipeline, build_region, camera_bind_group_layout, create_depth_view,
+    request_render_device, CameraUniform, ChunkArena, Frustum,
 };
 use cubara_voxel::ChunkCoord;
 
@@ -39,33 +39,36 @@ pub fn run() {
     .expect("no suitable GPU adapter");
     log::info!("GPU: {:?}", adapter.get_info());
 
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("cubara-bench-device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            memory_hints: wgpu::MemoryHints::Performance,
-        },
-        None,
-    ))
-    .expect("request device");
+    let (device, queue, multi_draw) = request_render_device(&adapter);
 
     // Held for the duration of the benchmark when built with `--features profile`.
     let _profiler = cubara_render::Profiler::init();
 
     // Scene: a streamed square region (the same path the live renderer uses), so
     // we measure a realistically heavy world instead of the tiny fixed grid.
-    let chunks = upload_region(&device, ChunkCoord::new(0, 0, 0), BENCH_RADIUS, 0..=2);
-    let (min, max) = chunks_bounds(&chunks);
+    let mut arena = build_region(
+        &device,
+        &queue,
+        ChunkCoord::new(0, 0, 0),
+        BENCH_RADIUS,
+        0..=2,
+        multi_draw,
+    );
+    let (min, max) = arena.bounds();
     let look_target = [
         (min[0] + max[0]) * 0.5,
         (min[1] + max[1]) * 0.5,
         (min[2] + max[2]) * 0.5,
     ];
     let view_radius = (max[0] - min[0]).max(max[2] - min[2]) * 0.75;
+    let total_chunks = arena.chunk_count();
     log::info!(
-        "rendering {WIDTH}x{HEIGHT}, {} chunk draw calls",
-        chunks.len()
+        "rendering {WIDTH}x{HEIGHT}, {total_chunks} chunks via {}",
+        if multi_draw {
+            "1 multi_draw_indexed_indirect"
+        } else {
+            "per-chunk draw_indexed (no MDI)"
+        }
     );
 
     // Camera uniform + bind group.
@@ -112,18 +115,20 @@ pub fn run() {
     // submit) and returns the CPU time spent plus how many chunks were drawn.
     // Frames are not individually waited on, so the GPU pipelines them — this
     // measures sustained throughput.
-    let submit_frame = |vt: f32| -> (f64, usize) {
+    let submit_frame = |arena: &mut ChunkArena, vt: f32| -> (f64, usize) {
         puffin::profile_scope!("frame");
         let vp = CameraUniform::view_proj_matrix(aspect, vt, look_target, view_radius);
         let uniform = CameraUniform::from_matrix(vp);
         queue.write_buffer(&camera_buffer, 0, bytemuck::bytes_of(&uniform));
         let frustum = Frustum::from_view_proj(vp);
 
+        // CPU per-frame work: frustum-cull + stage the indirect draw list, then
+        // encode a single indirect submit. This is the cost the arena should shrink.
         let cpu_start = Instant::now();
+        let visible = arena.prepare(&queue, &frustum) as usize;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("bench-encoder"),
         });
-        let mut visible = 0usize;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("bench-pass"),
@@ -154,12 +159,7 @@ pub fn run() {
 
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &camera_bind_group, &[]);
-            for chunk in &chunks {
-                if frustum.intersects_aabb(&chunk.aabb) {
-                    chunk.draw(&mut pass);
-                    visible += 1;
-                }
-            }
+            arena.encode(&mut pass);
         }
         queue.submit(std::iter::once(encoder.finish()));
         (cpu_start.elapsed().as_secs_f64() * 1000.0, visible)
@@ -168,7 +168,7 @@ pub fn run() {
     log::info!("warming up ({WARMUP_FRAMES} frames), then measuring {MEASURE_FRAMES}...");
 
     for _ in 0..WARMUP_FRAMES {
-        submit_frame(virtual_t);
+        submit_frame(&mut arena, virtual_t);
         let _ = device.poll(wgpu::Maintain::Poll);
         virtual_t += VIRTUAL_DT;
     }
@@ -180,7 +180,7 @@ pub fn run() {
     let wall_start = Instant::now();
     for _ in 0..MEASURE_FRAMES {
         cubara_render::Profiler::new_frame();
-        let (ms, visible) = submit_frame(virtual_t);
+        let (ms, visible) = submit_frame(&mut arena, virtual_t);
         cpu_ms.push(ms);
         visible_sum += visible as u64;
         let _ = device.poll(wgpu::Maintain::Poll);
@@ -190,7 +190,7 @@ pub fn run() {
     let wall_secs = wall_start.elapsed().as_secs_f64();
     let avg_visible = visible_sum as f64 / MEASURE_FRAMES as f64;
 
-    report(MEASURE_FRAMES, wall_secs, cpu_ms, avg_visible, chunks.len());
+    report(MEASURE_FRAMES, wall_secs, cpu_ms, avg_visible, total_chunks);
 }
 
 fn report(
