@@ -13,7 +13,7 @@ use std::sync::Arc;
 use cubara_render::{Profiler, Renderer};
 
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -55,6 +55,17 @@ impl ApplicationHandler for App {
                         renderer.set_cursor_captured(self.cursor_captured);
                     } else {
                         renderer.key_input(code, pressed);
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                // Left click breaks the targeted block, right click places one — but
+                // only while the cursor is captured (i.e. actually playing).
+                if self.cursor_captured && state == ElementState::Pressed {
+                    match button {
+                        MouseButton::Left => renderer.edit_block(false),
+                        MouseButton::Right => renderer.edit_block(true),
+                        _ => {}
                     }
                 }
             }
