@@ -4,6 +4,9 @@ These are the original wishes for the project, written down as the north star.
 Everything in [`PLAN.md`](PLAN.md) exists to serve these. If a future decision
 conflicts with one of these, we revisit it here first.
 
+**What ships, and when**, is in [`ROADMAP.md`](ROADMAP.md) — it defines the 1.0
+scope, the milestone ladder, and the gates each phase has to clear.
+
 ## Motivation
 
 Build the "definitive" voxel game. The mainstream voxel game is great, but its
