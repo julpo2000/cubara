@@ -4,6 +4,11 @@ These are the original wishes for the project, written down as the north star.
 Everything in [`PLAN.md`](PLAN.md) exists to serve these. If a future decision
 conflicts with one of these, we revisit it here first.
 
+**What ships, and when** — the 1.0 scope and milestone ladder — is decided
+together and recorded in `ROADMAP.md`. Gameplay and game-design decisions are the
+project owner's to make: they get discussed and agreed *as systems*, never
+invented feature-by-feature in the course of implementing something else.
+
 ## Motivation
 
 Build the "definitive" voxel game. The mainstream voxel game is great, but its
