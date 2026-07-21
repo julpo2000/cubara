@@ -49,6 +49,7 @@ frames after 200 warmup.
 | 2026-07-19 | **M4 — distance LOD streaming** [#39] | 1,182 | 46,920 | ~8,500⁵ | 0.083 ms | 0.23 ms | `4229513` |
 | 2026-07-20 | M4 — LOD retuned: 12-chunk full-res core, radius 28⁶ | 6,561 | 538,846 | ~1,450 | 0.49 ms | ~1.0 ms | `0f65a49` |
 | 2026-07-21 | Rule 2 — world state owned, not global⁷ | 1,349 | 361,326 | ~1,780 | 0.388 ms | ~1.0 ms | `refactor/world-owned-state` |
+| 2026-07-21 | Rule 5 — one scene-render path⁸ | 1,349 | 361,326 | ~1,875 | 0.372 ms | ~0.87 ms | `refactor/single-scene-render-path` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -115,6 +116,14 @@ older row (which was recorded on a different day): baseline **0.375 / 0.383 /
 the edge of this machine's run-to-run band, and the bench's per-frame loop does
 not touch `World` at all (it is read once at scene construction). Recorded as
 flat; the row exists so the claim is checkable rather than asserted.
+
+⁸ **One render path, and the noise question settled.** The window, `--bench` and
+`--screenshot` had three separate copies of pipeline + camera + depth + render
+pass; they now all call `SceneRenderer::encode_scene`. Runs: **0.374 / 0.381 /
+0.361 ms** (mean 0.372) — level with the `a4de4b3` baseline (mean 0.374) and
+*below* the row above, which retroactively confirms that row's +3.7% was
+run-to-run noise rather than a cost of owning world state. The bench gained a
+function call per frame and lost nothing else.
 
 ² **First meaningful FPS number.** The streaming renderer measures a ~1,350-chunk
 region (10× the old grid), which pushes the frame into being **CPU-submit-bound**:

@@ -3,12 +3,7 @@
 //! Renders the world once to an offscreen target, reads it back, and writes a PNG.
 //! Run with: `cargo run --release -- --screenshot out.png`
 
-use wgpu::util::DeviceExt;
-
-use cubara_render::{
-    build_pipeline, camera_bind_group_layout, create_depth_view, gpu_driven_features,
-    CameraUniform, ChunkArena, Frustum,
-};
+use cubara_render::{gpu_driven_features, CameraUniform, ChunkArena, Frustum, SceneRenderer};
 use cubara_voxel::ChunkCoord;
 use cubara_world::World;
 
@@ -73,22 +68,12 @@ pub fn run(path: &str) {
     );
     let frustum = Frustum::from_view_proj(vp);
     let draw_count = arena.prepare(&queue, &frustum);
-    let uniform = CameraUniform::from_matrix(vp);
-    let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("screenshot-camera"),
-        contents: bytemuck::bytes_of(&uniform),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
-    let camera_bgl = camera_bind_group_layout(&device);
-    let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("screenshot-camera-bind-group"),
-        layout: &camera_bgl,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: camera_buffer.as_entire_binding(),
-        }],
-    });
-    let pipeline = build_pipeline(&device, COLOR_FORMAT, &camera_bgl);
+
+    // The same scene renderer the window and bench use — ARCHITECTURE.md Rule 5.
+    // This is the whole point of the rule: when these were separate copies, this
+    // path silently stopped rendering what the game renders.
+    let mut scene = SceneRenderer::new(&device, &queue, COLOR_FORMAT, WIDTH, HEIGHT);
+    scene.set_camera(&queue, vp);
 
     let color = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("screenshot-color"),
@@ -105,7 +90,6 @@ pub fn run(path: &str) {
         view_formats: &[],
     });
     let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
-    let depth_view = create_depth_view(&device, WIDTH, HEIGHT);
 
     // Readback buffer: bytes-per-row must be a multiple of 256.
     let unpadded_bpr = WIDTH * 4;
@@ -121,37 +105,7 @@ pub fn run(path: &str) {
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("screenshot-encoder"),
     });
-    {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("screenshot-pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &color_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.45,
-                        g: 0.62,
-                        b: 0.80,
-                        a: 1.0,
-                    }),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &depth_view,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Store,
-                }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &camera_bind_group, &[]);
-        arena.encode(&mut pass, draw_count);
-    }
+    scene.encode_scene(&queue, &mut encoder, &color_view, &arena, draw_count, None);
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: &color,

@@ -20,7 +20,7 @@ use crate::arena::ChunkArena;
 use crate::camera::FlyCamera;
 use crate::culling::Frustum;
 use crate::mesher::{BuiltChunk, MeshPool};
-use crate::text::TextRenderer;
+use crate::scene::SceneRenderer;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -112,10 +112,8 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
 
-    pipeline: wgpu::RenderPipeline,
-    camera_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
-    depth_view: wgpu::TextureView,
+    /// The one scene-render path, shared with `--bench` and `--screenshot`.
+    scene: SceneRenderer,
     frustum: Frustum,
 
     /// All resident chunk geometry in shared buffers, drawn with one indirect submit.
@@ -143,8 +141,6 @@ pub struct Renderer {
     frames: u32,
     last_report: Instant,
 
-    /// Screen-space text for the debug overlay.
-    text: TextRenderer,
     /// Whether the F3 debug overlay is shown.
     show_debug: bool,
     /// Smoothed frame time in ms, for a stable on-screen FPS reading.
@@ -208,25 +204,7 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        // Camera uniform + bind group.
-        let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("camera-uniform"),
-            size: std::mem::size_of::<CameraUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let camera_bgl = camera_bind_group_layout(&device);
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera-bind-group"),
-            layout: &camera_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
-        });
-
-        let pipeline = build_pipeline(&device, format, &camera_bgl);
-        let depth_view = create_depth_view(&device, config.width, config.height);
+        let scene = SceneRenderer::new(&device, &queue, format, config.width, config.height);
 
         // Start above the terrain near the origin, looking out over it and slightly
         // down (yaw ~35°, gentle downward pitch).
@@ -237,7 +215,6 @@ impl Renderer {
 
         let world = Arc::new(World::new());
         let arena = ChunkArena::new(&device, multi_draw);
-        let text = TextRenderer::new(&device, &queue, format);
 
         // Capture the mouse for first-person look (Esc releases it — see the app).
         grab_cursor(&window, true);
@@ -248,10 +225,7 @@ impl Renderer {
             device,
             queue,
             config,
-            pipeline,
-            camera_buffer,
-            camera_bind_group,
-            depth_view,
+            scene,
             frustum,
             arena,
             mesh_pool: MeshPool::new(),
@@ -264,7 +238,6 @@ impl Renderer {
             visible_chunks: 0,
             frames: 0,
             last_report: Instant::now(),
-            text,
             show_debug: true,
             frame_ms: 0.0,
         };
@@ -330,8 +303,8 @@ impl Renderer {
             self.config.width = width;
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
-            self.depth_view =
-                create_depth_view(&self.device, self.config.width, self.config.height);
+            self.scene
+                .resize(&self.device, self.config.width, self.config.height);
         }
     }
 
@@ -436,60 +409,14 @@ impl Renderer {
 
         {
             puffin::profile_scope!("encode-pass");
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("main-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.45,
-                            g: 0.62,
-                            b: 0.80,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            self.arena.encode(&mut pass, draw_count);
-        }
-
-        // Debug overlay: a second pass over the same colour target (loaded, no depth).
-        if self.show_debug {
-            self.queue_debug_text();
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("overlay-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            self.text.flush(
+            let overlay = self.show_debug.then(|| self.debug_text());
+            self.scene.encode_scene(
                 &self.queue,
-                &mut pass,
-                self.config.width as f32,
-                self.config.height as f32,
+                &mut encoder,
+                &view,
+                &self.arena,
+                draw_count,
+                overlay.as_deref(),
             );
         }
 
@@ -504,8 +431,9 @@ impl Renderer {
         self.show_debug = !self.show_debug;
     }
 
-    /// Build this frame's debug text (with a drop shadow for readability).
-    fn queue_debug_text(&mut self) {
+    /// Build this frame's debug text. The overlay's drawing (including its drop
+    /// shadow) belongs to the shared scene path, so this only produces the string.
+    fn debug_text(&self) -> String {
         let p = self.camera.pos;
         let d = self.camera.look_dir();
         let facing = if d.x.abs() > d.z.abs() {
@@ -524,7 +452,7 @@ impl Renderer {
         } else {
             0.0
         };
-        let text = format!(
+        format!(
             "Cubara  (F3)\n\
              {fps:.0} fps  ({ms:.2} ms)\n\
              xyz  {x:.1} / {y:.1} / {z:.1}\n\
@@ -540,11 +468,7 @@ impl Renderer {
             cz = self.center.z,
             vis = self.visible_chunks,
             res = self.arena.len(),
-        );
-        const SCALE: f32 = 2.0;
-        // Shadow first (dark, offset), then the white text on top.
-        self.text.queue(&text, 10.0, 10.0, SCALE, [0.0, 0.0, 0.0]);
-        self.text.queue(&text, 8.0, 8.0, SCALE, [1.0, 1.0, 1.0]);
+        )
     }
 
     /// Advance the flying camera, stream if we crossed a chunk boundary, and upload
@@ -569,12 +493,9 @@ impl Renderer {
         // Take whatever the workers finished meshing since last frame.
         self.drain_meshes();
 
-        let aspect = self.config.width as f32 / self.config.height as f32;
-        let vp = self.camera.view_proj(aspect);
+        let vp = self.camera.view_proj(self.scene.aspect());
         self.frustum = Frustum::from_view_proj(vp);
-        let uniform = CameraUniform::from_matrix(vp);
-        self.queue
-            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+        self.scene.set_camera(&self.queue, vp);
     }
 
     /// Report frames-per-second roughly once per second.
