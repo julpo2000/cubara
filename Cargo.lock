@@ -448,6 +448,7 @@ dependencies = [
  "cubara-voxel",
  "cubara-world",
  "glam",
+ "image",
  "log",
  "pollster",
  "puffin",
