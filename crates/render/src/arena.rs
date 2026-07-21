@@ -394,6 +394,7 @@ impl ChunkArena {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         multi_draw: bool,
+        world: &World,
         center: ChunkCoord,
         radius: i32,
         y_range: std::ops::RangeInclusive<i32>,
@@ -401,7 +402,7 @@ impl ChunkArena {
         let mut arena = Self::new(device, multi_draw);
         let mut total_tris = 0u32;
         for coord in streaming::desired_chunks(center, radius, y_range) {
-            if let Some(chunk) = World::chunk_at(coord) {
+            if let Some(chunk) = world.chunk_at(coord) {
                 let level = streaming::lod_for(coord, center);
                 if arena.upload_chunk(queue, coord, &chunk, level) {
                     if let Some(slot) = arena.slots.get(&coord) {

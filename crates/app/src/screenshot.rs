@@ -10,6 +10,7 @@ use cubara_render::{
     CameraUniform, ChunkArena, Frustum,
 };
 use cubara_voxel::ChunkCoord;
+use cubara_world::World;
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
@@ -43,10 +44,12 @@ pub fn run(path: &str) {
     .expect("request device");
 
     // Scene: a streamed region, same path the live renderer and bench use.
+    let world = World::new();
     let mut arena = ChunkArena::from_region(
         &device,
         &queue,
         multi_draw,
+        &world,
         ChunkCoord::new(0, 0, 0),
         REGION_RADIUS,
         0..=2,

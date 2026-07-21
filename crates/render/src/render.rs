@@ -113,6 +113,11 @@ pub struct Renderer {
     /// Chunk the camera is currently in; streaming re-runs when this changes.
     center: ChunkCoord,
 
+    /// The world being rendered. Held behind an [`Arc`] so a meshing job can carry
+    /// the exact snapshot it was queued against; an edit publishes a new one via
+    /// [`Arc::make_mut`] rather than mutating state the workers can see.
+    world: Arc<World>,
+
     /// First-person camera, driven by keyboard + mouse input.
     camera: FlyCamera,
     last_frame: Instant,
@@ -212,6 +217,7 @@ impl Renderer {
         let frustum = Frustum::from_view_proj(camera.view_proj(aspect));
         let center = ChunkCoord::from_world_pos(camera.pos.to_array());
 
+        let world = Arc::new(World::new());
         let arena = ChunkArena::new(&device, multi_draw);
         let text = TextRenderer::new(&device, &queue, format);
 
@@ -234,6 +240,7 @@ impl Renderer {
             upload_queue: VecDeque::new(),
             resident: HashMap::new(),
             center,
+            world,
             camera,
             last_frame: Instant::now(),
             visible_chunks: 0,
@@ -269,7 +276,7 @@ impl Renderer {
     pub fn edit_block(&mut self, place: bool) {
         let origin = self.camera.pos.to_array();
         let dir = self.camera.look_dir().to_array();
-        let Some(hit) = World::raycast(origin, dir, EDIT_REACH) else {
+        let Some(hit) = self.world.raycast(origin, dir, EDIT_REACH) else {
             return;
         };
         let target = if place {
@@ -281,7 +288,9 @@ impl Renderer {
         } else {
             hit.block
         };
-        let cc = World::set_block(target[0], target[1], target[2], place);
+        // Publishes a fresh snapshot: workers holding the old Arc keep meshing the
+        // pre-edit world, and their results are superseded by the re-request below.
+        let cc = Arc::make_mut(&mut self.world).set_block(target[0], target[1], target[2], place);
         self.invalidate(cc);
     }
 
@@ -291,7 +300,7 @@ impl Renderer {
     fn invalidate(&mut self, cc: ChunkCoord) {
         self.mesh_pool.cancel(cc);
         self.mesh_pool
-            .request(cc, streaming::lod_for(cc, self.center));
+            .request(&self.world, cc, streaming::lod_for(cc, self.center));
     }
 
     pub fn window(&self) -> &Window {
@@ -344,7 +353,7 @@ impl Renderer {
             {
                 continue;
             }
-            self.mesh_pool.request(coord, level);
+            self.mesh_pool.request(&self.world, coord, level);
         }
         self.center = center;
     }
