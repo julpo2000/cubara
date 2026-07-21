@@ -51,6 +51,7 @@ frames after 200 warmup.
 | 2026-07-21 | Rule 2 — world state owned, not global⁷ | 1,349 | 361,326 | ~1,780 | 0.388 ms | ~1.0 ms | `refactor/world-owned-state` |
 | 2026-07-21 | Rule 5 — one scene-render path⁸ | 1,349 | 361,326 | ~1,875 | 0.372 ms | ~0.87 ms | `refactor/single-scene-render-path` |
 | 2026-07-21 | **Rule 3 — renderer renders only; all rules green**⁹ | 1,349 | 361,326 | ~1,920 | **0.361 ms** | ~0.90 ms | `refactor/renderer-renders-only` |
+| 2026-07-22 | Deterministic draw order (BTreeMap) [#81]¹⁰ | 1,349 | 361,326 | ~1,865 | 0.364 ms | ~0.92 ms | `fix/deterministic-draw-order` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -135,6 +136,17 @@ architecture work has now been measured four times and has not cost a
 millisecond. All of `scripts/check-architecture.sh` and
 `scripts/check-single-render-path.sh` pass, and both are required CI checks as
 of this commit.
+
+¹⁰ **Determinism is free here.** `ChunkArena.slots` moved from `HashMap` to
+`BTreeMap` so the per-frame indirect draw list is built in `ChunkCoord` order
+(#81). The concern was that this is a hot loop — ~1,349 entries iterated every
+frame — and `BTreeMap` iteration is pointer-chasing where `HashMap` is not.
+Measured same-machine A/B: baseline **0.365 / 0.365 / 0.367** (median 0.365) vs
+**0.360 / 0.367 / 0.364 / 0.375 / 0.364 / 0.364** (median 0.364). No measurable
+cost — the iteration is trivial next to the frustum test and the buffer write.
+Two early branch samples of 0.374/0.397 were thermal outliers, which is why nine
+runs were taken rather than three; a 3-sample read here would have reported a
+false 3% regression.
 
 ² **First meaningful FPS number.** The streaming renderer measures a ~1,350-chunk
 region (10× the old grid), which pushes the frame into being **CPU-submit-bound**:

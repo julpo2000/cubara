@@ -18,7 +18,7 @@
 //! the follow-up compute cull (#28) consumes; only *who writes the draw list*
 //! moves from CPU to GPU. No throwaway work.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use cubara_voxel::{Chunk, ChunkCoord, Mesh, Vertex};
 use cubara_world::{streaming, World};
@@ -175,7 +175,7 @@ pub struct ChunkArena {
 
     vertices: SlabAllocator,
     indices: SlabAllocator,
-    slots: HashMap<ChunkCoord, ChunkSlot>,
+    slots: BTreeMap<ChunkCoord, ChunkSlot>,
 
     /// Whether the device supports `multi_draw_indexed_indirect`.
     multi_draw: bool,
@@ -215,7 +215,7 @@ impl ChunkArena {
             indirect_buffer,
             vertices: SlabAllocator::new(VERTEX_CAPACITY),
             indices: SlabAllocator::new(INDEX_CAPACITY),
-            slots: HashMap::new(),
+            slots: BTreeMap::new(),
             multi_draw,
             visible: Vec::new(),
             warned_full: false,
@@ -340,6 +340,11 @@ impl ChunkArena {
     pub fn prepare(&mut self, queue: &wgpu::Queue, frustum: &Frustum) -> u32 {
         puffin::profile_function!();
         self.visible.clear();
+        // `slots` is a BTreeMap, so this iterates in `ChunkCoord` order every frame,
+        // regardless of the order workers finished meshing in. That makes the draw
+        // list — and therefore the rendered frame — deterministic (issue #81), and
+        // also makes the MAX_DRAWS cap below drop a stable set of chunks rather than
+        // whichever ones a hash happened to visit last.
         for slot in self.slots.values() {
             if self.visible.len() as u32 >= MAX_DRAWS {
                 break;

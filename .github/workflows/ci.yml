@@ -57,3 +57,10 @@ jobs:
         run: cargo build --all-targets
       - name: Test
         run: cargo test --all
+      # Re-run just the golden tests with output shown. `cargo test` captures
+      # stderr for *passing* tests, so without this the measured image deltas are
+      # invisible until something already fails. The reference is generated on one
+      # backend and checked on the others, so this line is how cross-backend drift
+      # becomes visible while there is still headroom to react to it.
+      - name: Golden image deltas
+        run: cargo test -p cubara-render --test golden -- --nocapture
