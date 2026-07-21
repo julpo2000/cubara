@@ -9,10 +9,7 @@
 
 use std::time::Instant;
 
-use cubara_render::{
-    build_pipeline, camera_bind_group_layout, create_depth_view, gpu_driven_features,
-    CameraUniform, ChunkArena, Frustum,
-};
+use cubara_render::{gpu_driven_features, CameraUniform, ChunkArena, Frustum, SceneRenderer};
 use cubara_voxel::ChunkCoord;
 use cubara_world::World;
 
@@ -88,26 +85,10 @@ pub fn run(radius: i32) {
         }
     );
 
-    // Camera uniform + bind group.
-    let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("bench-camera"),
-        size: std::mem::size_of::<CameraUniform>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let camera_bgl = camera_bind_group_layout(&device);
-    let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("bench-camera-bind-group"),
-        layout: &camera_bgl,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: camera_buffer.as_entire_binding(),
-        }],
-    });
+    // The same scene renderer the window uses — ARCHITECTURE.md Rule 5.
+    let mut scene = SceneRenderer::new(&device, &queue, COLOR_FORMAT, WIDTH, HEIGHT);
 
-    let pipeline = build_pipeline(&device, COLOR_FORMAT, &camera_bgl);
-
-    // Offscreen render targets.
+    // Offscreen colour target (the window's equivalent is the surface texture).
     let color = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("bench-color"),
         size: wgpu::Extent3d {
@@ -123,7 +104,6 @@ pub fn run(radius: i32) {
         view_formats: &[],
     });
     let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
-    let depth_view = create_depth_view(&device, WIDTH, HEIGHT);
 
     let aspect = WIDTH as f32 / HEIGHT as f32;
     let mut virtual_t = 0.0f32;
@@ -132,62 +112,34 @@ pub fn run(radius: i32) {
     // render-pass encode + submit) and returns the CPU time spent plus how many
     // chunks were drawn. Frames are not individually waited on, so the GPU
     // pipelines them — this measures sustained throughput.
-    let submit_frame = |arena: &mut ChunkArena, vt: f32| -> (f64, usize) {
-        puffin::profile_scope!("frame");
-        let vp = CameraUniform::view_proj_matrix(aspect, vt, look_target, view_radius);
-        let uniform = CameraUniform::from_matrix(vp);
-        queue.write_buffer(&camera_buffer, 0, bytemuck::bytes_of(&uniform));
-        let frustum = Frustum::from_view_proj(vp);
+    // `scene` is borrowed mutably here, so this is a closure over it rather than a
+    // plain fn: same shared encode_scene the window calls, no bench-local copy.
+    let submit_frame =
+        |arena: &mut ChunkArena, scene: &mut SceneRenderer, vt: f32| -> (f64, usize) {
+            puffin::profile_scope!("frame");
+            let vp = CameraUniform::view_proj_matrix(aspect, vt, look_target, view_radius);
+            scene.set_camera(&queue, vp);
+            let frustum = Frustum::from_view_proj(vp);
 
-        let cpu_start = Instant::now();
-        // CPU cull + indirect-list upload — the per-frame work we're measuring.
-        let draw_count = arena.prepare(&queue, &frustum);
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("bench-encoder"),
-        });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("bench-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &color_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.45,
-                            g: 0.62,
-                            b: 0.80,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
+            let cpu_start = Instant::now();
+            // CPU cull + indirect-list upload — the per-frame work we're measuring.
+            let draw_count = arena.prepare(&queue, &frustum);
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bench-encoder"),
             });
-
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &camera_bind_group, &[]);
-            arena.encode(&mut pass, draw_count);
-        }
-        queue.submit(std::iter::once(encoder.finish()));
-        (
-            cpu_start.elapsed().as_secs_f64() * 1000.0,
-            draw_count as usize,
-        )
-    };
+            // No overlay: the bench measures the world, not the debug HUD.
+            scene.encode_scene(&queue, &mut encoder, &color_view, arena, draw_count, None);
+            queue.submit(std::iter::once(encoder.finish()));
+            (
+                cpu_start.elapsed().as_secs_f64() * 1000.0,
+                draw_count as usize,
+            )
+        };
 
     log::info!("warming up ({WARMUP_FRAMES} frames), then measuring {MEASURE_FRAMES}...");
 
     for _ in 0..WARMUP_FRAMES {
-        submit_frame(&mut arena, virtual_t);
+        submit_frame(&mut arena, &mut scene, virtual_t);
         let _ = device.poll(wgpu::Maintain::Poll);
         virtual_t += VIRTUAL_DT;
     }
@@ -199,7 +151,7 @@ pub fn run(radius: i32) {
     let wall_start = Instant::now();
     for _ in 0..MEASURE_FRAMES {
         cubara_render::Profiler::new_frame();
-        let (ms, visible) = submit_frame(&mut arena, virtual_t);
+        let (ms, visible) = submit_frame(&mut arena, &mut scene, virtual_t);
         cpu_ms.push(ms);
         visible_sum += visible as u64;
         let _ = device.poll(wgpu::Maintain::Poll);
