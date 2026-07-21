@@ -15,7 +15,6 @@ Pre-alpha — engine foundation under construction.
 | Document | What it answers |
 |---|---|
 | [`REQUIREMENTS.md`](REQUIREMENTS.md) | Why the project exists — the founding, non-negotiable wishes. |
-| [`ROADMAP.md`](ROADMAP.md) | **What 1.0 is**, the milestone ladder, and the gate each phase must clear. |
 | [`PLAN.md`](PLAN.md) | How the engine is built — architecture and technical decisions. |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | How work lands: issues, PRs, required checks, verification. |
 | [`docs/ISSUE_STANDARD.md`](docs/ISSUE_STANDARD.md) | How to write an issue someone can execute without asking questions. |

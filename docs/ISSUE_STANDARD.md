@@ -76,8 +76,8 @@ enough" is not a criterion; "meshing a chunk stays under 2 ms at p99" is.
 
 ### References
 
-Files, `PLAN.md`/`ROADMAP.md` sections, prior issues and PRs, external papers or
-docs. Spell them out: `PLAN.md §5 (chunk system)`, not `§5`.
+Files, `PLAN.md` / `ROADMAP.md` sections, prior issues and PRs, external papers
+or docs. Spell them out: `PLAN.md §5 (chunk system)`, not `§5`.
 
 ## Naming
 
