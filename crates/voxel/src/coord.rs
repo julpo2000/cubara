@@ -9,7 +9,12 @@
 use crate::Chunk;
 
 /// The integer grid position of a cubic chunk.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+///
+/// `Ord` is derived, giving lexicographic `(x, y, z)` ordering. The exact order is
+/// arbitrary; what matters is that it is *total and stable*, so anything that
+/// iterates chunks in coordinate order — the arena's draw list, a save file —
+/// produces the same sequence every run (`ARCHITECTURE.md` Rule 1). See issue #81.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ChunkCoord {
     pub x: i32,
     pub y: i32,

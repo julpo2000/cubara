@@ -99,6 +99,15 @@ fn assert_golden(name: &str, world: &World, shot: Shot) {
     );
 
     let diff = headless::compare(&frame.pixels, &expected, TOLERANCE);
+    // Always reported, not just on failure: the reference is generated on one
+    // backend and checked on others, and this line is how the real cross-backend
+    // delta becomes visible in CI logs instead of guessed at.
+    eprintln!(
+        "golden {name}: {:.4}% differ (tolerance {TOLERANCE}, max delta {}), threshold {:.4}%",
+        diff.differing_fraction * 100.0,
+        diff.max_channel_delta,
+        MAX_DIFFERING * 100.0
+    );
     if diff.differing_fraction > MAX_DIFFERING {
         // Write what was actually rendered next to the reference, so the failure is
         // diagnosable instead of just numeric.
@@ -115,6 +124,44 @@ fn assert_golden(name: &str, world: &World, shot: Shot) {
             actual.display(),
         );
     }
+}
+
+#[test]
+fn the_same_scene_renders_byte_identically() {
+    // The property that makes every other visual test trustworthy, and the one
+    // multithreading will depend on: rendering must not vary run to run.
+    //
+    // This failed before issue #81 — 0.006% of pixels differed with a max channel
+    // delta of 63, because `ChunkArena` iterated a `HashMap` when building the
+    // indirect draw list, so chunks submitted in a different order each run and
+    // depth ties on silhouette edges resolved differently. Meshing already runs on
+    // a worker pool, so "whatever order results arrived in" was leaking into the
+    // rendered frame.
+    //
+    // Scope, stated honestly: `from_region` meshes synchronously, so this pins
+    // *draw-order* determinism, not worker-arrival determinism. Arrival order still
+    // decides which slab offsets a chunk lands in (`ChunkArena::insert` is first-fit),
+    // which no longer changes the image — the draw list is coord-sorted and the
+    // geometry content is identical — but does mean the arena's internal layout is
+    // not reproducible. That matters the moment world state is hashed or saved; see
+    // issue #83.
+    let shot = Shot::default();
+    let Some(a) = headless::render(&World::new(), shot) else {
+        eprintln!("SKIP the_same_scene_renders_byte_identically: no GPU adapter");
+        return;
+    };
+    let b = headless::render(&World::new(), shot).expect("adapter was available a moment ago");
+
+    // Tolerance 0: this is exactness, not similarity.
+    let diff = headless::compare(&a.pixels, &b.pixels, 0);
+    assert_eq!(
+        diff.differing_fraction,
+        0.0,
+        "the same scene rendered twice differs on {:.6}% of pixels (max channel \
+         delta {}) — draw order or meshing is leaking nondeterminism into the frame",
+        diff.differing_fraction * 100.0,
+        diff.max_channel_delta
+    );
 }
 
 #[test]
