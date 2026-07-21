@@ -26,6 +26,18 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  # ARCHITECTURE.md is only worth writing if something fails when it is broken.
+  # These are those somethings. Cheap (grep over the tree), no toolchain needed.
+  architecture:
+    name: architecture rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Architecture rules (ARCHITECTURE.md)
+        run: ./scripts/check-architecture.sh
+      - name: Single scene-render path (Rule 5)
+        run: ./scripts/check-single-render-path.sh
+
   check:
     name: clippy + build + test (${{ matrix.os }})
     strategy:

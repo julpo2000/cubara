@@ -50,6 +50,7 @@ frames after 200 warmup.
 | 2026-07-20 | M4 — LOD retuned: 12-chunk full-res core, radius 28⁶ | 6,561 | 538,846 | ~1,450 | 0.49 ms | ~1.0 ms | `0f65a49` |
 | 2026-07-21 | Rule 2 — world state owned, not global⁷ | 1,349 | 361,326 | ~1,780 | 0.388 ms | ~1.0 ms | `refactor/world-owned-state` |
 | 2026-07-21 | Rule 5 — one scene-render path⁸ | 1,349 | 361,326 | ~1,875 | 0.372 ms | ~0.87 ms | `refactor/single-scene-render-path` |
+| 2026-07-21 | **Rule 3 — renderer renders only; all rules green**⁹ | 1,349 | 361,326 | ~1,920 | **0.361 ms** | ~0.90 ms | `refactor/renderer-renders-only` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -124,6 +125,16 @@ pass; they now all call `SceneRenderer::encode_scene`. Runs: **0.374 / 0.381 /
 *below* the row above, which retroactively confirms that row's +3.7% was
 run-to-run noise rather than a cost of owning world state. The bench gained a
 function call per frame and lost nothing else.
+
+⁹ **Boundaries cost nothing.** World, camera, input handling and block editing
+moved off `Renderer` into `app::Game`; the renderer now receives what it draws.
+Runs: **0.362 / 0.359 / 0.362 ms** (mean 0.361) — the best of the refactor
+series and level with the `a4de4b3` baseline (0.374). Passing two references per
+frame instead of reading owned fields is free, which is worth recording: the
+architecture work has now been measured four times and has not cost a
+millisecond. All of `scripts/check-architecture.sh` and
+`scripts/check-single-render-path.sh` pass, and both are required CI checks as
+of this commit.
 
 ² **First meaningful FPS number.** The streaming renderer measures a ~1,350-chunk
 region (10× the old grid), which pushes the frame into being **CPU-submit-bound**:

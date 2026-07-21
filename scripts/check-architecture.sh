@@ -5,9 +5,7 @@
 # defect in ARCHITECTURE.md; a check that is disabled to make a build pass is a
 # defect in judgement.
 #
-# STATUS: this FAILS on the current tree, by design. It is the executable audit
-# of what has to be demolished. Each violation below is owned by an issue, and the
-# check is wired into CI by the PR that clears the last one.
+# Runs in CI as a required check.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 

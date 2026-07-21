@@ -6,11 +6,14 @@
 
 mod bench;
 mod caps;
+mod game;
 mod screenshot;
 
 use std::sync::Arc;
 
-use cubara_render::{Profiler, Renderer};
+use cubara_render::{grab_cursor, Profiler, Renderer};
+
+use crate::game::Game;
 
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
@@ -20,11 +23,17 @@ use winit::window::{Window, WindowId};
 
 #[derive(Default)]
 struct App {
+    /// World + camera + what input does to them. The renderer draws it; it does
+    /// not own it (`ARCHITECTURE.md` Rule 3).
+    game: Game,
     renderer: Option<Renderer>,
     /// Whether the mouse is captured for first-person look (toggled with Escape).
     cursor_captured: bool,
     /// Kept alive for the program's lifetime when built with `--features profile`.
     _profiler: Option<Profiler>,
+    /// When the last frame was drawn. The app loop owns the clock and hands `dt`
+    /// to the game; the renderer keeps its own timing only for the FPS readout.
+    last_frame: Option<std::time::Instant>,
 }
 
 impl ApplicationHandler for App {
@@ -34,8 +43,15 @@ impl ApplicationHandler for App {
         }
         let attrs = Window::default_attributes().with_title("Cubara");
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        self.renderer = Some(Renderer::new(window));
-        self.cursor_captured = true; // Renderer::new grabs the cursor
+        self.renderer = Some(Renderer::new(
+            window.clone(),
+            self.game.world(),
+            self.game.camera(),
+        ));
+        // Capture the mouse for first-person look (Esc releases it). A window
+        // concern, so the app owns it rather than the renderer.
+        grab_cursor(&window, true);
+        self.cursor_captured = true;
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -52,11 +68,11 @@ impl ApplicationHandler for App {
                     // Escape toggles mouse capture so you can leave the window.
                     if code == KeyCode::Escape && pressed {
                         self.cursor_captured = !self.cursor_captured;
-                        renderer.set_cursor_captured(self.cursor_captured);
+                        grab_cursor(renderer.window(), self.cursor_captured);
                     } else if code == KeyCode::F3 && pressed {
                         renderer.toggle_debug();
                     } else {
-                        renderer.key_input(code, pressed);
+                        self.game.key_input(code, pressed);
                     }
                 }
             }
@@ -64,15 +80,26 @@ impl ApplicationHandler for App {
                 // Left click breaks the targeted block, right click places one — but
                 // only while the cursor is captured (i.e. actually playing).
                 if self.cursor_captured && state == ElementState::Pressed {
-                    match button {
-                        MouseButton::Left => renderer.edit_block(false),
-                        MouseButton::Right => renderer.edit_block(true),
-                        _ => {}
+                    let edit = match button {
+                        MouseButton::Left => self.game.edit_block(false),
+                        MouseButton::Right => self.game.edit_block(true),
+                        _ => None,
+                    };
+                    // The game decides what changed; the renderer re-meshes it.
+                    if let Some(cc) = edit {
+                        renderer.invalidate(self.game.world(), cc);
                     }
                 }
             }
             WindowEvent::RedrawRequested => {
-                renderer.render();
+                let now = std::time::Instant::now();
+                let dt = self
+                    .last_frame
+                    .map(|t| (now - t).as_secs_f32())
+                    .unwrap_or(0.0);
+                self.last_frame = Some(now);
+                self.game.update(dt);
+                renderer.render(self.game.world(), self.game.camera());
                 // Immediately queue the next frame — we render continuously.
                 renderer.window().request_redraw();
             }
@@ -84,9 +111,7 @@ impl ApplicationHandler for App {
         // Raw mouse motion drives first-person look, but only while captured.
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
             if self.cursor_captured {
-                if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.mouse_look(dx as f32, dy as f32);
-                }
+                self.game.mouse_look(dx as f32, dy as f32);
             }
         }
     }
