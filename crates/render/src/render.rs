@@ -24,6 +24,24 @@ use crate::text::TextRenderer;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
+const VERTEX_ATTRS: [wgpu::VertexAttribute; 3] =
+    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32];
+
+/// The GPU vertex layout for [`Vertex`], which is plain data in `cubara-voxel` and
+/// knows nothing about the GPU (`ARCHITECTURE.md` Rule 3/4). The layout lives here,
+/// with the code that owns pipelines.
+///
+/// It must stay in step with the field order of [`Vertex`]; `vertex_layout_matches_vertex`
+/// below pins the stride so adding a field there fails here instead of silently
+/// mis-reading the buffer on the GPU.
+pub const fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &VERTEX_ATTRS,
+    }
+}
+
 /// How many chunks out (square radius) to keep resident around the camera. The inner
 /// core is full resolution and only the far rings drop to a coarser LOD (see
 /// [`streaming::lod_for`]), so this reaches well past the detailed core for a distant
@@ -647,7 +665,7 @@ pub fn build_pipeline(
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_main"),
-            buffers: &[Vertex::layout()],
+            buffers: &[vertex_layout()],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -678,4 +696,28 @@ pub fn build_pipeline(
         multiview: None,
         cache: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vertex_layout_matches_vertex() {
+        // `Vertex` is plain data in cubara-voxel; its GPU layout lives here. Nothing
+        // in the type system ties the two together, so pin it: a field added to
+        // Vertex changes the stride and fails here, rather than silently making the
+        // GPU read every vertex at the wrong offset.
+        let layout = vertex_layout();
+        assert_eq!(
+            layout.array_stride,
+            std::mem::size_of::<Vertex>() as wgpu::BufferAddress
+        );
+        assert_eq!(layout.array_stride, 28, "3 + 3 + 1 floats");
+        assert_eq!(layout.attributes.len(), 3, "position, normal, ao");
+
+        // Offsets must land on the real field boundaries.
+        let offsets: Vec<u64> = layout.attributes.iter().map(|a| a.offset).collect();
+        assert_eq!(offsets, vec![0, 12, 24]);
+    }
 }
