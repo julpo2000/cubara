@@ -460,7 +460,6 @@ name = "cubara-voxel"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
- "wgpu",
 ]
 
 [[package]]
