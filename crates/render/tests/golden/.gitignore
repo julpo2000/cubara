@@ -1,0 +1,2 @@
+# .actual.png files are debugging output from a failed golden test.
+*.actual.png
