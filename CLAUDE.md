@@ -1,5 +1,65 @@
 # Working agreement (Claude Code)
 
+## Read this before writing code: the architecture standard
+
+[`ARCHITECTURE.md`](ARCHITECTURE.md) defines what "a solid engine" means here, as
+seven rules. **Read it before the first edit of a session**, not after a PR is
+open. It is short.
+
+This section exists because of a measured failure. The performance discipline
+below was followed on *every* feature that landed — because it is written here,
+in the file that gets read at the start of the work. The architecture
+requirement lived only in `REQUIREMENTS.md`, which nothing loads before coding,
+and it was violated until the renderer had three divergent copies of itself, the
+world's state was a global, and the pure data crate depended on `wgpu`. Same
+project, same author, same good intentions; the only difference was *where the
+rule was written*.
+
+The load-bearing points:
+
+- **Rule 1 — the simulation is deterministic.** Tick-driven, ordered iteration,
+  seeded RNG as world state. The keystone, and the only rule that cannot be
+  retrofitted.
+- **Rule 2 — no ambient state.** No globals, no singletons. Pass state in.
+- **Rule 3 — dependencies point one way.** The renderer does not own gameplay.
+- **Rule 4 — the simulation runs with no GPU.** Data/sim crates never depend on
+  `wgpu` or `winit`.
+- **Rule 5 — one implementation per concern.** One scene-render path.
+- **Rule 6 — behaviour is pinned by tests before it is rewritten.**
+
+`scripts/check-architecture.sh` and `scripts/check-single-render-path.sh` enforce
+these and run in CI as the `architecture rules` check. **Run them locally before
+pushing.** They are greps and take under a second:
+
+```bash
+./scripts/check-architecture.sh && ./scripts/check-single-render-path.sh
+```
+
+They catch the violation *shapes* seen so far. They cannot catch a novel one, so
+the standing review question is still: **what fails when someone breaks this?**
+If a new rule has no answer, write a check rather than a paragraph.
+
+## Design decisions are the project owner's
+
+Engineering process — crate layout, refactors, test strategy, CI — is yours to
+decide and act on without asking.
+
+**Gameplay and roadmap are not.** What the game contains, which mechanics it
+uses, what a release includes, and in what order: ask, and design it *as a
+system* rather than one feature at a time. Do not invent a roadmap, a feature
+list, or a mechanic and write it into the repo as though it were settled. A
+plausible-sounding invention is worse than a question, because it looks decided.
+
+## Verification means an automated check
+
+A screenshot someone looked at once proves nothing about the next commit.
+Rendering changes ship with a golden-image test; logic lives in pure functions
+with unit tests, outside the GPU path. See `CONTRIBUTING.md`.
+
+Do not drive the app with synthetic OS-level input (AppleScript keystrokes and
+similar) to "verify" something — it lands on the user's real desktop, not
+reliably in the app, and proves nothing either way.
+
 ## Installing software
 
 **Never install anything (winget, cargo tools, global npm/pip packages, etc.)
@@ -19,9 +79,9 @@ pushing through it silently.
 Repo facts that make this work:
 - `main` is a **protected branch**: direct pushes are rejected. Everything
   lands via a PR.
-- A PR only merges once **3 required status checks** are green: `clippy +
+- A PR only merges once the **required status checks** are green: `clippy +
   build + test (macos-latest)`, `clippy + build + test (windows-latest)`,
-  `rustfmt`.
+  `rustfmt`, and `architecture rules`.
 - `gh` (GitHub CLI) is installed and authenticated as `julpo2000` — use it for
   PR creation/merging (`gh pr create`, `gh pr checks`, `gh pr merge`) instead
   of asking the user to click through the GitHub web UI.
