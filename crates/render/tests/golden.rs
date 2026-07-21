@@ -30,20 +30,24 @@ const TOLERANCE: u8 = 12;
 
 /// Fraction of pixels allowed to exceed [`TOLERANCE`].
 ///
-/// Calibrated against measurement, not taste (macOS/M3, Metal):
+/// Calibrated from measurement, not taste. The reference is blessed on macOS/Metal
+/// and checked everywhere, so the number that matters is the *cross-backend* delta:
 ///
 /// | Signal | Differing pixels |
 /// |---|---|
-/// | Same machine, same scene, rendered twice | **0.006%** (max channel delta 63) |
-/// | A gash carved across the whole framed region | **4.08%** |
-/// | This threshold | 0.5% |
+/// | Same machine, same scene, twice | **0.0000%** (exact, since #81) |
+/// | macOS CI runner vs the reference | 0.0000% (max channel delta 1) |
+/// | **Windows CI runner (DX12) vs the reference** | **0.0215%** (max delta 79) |
+/// | A gash carved across the framed region | **4.07%** |
+/// | This threshold | 0.2% |
 ///
-/// That is ~80x above the noise floor and ~8x below an obvious regression. The
-/// noise floor being non-zero at all is itself a finding: chunk draw order is not
-/// stable between runs, so a handful of silhouette pixels resolve differently. See
-/// issue #81 (chunk draw order is not deterministic) — once that is fixed this threshold
-/// can drop a long way, and the test gets correspondingly sharper.
-const MAX_DIFFERING: f64 = 0.005;
+/// ~9x above the worst measured backend difference, and ~20x below an obvious
+/// regression. The Windows delta is silhouette-edge pixels rasterising differently
+/// between DX12 and Metal — inherent, not a bug, and it will not go to zero.
+///
+/// Do not tighten this to hug the measured number. A golden test that fires on a
+/// driver update gets muted, and a muted test is worse than no test.
+const MAX_DIFFERING: f64 = 0.002;
 
 fn golden_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden")
