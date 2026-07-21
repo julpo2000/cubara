@@ -14,6 +14,7 @@ use cubara_render::{
     CameraUniform, ChunkArena, Frustum,
 };
 use cubara_voxel::ChunkCoord;
+use cubara_world::World;
 
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
@@ -60,10 +61,12 @@ pub fn run(radius: i32) {
     // Scene: a streamed square region (the same path the live renderer uses), so
     // we measure a realistically heavy world instead of the tiny fixed grid. All
     // geometry goes into one shared arena, drawn with a single indirect submit.
+    let world = World::new();
     let mut arena = ChunkArena::from_region(
         &device,
         &queue,
         multi_draw,
+        &world,
         ChunkCoord::new(0, 0, 0),
         radius,
         0..=2,

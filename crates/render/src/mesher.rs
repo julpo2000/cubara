@@ -28,9 +28,19 @@ pub struct BuiltChunk {
 }
 
 /// Generate + mesh the chunk at `coord` at LOD `level`, as the synchronous path would.
-fn mesh_coord(coord: ChunkCoord, level: u32) -> Option<(Mesh, Aabb)> {
-    World::chunk_at(coord).and_then(|chunk| build_chunk_mesh(coord, &chunk, level))
+fn mesh_coord(world: &World, coord: ChunkCoord, level: u32) -> Option<(Mesh, Aabb)> {
+    world
+        .chunk_at(coord)
+        .and_then(|chunk| build_chunk_mesh(coord, &chunk, level))
 }
+
+/// One meshing job: what to mesh, and the world snapshot to mesh it from.
+///
+/// The snapshot travels *with* the job rather than the workers reaching for shared
+/// state (`ARCHITECTURE.md` Rule 2). An edit publishes a new [`Arc`] via
+/// [`MeshPool::request`], so a job always meshes a consistent view and readers
+/// never block a writer.
+type Job = (Arc<World>, ChunkCoord, u32);
 
 /// A pool of worker threads that mesh chunks off the main thread.
 ///
@@ -39,7 +49,7 @@ fn mesh_coord(coord: ChunkCoord, level: u32) -> Option<(Mesh, Aabb)> {
 /// matches (the chunk was unloaded, or its LOD changed as the camera moved) is
 /// dropped by [`poll`](Self::poll) instead of uploaded.
 pub struct MeshPool {
-    job_tx: Sender<(ChunkCoord, u32)>,
+    job_tx: Sender<Job>,
     result_rx: Receiver<BuiltChunk>,
     in_flight: HashMap<ChunkCoord, u32>,
     _workers: Vec<JoinHandle<()>>,
@@ -56,7 +66,7 @@ impl MeshPool {
     }
 
     fn with_workers(workers: usize) -> Self {
-        let (job_tx, job_rx) = std::sync::mpsc::channel::<(ChunkCoord, u32)>();
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
         let (result_tx, result_rx) = std::sync::mpsc::channel::<BuiltChunk>();
         // One receiver shared by all workers: each grabs the next job under the lock,
         // then releases it and meshes in parallel with the others.
@@ -69,7 +79,7 @@ impl MeshPool {
                 std::thread::Builder::new()
                     .name("cubara-mesher".into())
                     .spawn(move || loop {
-                        let (coord, level) = {
+                        let (world, coord, level) = {
                             let rx = jobs.lock().expect("mesher job lock");
                             match rx.recv() {
                                 Ok(job) => job,
@@ -80,7 +90,7 @@ impl MeshPool {
                         let built = BuiltChunk {
                             coord,
                             level,
-                            geometry: mesh_coord(coord, level),
+                            geometry: mesh_coord(&world, coord, level),
                         };
                         if results.send(built).is_err() {
                             break; // renderer gone
@@ -98,14 +108,18 @@ impl MeshPool {
         }
     }
 
-    /// Queue `coord` for meshing at LOD `level`, unless that exact (coord, level) is
-    /// already in flight. Requesting a coord already in flight at a *different* level
-    /// supersedes it — the stale result is dropped on arrival.
-    pub fn request(&mut self, coord: ChunkCoord, level: u32) {
+    /// Queue `coord` for meshing at LOD `level` against the `world` snapshot, unless
+    /// that exact (coord, level) is already in flight. Requesting a coord already in
+    /// flight at a *different* level supersedes it — the stale result is dropped on
+    /// arrival.
+    ///
+    /// The caller passes the world it wants meshed, so a job can never observe an
+    /// edit that lands after it was queued.
+    pub fn request(&mut self, world: &Arc<World>, coord: ChunkCoord, level: u32) {
         if self.in_flight.get(&coord) != Some(&level) {
             self.in_flight.insert(coord, level);
             // Send can only fail if all workers died; nothing useful to do if so.
-            let _ = self.job_tx.send((coord, level));
+            let _ = self.job_tx.send((Arc::clone(world), coord, level));
         }
     }
 
@@ -158,10 +172,11 @@ mod tests {
         // Meshing on workers must produce exactly what the synchronous path does,
         // for every requested coord (including empty chunks, reported as None), at
         // the requested LOD level.
+        let world = Arc::new(World::new());
         let coords = streaming::desired_chunks(ChunkCoord::new(0, 0, 0), 1, 0..=2);
         let mut pool = MeshPool::with_workers(3);
         for (i, &c) in coords.iter().enumerate() {
-            pool.request(c, (i % 3) as u32); // a mix of levels 0, 1, 2
+            pool.request(&world, c, (i % 3) as u32); // a mix of levels 0, 1, 2
         }
 
         let mut got: HashMap<ChunkCoord, Option<usize>> = HashMap::new();
@@ -178,16 +193,17 @@ mod tests {
             "every requested coord returns once"
         );
         for (i, &c) in coords.iter().enumerate() {
-            let expect = mesh_coord(c, (i % 3) as u32).map(|(m, _)| m.triangle_count());
+            let expect = mesh_coord(&world, c, (i % 3) as u32).map(|(m, _)| m.triangle_count());
             assert_eq!(got.get(&c).copied().flatten(), expect, "mismatch at {c:?}");
         }
     }
 
     #[test]
     fn cancelled_coords_are_dropped_by_poll() {
+        let world = Arc::new(World::new());
         let mut pool = MeshPool::with_workers(1);
         let c = ChunkCoord::new(0, 0, 0);
-        pool.request(c, 0);
+        pool.request(&world, c, 0);
         pool.cancel(c);
         // Give the worker time to finish and enqueue its (now unwanted) result.
         while !pool.in_flight().is_empty() {
@@ -201,10 +217,11 @@ mod tests {
     fn superseded_level_result_is_dropped() {
         // Re-requesting a coord at a new level before draining supersedes the old
         // one: only the current level's mesh should ever surface.
+        let world = Arc::new(World::new());
         let mut pool = MeshPool::with_workers(1);
         let c = ChunkCoord::new(0, 0, 0);
-        pool.request(c, 0);
-        pool.request(c, 2);
+        pool.request(&world, c, 0);
+        pool.request(&world, c, 2);
         let mut levels = Vec::new();
         while !pool.in_flight().is_empty() {
             for built in pool.poll() {
