@@ -10,7 +10,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
-use winit::keyboard::KeyCode;
 use winit::window::{CursorGrabMode, Window};
 
 use cubara_voxel::{ChunkCoord, Vertex};
@@ -50,8 +49,6 @@ const STREAM_RADIUS: i32 = 28;
 /// Vertical chunk band to stream — the terrain sits comfortably inside it.
 const STREAM_Y_MIN: i32 = 0;
 const STREAM_Y_MAX: i32 = 2;
-/// How far the block-editing ray reaches, in blocks.
-const EDIT_REACH: f32 = 6.0;
 /// Cap on chunk geometry uploads per frame. Crossing a chunk boundary re-LODs a
 /// whole ring at once; spreading the GPU uploads over a few frames avoids the
 /// resulting frame-time spike (chunks pop in a hair later, imperceptibly).
@@ -129,13 +126,6 @@ pub struct Renderer {
     /// Chunk the camera is currently in; streaming re-runs when this changes.
     center: ChunkCoord,
 
-    /// The world being rendered. Held behind an [`Arc`] so a meshing job can carry
-    /// the exact snapshot it was queued against; an edit publishes a new one via
-    /// [`Arc::make_mut`] rather than mutating state the workers can see.
-    world: Arc<World>,
-
-    /// First-person camera, driven by keyboard + mouse input.
-    camera: FlyCamera,
     last_frame: Instant,
     visible_chunks: usize,
     frames: u32,
@@ -148,7 +138,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(window: Arc<Window>) -> Self {
+    pub fn new(window: Arc<Window>, world: &Arc<World>, camera: &FlyCamera) -> Self {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -206,18 +196,11 @@ impl Renderer {
 
         let scene = SceneRenderer::new(&device, &queue, format, config.width, config.height);
 
-        // Start above the terrain near the origin, looking out over it and slightly
-        // down (yaw ~35°, gentle downward pitch).
-        let camera = FlyCamera::new(glam::vec3(0.0, 48.0, 0.0), 0.6, -0.3);
         let aspect = config.width as f32 / config.height as f32;
         let frustum = Frustum::from_view_proj(camera.view_proj(aspect));
         let center = ChunkCoord::from_world_pos(camera.pos.to_array());
 
-        let world = Arc::new(World::new());
         let arena = ChunkArena::new(&device, multi_draw);
-
-        // Capture the mouse for first-person look (Esc releases it — see the app).
-        grab_cursor(&window, true);
 
         let mut renderer = Self {
             window,
@@ -232,8 +215,6 @@ impl Renderer {
             upload_queue: VecDeque::new(),
             resident: HashMap::new(),
             center,
-            world,
-            camera,
             last_frame: Instant::now(),
             visible_chunks: 0,
             frames: 0,
@@ -242,56 +223,17 @@ impl Renderer {
             frame_ms: 0.0,
         };
         // Prime the initial region so the first frame has something to draw.
-        renderer.stream_around(center);
+        renderer.stream_around(world, center);
         renderer
-    }
-
-    /// Feed a key press/release to the camera. Returns whether it was consumed.
-    pub fn key_input(&mut self, key: KeyCode, pressed: bool) -> bool {
-        self.camera.key(key, pressed)
-    }
-
-    /// Feed a raw mouse-motion delta (pixels) to the camera's look.
-    pub fn mouse_look(&mut self, dx: f32, dy: f32) {
-        self.camera.mouse_look(dx, dy);
-    }
-
-    /// Grab (or release) the mouse cursor for first-person look.
-    pub fn set_cursor_captured(&self, captured: bool) {
-        grab_cursor(&self.window, captured);
-    }
-
-    /// Break (`place = false`) or place (`true`) the block the camera is looking at,
-    /// within [`EDIT_REACH`], and re-mesh the affected chunk. No-op if nothing is in
-    /// reach. Placing puts the block against the hit face.
-    pub fn edit_block(&mut self, place: bool) {
-        let origin = self.camera.pos.to_array();
-        let dir = self.camera.look_dir().to_array();
-        let Some(hit) = self.world.raycast(origin, dir, EDIT_REACH) else {
-            return;
-        };
-        let target = if place {
-            [
-                hit.block[0] + hit.normal[0],
-                hit.block[1] + hit.normal[1],
-                hit.block[2] + hit.normal[2],
-            ]
-        } else {
-            hit.block
-        };
-        // Publishes a fresh snapshot: workers holding the old Arc keep meshing the
-        // pre-edit world, and their results are superseded by the re-request below.
-        let cc = Arc::make_mut(&mut self.world).set_block(target[0], target[1], target[2], place);
-        self.invalidate(cc);
     }
 
     /// Force a re-mesh of `cc` (e.g. after an edit): the worker re-reads the edit
     /// overlay, and [`drain_meshes`](Self::drain_meshes) swaps the geometry in
     /// atomically, so there's no gap.
-    fn invalidate(&mut self, cc: ChunkCoord) {
+    pub fn invalidate(&mut self, world: &Arc<World>, cc: ChunkCoord) {
         self.mesh_pool.cancel(cc);
         self.mesh_pool
-            .request(&self.world, cc, streaming::lod_for(cc, self.center));
+            .request(world, cc, streaming::lod_for(cc, self.center));
     }
 
     pub fn window(&self) -> &Window {
@@ -313,7 +255,7 @@ impl Renderer {
     /// ones, and resident ones whose LOD changed as the camera moved. Meshing happens
     /// on the worker pool; results are uploaded in [`drain_meshes`](Self::drain_meshes),
     /// so this never meshes on the main thread.
-    fn stream_around(&mut self, center: ChunkCoord) {
+    fn stream_around(&mut self, world: &Arc<World>, center: ChunkCoord) {
         puffin::profile_function!();
         let mut desired =
             streaming::desired_chunks(center, STREAM_RADIUS, STREAM_Y_MIN..=STREAM_Y_MAX);
@@ -344,7 +286,7 @@ impl Renderer {
             {
                 continue;
             }
-            self.mesh_pool.request(&self.world, coord, level);
+            self.mesh_pool.request(world, coord, level);
         }
         self.center = center;
     }
@@ -379,10 +321,10 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self) {
+    pub fn render(&mut self, world: &Arc<World>, camera: &FlyCamera) {
         crate::profiling::Profiler::new_frame();
         puffin::profile_function!();
-        self.update();
+        self.update(world, camera);
 
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
@@ -409,7 +351,7 @@ impl Renderer {
 
         {
             puffin::profile_scope!("encode-pass");
-            let overlay = self.show_debug.then(|| self.debug_text());
+            let overlay = self.show_debug.then(|| self.debug_text(camera));
             self.scene.encode_scene(
                 &self.queue,
                 &mut encoder,
@@ -433,9 +375,9 @@ impl Renderer {
 
     /// Build this frame's debug text. The overlay's drawing (including its drop
     /// shadow) belongs to the shared scene path, so this only produces the string.
-    fn debug_text(&self) -> String {
-        let p = self.camera.pos;
-        let d = self.camera.look_dir();
+    fn debug_text(&self, camera: &FlyCamera) -> String {
+        let p = camera.pos;
+        let d = camera.look_dir();
         let facing = if d.x.abs() > d.z.abs() {
             if d.x > 0.0 {
                 "east (+x)"
@@ -473,7 +415,7 @@ impl Renderer {
 
     /// Advance the flying camera, stream if we crossed a chunk boundary, and upload
     /// the new camera matrix + frustum.
-    fn update(&mut self) {
+    fn update(&mut self, world: &Arc<World>, camera: &FlyCamera) {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -484,16 +426,14 @@ impl Renderer {
         } else {
             self.frame_ms * 0.9 + ms * 0.1
         };
-        self.camera.update(dt);
-
-        let center = ChunkCoord::from_world_pos(self.camera.pos.to_array());
+        let center = ChunkCoord::from_world_pos(camera.pos.to_array());
         if center != self.center {
-            self.stream_around(center);
+            self.stream_around(world, center);
         }
         // Take whatever the workers finished meshing since last frame.
         self.drain_meshes();
 
-        let vp = self.camera.view_proj(self.scene.aspect());
+        let vp = camera.view_proj(self.scene.aspect());
         self.frustum = Frustum::from_view_proj(vp);
         self.scene.set_camera(&self.queue, vp);
     }
@@ -518,7 +458,7 @@ impl Renderer {
 /// Grab + hide the cursor for first-person look, or release it. Best-effort:
 /// `Locked` isn't supported on every platform, so fall back to `Confined`, and
 /// never panic if the platform refuses.
-fn grab_cursor(window: &Window, grab: bool) {
+pub fn grab_cursor(window: &Window, grab: bool) {
     if grab {
         if window.set_cursor_grab(CursorGrabMode::Locked).is_err() {
             let _ = window.set_cursor_grab(CursorGrabMode::Confined);

@@ -22,6 +22,7 @@ winit.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
 bytemuck.workspace = true
+glam.workspace = true
 log.workspace = true
 env_logger.workspace = true
 # puffin scope macros compile to near-nothing unless scopes are enabled at runtime.

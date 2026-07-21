@@ -431,6 +431,7 @@ dependencies = [
  "cubara-voxel",
  "cubara-world",
  "env_logger",
+ "glam",
  "image",
  "log",
  "pollster",

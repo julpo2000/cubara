@@ -21,7 +21,7 @@ pub use camera::FlyCamera;
 pub use culling::{Aabb, Frustum};
 pub use profiling::Profiler;
 pub use render::{
-    build_pipeline, camera_bind_group_layout, create_depth_view, gpu_driven_features,
+    build_pipeline, camera_bind_group_layout, create_depth_view, gpu_driven_features, grab_cursor,
     CameraUniform, Renderer,
 };
 pub use scene::SceneRenderer;
