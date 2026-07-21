@@ -15,7 +15,8 @@ Pre-alpha — engine foundation under construction.
 | Document | What it answers |
 |---|---|
 | [`REQUIREMENTS.md`](REQUIREMENTS.md) | Why the project exists — the founding, non-negotiable wishes. |
-| [`PLAN.md`](PLAN.md) | How the engine is built — architecture and technical decisions. |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | **The engineering standard** — the rules the codebase holds to, and what enforces each one. |
+| [`PLAN.md`](PLAN.md) | How the engine is built — technical decisions and the chunk/render approach. |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | How work lands: issues, PRs, required checks, verification. |
 | [`docs/ISSUE_STANDARD.md`](docs/ISSUE_STANDARD.md) | How to write an issue someone can execute without asking questions. |
 | [`BENCHMARKS.md`](BENCHMARKS.md) | Measured performance history, per machine, per feature. |
