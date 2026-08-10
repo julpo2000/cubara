@@ -30,10 +30,11 @@ Expansion-readiness here is exactly two things:
 
    | Decision | If deferred |
    |---|---|
-   | Stable **string** block identity (§3) | Every save and every mod breaks the day a block is inserted in the middle of a file. |
-   | Block state lives in the **flat id space** (§3.4) | The voxel array grows a second field; palette compression, meshing and saves all change shape. |
+   | **Names are identity, numbers are per-world** (§3) | Every save and every mod breaks the day a block is inserted in the middle of a file. |
+   | Block **shape and state live in the flat id space** (§3.5) | The voxel array grows a second field; palette compression, meshing and saves all change shape. |
+   | The **save format**, designed with the block representation (§7) | The chunk layout gets designed twice, and the second one is a migration. This is why persistence is in phase 1 and not phase 2. |
    | Vertices are **node-local**, not world-space (§5) | Precision failures far from origin, and a vertex format change means re-meshing the world. |
-   | **Fixed tick + seeded RNG in world state** (§8) | Determinism cannot be retrofitted — Rule 1. It is a rewrite, and it takes multiplayer and replays with it. |
+   | **Fixed tick + seeded RNG in world state** (§9) | Determinism cannot be retrofitted — Rule 1. It is a rewrite, and it takes multiplayer and replays with it. |
 
 Everything else is deliberately built for today's requirement only.
 
@@ -100,7 +101,7 @@ meshes.** That is §6, and it is the block phase 1 turns on.
 |---|---|---|
 | Triangles per frame | ≲ 1M | ~1 ms of GPU for a simple opaque pass on an M3. With ≤2,000 nodes that is ~500 tris/node; radius 12 measures 161 tris/chunk today, and caves will push it up — which is why caves are in phase 1, so the budget is tested honestly. |
 | Vertex memory | ≤ 32 MB | 4M-vertex arena. At today's 28-byte vertex that is 112 MB, and adding a texture layer naively makes it 160 MB. §5 packs it to 8 bytes. |
-| Worldgen samples for a full load | ~8.2M | 2,000 nodes × 16³ samples each. Generating far nodes at full resolution and downsampling would be ~545M samples — a factor of 65. This is why generation is LOD-native (§7). |
+| Worldgen samples for a full load | ~8.2M | 2,000 nodes × 16³ samples each. Generating far nodes at full resolution and downsampling would be ~545M samples — a factor of 65. This is why generation is LOD-native (§8). |
 
 The triangle ceiling is an estimate, not a measurement. **Block 1.0 replaces it
 with a measured number before anything is built on it.**
@@ -119,57 +120,106 @@ pub struct BlockId(pub u16);   // 65,536 types; 0 is always air
 A **runtime** index into the registry. It is not stable across runs, and it never
 reaches disk or the network in raw form.
 
-### 3.2 The registry, from RON
+### 3.2 The registry, authored as material × shape
 
-`cubara-voxel` owns `BlockRegistry`, loaded from `assets/blocks/*.ron`:
+`cubara-voxel` owns `BlockRegistry`, loaded from `assets/blocks/*.ron`. A
+definition describes a **material**, and the shapes that material comes in:
 
 ```ron
-Block(
-    name: "cubara:stone",
-    solid: true,
-    faces: All("stone"),                         // or Sided(top: .., side: .., bottom: ..)
+Material(
+    name:     "cubara:stone",
+    solid:    true,
+    faces:    All("stone"),          // or Sided(top: .., side: .., bottom: ..)
+    shapes:   [Full],                // phase 1 has only Full; later: Stair, Slab, …
 )
 ```
 
-Phase 1 defines exactly three: `cubara:stone`, `cubara:soil`, `cubara:grass`
-(sided — grass top, soil bottom, a blended side). Names, textures and art are
-original to the project.
+At startup the registry **expands** each material × shape pair into its own
+`BlockId`. `cubara:oak` with `[Full, Stair, Slab]` becomes three ids. You author
+a material once and get its whole family; the rest of the engine only ever sees a
+flat list of ids and never learns what a "shape" is.
+
+Phase 1 defines exactly three materials, all `Full`: `cubara:stone`,
+`cubara:soil`, `cubara:grass` (sided — grass top, soil bottom, a blended side).
+The `shapes` field carries one value and the expansion is a one-element loop; it
+is written this way now because it costs nothing and because the alternative —
+one hand-written definition per material-and-shape combination — is the
+combinatorial explosion this decomposition exists to avoid.
 
 The registry resolves texture *names*. It does not know what an array layer is —
 `cubara-render` maps names to layers when it builds the texture array. That is the
 seam that keeps the block definitions GPU-free (Rule 4).
 
-### 3.3 Stable identity is the string, not the number
+### 3.3 Where numbers live, and where names live
 
-**Runtime ids are assigned by sorting block names lexicographically.** Same set of
-definitions in, same ids out, on every machine and every run — which is what
-Rule 1 needs.
+There is no string anywhere near a block in memory or in the bulk of a save file.
+Concretely:
 
-Anything persisted or transmitted stores **names**: a chunk's palette on disk is a
-list of strings (or indices into a per-world name table that is itself stored as
-strings). Loading a world maps names → current runtime ids.
+| Where | What is stored | Size |
+|---|---|---|
+| The voxel array | index into the chunk's palette | **4 bits** typically |
+| The chunk's palette (memory and disk) | `BlockId` — a `u16` | 2 bytes × ~3–20 entries |
+| The world header, once per world | `id → name` table | a few KB per world, total |
+| Never | a name | — |
 
-This costs one sort and one lookup table. It is here rather than in phase 2
-because the alternative is discovering, after there are saved worlds, that
-inserting a block into a RON file silently reinterprets every stone block in every
-save as dirt — and that a mod adding blocks makes existing worlds unloadable. It
-is the cheapest expansion insurance in the project.
+So a chunk on disk is a handful of `u16`s plus bit-packed indices, which is
+**four times smaller** than storing a 2-byte id per block outright, and the names
+exist exactly once per world file rather than once per chunk.
 
-### 3.4 Block state and block entities — decided, not built
+### 3.4 Names are identity; numbers are per-world
 
-Phase 1 has no block state and no block entities. The decisions are recorded here
-so they are not made badly under pressure in phase 2:
+Runtime `BlockId`s are assigned by sorting material×shape names
+lexicographically: the same definitions in, the same ids out, on every machine and
+every run — which is what Rule 1 needs. The world header records the mapping that
+was in force when the world was created, and loading remaps saved ids → current
+runtime ids (§7.2).
 
-- **Block state** (a log's axis, wheat's growth stage) becomes **distinct ids in
-  the same flat id space** — the registry expands `cubara:wheat` with a growth
-  property into eight ids. The voxel array stays a single `u16` forever, palette
-  compression keeps working unchanged, and the mesher never learns what a property
-  is. No field is added now.
-- **Block entity data** (a furnace's contents) lives in a per-chunk side table,
-  `BTreeMap<LocalPos, BlockEntity>` — ordered, because Rule 1 forbids letting
-  iteration order affect results. It is *not* in the voxel array. Nothing is added
-  now; the point is that when phase 2 adds a furnace, the chunk format does not
-  change.
+The reason this matters is not tidiness, it is that **a number has to be assigned
+by someone, and that someone has to stay consistent forever.** If the number is
+the identity then inserting a block into a file renumbers everything after it and
+silently reinterprets every stone block in every existing save as soil. And a
+fixed partition of the id space — a byte for the category, a byte for the member —
+adds a second failure: two mods that both claim category `0x2A` produce worlds
+that used them both and can never be recovered, and a category that fills up
+cannot borrow from an empty one. 65,536 ids is plenty; a *fixed division* of them
+is the part that binds.
+
+With names as identity, a mod's blocks take whatever numbers are free in the world
+they are installed into, and a conflict is structurally impossible. The cost is
+one sort and one table.
+
+### 3.5 Shape and state in the flat id space — and why that is free
+
+**Block state** (a log's axis, wheat's growth stage) and **shape** (stair, slab)
+are the same problem, and both are handled the way §3.2 handles shape: the
+registry expands them into **distinct ids in one flat space**. The voxel array
+stays a single palette index forever, palette compression keeps working unchanged,
+the mesher never learns what a property is, and the save format does not move.
+
+The objection to flattening is that ids explode — thousands of materials times
+several shapes times several states. Palette compression is what makes that a
+non-issue: a chunk containing oak stairs spends **one palette entry** on them, and
+its voxel array is still 4-bit indices. The explosion is confined to the registry,
+which is a few thousand entries in RAM and is not in any hot path.
+
+This is why shape is *not* a third byte per voxel. A byte per block would cost
+4 KB per chunk — for information that, in the overwhelming majority of chunks, has
+one or two distinct values.
+
+Nothing here is built in phase 1 beyond the one-element expansion in §3.2. What is
+built is the id space that makes it a registry change later rather than a chunk
+format change.
+
+### 3.6 Block entities
+
+A furnace's contents are not block state — they are unbounded and per-instance.
+They live in a per-chunk side table, `BTreeMap<LocalPos, BlockEntity>`, ordered
+because Rule 1 forbids letting iteration order affect results, and serialised as
+its own section of the chunk payload (§7.3).
+
+Phase 1 has none and writes no such section. The format carries a version number
+(§7.1), so adding the section in phase 2 is a version bump — which is the seam,
+and the reason no empty field is reserved for it now.
 
 ---
 
@@ -302,7 +352,115 @@ which worker finishes first (Rule 1, and the fix for [#83](../../issues/83)).
 
 ---
 
-## §7 Worldgen
+## §7 The save format
+
+Persistence is in phase 1 because the on-disk format and the in-memory block
+representation are one decision (§0). Designing them apart means designing the
+chunk layout twice, and calling the second one a migration.
+
+### 7.1 Layout
+
+```
+saves/<world>/
+  level.ron                      # header: seed, tick, RNG, player, id table
+  region/r.<rx>.<ry>.<rz>.cbr    # 32×32×32 chunks = 512³ blocks per region
+```
+
+Regions are cubic because chunks are (`REQUIREMENTS.md` #4) — a column-shaped
+region would reintroduce the vertical special case that cubic chunks exist to
+remove.
+
+A region file is a sorted directory followed by payloads:
+
+```
+"CBRG" | u16 format_version | u32 entry_count
+[ u16 local_index | u32 offset | u32 length ] × entry_count   — sorted by index
+payloads, written in that same order
+```
+
+Sorted, and written in directory order, so **the same world state produces a
+byte-identical file** — which is what makes the round-trip test a hash comparison
+rather than a semantic diff. All integers are explicitly little-endian, so a world
+saved on Windows loads on macOS; CI runs both, so a fixture world committed to the
+repo tests exactly that.
+
+No compression in phase 1. Chunks are already palette-compressed and only edited
+ones are written, so the win would be small and it needs a new dependency — a
+decision to take deliberately, not in passing.
+
+### 7.2 The header and the id table
+
+`level.ron` is RON — the registry already parses it, worlds are tiny, and a
+header you can read in a text editor is worth a lot while the format is young.
+
+```ron
+World(
+    format_version:   1,
+    worldgen_version: 1,
+    seed:   6017244015443278,
+    tick:   148203,
+    rng:    (state: .., inc: ..),
+    player: (pos: (..), vel: (..), yaw: .., pitch: ..),
+    blocks: [ (1, "cubara:grass"), (2, "cubara:soil"), (3, "cubara:stone") ],
+)
+```
+
+`blocks` is the id table from §3.4: the numbers that were in force when this world
+was created. Loading builds a `saved_id → runtime_id` remap, so ids may be
+reassigned freely between runs and a mod's blocks take whatever numbers are free.
+
+Two guards, both hard errors in phase 1 rather than silent damage:
+
+- **A name in the table that the registry no longer knows** (a removed mod) fails
+  the load and names what is missing. Preserving unknown blocks so the world
+  survives a temporarily-uninstalled mod is the right long-term answer and is
+  phase-2 work; the id table is the seam it attaches to.
+- **A `worldgen_version` mismatch** fails the load, because of §7.4.
+
+### 7.3 Chunk payload
+
+The in-memory representation, written out — §4's two cases and nothing else:
+
+```
+u8 storage:  0 = uniform            → u16 block_id
+             1 = palette            → u8 len, [u16; len], u8 bits, [u64; n] packed
+```
+
+Phase 2's block entities (§3.6) become a further section, guarded by
+`format_version`. Nothing is reserved for them now.
+
+### 7.4 Only edits are written
+
+Worldgen is a pure function of the seed (§8), so an unmodified chunk can be
+regenerated instead of stored. A chunk is written only once it has been edited —
+which is already exactly where `World::set_block` marks it.
+
+Two consequences, one good and one that has to be guarded:
+
+- Saves are tiny and proportional to what you actually built, not to how far you
+  walked. At radius 64 that is the difference between a few KB and tens of
+  thousands of chunks on disk.
+- It makes reloading an **aggressive test of Rule 1**: if worldgen is not
+  deterministic across runs, threads or platforms, the world visibly changes shape
+  around your edits. That is the failure mode `worldgen_version` guards — when the
+  generator changes, old worlds must not be silently regenerated into something
+  else. Phase 2 decides whether the answer is migration or persisting generated
+  terrain; phase 1 refuses to load and says so.
+
+LOD nodes are never written. They hold no voxel data (§4) and are pure derived
+geometry.
+
+### 7.5 What pins it
+
+- **Round trip:** generate, apply a scripted edit sequence, hash, save, load,
+  hash — equal.
+- **Fixture:** a world file committed to the repo loads to a known hash on
+  Windows and macOS both.
+- **Regeneration:** an unedited chunk that has been evicted and reloaded equals
+  the chunk originally generated, bit for bit.
+- **Byte stability:** saving the same world state twice produces identical bytes.
+
+## §8 Worldgen
 
 ```rust
 pub struct WorldGen { seed: u64 }
@@ -326,7 +484,7 @@ we will know in phase 1 rather than discovering it in multiplayer.
 
 ---
 
-## §8 The tick loop and the sim/render seam
+## §9 The tick loop and the sim/render seam
 
 `cubara-sim` is new, small, and GPU-free.
 
@@ -355,7 +513,7 @@ if it can move the player, the boundary is wrong (Rule 3).
 
 ---
 
-## §9 Player physics
+## §10 Player physics
 
 An AABB swept against solid voxels, resolved **axis by axis in a fixed order**
 (Y, then X, then Z) so the result never depends on iteration or scheduling.
@@ -376,7 +534,7 @@ implementation.
 
 ---
 
-## §10 The render path
+## §11 The render path
 
 Unchanged in shape — one `render_scene`, one arena, one indirect submit — with
 three additions:
@@ -394,13 +552,15 @@ nothing gameplay-related — which is the seam this section exists to protect.
 
 ---
 
-## §11 Decisions, in one table
+## §12 Decisions, in one table
 
 | # | Decision | Rejected alternative | Because |
 |---|---|---|---|
 | 1 | `BlockId(u16)` + per-chunk palette, `Uniform` fast path | one byte per voxel | memory at radius 64; and 256 types is not "thousands" |
-| 2 | Registry from RON; **names** are the stable identity | raw numeric ids on disk | inserting a block would corrupt every save and every mod |
-| 3 | Block state as distinct ids in a flat space | a second field per voxel | keeps the voxel array, palette and mesher unchanged forever |
+| 2 | Registry from RON; **names** are the stable identity, numbers are per-world | a fixed id partition (byte of category + byte of member) | ids are plentiful; a *fixed division* of them is what binds — two mods claiming one category make a world unrecoverable, and a full category cannot borrow from an empty one |
+| 3 | Materials authored with their **shapes**, expanded to a flat id space | one hand-written definition per material-and-shape pair | you write "oak" once and get its family; the combinatorial explosion stays in the registry |
+| 3b | Shape and block state as distinct ids, not a byte per voxel | a third byte in the voxel array | palette compression makes flattening free; a shape byte costs 4 KB/chunk for data that has one or two distinct values per chunk |
+| 3c | Only **edited** chunks are written; the rest regenerate from the seed | persisting all generated terrain | saves scale with what you built, not how far you walked — and reloading becomes a hard test of Rule 1 (guarded by `worldgen_version`) |
 | 4 | 8-byte packed, **node-local** vertex | 28-byte world-space f32 | vertex-memory budget; precision far from origin; re-meshing cost later |
 | 5 | `INDIRECT_FIRST_INSTANCE` → `instance_index` for per-node data | per-vertex node index | zero per-vertex cost, one path on both backends (fallback recorded) |
 | 6 | LOD node = 2^L chunks, one mesh, one draw, 16³ samples | per-chunk voxel downsampling | draws are the binding constraint (§2); triangle reduction alone cannot reach radius 64 |
@@ -409,16 +569,20 @@ nothing gameplay-related — which is the seam this section exists to protect.
 | 9 | Fixed 60 Hz tick, render-side interpolation | per-frame simulation | Rule 1; and it is a rewrite if deferred |
 | 10 | `cubara-render` loses its `cubara-world` dependency | leave it | Rule 3; it is what makes the renderer rebuildable |
 
-## §12 What phase 1 does not build
+## §13 What phase 1 does not build
 
-Inventory, items, crafting, mobs, health, day/night, save/load, trees, ores,
-water, transparency, lighting propagation, multiplayer, mods.
+Inventory, items, crafting, mobs, health, day/night, trees, ores, water,
+transparency, lighting propagation, multiplayer, mods. Also, deliberately: block
+shapes and block state beyond the one-element expansion (§3.2), block entities
+(§3.6), compression in the save format (§7.1), and preserving blocks whose mod has
+been uninstalled (§7.2).
 
 The claim this document makes is not that those will be easy. It is that each one
-lands at a **named seam** — a new registry field, a second render pass, a new
-system in `cubara-sim`, a serialiser over a chunk format that already stores
-stable names — rather than as a change to the voxel array, the mesher, the arena
-and the streaming policy at the same time. If a phase-2 feature cannot find its
-seam, that is a defect in this document and it gets fixed here.
+lands at a **named seam** — a registry expansion, a second render pass, a new
+system in `cubara-sim`, a `format_version` bump over a chunk payload that already
+holds palette-compressed ids and a world header that already holds the id table —
+rather than as a change to the voxel array, the mesher, the arena and the save
+format at the same time. If a phase-2 feature cannot find its seam, that is a
+defect in this document and it gets fixed here.
 
 [wgpu#6823]: https://github.com/gfx-rs/wgpu/issues/6823

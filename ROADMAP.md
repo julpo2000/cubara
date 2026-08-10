@@ -19,7 +19,7 @@ applies to phases too: *a requirement that isn't enforced by machinery is a wish
 
 | Phase | Name | The one-sentence result |
 |---|---|---|
-| **1** | The engine stands | A textured, walkable, cave-riddled world at render distance 64 that runs at 1000+ FPS. |
+| **1** | The engine stands | A textured, walkable, cave-riddled world at render distance 64 that runs at 1000+ FPS — and is still there after you close it. |
 | **2** | The first survival world | You can survive in it: gather, craft, smelt, eat, and be attacked — and it is still there tomorrow. |
 | **3** | Modern depth, with synergy | The features of a full modern voxel game, each admitted only if it connects to what already exists. |
 
@@ -65,12 +65,16 @@ left undone. Then the owner plays it.
 
 **The result:** a world of three textured block types over seeded noise terrain
 with real cave systems, which you walk through under gravity rather than fly
-through, rendered to a horizon 64 chunks away at over 1000 FPS.
+through, rendered to a horizon 64 chunks away at over 1000 FPS, and which you can
+save and come back to.
 
 This is the last phase that is purely about the engine. Everything in it is
-foundation for phase 2, and two of its pieces — determinism and stable block
-identity — are here specifically because they are the ones that cannot be
-retrofitted later without a rewrite.
+foundation for phase 2, and three of its pieces — determinism, block identity,
+and the save format — are here specifically because they are the ones that cannot
+be retrofitted later without a rewrite or a migration. Persistence is in this
+phase for a precise reason: the on-disk format and the in-memory block
+representation are the same decision, so designing them apart means designing the
+chunk layout twice and calling the second one a migration.
 
 The full design is in
 [`docs/PHASE1_ARCHITECTURE.md`](docs/PHASE1_ARCHITECTURE.md). It is not a summary
@@ -91,10 +95,11 @@ own PR. The order is a dependency order, not a preference.
 | **1.4** | Texture array + per-face texture indices + the material shader | Three original 16×16 textures; the flat green in `mesh.wgsl` goes away. Pinned by a golden-image test. | [#43](../../issues/43), [#44](../../issues/44) |
 | **1.5** | Seeded 3D noise worldgen with cave systems | Caves are the honest meshing load — a smooth heightmap flatters the renderer. The seed becomes world state (Rule 1). | [#48](../../issues/48) |
 | **1.6** | Fixed-timestep tick loop + seeded world RNG | ~100 lines now; a rewrite later. Rule 1 is the keystone and the only rule that cannot be retrofitted. | [#57](../../issues/57) |
-| **1.7** | Player: AABB collision, gravity, walking; free-fly becomes a debug toggle | Runs in the sim at fixed tick rate, so movement is deterministic and phase 2 inherits it. | [#53](../../issues/53) |
-| **1.8** | **LOD as draw-count reduction** — the region node tree, and `cubara-render` stops depending on `cubara-world` | The block that decides whether radius 64 is reachable at all. Tracking issue with sub-issues; see design §6 and §1. | [#38](../../issues/38) |
-| **1.9** | Determinism harness: world-state hash + replay test, single- vs multi-threaded | Rule 1's missing enforcement. Turns "deterministic" from prose into a CI failure. | new |
-| **1.10** | Whatever block 1.8's measurements say is still missing — occlusion culling is the standing candidate | Deliberately unspecified: it is chosen from a profile, not from a guess. | [#42](../../issues/42) |
+| **1.7** | Player: AABB collision, gravity, walking; free-fly becomes a debug toggle; selected-block highlight | Runs in the sim at fixed tick rate, so movement is deterministic and phase 2 inherits it. | [#53](../../issues/53), [#52](../../issues/52) |
+| **1.8** | Determinism harness: world-state hash + replay test, single- vs multi-threaded | Rule 1's missing enforcement, and the hash that block 1.9's round-trip test is built on. | new |
+| **1.9** | **Save/load:** world header with the block id table, region files, chunk payload | The on-disk format and the in-memory block representation are one decision, so they are made in one phase. See design §7. | [#60](../../issues/60) |
+| **1.10** | **LOD as draw-count reduction** — the region node tree, and `cubara-render` stops depending on `cubara-world` | The block that decides whether radius 64 is reachable at all. Tracking issue with sub-issues; see design §6 and §1. | [#38](../../issues/38) |
+| **1.11** | Whatever block 1.10's measurements say is still missing — occlusion culling is the standing candidate | Deliberately unspecified: it is chosen from a profile, not from a guess. | [#42](../../issues/42) |
 
 ### Exit gate
 
@@ -113,6 +118,9 @@ Passes only when **all** of the following hold, and it exits non-zero otherwise:
   mouth, and an LOD boundary at distance.
 - Unit tests cover: a player AABB never passes through a solid voxel, and the
   same seed produces a bit-identical chunk on both platforms.
+- **The save round-trip test:** edit a world, save it, load it, and land on the
+  same world-state hash — and a world file committed as a fixture loads to that
+  same hash on Windows and macOS both, which CI already runs.
 
 **Run on both machines** (Windows/RTX 4060 and macOS/M3), with a `BENCHMARKS.md`
 row for each. The perf half of the gate deliberately does **not** run in CI —
@@ -123,10 +131,11 @@ silently.
 
 ### Explicitly not in phase 1
 
-Inventory, items, crafting, mobs, health, day/night, save/load, trees, ores,
-water, transparency, multiplayer, mods. Blocks may be placed and broken (that
-already works) but nothing is *collected*. If one of these turns out to be
-load-bearing for the gate, that is a finding to report, not a licence to build it.
+Inventory, items, crafting, mobs, health, day/night, trees, ores, water,
+transparency, multiplayer, mods. Blocks may be placed and broken (that already
+works) and the result survives a restart, but nothing is *collected*. If one of
+these turns out to be load-bearing for the gate, that is a finding to report, not
+a licence to build it.
 
 ---
 
@@ -147,7 +156,7 @@ forces the simulation to become a real game loop.
 | **2.5** | ECS for entities | Arrives when there are entities worth having — dropped items and mobs — not before. [#56](../../issues/56) |
 | **2.6** | Chunk state machine: `Active ⇄ Dormant` | [#47](../../issues/47) |
 | **2.7** | Dormant-chunk catch-up (the Factorio timers) + a worked process | The founding chunk idea, and only now is there a process (a growing tree, a running furnace) real enough to test it against. [#58](../../issues/58), [#59](../../issues/59) |
-| **2.8** | Save/load: region file format | [#60](../../issues/60) |
+| **2.8** | Extend the save format: block entities, entity state, inventory | Phase 1 ships the format (design §7); phase 2 adds the state phase 2 invented. A format version bump, not a new format. |
 | **2.9** | Health, hunger, damage, and the first hostile mobs | The largest block, and last: it is the one that needs every system before it. |
 
 Note that the tick loop is *not* in this list — it lands in phase 1 (block 1.6).
@@ -168,8 +177,9 @@ tick, not the tick itself.
   and completes the loop — chop a tree, craft a tool, mine iron ore, smelt it,
   eat, take damage — then asserts a world-state hash. It runs single-threaded and
   multi-threaded and must agree.
-- **The round-trip test:** save the world mid-script, reload it, run the rest of
-  the script, and land on the same hash as the uninterrupted run.
+- **The round-trip test**, extended from phase 1 to cover phase 2's state: save
+  the world mid-script, reload it, run the rest of the script, and land on the
+  same hash as the uninterrupted run.
 - **The dormant test:** a chunk left dormant for N ticks and then activated ends
   in the same state as one simulated continuously for N ticks.
 
@@ -209,7 +219,7 @@ scheduled against phase 3's needs rather than pursued on their own.
 
 | Phase 1 | Phase 2 | Engine work, scheduled against phase 3 |
 |---|---|---|
-| #83, #46, #54, #55, #43, #44, #48, #57, #53, #38, #52 | #56, #47, #58, #59, #60 | #28, #32, #33, #42, #36 |
+| #83, #46, #54, #55, #43, #44, #48, #57, #53, #52, #60, #38 | #56, #47, #58, #59 | #28, #32, #33, #42, #36 |
 
 Each phase is the GitHub milestone of the same name, and every open issue is
 filed under one — an issue that fits no phase is unscheduled work, not a reason
