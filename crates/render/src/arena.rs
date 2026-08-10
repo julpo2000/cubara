@@ -597,8 +597,15 @@ impl ChunkArena {
     ) -> Self {
         let mut arena = Self::new(device, multi_draw);
         let mut total_tris = 0u32;
+        // TODO(#48): every solid voxel is this one id until real terrain
+        // materials (block 1.5) -- see `World::chunk_at`'s doc comment for
+        // why it's resolved by name here rather than a hardcoded `BlockId`.
+        let solid = ctx
+            .registry
+            .id_of("cubara:stone")
+            .expect("assets/blocks must define cubara:stone");
         for coord in streaming::desired_chunks(center, radius, y_range) {
-            if let Some(chunk) = world.chunk_at(coord) {
+            if let Some(chunk) = world.chunk_at(coord, solid) {
                 let level = streaming::lod_for(coord, center);
                 if arena.upload_chunk(queue, coord, &chunk, ctx, level) {
                     if let Some(slot) = arena.slots.get(&coord) {

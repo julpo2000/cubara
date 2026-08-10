@@ -51,13 +51,20 @@ fn mesh_coord(
     coord: ChunkCoord,
     level: u32,
 ) -> Option<(Mesh, Aabb)> {
-    let layer_of = |id| assets.layers.layer_of(id);
+    let layer_of = |name: &str| assets.layers.layer_of(name);
     let ctx = MeshContext {
         registry: &assets.registry,
         layer_of: &layer_of,
     };
+    // TODO(#48): every solid voxel is this one id until real terrain
+    // materials (block 1.5) -- see `World::chunk_at`'s doc comment for why
+    // it's resolved by name here rather than a hardcoded `BlockId`.
+    let solid = assets
+        .registry
+        .id_of("cubara:stone")
+        .expect("assets/blocks must define cubara:stone");
     world
-        .chunk_at(coord)
+        .chunk_at(coord, solid)
         .and_then(|chunk| build_chunk_mesh(coord, &chunk, &ctx, level))
 }
 

@@ -56,8 +56,10 @@ frames after 200 warmup.
 | 2026-08-10 | `BlockId` + per-chunk palette compression [#46]¹² | 25,131 | 762,516 | ~991 | 0.720 ms | ~1.23 ms | `174a2ce` |
 | 2026-08-10 | Packed vertex + texture array [#43], radius 12 — `first_instance` mechanism, superseded¹³ | 1,349 | 361,326 | ~2,050 | 0.328 ms | ~0.96 ms | *(superseded, not merged)* |
 | 2026-08-10 | Packed vertex + texture array [#43], radius 64 — `first_instance` mechanism, superseded¹³ | 25,131 | 762,516 | ~728 | 1.317 ms | ~1.49 ms | *(superseded, not merged)* |
-| 2026-08-11 | **Packed vertex + texture array, node_index-in-vertex (final)** [#43], radius 12¹⁴ | 1,349 | 361,326 | ~2,460 | **0.273 ms** | ~0.57 ms | *(this PR)* |
-| 2026-08-11 | **Packed vertex + texture array, node_index-in-vertex (final)** [#43], radius 64¹⁴ | 25,131 | 762,516 | ~1,016 | **0.697 ms** | ~1.05 ms | *(this PR)* |
+| 2026-08-11 | **Packed vertex + texture array, node_index-in-vertex (final)** [#43], radius 12¹⁴ | 1,349 | 361,326 | ~2,460 | **0.273 ms** | ~0.57 ms | `218eb41` |
+| 2026-08-11 | **Packed vertex + texture array, node_index-in-vertex (final)** [#43], radius 64¹⁴ | 25,131 | 762,516 | ~1,016 | **0.697 ms** | ~1.05 ms | `218eb41` |
+| 2026-08-11 | Per-face material appearance [#44], radius 12¹⁵ | 1,349 | 361,326 | ~2,452 | 0.275 ms | ~0.56 ms | *(this PR)* |
+| 2026-08-11 | Per-face material appearance [#44], radius 64¹⁵ | 25,131 | 762,516 | ~1,016 | 0.707 ms | ~1.31 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -327,6 +329,57 @@ correctness it buys — if anything the opposite showed up. Vertex memory is
 48 MB at the fixed 4M-vertex capacity (§2), not the 32 MB originally targeted;
 that budget was never the binding constraint at any measured scene (draws
 are), so the deviation is paid for without a measured cost.
+
+¹⁵ **Per-face material appearance (issue #44) — flat within noise, as
+expected.** The mesher now resolves each quad's texture via
+`registry.texture_for_face(block, face)` instead of one name per block id, and
+the shader is unchanged (still one `texture_2d_array` sample per fragment,
+just now reading a layer that can vary by face instead of only by block). The
+extra work is a `HashMap` lookup plus a six-way match, paid once per quad at
+mesh-build time on a worker thread -- not in the per-frame draw path this
+table measures -- so no shift was expected, and none showed up: radius 12
+**0.273 → 0.275 ms** and radius 64 **0.697 → 0.707 ms**, both inside the
+run-to-run noise band established in¹⁴ (±2%). Recorded to keep the "every
+feature is measured" rule honest, not because a delta was anticipated.
+
+**A real, pre-existing bug surfaced by this block, not introduced by it:**
+`World::chunk_at` filled every solid voxel with the hardcoded constant
+`BlockId::STONE` (`BlockId(1)`), left over from before the block registry
+existed (block 1.3, issue #54). Block ids are assigned by sorted material
+name (§3.4) -- and in the real `assets/blocks` registry, `"cubara:grass"`
+sorts before `"cubara:soil"` and `"cubara:stone"`, so id 1 is actually
+**grass**, not stone. Block 1.4a's single-texture-per-block-id resolution
+couldn't reveal this (every face of "id 1" got grass's *top* texture
+uniformly, which read as an oddly-olive but otherwise unremarkable flat
+colour); per-face resolution immediately did, because grass is a `Sided`
+material -- the terrain rendered with a visibly mottled tan/blue pattern
+where AO-darkened slopes happened to pick up `grass_side`'s blue-ish
+placeholder colour depending on which of the six directions each quad faced.
+Fixed by having `World::chunk_at` take its solid id as a parameter
+(`chunk_at(coord, solid: BlockId)`), resolved by the caller from its actual
+loaded registry (`registry.id_of("cubara:stone")`) instead of a hardcoded
+number -- consistent with §3.4's own rule that consumers must never assume a
+specific numeric id. `terrain.png` and `materials.png` are both re-blessed:
+`terrain.png` because the whole scene is stone and now correctly renders
+stone's tan-gold placeholder colour instead of grass's olive one everywhere;
+`materials.png` because its grass chunk (which *was* the real `cubara:grass`
+id, resolved by name, not the buggy constant) now shows a visibly different
+colour on its side face (`grass_side`, blue-ish) than its top
+(`grass_top`, olive) -- the actual point of this block, now visible in the
+reference image. Both changes were inspected by eye before blessing.
+
+**Why the golden coverage stops at top vs. side, not top vs. side vs.
+bottom in one frame:** top and bottom are opposite faces of a convex block,
+so no single camera position can ever see both at once, with or without a
+custom camera -- back-face culling removes whichever one faces away. Proving
+the bottom resolves correctly needed a deterministic check instead of a
+screenshot: `cubara_voxel::voxel::tests::sided_material_gives_each_face_its_own_layer`
+meshes an isolated `Sided` block and asserts each of the six emitted quads'
+`tex_layer` against the exact face it should carry (`PosY` → top, `NegY` →
+bottom, the four horizontal directions → side) -- strictly more precise than
+a pixel-diff against a flat placeholder colour could be, and it doesn't need
+a new camera-override mechanism in the shared headless render path to get
+there.
 
 ## Detailed run logs
 

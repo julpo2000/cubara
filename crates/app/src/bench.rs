@@ -62,7 +62,7 @@ pub fn run(radius: i32) {
     // geometry goes into one shared arena, drawn with a single indirect submit.
     let world = World::new();
     let (mesh_assets, tex_view, tex_sampler) = load_mesh_assets(&device, &queue);
-    let layer_of = |id| mesh_assets.layers.layer_of(id);
+    let layer_of = |name: &str| mesh_assets.layers.layer_of(name);
     let ctx = MeshContext {
         registry: &mesh_assets.registry,
         layer_of: &layer_of,

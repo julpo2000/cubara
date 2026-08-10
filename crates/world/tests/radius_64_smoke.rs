@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cubara_voxel::{BlockId, BlockRegistry, ChunkCoord, Faces, Material, MeshContext, Shape};
+use cubara_voxel::{BlockRegistry, ChunkCoord, Faces, Material, MeshContext, Shape};
 use cubara_world::{streaming, World};
 
 const RADIUS: i32 = 64;
@@ -42,7 +42,7 @@ fn test_registry() -> BlockRegistry {
     .expect("fixture registry is valid")
 }
 
-fn zero_layer(_: BlockId) -> u32 {
+fn zero_layer(_: &str) -> u32 {
     0
 }
 
@@ -73,6 +73,7 @@ fn radius_64_world_load_settles_within_budget() {
     let handle = thread::spawn(move || {
         let world = World::new();
         let registry = test_registry();
+        let stone = registry.id_of("cubara:stone").unwrap();
         let ctx = MeshContext {
             registry: &registry,
             layer_of: &zero_layer,
@@ -81,7 +82,7 @@ fn radius_64_world_load_settles_within_budget() {
         let mut vertices = 0u64;
         let mut indices = 0u64;
         for coord in coords {
-            if let Some(chunk) = world.chunk_at(coord) {
+            if let Some(chunk) = world.chunk_at(coord, stone) {
                 let level = streaming::lod_for(coord, center);
                 let mesh = chunk.build_mesh_lod(&ctx, level);
                 if !mesh.indices.is_empty() {

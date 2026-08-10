@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::block::BlockId;
+use crate::mesh::Face;
 
 /// The physical shape a material comes in. Phase 1 has only `Full`; a
 /// material with more (`Stair`, `Slab`, …) would expand to one id per shape
@@ -68,6 +69,20 @@ impl Faces {
             Faces::Sided { top, side, bottom } => {
                 vec![top.as_str(), side.as_str(), bottom.as_str()]
             }
+        }
+    }
+
+    /// The texture name for a specific face direction -- `PosY` is top,
+    /// `NegY` is bottom, and the four horizontal directions are all "side".
+    /// `All` materials ignore `face` entirely.
+    fn texture_for(&self, face: Face) -> &str {
+        match self {
+            Faces::All(name) => name.as_str(),
+            Faces::Sided { top, side, bottom } => match face {
+                Face::PosY => top.as_str(),
+                Face::NegY => bottom.as_str(),
+                Face::PosX | Face::NegX | Face::PosZ | Face::NegZ => side.as_str(),
+            },
         }
     }
 }
@@ -293,8 +308,6 @@ impl BlockRegistry {
     }
 
     /// Every `BlockId` this registry assigned, air included, in ascending order.
-    /// What `cubara-render` walks to build a block-id -> texture-array-layer
-    /// table (see [`placeholder_texture`](Self::placeholder_texture)).
     pub fn ids(&self) -> impl Iterator<Item = BlockId> + '_ {
         (0..self.entries.len() as u16).map(BlockId)
     }
@@ -314,17 +327,14 @@ impl BlockRegistry {
         names
     }
 
-    /// The one texture name to use for every face of `id`, until per-face
-    /// material selection (block 1.4b) exists. `All` materials use their one
-    /// texture; `Sided` materials use their top texture as a stand-in.
+    /// The texture name `id` shows on `face` -- an `All` material gives the
+    /// same name for every face; a `Sided` material gives its top/side/bottom
+    /// texture depending on which of the six directions `face` is (§3.2).
     /// `None` for air (nothing to texture) or an id this registry doesn't
     /// have.
-    pub fn placeholder_texture(&self, id: BlockId) -> Option<&str> {
+    pub fn texture_for_face(&self, id: BlockId, face: Face) -> Option<&str> {
         let faces = self.entries.get(id.0 as usize)?.faces.as_ref()?;
-        Some(match faces {
-            Faces::All(name) => name.as_str(),
-            Faces::Sided { top, .. } => top.as_str(),
-        })
+        Some(faces.texture_for(face))
     }
 
     /// Check every material's referenced texture names against real files in
@@ -631,17 +641,34 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_texture_resolves_all_and_sided_materials() {
+    fn texture_for_face_resolves_all_and_sided_materials() {
         let registry = BlockRegistry::from_materials(vec![stone(), grass()]).unwrap();
-        assert_eq!(registry.placeholder_texture(BlockId::AIR), None);
+        assert_eq!(registry.texture_for_face(BlockId::AIR, Face::PosY), None);
+
+        let stone_id = registry.id_of("cubara:stone").unwrap();
+        for face in [Face::PosY, Face::NegY, Face::PosX, Face::NegZ] {
+            assert_eq!(
+                registry.texture_for_face(stone_id, face),
+                Some("stone"),
+                "an All material uses the same texture on every face"
+            );
+        }
+
+        let grass_id = registry.id_of("cubara:grass").unwrap();
         assert_eq!(
-            registry.placeholder_texture(registry.id_of("cubara:stone").unwrap()),
-            Some("stone")
+            registry.texture_for_face(grass_id, Face::PosY),
+            Some("grass_top")
         );
         assert_eq!(
-            registry.placeholder_texture(registry.id_of("cubara:grass").unwrap()),
-            Some("grass_top"),
-            "Sided materials use their top texture until 1.4b's per-face selection"
+            registry.texture_for_face(grass_id, Face::NegY),
+            Some("soil")
         );
+        for face in [Face::PosX, Face::NegX, Face::PosZ, Face::NegZ] {
+            assert_eq!(
+                registry.texture_for_face(grass_id, face),
+                Some("grass_side"),
+                "all four horizontal directions use the side texture"
+            );
+        }
     }
 }
