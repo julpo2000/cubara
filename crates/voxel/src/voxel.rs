@@ -13,17 +13,20 @@ use crate::registry::BlockRegistry;
 use crate::storage::ChunkStorage;
 
 /// What the mesher needs beyond a chunk's raw block ids: whether an id is
-/// solid, and which texture-array layer represents it. Bundled because the
-/// two always travel together and neither belongs to `cubara-voxel` alone --
-/// `layer_of` is supplied by `cubara-render`, which is the only thing that
-/// knows what a texture-array layer is (`ARCHITECTURE.md` Rule 4: this crate
-/// stays GPU-free, so it takes the mapping as a callback rather than owning
-/// it). Phase 1.4a: one layer per block id, ignoring which face -- per-face
-/// material selection is 1.4b.
+/// solid, and which texture-array layer a texture *name* occupies. Bundled
+/// because the two always travel together and neither belongs to
+/// `cubara-voxel` alone -- `layer_of` is supplied by `cubara-render`, which is
+/// the only thing that knows what a texture-array layer is (`ARCHITECTURE.md`
+/// Rule 4: this crate stays GPU-free, so it takes the mapping as a callback
+/// rather than owning it). The mesher resolves a quad's `(BlockId, Face)` to a
+/// texture *name* via `registry` (§3.2's `Sided` top/side/bottom, or `All`'s
+/// one name), then `layer_of` turns that name into a GPU layer index -- face
+/// selection is data the registry already owns, so it happens here rather
+/// than in the shader (block 1.4b, `docs/PHASE1_ARCHITECTURE.md` §11).
 #[derive(Clone, Copy)]
 pub struct MeshContext<'a> {
     pub registry: &'a BlockRegistry,
-    pub layer_of: &'a dyn Fn(BlockId) -> u32,
+    pub layer_of: &'a dyn Fn(&str) -> u32,
 }
 
 /// One cell of a greedy-mesh slice: the face orientation, its four corners'
@@ -400,7 +403,11 @@ fn push_quad(
     dv[v] = h;
 
     let face = Face::from_axis_sign(d, sign);
-    let tex_layer = (ctx.layer_of)(block);
+    let tex_layer = ctx
+        .registry
+        .texture_for_face(block, face)
+        .map(|name| (ctx.layer_of)(name))
+        .unwrap_or(0);
 
     let c0 = base;
     let c1 = [base[0] + du[0], base[1] + du[1], base[2] + du[2]];
@@ -506,9 +513,9 @@ mod tests {
         .expect("fixture registry is valid")
     }
 
-    /// Every block maps to texture layer 0 -- these tests are about geometry,
+    /// Every texture name maps to layer 0 -- these tests are about geometry,
     /// not texturing (that's `mesh::tests` and the render crate).
-    fn zero_layer(_: BlockId) -> u32 {
+    fn zero_layer(_: &str) -> u32 {
         0
     }
 
@@ -738,7 +745,7 @@ mod tests {
         // boundary; both solid, so that boundary emits no face, but the two
         // slabs' *outer* faces must stay as separate quads (different layers).
         let chunk = Chunk::from_fn(|x, _, _| if x < 8 { stone } else { soil });
-        let layer_of = |id: BlockId| if id == stone { 0 } else { 1 };
+        let layer_of = |name: &str| if name == "stone" { 0 } else { 1 };
         let mesh_ctx = MeshContext {
             registry: &two_materials,
             layer_of: &layer_of,
@@ -752,6 +759,60 @@ mod tests {
             std::collections::HashSet::from([0, 1]),
             "both materials' textures must appear, not just one"
         );
+    }
+
+    #[test]
+    fn sided_material_gives_each_face_its_own_layer() {
+        // Block 1.4b: the mesher, not the shader, resolves face direction to
+        // a texture layer -- a single isolated `Sided` block must come out of
+        // meshing with its top/bottom/side quads wearing three different
+        // layers, driven entirely by `registry.texture_for_face`.
+        let registry = BlockRegistry::from_materials(vec![(
+            std::path::PathBuf::from("grass.ron"),
+            Material {
+                name: "cubara:grass".to_string(),
+                solid: true,
+                faces: Faces::Sided {
+                    top: "grass_top".to_string(),
+                    side: "grass_side".to_string(),
+                    bottom: "soil".to_string(),
+                },
+                shapes: vec![Shape::Full],
+            },
+        )])
+        .unwrap();
+        let grass = registry.id_of("cubara:grass").unwrap();
+
+        // A single interior block: all 6 faces visible, none merged.
+        let chunk = Chunk::from_fn(|x, y, z| {
+            if (x, y, z) == (5, 5, 5) {
+                grass
+            } else {
+                BlockId::AIR
+            }
+        });
+        let layer_of = |name: &str| match name {
+            "grass_top" => 10,
+            "grass_side" => 20,
+            "soil" => 30,
+            other => panic!("unexpected texture name {other}"),
+        };
+        let mesh_ctx = MeshContext {
+            registry: &registry,
+            layer_of: &layer_of,
+        };
+        let mesh = chunk.build_mesh(&mesh_ctx);
+
+        let layer_by_face: std::collections::HashMap<Face, u32> = mesh
+            .vertices
+            .iter()
+            .map(|v| (v.face(), v.tex_layer()))
+            .collect();
+        assert_eq!(layer_by_face.get(&Face::PosY), Some(&10), "top");
+        assert_eq!(layer_by_face.get(&Face::NegY), Some(&30), "bottom");
+        for face in [Face::PosX, Face::NegX, Face::PosZ, Face::NegZ] {
+            assert_eq!(layer_by_face.get(&face), Some(&20), "side face {face:?}");
+        }
     }
 
     #[test]

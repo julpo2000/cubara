@@ -82,17 +82,24 @@ impl World {
     }
 
     /// Generate the chunk at `coord` from terrain overlaid with any player edits, or
-    /// `None` if it ends up with no solid blocks.
-    pub fn chunk_at(&self, coord: ChunkCoord) -> Option<Chunk> {
+    /// `None` if it ends up with no solid blocks. Every solid cell is `solid` --
+    /// real per-voxel material variety is block 1.5's terrain, not this one -- but
+    /// the caller supplies which id that is (resolved from its own loaded registry
+    /// by name, e.g. `registry.id_of("cubara:stone")`) rather than this crate
+    /// assuming a fixed number. `BlockId`s are assigned by sorted name per registry
+    /// (§3.4), so a hardcoded id here would silently mean a different material --
+    /// or a `Sided` one with an entirely different look -- the moment the loaded
+    /// registry's material set changed; that exact mismatch (id 1 meaning
+    /// `cubara:grass`, not `cubara:stone`, in the real 3-material registry) is what
+    /// block 1.4b's per-face resolution surfaced.
+    pub fn chunk_at(&self, coord: ChunkCoord, solid: BlockId) -> Option<Chunk> {
         let size = Chunk::SIZE as i32;
         let chunk = Chunk::from_fn(|lx, ly, lz| {
             let wx = coord.x * size + lx as i32;
             let wy = coord.y * size + ly as i32;
             let wz = coord.z * size + lz as i32;
-            // TODO(#54): BlockId::STONE stands in for every non-air block until
-            // the registry exists -- the three-material world arrives in 1.4.
             if self.is_solid_at(wx, wy, wz) {
-                BlockId::STONE
+                solid
             } else {
                 BlockId::AIR
             }
@@ -105,7 +112,7 @@ impl World {
 mod tests {
     use super::*;
     use crate::streaming;
-    use cubara_voxel::{BlockId, BlockRegistry, Faces, Material, MeshContext, Shape};
+    use cubara_voxel::{BlockRegistry, Faces, Material, MeshContext, Shape};
 
     /// A registry with a single solid material -- air (0) plus one other
     /// material sorts to id 1, matching `BlockId::STONE`, which is what
@@ -126,7 +133,7 @@ mod tests {
         .expect("fixture registry is valid")
     }
 
-    fn zero_layer(_: BlockId) -> u32 {
+    fn zero_layer(_: &str) -> u32 {
         0
     }
 
@@ -150,11 +157,12 @@ mod tests {
         let world = World::new();
         let registry = test_registry();
         let ctx = test_ctx(&registry);
+        let stone = registry.id_of("cubara:stone").unwrap();
         let coords = streaming::desired_chunks(ChunkCoord::new(0, 0, 0), 2, 0..=2);
         let mut chunks = 0usize;
         let mut tris = 0usize;
         for coord in coords {
-            if let Some(chunk) = world.chunk_at(coord) {
+            if let Some(chunk) = world.chunk_at(coord, stone) {
                 chunks += 1;
                 tris += chunk.build_mesh(&ctx).triangle_count();
             }
@@ -214,10 +222,13 @@ mod tests {
         // A chunk high in the air is empty (None) until we place a block in it.
         let mut world = World::new();
         let cc = ChunkCoord::new(0, 8, 0); // blocks y 128..143
-        assert!(world.chunk_at(cc).is_none(), "air chunk starts empty");
+        assert!(
+            world.chunk_at(cc, BlockId::STONE).is_none(),
+            "air chunk starts empty"
+        );
         world.set_block(0, 130, 0, true);
         assert!(
-            world.chunk_at(cc).is_some(),
+            world.chunk_at(cc, BlockId::STONE).is_some(),
             "placing a block makes the chunk non-empty"
         );
     }

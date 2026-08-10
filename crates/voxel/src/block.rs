@@ -16,9 +16,15 @@ impl BlockId {
     /// Always "no block". Every chunk starts out entirely this id.
     pub const AIR: BlockId = BlockId(0);
 
-    // TODO(#54): placeholder until the block registry exists. Every non-air
-    // block in phase 1 is this one id; the registry (names as identity,
-    // numbers assigned per world) replaces it, and per-face materials/textures
-    // arrive in block 1.4.
+    // A generically useful "some solid, non-air block" id for tests and
+    // fixtures that build their own single-material (or matching) registry --
+    // air is always 0, so a registry's one other material always lands here.
+    // Not safe to assume against a real, multi-material registry: ids are
+    // assigned by sorted name (§3.4), so "cubara:stone" is not id 1 in the
+    // real `assets/blocks` registry (`cubara:grass` sorts first). Block
+    // 1.4b's per-face resolution is what surfaced `World::chunk_at` wrongly
+    // assuming otherwise; that call site now takes its solid id as a
+    // parameter, resolved from the real registry by name, instead of this
+    // constant.
     pub const STONE: BlockId = BlockId(1);
 }

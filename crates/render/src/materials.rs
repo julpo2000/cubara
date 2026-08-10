@@ -9,24 +9,27 @@
 
 use std::collections::HashMap;
 
-use cubara_voxel::{BlockId, BlockRegistry};
+use cubara_voxel::BlockRegistry;
 
 const TILE_SIZE: u32 = 16;
 const TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-/// Maps each block id to the texture-array layer used for *all* its faces.
-/// Phase 1.4a: one layer per block id, not per face — per-face material
-/// selection (grass top/side/bottom) is block 1.4b.
+/// Maps a texture *name* (as authored in a material's `faces`) to its
+/// texture-array layer. Keyed by name rather than `BlockId` because face
+/// selection already happened by the time this is consulted -- the mesher
+/// resolves a quad's `(BlockId, Face)` to a texture name via the registry's
+/// `Sided`/`All` data (block 1.4b), and this is the last step, turning that
+/// name into a GPU layer index.
 pub struct TextureLayers {
-    layer_of: HashMap<BlockId, u32>,
+    layer_of: HashMap<String, u32>,
 }
 
 impl TextureLayers {
-    pub fn layer_of(&self, id: BlockId) -> u32 {
-        self.layer_of.get(&id).copied().unwrap_or(0)
+    pub fn layer_of(&self, name: &str) -> u32 {
+        self.layer_of.get(name).copied().unwrap_or(0)
     }
 
-    /// An empty mapping -- every id falls through to layer 0 via
+    /// An empty mapping -- every name falls through to layer 0 via
     /// [`layer_of`](Self::layer_of)'s default. For tests that need a
     /// [`MeshAssets`] but don't care about texturing (geometry/pooling logic
     /// tests, which shouldn't need a GPU device just to build a real texture
@@ -146,19 +149,11 @@ pub fn build(
         ..Default::default()
     });
 
-    let layer_index: HashMap<&str, u32> = names
+    let layer_of: HashMap<String, u32> = names
         .iter()
         .enumerate()
-        .map(|(i, &n)| (n, i as u32))
+        .map(|(i, &n)| (n.to_string(), i as u32))
         .collect();
-    let mut layer_of = HashMap::new();
-    for id in registry.ids() {
-        if let Some(tex) = registry.placeholder_texture(id) {
-            if let Some(&layer) = layer_index.get(tex) {
-                layer_of.insert(id, layer);
-            }
-        }
-    }
 
     (view, sampler, TextureLayers { layer_of })
 }
@@ -216,12 +211,12 @@ pub fn bind_group(
 /// travels as one `Arc` to every worker thread (`crate::mesher::MeshPool`).
 ///
 /// There is deliberately no `fn context(&self) -> MeshContext` here: a
-/// `MeshContext` borrows a `Fn(BlockId) -> u32` by reference, and that
-/// closure has to live at the call site (a method can't hand back a
-/// reference to a closure it only just created and is about to drop). Build
-/// it where it's used:
+/// `MeshContext` borrows a `Fn(&str) -> u32` by reference, and that closure
+/// has to live at the call site (a method can't hand back a reference to a
+/// closure it only just created and is about to drop). Build it where it's
+/// used:
 /// ```ignore
-/// let layer_of = |id| assets.layers.layer_of(id);
+/// let layer_of = |name: &str| assets.layers.layer_of(name);
 /// let ctx = MeshContext { registry: &assets.registry, layer_of: &layer_of };
 /// ```
 pub struct MeshAssets {

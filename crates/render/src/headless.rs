@@ -115,7 +115,7 @@ fn render_arena(
     } = shot;
 
     let (mesh_assets, tex_view, tex_sampler) = load_mesh_assets(&device, &queue);
-    let layer_of = |id| mesh_assets.layers.layer_of(id);
+    let layer_of = |name: &str| mesh_assets.layers.layer_of(name);
     let ctx = MeshContext {
         registry: &mesh_assets.registry,
         layer_of: &layer_of,

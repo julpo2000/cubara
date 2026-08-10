@@ -11,7 +11,7 @@
 /// exactly one of these -- the shader looks the normal up from this rather
 /// than carrying it as vertex data (`docs/PHASE1_ARCHITECTURE.md` §5.2).
 #[repr(u8)]
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Face {
     PosX = 0,
     NegX = 1,
