@@ -21,6 +21,7 @@
 use std::path::{Path, PathBuf};
 
 use cubara_render::headless::{self, Shot};
+use cubara_voxel::{BlockRegistry, Chunk, ChunkCoord};
 use cubara_world::World;
 
 /// Per-channel difference treated as equal. The same scene rasterises slightly
@@ -171,6 +172,86 @@ fn the_same_scene_renders_byte_identically() {
 #[test]
 fn terrain_renders_as_expected() {
     assert_golden("terrain", &World::new(), Shot::default());
+}
+
+#[test]
+fn distinct_materials_render_with_distinct_textures() {
+    // Block 1.4a's own bar: the packed vertex format carries a texture-array
+    // layer per quad, resolved from the block registry -- this must actually
+    // show up as visibly different colours on different materials, not just
+    // "the flat green constant became a flat placeholder constant". `World`
+    // can't produce mixed materials yet (worldgen is still `BlockId::STONE`-
+    // only until block 1.5), so this goes through `render_chunks` with
+    // explicit chunks instead.
+    let assets_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/blocks");
+    let registry = BlockRegistry::load(&assets_dir).expect("assets/blocks must be valid");
+    let stone = registry
+        .id_of("cubara:stone")
+        .expect("cubara:stone in registry");
+    let soil = registry
+        .id_of("cubara:soil")
+        .expect("cubara:soil in registry");
+    let grass = registry
+        .id_of("cubara:grass")
+        .expect("cubara:grass in registry");
+
+    // Three chunks in a row, each a solid block of one material.
+    let chunks = vec![
+        (ChunkCoord::new(-1, 0, 0), Chunk::from_fn(|_, _, _| stone)),
+        (ChunkCoord::new(0, 0, 0), Chunk::from_fn(|_, _, _| soil)),
+        (ChunkCoord::new(1, 0, 0), Chunk::from_fn(|_, _, _| grass)),
+    ];
+
+    let shot = Shot {
+        width: 960,
+        height: 540,
+        region_radius: 0, // unused by render_chunks -- the chunk list is explicit
+        orbit_t: 5.0,
+    };
+
+    let Some(frame) = headless::render_chunks(&chunks, shot) else {
+        eprintln!("SKIP distinct_materials_render_with_distinct_textures: no GPU adapter");
+        return;
+    };
+
+    let path = golden_dir().join("materials.png");
+
+    if std::env::var_os("CUBARA_BLESS").is_some() {
+        save_png(&path, frame.width, frame.height, &frame.pixels);
+        eprintln!("BLESSED {}", path.display());
+        return;
+    }
+
+    assert!(
+        path.exists(),
+        "no golden image at {}. If this is a new test, create it with:\n    \
+         CUBARA_BLESS=1 cargo test -p cubara-render --test golden",
+        path.display()
+    );
+
+    let (gw, gh, expected) = load_png(&path);
+    assert_eq!((gw, gh), (frame.width, frame.height));
+
+    let diff = headless::compare(&frame.pixels, &expected, TOLERANCE);
+    eprintln!(
+        "golden materials: {:.4}% differ (tolerance {TOLERANCE}, max delta {}), threshold {:.4}%",
+        diff.differing_fraction * 100.0,
+        diff.max_channel_delta,
+        MAX_DIFFERING * 100.0
+    );
+    if diff.differing_fraction > MAX_DIFFERING {
+        let actual = golden_dir().join("materials.actual.png");
+        save_png(&actual, frame.width, frame.height, &frame.pixels);
+        panic!(
+            "golden materials differs: {:.2}% of pixels exceed tolerance {TOLERANCE} \
+             (max channel delta {}), allowed {:.2}%.\n  expected: {}\n  actual:   {}",
+            diff.differing_fraction * 100.0,
+            diff.max_channel_delta,
+            MAX_DIFFERING * 100.0,
+            path.display(),
+            actual.display(),
+        );
+    }
 }
 
 #[test]

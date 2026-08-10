@@ -105,13 +105,14 @@ impl World {
 mod tests {
     use super::*;
     use crate::streaming;
-    use cubara_voxel::{BlockRegistry, Faces, Material, Shape};
+    use cubara_voxel::{BlockId, BlockRegistry, Faces, Material, MeshContext, Shape};
 
     /// A registry with a single solid material -- air (0) plus one other
     /// material sorts to id 1, matching `BlockId::STONE`, which is what
-    /// `World::chunk_at` actually assigns today (`TODO(#54)`... resolved by
-    /// this very block; the real registry from RON lands with the app, this
-    /// crate's tests only need solid-vs-air).
+    /// `World::chunk_at` actually assigns today. This crate's tests only need
+    /// solid-vs-air, not texturing, so `layer_of` is a constant stub -- the
+    /// real registry (from RON) and texture layers (from the block registry's
+    /// texture names) both live with the app, in `cubara-render`.
     fn test_registry() -> BlockRegistry {
         BlockRegistry::from_materials(vec![(
             std::path::PathBuf::from("test-fixture.ron"),
@@ -123,6 +124,17 @@ mod tests {
             },
         )])
         .expect("fixture registry is valid")
+    }
+
+    fn zero_layer(_: BlockId) -> u32 {
+        0
+    }
+
+    fn test_ctx(registry: &BlockRegistry) -> MeshContext<'_> {
+        MeshContext {
+            registry,
+            layer_of: &zero_layer,
+        }
     }
 
     #[test]
@@ -137,13 +149,14 @@ mod tests {
         // splits into more, smaller quads. Expected and accepted for the AO quality.
         let world = World::new();
         let registry = test_registry();
+        let ctx = test_ctx(&registry);
         let coords = streaming::desired_chunks(ChunkCoord::new(0, 0, 0), 2, 0..=2);
         let mut chunks = 0usize;
         let mut tris = 0usize;
         for coord in coords {
             if let Some(chunk) = world.chunk_at(coord) {
                 chunks += 1;
-                tris += chunk.build_mesh(&registry).triangle_count();
+                tris += chunk.build_mesh(&ctx).triangle_count();
             }
         }
         assert_eq!((chunks, tris), (52, 14716));

@@ -19,26 +19,40 @@ use cubara_world::{streaming, World};
 use crate::arena::ChunkArena;
 use crate::camera::FlyCamera;
 use crate::culling::Frustum;
+use crate::materials::{self, MeshAssets};
 use crate::mesher::{sort_batch, BuiltChunk, MeshPool};
 use crate::scene::SceneRenderer;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// Load the real `assets/blocks/*.ron` registry -- the same set of materials
-/// every entry point (window, `--bench`, `--screenshot`, golden tests) meshes
-/// against. `CARGO_MANIFEST_DIR` is `crates/render`, so `../..` reaches the
-/// repo root regardless of the caller's working directory.
-pub fn load_registry() -> BlockRegistry {
+/// Load the real `assets/blocks/*.ron` registry and build the texture array
+/// from it -- the same materials every entry point (window, `--bench`,
+/// `--screenshot`, golden tests) meshes and renders against.
+/// `CARGO_MANIFEST_DIR` is `crates/render`, so `../..` reaches the repo root
+/// regardless of the caller's working directory.
+///
+/// Returns the CPU-side [`MeshAssets`] (what meshing needs -- ready to `Arc`
+/// and share with worker threads) plus the texture array's view and sampler
+/// (what [`SceneRenderer`] needs to bind it); these travel separately because
+/// they're consumed in different places, not because they're built
+/// separately -- `materials::build` does both in one pass.
+pub fn load_mesh_assets(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> (MeshAssets, wgpu::TextureView, wgpu::Sampler) {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/blocks");
-    BlockRegistry::load(&dir).expect("assets/blocks must be valid")
+    let registry = BlockRegistry::load(&dir).expect("assets/blocks must be valid");
+    let (view, sampler, layers) = materials::build(device, queue, &registry);
+    (MeshAssets { registry, layers }, view, sampler)
 }
 
 const VERTEX_ATTRS: [wgpu::VertexAttribute; 3] =
-    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32];
+    wgpu::vertex_attr_array![0 => Uint32, 1 => Uint32, 2 => Uint32];
 
 /// The GPU vertex layout for [`Vertex`], which is plain data in `cubara-voxel` and
 /// knows nothing about the GPU (`ARCHITECTURE.md` Rule 3/4). The layout lives here,
-/// with the code that owns pipelines.
+/// with the code that owns pipelines. Three `u32` words, unpacked in the shader --
+/// see `docs/PHASE1_ARCHITECTURE.md` §5.2 for the bit layout.
 ///
 /// It must stay in step with the field order of [`Vertex`]; `vertex_layout_matches_vertex`
 /// below pins the stride so adding a field there fails here instead of silently
@@ -105,6 +119,15 @@ impl CameraUniform {
 /// device. Also returns whether `MULTI_DRAW_INDIRECT` made the cut, which selects
 /// the arena's fast indirect draw path over the `draw_indexed` fallback (see the
 /// #26 spike: both target backends support it, but not all do).
+///
+/// Deliberately does **not** request `INDIRECT_FIRST_INSTANCE`: block 1.4a
+/// tried building per-node origin lookup on `first_instance` +
+/// `@builtin(instance_index)` and found it unreliable in *both* directions
+/// across real CI backends -- broken with `multi_draw_indexed_indirect` on one
+/// software DX12 adapter, broken in the plain `draw_indexed` fallback on
+/// another virtualized Metal adapter, with no combination that was safe
+/// everywhere. `node_index` is a plain vertex attribute instead (§5.3), so
+/// this feature is unused now; see the design doc for the full story.
 pub fn gpu_driven_features(adapter: &wgpu::Adapter) -> (wgpu::Features, bool) {
     let features = adapter.features() & wgpu::Features::MULTI_DRAW_INDIRECT;
     let multi_draw = features.contains(wgpu::Features::MULTI_DRAW_INDIRECT);
@@ -125,9 +148,10 @@ pub struct Renderer {
 
     /// All resident chunk geometry in shared buffers, drawn with one indirect submit.
     arena: ChunkArena,
-    /// Which blocks exist and what they resolve to -- loaded once at startup,
-    /// shared with every mesh job (`ARCHITECTURE.md` Rule 4: still GPU-free).
-    registry: Arc<BlockRegistry>,
+    /// Which blocks exist and what texture layer represents each -- loaded
+    /// once at startup, shared with every mesh job (`ARCHITECTURE.md` Rule 4:
+    /// the registry half stays GPU-free; only the layer numbers came from us).
+    mesh_assets: Arc<MeshAssets>,
     /// Background worker pool that generates + meshes chunks off the main thread.
     mesh_pool: MeshPool,
     /// Finished meshes waiting to be uploaded, drained at most
@@ -207,14 +231,23 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let scene = SceneRenderer::new(&device, &queue, format, config.width, config.height);
+        let (mesh_assets, tex_view, tex_sampler) = load_mesh_assets(&device, &queue);
+        let mesh_assets = Arc::new(mesh_assets);
+        let scene = SceneRenderer::new(
+            &device,
+            &queue,
+            format,
+            config.width,
+            config.height,
+            &tex_view,
+            &tex_sampler,
+        );
 
         let aspect = config.width as f32 / config.height as f32;
         let frustum = Frustum::from_view_proj(camera.view_proj(aspect));
         let center = ChunkCoord::from_world_pos(camera.pos.to_array());
 
         let arena = ChunkArena::new(&device, multi_draw);
-        let registry = Arc::new(load_registry());
 
         let mut renderer = Self {
             window,
@@ -225,7 +258,7 @@ impl Renderer {
             scene,
             frustum,
             arena,
-            registry,
+            mesh_assets,
             mesh_pool: MeshPool::new(),
             upload_queue: VecDeque::new(),
             resident: HashMap::new(),
@@ -249,7 +282,7 @@ impl Renderer {
         self.mesh_pool.cancel(cc);
         self.mesh_pool.request(
             world,
-            &self.registry,
+            &self.mesh_assets,
             cc,
             streaming::lod_for(cc, self.center),
         );
@@ -305,7 +338,8 @@ impl Renderer {
             {
                 continue;
             }
-            self.mesh_pool.request(world, &self.registry, coord, level);
+            self.mesh_pool
+                .request(world, &self.mesh_assets, coord, level);
         }
         self.center = center;
     }
@@ -508,6 +542,28 @@ pub fn camera_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout 
     })
 }
 
+/// One world-space origin per resident chunk ("node"), read in the vertex
+/// shader (`@group(1)` in `mesh.wgsl`) by the `node_index` baked into each
+/// [`Vertex`] -- what turns a node-local packed vertex into a world position
+/// without a CPU-side translate. [`ChunkArena`] owns the actual buffer/bind
+/// group (it's tied to chunk residency); this layout is shared between that
+/// and the pipeline so the two stay structurally compatible.
+pub fn origins_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("node-origins-bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    })
+}
+
 pub fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth-texture"),
@@ -530,6 +586,8 @@ pub fn build_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
     camera_bgl: &wgpu::BindGroupLayout,
+    origins_bgl: &wgpu::BindGroupLayout,
+    textures_bgl: &wgpu::BindGroupLayout,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("mesh-shader"),
@@ -538,7 +596,7 @@ pub fn build_pipeline(
 
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("mesh-layout"),
-        bind_group_layouts: &[camera_bgl],
+        bind_group_layouts: &[camera_bgl, origins_bgl, textures_bgl],
         push_constant_ranges: &[],
     });
 
@@ -596,11 +654,11 @@ mod tests {
             layout.array_stride,
             std::mem::size_of::<Vertex>() as wgpu::BufferAddress
         );
-        assert_eq!(layout.array_stride, 28, "3 + 3 + 1 floats");
-        assert_eq!(layout.attributes.len(), 3, "position, normal, ao");
+        assert_eq!(layout.array_stride, 12, "three packed u32 words");
+        assert_eq!(layout.attributes.len(), 3, "packed0, packed1, packed2");
 
         // Offsets must land on the real field boundaries.
         let offsets: Vec<u64> = layout.attributes.iter().map(|a| a.offset).collect();
-        assert_eq!(offsets, vec![0, 12, 24]);
+        assert_eq!(offsets, vec![0, 4, 8]);
     }
 }

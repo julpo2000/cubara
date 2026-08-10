@@ -5,12 +5,12 @@
 //! is what makes a committed reference image *evidence*: if this rendered anything
 //! other than what the game renders, a passing golden test would prove nothing.
 
-use cubara_voxel::ChunkCoord;
+use cubara_voxel::{Chunk, ChunkCoord, MeshContext};
 use cubara_world::World;
 
 use crate::arena::ChunkArena;
 use crate::culling::Frustum;
-use crate::render::{gpu_driven_features, load_registry, CameraUniform};
+use crate::render::{gpu_driven_features, load_mesh_assets, CameraUniform};
 use crate::scene::SceneRenderer;
 
 /// A rendered frame: tightly-packed RGBA8, `width * height * 4` bytes.
@@ -50,6 +50,41 @@ const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// Returns `None` if no GPU adapter is available, so callers can decide whether
 /// that is a skip or a failure.
 pub fn render(world: &World, shot: Shot) -> Option<Frame> {
+    render_arena(shot, |device, queue, multi_draw, ctx| {
+        ChunkArena::from_region(
+            device,
+            queue,
+            multi_draw,
+            world,
+            ctx,
+            ChunkCoord::new(0, 0, 0),
+            shot.region_radius,
+            0..=2,
+        )
+    })
+}
+
+/// Render explicit `(coord, chunk)` pairs offscreen -- for scenes `World`
+/// can't produce yet, e.g. several distinct block ids side by side (`World`
+/// only ever assigns `BlockId::STONE`/air until real multi-material worldgen,
+/// block 1.5). Otherwise identical to [`render`]: same device setup, same
+/// [`SceneRenderer::encode_scene`] path (`ARCHITECTURE.md` Rule 5).
+pub fn render_chunks(chunks: &[(ChunkCoord, Chunk)], shot: Shot) -> Option<Frame> {
+    render_arena(shot, |device, queue, multi_draw, ctx| {
+        let mut arena = ChunkArena::new(device, multi_draw);
+        for (coord, chunk) in chunks {
+            arena.upload_chunk(queue, *coord, chunk, ctx, 0);
+        }
+        arena
+    })
+}
+
+/// Shared device setup, camera framing and readback for [`render`] and
+/// [`render_chunks`]; `build_arena` is the one part that differs between them.
+fn render_arena(
+    shot: Shot,
+    build_arena: impl FnOnce(&wgpu::Device, &wgpu::Queue, bool, &MeshContext) -> ChunkArena,
+) -> Option<Frame> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         ..Default::default()
@@ -75,21 +110,17 @@ pub fn render(world: &World, shot: Shot) -> Option<Frame> {
     let Shot {
         width,
         height,
-        region_radius,
+        region_radius: _,
         orbit_t,
     } = shot;
 
-    let registry = load_registry();
-    let mut arena = ChunkArena::from_region(
-        &device,
-        &queue,
-        multi_draw,
-        world,
-        &registry,
-        ChunkCoord::new(0, 0, 0),
-        region_radius,
-        0..=2,
-    );
+    let (mesh_assets, tex_view, tex_sampler) = load_mesh_assets(&device, &queue);
+    let layer_of = |id| mesh_assets.layers.layer_of(id);
+    let ctx = MeshContext {
+        registry: &mesh_assets.registry,
+        layer_of: &layer_of,
+    };
+    let mut arena = build_arena(&device, &queue, multi_draw, &ctx);
     let (min, max) = arena.bounds()?;
     let look_target = [
         (min[0] + max[0]) * 0.5,
@@ -106,7 +137,15 @@ pub fn render(world: &World, shot: Shot) -> Option<Frame> {
     );
     let draw_count = arena.prepare(&queue, &Frustum::from_view_proj(vp));
 
-    let mut scene = SceneRenderer::new(&device, &queue, COLOR_FORMAT, width, height);
+    let mut scene = SceneRenderer::new(
+        &device,
+        &queue,
+        COLOR_FORMAT,
+        width,
+        height,
+        &tex_view,
+        &tex_sampler,
+    );
     scene.set_camera(&queue, vp);
 
     let color = device.create_texture(&wgpu::TextureDescriptor {

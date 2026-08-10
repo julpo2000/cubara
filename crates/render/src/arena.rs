@@ -20,35 +20,42 @@
 
 use std::collections::BTreeMap;
 
-use cubara_voxel::{BlockRegistry, Chunk, ChunkCoord, Mesh, Vertex};
+use cubara_voxel::{Chunk, ChunkCoord, Mesh, MeshContext, Vertex};
 use cubara_world::{streaming, World};
 
 use crate::culling::{Aabb, Frustum};
 
-/// Mesh a chunk into world space at LOD `level` and compute its bounds — the
-/// CPU-heavy part of getting a chunk on screen, split out so it can run on a worker
-/// thread (see [`crate::mesher`]). Returns `None` for a chunk that produces no
-/// geometry. `level` 0 is full resolution; higher is coarser (see
+/// Mesh a chunk at LOD `level` and compute its **world-space** bounds — the
+/// CPU-heavy part of getting a chunk on screen, split out so it can run on a
+/// worker thread (see [`crate::mesher`]). Returns `None` for a chunk that
+/// produces no geometry. `level` 0 is full resolution; higher is coarser (see
 /// [`build_mesh_lod`](cubara_voxel::Chunk::build_mesh_lod)).
+///
+/// The returned [`Mesh`] stays node-local (§5.2) -- there is no CPU translate
+/// here, unlike before the packed vertex format. World placement is a
+/// GPU-side per-node origin add, keyed by the node index [`ChunkArena::insert`]
+/// assigns; the [`Aabb`] below is the one place this function still needs
+/// world space, since frustum culling happens on the CPU against
+/// [`ChunkCoord::world_offset`]-shifted bounds.
 pub(crate) fn build_chunk_mesh(
     coord: ChunkCoord,
     chunk: &Chunk,
-    registry: &BlockRegistry,
+    ctx: &MeshContext,
     level: u32,
 ) -> Option<(Mesh, Aabb)> {
-    let mut mesh = chunk.build_mesh_lod(registry, level);
-    mesh.translate(coord.world_offset());
+    let mesh = chunk.build_mesh_lod(ctx, level);
     if mesh.indices.is_empty() {
         return None;
     }
     let mut min = glam::Vec3::splat(f32::MAX);
     let mut max = glam::Vec3::splat(f32::MIN);
     for v in &mesh.vertices {
-        let p = glam::Vec3::from(v.position);
+        let p = glam::Vec3::new(v.x() as f32, v.y() as f32, v.z() as f32);
         min = min.min(p);
         max = max.max(p);
     }
-    Some((mesh, Aabb::new(min, max)))
+    let offset = glam::Vec3::from(coord.world_offset());
+    Some((mesh, Aabb::new(min + offset, max + offset)))
 }
 
 /// Vertex-arena capacity, in vertices (~112 MiB at 28 bytes/vertex). The heaviest
@@ -61,6 +68,50 @@ const INDEX_CAPACITY: u32 = 6_000_000;
 /// Max chunks the indirect-args buffer can hold (upper bound on visible chunks).
 /// 16k covers a square radius of ~52 chunks across the 3-high vertical band.
 const MAX_DRAWS: u32 = 16_384;
+/// Max simultaneously *resident* chunks with a node-origin slot -- unlike
+/// `MAX_DRAWS` (a per-frame visible-set cap), this bounds the whole streamed
+/// set, which is why it's sized well above `MAX_DRAWS`: radius 64 measured
+/// 25,131 resident chunks (`BENCHMARKS.md`), so 65,536 leaves ~2.6× headroom.
+const MAX_NODES: u32 = 65_536;
+
+/// A free-list index allocator over `0..MAX_NODES`, handing out the node
+/// index each resident chunk uses to find its origin in the storage buffer.
+/// The index is baked into every vertex of that chunk's mesh (`Vertex::
+/// with_node_index`, [`insert`](ChunkArena::insert)) and read back by
+/// `mesh.wgsl` from vertex data, not `@builtin(instance_index)` — see §5.3
+/// for why neither instance-indexing mechanism survived every real backend.
+/// Simpler than [`SlabAllocator`]: every unit is exactly one index, so
+/// there's no coalescing to do.
+struct NodeIndexAllocator {
+    next: u32,
+    free: Vec<u32>,
+}
+
+impl NodeIndexAllocator {
+    fn new() -> Self {
+        Self {
+            next: 0,
+            free: Vec::new(),
+        }
+    }
+
+    fn alloc(&mut self) -> Option<u32> {
+        if let Some(i) = self.free.pop() {
+            return Some(i);
+        }
+        if self.next < MAX_NODES {
+            let i = self.next;
+            self.next += 1;
+            Some(i)
+        } else {
+            None
+        }
+    }
+
+    fn free(&mut self, index: u32) {
+        self.free.push(index);
+    }
+}
 
 /// Capacity headroom for the arena's three fixed-size resources — vertices,
 /// indices and per-frame draws. `*_used` is a high-water mark (vertices/indices)
@@ -122,6 +173,10 @@ struct ChunkSlot {
     first_index: u32,
     index_count: u32,
     aabb: Aabb,
+    /// This chunk's slot in the node-origins storage buffer. Baked into every
+    /// vertex of this chunk's mesh at insert time ([`Vertex::with_node_index`]),
+    /// so `mesh.wgsl` reads it from vertex data rather than an instance index.
+    node_index: u32,
 }
 
 /// First-fit free-list suballocator over a fixed capacity of fixed-size units
@@ -207,9 +262,15 @@ pub struct ChunkArena {
     index_buffer: wgpu::Buffer,
     /// One `DrawIndexedIndirect` per visible chunk, rewritten each frame.
     indirect_buffer: wgpu::Buffer,
+    /// One world-space origin per resident chunk, indexed by the `node_index`
+    /// baked into each vertex -- what `mesh.wgsl` adds to a packed vertex's
+    /// node-local position (see [`build_chunk_mesh`]).
+    origins_buffer: wgpu::Buffer,
+    origins_bind_group: wgpu::BindGroup,
 
     vertices: SlabAllocator,
     indices: SlabAllocator,
+    nodes: NodeIndexAllocator,
     slots: BTreeMap<ChunkCoord, ChunkSlot>,
 
     /// Whether the device supports `multi_draw_indexed_indirect`.
@@ -243,18 +304,45 @@ impl ChunkArena {
             usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // vec4 (16 bytes) per node: storage buffers want their elements
+        // aligned to 16 bytes anyway, and it leaves a spare float per entry
+        // (unused today) rather than fighting alignment padding.
+        let origins_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chunk-arena-node-origins"),
+            size: MAX_NODES as u64 * 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let origins_bgl = crate::render::origins_bind_group_layout(device);
+        let origins_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("chunk-arena-node-origins-bind-group"),
+            layout: &origins_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: origins_buffer.as_entire_binding(),
+            }],
+        });
 
         Self {
             vertex_buffer,
             index_buffer,
             indirect_buffer,
+            origins_buffer,
+            origins_bind_group,
             vertices: SlabAllocator::new(VERTEX_CAPACITY),
             indices: SlabAllocator::new(INDEX_CAPACITY),
+            nodes: NodeIndexAllocator::new(),
             slots: BTreeMap::new(),
             multi_draw,
             visible: Vec::new(),
             warned_full: false,
         }
+    }
+
+    /// The bind group for `@group(1)` in `mesh.wgsl` -- the node-origins
+    /// storage buffer this arena's resident chunks are indexed into.
+    pub fn origins_bind_group(&self) -> &wgpu::BindGroup {
+        &self.origins_bind_group
     }
 
     /// Mesh `chunk` at LOD `level` and upload it — the synchronous path used by the
@@ -266,19 +354,22 @@ impl ChunkArena {
         queue: &wgpu::Queue,
         coord: ChunkCoord,
         chunk: &Chunk,
-        registry: &BlockRegistry,
+        ctx: &MeshContext,
         level: u32,
     ) -> bool {
-        match build_chunk_mesh(coord, chunk, registry, level) {
+        match build_chunk_mesh(coord, chunk, ctx, level) {
             Some((mesh, aabb)) => self.insert(queue, coord, &mesh, aabb),
             None => false,
         }
     }
 
-    /// Sub-allocate an already-built world-space `mesh` (with precomputed `aabb`)
-    /// into the shared arenas and upload it. No-op if `coord` is already resident.
-    /// Returns whether the geometry was added. This is the GPU-side step, kept off
-    /// the meshing so the latter can run on worker threads.
+    /// Sub-allocate an already-built node-local `mesh` (with precomputed
+    /// world-space `aabb`) into the shared arenas and upload it, plus a
+    /// node-origins slot recording `coord`'s world offset for the vertex
+    /// shader to add back (§5.2 -- vertices themselves stay node-local). No-op
+    /// if `coord` is already resident. Returns whether the geometry was
+    /// added. This is the GPU-side step, kept off the meshing so the latter
+    /// can run on worker threads.
     pub(crate) fn insert(
         &mut self,
         queue: &wgpu::Queue,
@@ -291,36 +382,66 @@ impl ChunkArena {
         }
         let vertex_len = mesh.vertices.len() as u32;
         let index_count = mesh.indices.len() as u32;
-        let (Some(base_vertex), Some(first_index)) = (
-            self.vertices.alloc(vertex_len),
-            self.indices.alloc(index_count),
-        ) else {
-            // Roll back a partial allocation so the arenas stay consistent.
-            if let Some(v) = self.vertices.alloc(vertex_len) {
+
+        // Attempt all three up front and name every result, so a partial
+        // failure below can free exactly what *did* succeed rather than
+        // guessing -- re-calling `alloc` in the failure branch would hand
+        // back a fresh (different) offset, not the one that leaked.
+        let base_vertex = self.vertices.alloc(vertex_len);
+        let first_index = self.indices.alloc(index_count);
+        let node_index = self.nodes.alloc();
+
+        let (Some(base_vertex), Some(first_index), Some(node_index)) =
+            (base_vertex, first_index, node_index)
+        else {
+            if let Some(v) = base_vertex {
                 self.vertices.free(v, vertex_len);
+            }
+            if let Some(i) = first_index {
+                self.indices.free(i, index_count);
+            }
+            if let Some(n) = node_index {
+                self.nodes.free(n);
             }
             if !self.warned_full {
                 log::warn!(
-                    "chunk arena full (v {}/{}, i {}/{}) — skipping chunks; raise capacity",
+                    "chunk arena full (v {}/{}, i {}/{}, nodes {}/{}) — skipping chunks; \
+                     raise capacity",
                     self.vertices.high_water,
                     VERTEX_CAPACITY,
                     self.indices.high_water,
-                    INDEX_CAPACITY
+                    INDEX_CAPACITY,
+                    self.nodes.next,
+                    MAX_NODES,
                 );
                 self.warned_full = true;
             }
             return false;
         };
 
+        // `node_index` is only known now (the mesh was built off-thread, before
+        // this chunk had an arena slot), so stamp it into every vertex here
+        // rather than baking it into `build_chunk_mesh`'s output.
+        let stamped: Vec<Vertex> = mesh
+            .vertices
+            .iter()
+            .map(|v| v.with_node_index(node_index))
+            .collect();
         queue.write_buffer(
             &self.vertex_buffer,
             base_vertex as u64 * std::mem::size_of::<Vertex>() as u64,
-            bytemuck::cast_slice(&mesh.vertices),
+            bytemuck::cast_slice(&stamped),
         );
         queue.write_buffer(
             &self.index_buffer,
             first_index as u64 * std::mem::size_of::<u32>() as u64,
             bytemuck::cast_slice(&mesh.indices),
+        );
+        let [ox, oy, oz] = coord.world_offset();
+        queue.write_buffer(
+            &self.origins_buffer,
+            node_index as u64 * 16,
+            bytemuck::bytes_of(&[ox, oy, oz, 0.0f32]),
         );
 
         self.slots.insert(
@@ -331,6 +452,7 @@ impl ChunkArena {
                 first_index,
                 index_count,
                 aabb,
+                node_index,
             },
         );
         true
@@ -341,6 +463,7 @@ impl ChunkArena {
         if let Some(slot) = self.slots.remove(&coord) {
             self.vertices.free(slot.base_vertex, slot.vertex_len);
             self.indices.free(slot.first_index, slot.index_count);
+            self.nodes.free(slot.node_index);
         }
     }
 
@@ -418,6 +541,9 @@ impl ChunkArena {
                     instance_count: 1,
                     first_index: slot.first_index,
                     base_vertex: slot.base_vertex as i32,
+                    // Not used to look up the node origin -- that index is
+                    // baked into vertex data instead (§5.3) -- so this is
+                    // always the default single-instance draw.
                     first_instance: 0,
                 });
             }
@@ -464,7 +590,7 @@ impl ChunkArena {
         queue: &wgpu::Queue,
         multi_draw: bool,
         world: &World,
-        registry: &BlockRegistry,
+        ctx: &MeshContext,
         center: ChunkCoord,
         radius: i32,
         y_range: std::ops::RangeInclusive<i32>,
@@ -474,7 +600,7 @@ impl ChunkArena {
         for coord in streaming::desired_chunks(center, radius, y_range) {
             if let Some(chunk) = world.chunk_at(coord) {
                 let level = streaming::lod_for(coord, center);
-                if arena.upload_chunk(queue, coord, &chunk, registry, level) {
+                if arena.upload_chunk(queue, coord, &chunk, ctx, level) {
                     if let Some(slot) = arena.slots.get(&coord) {
                         total_tris += slot.index_count / 3;
                     }
