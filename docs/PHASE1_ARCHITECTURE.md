@@ -30,6 +30,7 @@ Expansion-readiness here is exactly two things:
 
    | Decision | If deferred |
    |---|---|
+   | **`generate(seed, coord)` is pure** — no neighbour state, no order (§8.1) | The save format cannot regenerate unedited chunks, LOD cannot generate a far node, and the worker pool is nondeterministic. Everything below leans on this one. |
    | **Names are identity, numbers are per-world** (§3) | Every save and every mod breaks the day a block is inserted in the middle of a file. |
    | Block **shape and state live in the flat id space** (§3.5) | The voxel array grows a second field; palette compression, meshing and saves all change shape. |
    | The **save format**, designed with the block representation (§7) | The chunk layout gets designed twice, and the second one is a migration. This is why persistence is in phase 1 and not phase 2. |
@@ -462,25 +463,100 @@ geometry.
 
 ## §8 Worldgen
 
+### 8.1 The contract
+
+> **`generate(seed, coord)` is a pure function.** Generating a chunk reads
+> nothing but the seed and that chunk's own coordinate — no neighbouring chunk's
+> state, no generation order, no shared mutable scratch.
+
+This is the load-bearing invariant of the whole design, and it is stated as a
+contract because three separate things depend on it:
+
+- **§7.4 — only edited chunks are saved.** An unedited chunk is regenerated on
+  load, in isolation, in whatever order streaming happens to want it. If
+  generation depended on neighbours, "regenerate it" would not be well-defined and
+  the save format would have to persist everything.
+- **§6 — LOD.** A far node covers 512 chunks and samples its own volume directly.
+  It cannot ask what its neighbours generated; they do not exist.
+- **Rule 1 — determinism.** Order-dependent generation on a worker pool is
+  nondeterminism by construction.
+
 ```rust
 pub struct WorldGen { seed: u64 }
-impl WorldGen { fn density(&self, x: i32, y: i32, z: i32) -> f32; }
+
+impl WorldGen {
+    /// Terrain density at a world position. Positive = solid.
+    fn density(&self, x: i32, y: i32, z: i32) -> f32;
+    /// Fill a lattice of `16³` samples with `step` blocks between them.
+    fn generate(&self, origin: IVec3, step: i32) -> ChunkStorage;
+}
 ```
 
-A pure function of position and seed, with no state, no wall clock and no ambient
-RNG. Terrain is layered noise; caves are a second 3D noise field subtracted from
-the terrain density.
+`step` is what makes it LOD-native: a level-0 chunk passes `step = 1`, a level-3
+node passes `step = 8`. Nothing generates at full resolution and downsamples,
+which is the factor-of-65 in §2.
 
-**LOD-native by construction:** a node evaluates `density` on its own lattice at
-its own step size. Nothing generates at full resolution and downsamples, which is
-the factor-of-65 in §2.
+**Enforced by:** a test that generates a chunk in isolation, then generates it
+again after generating a shuffled selection of its neighbours, and asserts the two
+are bit-identical. It is cheap, and it fails the moment someone reaches for a
+neighbour.
 
-**The cross-platform float risk, stated plainly.** Rule 1 says no floating point
-where integers will do, and noise is floating point. The mitigation is that the
-*output* is thresholded to a `BlockId`, and the determinism test asserts that the
-same seed produces a **bit-identical block array on Windows and macOS** — both of
-which CI already runs. If that test ever fails, the fix is fixed-point noise, and
-we will know in phase 1 rather than discovering it in multiplayer.
+### 8.2 Positional hashing, never a stream
+
+Where generation needs randomness it uses a **hash of the position and the seed** —
+`hash(seed, x, y, z)` — never a stateful RNG advanced across chunks. A sequential
+stream makes the *n*-th value depend on how many chunks were generated before,
+which is exactly the order dependence §8.1 forbids.
+
+The world RNG in §9 is the *simulation's* RNG. Worldgen does not touch it. Two
+different mechanisms for two different jobs, and conflating them is how generation
+quietly becomes order-dependent.
+
+### 8.3 Caves are a noise field, not carved tunnels
+
+Caves are a second 3D noise field subtracted from the terrain density. The
+alternative — walking a worm along a path and carving it out — is rejected
+specifically because it breaks §8.1: a tunnel that starts in one chunk and ends
+four chunks away makes generating one chunk require knowing about a walker that
+began somewhere else. Noise is positional, so a cave crosses chunk boundaries for
+free and every chunk agrees about it without anyone being asked.
+
+### 8.4 Structures (phase 2's trees) keep the contract
+
+A tree is the first thing that genuinely wants to write outside its own chunk: a
+trunk at a chunk edge has leaves in the neighbour. The decision is recorded now,
+because the alternative would invalidate §7.4 and the save format we just chose.
+
+**A structure pass with a declared maximum radius.** Every structure kind declares
+how far it can reach, in chunks. To generate chunk C, the structure pass runs for
+every chunk within that radius of C — deciding from `hash(seed, coord)` whether a
+tree is placed there and where — and keeps only the blocks that land inside C.
+
+It is still a pure function of `(seed, coord)`. Nothing is queued, nothing is
+written into a neighbour, and no chunk needs to have been generated first. The
+cost is running the placement decision redundantly for the neighbourhood, which is
+a handful of hashes — the expensive part is the terrain density, and that is not
+repeated.
+
+Rejected: **deferred writes** ("chunk A queues leaves into chunk B"). It requires
+pending-write storage, a merge order, and it produces different results depending
+on which chunk was generated first — order dependence, on a worker pool, in the
+one system that must not have it. It is also how chunk-border artifacts happen.
+
+**Structures run at LOD level 0 only.** A tree sampled every 8 blocks is one
+stray voxel, so far nodes are terrain-only and forests appear as you approach.
+That pop is a real artifact and it is accepted for phase 1; the fixes (a coarse
+canopy term in the density function, or impostors) are measured against the budget
+in block 1.11 rather than assumed.
+
+### 8.5 The cross-platform float risk, stated plainly
+
+Rule 1 says no floating point where integers will do, and noise is floating point.
+The mitigation is that the *output* is thresholded to a `BlockId`, and the
+determinism test asserts that the same seed produces a **bit-identical block array
+on Windows and macOS** — both of which CI already runs. If that test ever fails,
+the fix is fixed-point noise, and we will know in phase 1 rather than discovering
+it in multiplayer.
 
 ---
 
@@ -566,6 +642,9 @@ nothing gameplay-related — which is the seam this section exists to protect.
 | 6 | LOD node = 2^L chunks, one mesh, one draw, 16³ samples | per-chunk voxel downsampling | draws are the binding constraint (§2); triangle reduction alone cannot reach radius 64 |
 | 7 | Skirts at LOD seams | stitched transition geometry | local and parallel-safe; stitching serialises the mesher |
 | 8 | Density function sampled at node resolution | generate full-res, downsample | 8.2M samples vs 545M for a full radius-64 load |
+| 8b | Caves as a 3D noise field | worm-walked carved tunnels | a worm starting four chunks away breaks per-chunk purity (§8.1); noise is positional and crosses borders for free |
+| 8c | Structures via a fixed-radius placement pass | deferred writes into neighbouring chunks | keeps `generate(seed, coord)` pure; deferred writes are order-dependent on a worker pool and cause border artifacts |
+| 8d | Positional hashing for generation randomness | a stateful RNG stream | a stream's *n*-th value depends on how many chunks came before — order dependence in the one system that must not have it |
 | 9 | Fixed 60 Hz tick, render-side interpolation | per-frame simulation | Rule 1; and it is a rewrite if deferred |
 | 10 | `cubara-render` loses its `cubara-world` dependency | leave it | Rule 3; it is what makes the renderer rebuildable |
 
