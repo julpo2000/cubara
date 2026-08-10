@@ -118,6 +118,9 @@ Passes only when **all** of the following hold, and it exits non-zero otherwise:
   mouth, and an LOD boundary at distance.
 - Unit tests cover: a player AABB never passes through a solid voxel, and the
   same seed produces a bit-identical chunk on both platforms.
+- **The isolation test:** a chunk generated on its own is bit-identical to the
+  same chunk generated after a shuffled selection of its neighbours. This is what
+  makes "regenerate anything that was not edited" sound — see design §8.1.
 - **The save round-trip test:** edit a world, save it, load it, and land on the
   same world-state hash — and a world file committed as a fixture loads to that
   same hash on Windows and macOS both, which CI already runs.
@@ -151,7 +154,7 @@ forces the simulation to become a real game loop.
 |---|---|---|
 | **2.1** | Items, inventory, and the hotbar | Broken blocks become items; blocks are placed from the hotbar. The first thing that makes the world feel owned. |
 | **2.2** | Crafting: recipes from data files, a crafting grid | Data-driven like the block registry, and for the same reasons. |
-| **2.3** | Trees and ores in worldgen; wood, leaves, iron ore | The content that gives 2.1 and 2.2 something to be about, and the first blocks with *behaviour* rather than just appearance. |
+| **2.3** | Trees and ores in worldgen; wood, leaves, iron ore | The content that gives 2.1 and 2.2 something to be about. A tree is also the first thing that wants to write outside its own chunk — it lands via the fixed-radius structure pass (design §8.4), which keeps generation pure and the save format sound. |
 | **2.4** | Tools, mining, and smelting: chop a tree, mine iron, run a furnace | Closes `REQUIREMENTS.md` #5's alpha definition. A furnace is the first block that owns state over time. |
 | **2.5** | ECS for entities | Arrives when there are entities worth having — dropped items and mobs — not before. [#56](../../issues/56) |
 | **2.6** | Chunk state machine: `Active ⇄ Dormant` | [#47](../../issues/47) |
