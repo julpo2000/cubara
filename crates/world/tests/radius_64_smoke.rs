@@ -26,8 +26,9 @@ use cubara_world::{streaming, World};
 const RADIUS: i32 = 64;
 
 /// Local measurement (Apple M3, release build): a radius-64 load settles in
-/// ~1 second. 120s leaves generous headroom for a slower or loaded CI runner
-/// without masking a genuine hang.
+/// ~1.3-1.4 seconds (see `BENCHMARKS.md`'s block-1.2 row for why that moved
+/// from ~250-270 ms). 120s leaves generous headroom for a slower or loaded CI
+/// runner without masking a genuine hang.
 const TIME_BUDGET: Duration = Duration::from_secs(120);
 
 /// Mirrors `cubara_render::arena::{VERTEX_CAPACITY, INDEX_CAPACITY}`. If those
