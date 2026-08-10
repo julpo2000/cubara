@@ -20,10 +20,26 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cubara_voxel::ChunkCoord;
+use cubara_voxel::{BlockRegistry, ChunkCoord, Faces, Material, Shape};
 use cubara_world::{streaming, World};
 
 const RADIUS: i32 = 64;
+
+/// A registry with a single solid material -- matches `World::chunk_at`'s
+/// current `BlockId::STONE` placeholder (block 1.4 is the real three-material
+/// registry wired into the app; this smoke test only needs solid-vs-air).
+fn test_registry() -> BlockRegistry {
+    BlockRegistry::from_materials(vec![(
+        std::path::PathBuf::from("test-fixture.ron"),
+        Material {
+            name: "cubara:stone".to_string(),
+            solid: true,
+            faces: Faces::All("stone".to_string()),
+            shapes: vec![Shape::Full],
+        },
+    )])
+    .expect("fixture registry is valid")
+}
 
 /// Local measurement (Apple M3, release build): a radius-64 load settles in
 /// ~1.3-1.4 seconds (see `BENCHMARKS.md`'s block-1.2 row for why that moved
@@ -51,13 +67,14 @@ fn radius_64_world_load_settles_within_budget() {
 
     let handle = thread::spawn(move || {
         let world = World::new();
+        let registry = test_registry();
         let mut chunks = 0u64;
         let mut vertices = 0u64;
         let mut indices = 0u64;
         for coord in coords {
             if let Some(chunk) = world.chunk_at(coord) {
                 let level = streaming::lod_for(coord, center);
-                let mesh = chunk.build_mesh_lod(level);
+                let mesh = chunk.build_mesh_lod(&registry, level);
                 if !mesh.indices.is_empty() {
                     chunks += 1;
                     vertices += mesh.vertices.len() as u64;

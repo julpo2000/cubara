@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 
-use cubara_voxel::{Chunk, ChunkCoord, Mesh, Vertex};
+use cubara_voxel::{BlockRegistry, Chunk, ChunkCoord, Mesh, Vertex};
 use cubara_world::{streaming, World};
 
 use crate::culling::{Aabb, Frustum};
@@ -33,9 +33,10 @@ use crate::culling::{Aabb, Frustum};
 pub(crate) fn build_chunk_mesh(
     coord: ChunkCoord,
     chunk: &Chunk,
+    registry: &BlockRegistry,
     level: u32,
 ) -> Option<(Mesh, Aabb)> {
-    let mut mesh = chunk.build_mesh_lod(level);
+    let mut mesh = chunk.build_mesh_lod(registry, level);
     mesh.translate(coord.world_offset());
     if mesh.indices.is_empty() {
         return None;
@@ -265,9 +266,10 @@ impl ChunkArena {
         queue: &wgpu::Queue,
         coord: ChunkCoord,
         chunk: &Chunk,
+        registry: &BlockRegistry,
         level: u32,
     ) -> bool {
-        match build_chunk_mesh(coord, chunk, level) {
+        match build_chunk_mesh(coord, chunk, registry, level) {
             Some((mesh, aabb)) => self.insert(queue, coord, &mesh, aabb),
             None => false,
         }
@@ -456,11 +458,13 @@ impl ChunkArena {
     /// distance-based LOD ([`streaming::lod_for`]) — the same scene and detail
     /// falloff the live renderer streams, exposed so the headless bench/screenshot
     /// build and draw it too.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_region(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         multi_draw: bool,
         world: &World,
+        registry: &BlockRegistry,
         center: ChunkCoord,
         radius: i32,
         y_range: std::ops::RangeInclusive<i32>,
@@ -470,7 +474,7 @@ impl ChunkArena {
         for coord in streaming::desired_chunks(center, radius, y_range) {
             if let Some(chunk) = world.chunk_at(coord) {
                 let level = streaming::lod_for(coord, center);
-                if arena.upload_chunk(queue, coord, &chunk, level) {
+                if arena.upload_chunk(queue, coord, &chunk, registry, level) {
                     if let Some(slot) = arena.slots.get(&coord) {
                         total_tris += slot.index_count / 3;
                     }

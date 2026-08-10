@@ -8,6 +8,7 @@
 
 use crate::block::BlockId;
 use crate::mesh::{Mesh, Vertex};
+use crate::registry::BlockRegistry;
 use crate::storage::ChunkStorage;
 
 /// One cell of a greedy-mesh slice: the face orientation plus its four corners'
@@ -66,16 +67,16 @@ impl Chunk {
         self.storage.set(Self::index(x, y, z), id, Self::VOLUME);
     }
 
-    // TODO(#54): once the block registry exists, this is a registry lookup --
-    // a block can be non-air and still not solid (e.g. a future transparent
-    // type). For phase 1's single non-air id, "solid" and "not air" coincide.
+    /// Whether the block at a local position is solid, per `registry`. A
+    /// block can be non-air and still not solid (e.g. a future transparent
+    /// type), so this is a real registry lookup, not just "not air".
     #[inline]
-    pub fn is_solid(&self, x: usize, y: usize, z: usize) -> bool {
-        self.get(x, y, z) != BlockId::AIR
+    pub fn is_solid(&self, registry: &BlockRegistry, x: usize, y: usize, z: usize) -> bool {
+        registry.is_solid(self.get(x, y, z))
     }
 
     /// Solidity with bounds handling: anything outside the chunk counts as empty.
-    fn solid_at(&self, x: i32, y: i32, z: i32) -> bool {
+    fn solid_at(&self, registry: &BlockRegistry, x: i32, y: i32, z: i32) -> bool {
         if x < 0 || y < 0 || z < 0 {
             return false;
         }
@@ -83,7 +84,7 @@ impl Chunk {
         if x >= Self::SIZE || y >= Self::SIZE || z >= Self::SIZE {
             return false;
         }
-        self.is_solid(x, y, z)
+        self.is_solid(registry, x, y, z)
     }
 
     /// Build a chunk by asking `f` for each local block's id.
@@ -128,8 +129,10 @@ impl Chunk {
 
     /// Greedy-mesh the chunk at full resolution (LOD 0). Vertices are in local chunk
     /// space (0..SIZE); callers offset them into the world.
-    pub fn build_mesh(&self) -> Mesh {
-        greedy_mesh(Self::SIZE as i32, 1.0, |x, y, z| self.solid_at(x, y, z))
+    pub fn build_mesh(&self, registry: &BlockRegistry) -> Mesh {
+        greedy_mesh(Self::SIZE as i32, 1.0, |x, y, z| {
+            self.solid_at(registry, x, y, z)
+        })
     }
 
     /// Greedy-mesh a downsampled copy for distant LOD. `level` halves the resolution
@@ -137,14 +140,14 @@ impl Chunk {
     /// coarse cell is solid when at least half the fine cells it covers are solid
     /// (majority, ties solid). Vertices still span 0..SIZE, so a coarse chunk keeps
     /// the same world footprint as the full one — just with far fewer triangles.
-    pub fn build_mesh_lod(&self, level: u32) -> Mesh {
+    pub fn build_mesh_lod(&self, registry: &BlockRegistry, level: u32) -> Mesh {
         let level = level.min(Self::SIZE.trailing_zeros()); // log2(SIZE)
         if level == 0 {
-            return self.build_mesh();
+            return self.build_mesh(registry);
         }
         let factor = 1i32 << level;
         let n = Self::SIZE as i32 / factor;
-        let coarse = self.downsample(level);
+        let coarse = self.downsample(registry, level);
         greedy_mesh(n, factor as f32, |x, y, z| {
             if x < 0 || y < 0 || z < 0 || x >= n || y >= n || z >= n {
                 return false;
@@ -155,7 +158,7 @@ impl Chunk {
 
     /// Majority-downsampled solidity grid at `level` (side `SIZE >> level`): each
     /// coarse cell is solid when ≥ half of the `factor³` fine cells it covers are.
-    fn downsample(&self, level: u32) -> Vec<bool> {
+    fn downsample(&self, registry: &BlockRegistry, level: u32) -> Vec<bool> {
         let factor = 1usize << level;
         let n = Self::SIZE / factor;
         let threshold = (factor * factor * factor).div_ceil(2); // ≥ half ⇒ solid
@@ -168,6 +171,7 @@ impl Chunk {
                         for dy in 0..factor {
                             for dx in 0..factor {
                                 if self.is_solid(
+                                    registry,
                                     cx * factor + dx,
                                     cy * factor + dy,
                                     cz * factor + dz,
@@ -394,6 +398,7 @@ fn push_quad(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::{Faces, Material, Shape};
 
     fn empty() -> Chunk {
         Chunk {
@@ -409,6 +414,24 @@ mod tests {
 
     fn set(chunk: &mut Chunk, x: usize, y: usize, z: usize) {
         chunk.set(x, y, z, BlockId::STONE);
+    }
+
+    /// A registry with a single solid material -- air (0) plus one other
+    /// material sorts to id 1, matching `BlockId::STONE`. Meshing tests only
+    /// care about solid-vs-air, not registry mechanics (that's
+    /// `registry::tests`), so this is the minimal fixture that makes
+    /// `BlockId::STONE` solid.
+    fn registry() -> BlockRegistry {
+        BlockRegistry::from_materials(vec![(
+            std::path::PathBuf::from("test-fixture.ron"),
+            Material {
+                name: "cubara:stone".to_string(),
+                solid: true,
+                faces: Faces::All("stone".to_string()),
+                shapes: vec![Shape::Full],
+            },
+        )])
+        .expect("fixture registry is valid")
     }
 
     fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -427,7 +450,7 @@ mod tests {
     fn single_block_makes_six_quads() {
         let mut chunk = empty();
         set(&mut chunk, 5, 5, 5);
-        let mesh = chunk.build_mesh();
+        let mesh = chunk.build_mesh(&registry());
         assert_eq!(mesh.vertices.len(), 24, "6 quads * 4 vertices");
         assert_eq!(mesh.triangle_count(), 12);
     }
@@ -435,7 +458,7 @@ mod tests {
     #[test]
     fn full_chunk_merges_each_face_into_one_quad() {
         let chunk = uniform(BlockId::STONE);
-        let mesh = chunk.build_mesh();
+        let mesh = chunk.build_mesh(&registry());
         // Only the 6 outer faces are visible, each merged into a single quad.
         assert_eq!(mesh.triangle_count(), 12);
     }
@@ -468,7 +491,7 @@ mod tests {
     fn lone_block_is_fully_lit() {
         let mut chunk = empty();
         set(&mut chunk, 5, 5, 5);
-        let mesh = chunk.build_mesh();
+        let mesh = chunk.build_mesh(&registry());
         assert!(
             mesh.vertices.iter().all(|v| v.ao == 1.0),
             "a block with no neighbours has no occluded corners"
@@ -481,7 +504,7 @@ mod tests {
         let mut chunk = empty();
         set(&mut chunk, 5, 5, 5);
         set(&mut chunk, 6, 6, 5);
-        let mesh = chunk.build_mesh();
+        let mesh = chunk.build_mesh(&registry());
         assert!(
             mesh.vertices.iter().any(|v| v.ao < 1.0),
             "a diagonal neighbour should occlude at least one corner"
@@ -506,8 +529,9 @@ mod tests {
         // A full chunk downsamples to a full coarse chunk: still six merged faces,
         // and it must occupy the same 0..16 world footprint (scale compensates).
         let chunk = uniform(BlockId::STONE);
+        let registry = registry();
         for level in 1..=4 {
-            let mesh = chunk.build_mesh_lod(level);
+            let mesh = chunk.build_mesh_lod(&registry, level);
             assert_eq!(
                 mesh.triangle_count(),
                 12,
@@ -526,7 +550,7 @@ mod tests {
         // Bottom half solid (fine y < 8) → at LOD 1 the coarse cells for y 0..4 are
         // fully solid and 4..8 empty, so it's a clean slab whose top sits at world y=8.
         let chunk = Chunk::from_fn(|_, y, _| if y < 8 { BlockId::STONE } else { BlockId::AIR });
-        let mesh = chunk.build_mesh_lod(1);
+        let mesh = chunk.build_mesh_lod(&registry(), 1);
         assert_eq!(mesh.triangle_count(), 12, "slab = six merged faces");
         let (min, max) = bounds(&mesh);
         assert_eq!((min[1], max[1]), (0.0, 8.0), "slab spans world y 0..8");
@@ -543,8 +567,9 @@ mod tests {
                 BlockId::AIR
             }
         });
-        let full = chunk.build_mesh().triangle_count();
-        let lod1 = chunk.build_mesh_lod(1).triangle_count();
+        let registry = registry();
+        let full = chunk.build_mesh(&registry).triangle_count();
+        let lod1 = chunk.build_mesh_lod(&registry, 1).triangle_count();
         assert!(
             lod1 < full,
             "LOD 1 ({lod1}) should have fewer tris than LOD 0 ({full})"
@@ -555,7 +580,7 @@ mod tests {
     fn lod_level_is_capped_not_panicking() {
         // An absurd level clamps to log2(SIZE) rather than producing an empty grid.
         let chunk = uniform(BlockId::STONE);
-        assert_eq!(chunk.build_mesh_lod(99).triangle_count(), 12);
+        assert_eq!(chunk.build_mesh_lod(&registry(), 99).triangle_count(), 12);
     }
 
     #[test]
@@ -564,7 +589,7 @@ mod tests {
         // geometric normal must agree with the stored normal.
         let mut chunk = empty();
         set(&mut chunk, 5, 5, 5);
-        let mesh = chunk.build_mesh();
+        let mesh = chunk.build_mesh(&registry());
         for quad in 0..mesh.vertices.len() / 4 {
             let v0 = mesh.vertices[quad * 4].position;
             let v1 = mesh.vertices[quad * 4 + 1].position;
@@ -604,8 +629,9 @@ mod tests {
         assert!(matches!(chunk.storage, ChunkStorage::Palette { .. }));
         assert_eq!(chunk.get(3, 4, 5), BlockId::STONE);
         assert_eq!(chunk.get(0, 0, 0), BlockId::AIR);
-        assert!(chunk.is_solid(3, 4, 5));
-        assert!(!chunk.is_solid(0, 0, 0));
+        let registry = registry();
+        assert!(chunk.is_solid(&registry, 3, 4, 5));
+        assert!(!chunk.is_solid(&registry, 0, 0, 0));
     }
 
     #[test]

@@ -9,7 +9,9 @@
 
 use std::time::Instant;
 
-use cubara_render::{gpu_driven_features, CameraUniform, ChunkArena, Frustum, SceneRenderer};
+use cubara_render::{
+    gpu_driven_features, load_registry, CameraUniform, ChunkArena, Frustum, SceneRenderer,
+};
 use cubara_voxel::ChunkCoord;
 use cubara_world::World;
 
@@ -59,11 +61,13 @@ pub fn run(radius: i32) {
     // we measure a realistically heavy world instead of the tiny fixed grid. All
     // geometry goes into one shared arena, drawn with a single indirect submit.
     let world = World::new();
+    let registry = load_registry();
     let mut arena = ChunkArena::from_region(
         &device,
         &queue,
         multi_draw,
         &world,
+        &registry,
         ChunkCoord::new(0, 0, 0),
         radius,
         0..=2,
