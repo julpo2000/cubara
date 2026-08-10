@@ -60,6 +60,38 @@ The part that binds an autonomous session:
 - **A phase ends with a report, not with the next phase** — gate output,
   benchmark deltas, what was built, what was left undone. Then the owner plays it.
 
+### "Go ahead" — the autonomous session procedure
+
+When the owner starts a session with nothing more than *go ahead* / *ga maar*,
+that means: **work the active phase, block by block, until the phase ends or you
+hit a stop condition.** Concretely, and in this order:
+
+1. `./scripts/next-block.sh` — prints the next block and the issues in it. This
+   is not a suggestion; it is the order. Do not re-derive it.
+2. Read the issue. Its **Design decisions** section is binding. If implementing
+   it requires a decision the issue does not contain, that is a defect in the
+   issue — fix the issue first, or stop and ask if it is a gameplay decision.
+3. Branch, implement, test, `cargo fmt`, clippy, `./scripts/check-architecture.sh
+   && ./scripts/check-single-render-path.sh`, PR, wait for CI, merge, delete
+   branch. Close the issue.
+4. Perf-relevant block? `cargo run --release -- --bench 64`, append the
+   `BENCHMARKS.md` row with the delta, in the same PR.
+5. Back to 1. Repeat until `next-block.sh` says there are none left.
+6. Then run the gate and **report**. Do not start the next phase.
+
+**Stop conditions — end the session and report, rather than pushing through:**
+
+- A gameplay or content decision the roadmap and design docs do not settle.
+- The exit gate is unreachable and the levers in the design doc are exhausted.
+- A block turns out to need a decision that contradicts
+  `docs/PHASE1_ARCHITECTURE.md`. Say so in the PR and change the design doc in
+  that PR, with reasoning — do not silently diverge from it.
+- CI fails for a reason you do not understand. Flag it; do not disable the check.
+
+**Never:** regenerate a golden reference image to make a test pass without saying
+so explicitly in the PR and explaining what changed and why the new image is
+correct. A silently regenerated golden is the same as having no test.
+
 ## Design decisions are the project owner's
 
 Engineering process — crate layout, refactors, test strategy, CI — is yours to
