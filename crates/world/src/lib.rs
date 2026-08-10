@@ -10,4 +10,4 @@ pub mod streaming;
 mod world;
 
 pub use raycast::{raycast, RayHit};
-pub use world::World;
+pub use world::{TerrainBlocks, World};
