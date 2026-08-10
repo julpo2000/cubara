@@ -105,6 +105,25 @@ impl World {
 mod tests {
     use super::*;
     use crate::streaming;
+    use cubara_voxel::{BlockRegistry, Faces, Material, Shape};
+
+    /// A registry with a single solid material -- air (0) plus one other
+    /// material sorts to id 1, matching `BlockId::STONE`, which is what
+    /// `World::chunk_at` actually assigns today (`TODO(#54)`... resolved by
+    /// this very block; the real registry from RON lands with the app, this
+    /// crate's tests only need solid-vs-air).
+    fn test_registry() -> BlockRegistry {
+        BlockRegistry::from_materials(vec![(
+            std::path::PathBuf::from("test-fixture.ron"),
+            Material {
+                name: "cubara:stone".to_string(),
+                solid: true,
+                faces: Faces::All("stone".to_string()),
+                shapes: vec![Shape::Full],
+            },
+        )])
+        .expect("fixture registry is valid")
+    }
 
     #[test]
     fn region_mesh_output_is_stable() {
@@ -117,13 +136,14 @@ mod tests {
         // AO-varying cells can no longer merge into the same quad, so bumpy terrain
         // splits into more, smaller quads. Expected and accepted for the AO quality.
         let world = World::new();
+        let registry = test_registry();
         let coords = streaming::desired_chunks(ChunkCoord::new(0, 0, 0), 2, 0..=2);
         let mut chunks = 0usize;
         let mut tris = 0usize;
         for coord in coords {
             if let Some(chunk) = world.chunk_at(coord) {
                 chunks += 1;
-                tris += chunk.build_mesh().triangle_count();
+                tris += chunk.build_mesh(&registry).triangle_count();
             }
         }
         assert_eq!((chunks, tris), (52, 14716));

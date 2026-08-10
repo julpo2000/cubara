@@ -1,0 +1,6 @@
+Material(
+    name:   "cubara:stone",
+    solid:  true,
+    faces:  All("stone"),
+    shapes: [Full],
+)

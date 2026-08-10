@@ -10,7 +10,7 @@ use cubara_world::World;
 
 use crate::arena::ChunkArena;
 use crate::culling::Frustum;
-use crate::render::{gpu_driven_features, CameraUniform};
+use crate::render::{gpu_driven_features, load_registry, CameraUniform};
 use crate::scene::SceneRenderer;
 
 /// A rendered frame: tightly-packed RGBA8, `width * height * 4` bytes.
@@ -79,11 +79,13 @@ pub fn render(world: &World, shot: Shot) -> Option<Frame> {
         orbit_t,
     } = shot;
 
+    let registry = load_registry();
     let mut arena = ChunkArena::from_region(
         &device,
         &queue,
         multi_draw,
         world,
+        &registry,
         ChunkCoord::new(0, 0, 0),
         region_radius,
         0..=2,

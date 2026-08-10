@@ -8,3 +8,5 @@ authors.workspace = true
 
 [dependencies]
 bytemuck.workspace = true
+serde.workspace = true
+ron.workspace = true

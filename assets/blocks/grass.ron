@@ -1,0 +1,6 @@
+Material(
+    name:   "cubara:grass",
+    solid:  true,
+    faces:  Sided(top: "grass_top", side: "grass_side", bottom: "soil"),
+    shapes: [Full],
+)

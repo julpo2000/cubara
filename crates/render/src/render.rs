@@ -7,12 +7,13 @@
 //! camera) are public so the headless bench/screenshot paths build the same scene.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
 use winit::window::{CursorGrabMode, Window};
 
-use cubara_voxel::{ChunkCoord, Vertex};
+use cubara_voxel::{BlockRegistry, ChunkCoord, Vertex};
 use cubara_world::{streaming, World};
 
 use crate::arena::ChunkArena;
@@ -22,6 +23,15 @@ use crate::mesher::{sort_batch, BuiltChunk, MeshPool};
 use crate::scene::SceneRenderer;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// Load the real `assets/blocks/*.ron` registry -- the same set of materials
+/// every entry point (window, `--bench`, `--screenshot`, golden tests) meshes
+/// against. `CARGO_MANIFEST_DIR` is `crates/render`, so `../..` reaches the
+/// repo root regardless of the caller's working directory.
+pub fn load_registry() -> BlockRegistry {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/blocks");
+    BlockRegistry::load(&dir).expect("assets/blocks must be valid")
+}
 
 const VERTEX_ATTRS: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32];
@@ -115,6 +125,9 @@ pub struct Renderer {
 
     /// All resident chunk geometry in shared buffers, drawn with one indirect submit.
     arena: ChunkArena,
+    /// Which blocks exist and what they resolve to -- loaded once at startup,
+    /// shared with every mesh job (`ARCHITECTURE.md` Rule 4: still GPU-free).
+    registry: Arc<BlockRegistry>,
     /// Background worker pool that generates + meshes chunks off the main thread.
     mesh_pool: MeshPool,
     /// Finished meshes waiting to be uploaded, drained at most
@@ -201,6 +214,7 @@ impl Renderer {
         let center = ChunkCoord::from_world_pos(camera.pos.to_array());
 
         let arena = ChunkArena::new(&device, multi_draw);
+        let registry = Arc::new(load_registry());
 
         let mut renderer = Self {
             window,
@@ -211,6 +225,7 @@ impl Renderer {
             scene,
             frustum,
             arena,
+            registry,
             mesh_pool: MeshPool::new(),
             upload_queue: VecDeque::new(),
             resident: HashMap::new(),
@@ -232,8 +247,12 @@ impl Renderer {
     /// atomically, so there's no gap.
     pub fn invalidate(&mut self, world: &Arc<World>, cc: ChunkCoord) {
         self.mesh_pool.cancel(cc);
-        self.mesh_pool
-            .request(world, cc, streaming::lod_for(cc, self.center));
+        self.mesh_pool.request(
+            world,
+            &self.registry,
+            cc,
+            streaming::lod_for(cc, self.center),
+        );
     }
 
     pub fn window(&self) -> &Window {
@@ -286,7 +305,7 @@ impl Renderer {
             {
                 continue;
             }
-            self.mesh_pool.request(world, coord, level);
+            self.mesh_pool.request(world, &self.registry, coord, level);
         }
         self.center = center;
     }

@@ -8,11 +8,13 @@
 pub mod block;
 pub mod coord;
 pub mod mesh;
+pub mod registry;
 pub mod storage;
 pub mod voxel;
 
 pub use block::BlockId;
 pub use coord::ChunkCoord;
 pub use mesh::{Mesh, Vertex};
+pub use registry::{BlockRegistry, Faces, Material, RegistryError, Shape};
 pub use storage::ChunkStorage;
 pub use voxel::Chunk;

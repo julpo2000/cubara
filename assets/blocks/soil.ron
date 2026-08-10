@@ -1,0 +1,6 @@
+Material(
+    name:   "cubara:soil",
+    solid:  true,
+    faces:  All("soil"),
+    shapes: [Full],
+)
