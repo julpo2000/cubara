@@ -39,6 +39,27 @@ They catch the violation *shapes* seen so far. They cannot catch a novel one, so
 the standing review question is still: **what fails when someone breaks this?**
 If a new rule has no answer, write a check rather than a paragraph.
 
+## Then read this: what we are building right now
+
+[`ROADMAP.md`](ROADMAP.md) says which of three phases is active, the ordered
+blocks inside it, and the **exit gate** that decides when it is finished. Phase 1
+also has a full design in
+[`docs/PHASE1_ARCHITECTURE.md`](docs/PHASE1_ARCHITECTURE.md) — read it before
+touching blocks, meshing, LOD or the tick loop; it has already made those
+decisions, with the reasons.
+
+This is written here for the same reason the architecture standard is: the file
+that gets read at the start of the work is the only place a rule actually holds.
+
+The part that binds an autonomous session:
+
+- **Work the phase's blocks in order.** Pick the next unblocked one; do not
+  freelance a nearby improvement into a phase it does not belong to.
+- **Do not move the exit gate.** If it cannot be met, report the measured number
+  and the levers tried. Changing the gate is the owner's call, never the agent's.
+- **A phase ends with a report, not with the next phase** — gate output,
+  benchmark deltas, what was built, what was left undone. Then the owner plays it.
+
 ## Design decisions are the project owner's
 
 Engineering process — crate layout, refactors, test strategy, CI — is yours to

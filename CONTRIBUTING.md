@@ -99,11 +99,16 @@ FPS is noisy at small/submit-bound scenes; lean on **CPU/frame** as the comparab
 metric until a feature makes the scene genuinely CPU- or GPU-bound. See the notes at
 the top of `BENCHMARKS.md`.
 
-## Milestones
+## Phases and milestones
 
-Each phase (M1, M2, … see PLAN.md §7) is a GitHub milestone; issues are filed under
-the milestone they belong to. `platform:` labels mark whether work is cross-platform
-(one wgpu code path) or specific to a backend.
+Work is cut into three phases with machine-checkable exit gates — see
+[`ROADMAP.md`](ROADMAP.md). Each phase is a GitHub milestone, and every issue is
+filed under the phase it belongs to; an issue that fits no phase is a sign the
+work is not scheduled yet, not a reason to start it. `platform:` labels mark
+whether work is cross-platform (one wgpu code path) or specific to a backend.
+
+A phase is finished when `./scripts/check-phase-gate.sh <n>` passes on both
+machines — not when the issues happen to be closed.
 
 ## Copyright
 

@@ -16,6 +16,8 @@ Pre-alpha — engine foundation under construction.
 |---|---|
 | [`REQUIREMENTS.md`](REQUIREMENTS.md) | Why the project exists — the founding, non-negotiable wishes. |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | **The engineering standard** — the rules the codebase holds to, and what enforces each one. |
+| [`ROADMAP.md`](ROADMAP.md) | **What ships, and when** — the three phases, their exit gates, and how autonomous work stays inside one. |
+| [`docs/PHASE1_ARCHITECTURE.md`](docs/PHASE1_ARCHITECTURE.md) | The design phase 1 implements — budgets, block identity, LOD, the tick seam. |
 | [`PLAN.md`](PLAN.md) | How the engine is built — technical decisions and the chunk/render approach. |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | How work lands: issues, PRs, required checks, verification. |
 | [`docs/ISSUE_STANDARD.md`](docs/ISSUE_STANDARD.md) | How to write an issue someone can execute without asking questions. |
