@@ -155,26 +155,26 @@ system around it from the start.
 
 ## 7. Roadmap & milestones
 
-Each milestone = a GitHub milestone with issues. The **M1 gate** is your hard
-condition: only after 1000+ FPS do we build gameplay.
+**Superseded by [`ROADMAP.md`](ROADMAP.md).** What ships and when — the three
+phases, their machine-checkable exit gates, and the autonomy contract that says
+when work stops and the owner tests — lives there and only there.
 
-| # | Milestone | Result |
-|---|---|---|
-| M0 | **Setup** | Repo, project skeleton, window + clear screen, CI green |
-| M1 | **First chunk** | Render one chunk of cubes; **1000+ FPS** in benchmark ← *gate* |
-| M2 | **Meshing & culling** | Greedy meshing, hidden-face + frustum culling, multiple chunks, simple worldgen |
-| M3 | **Streaming** | Load/unload chunks around the player; "infinite" flat world |
-| M3.5 | **GPU-driven rendering** | Shared buffers + `multi_draw_indirect`, then GPU compute culling — see §10 |
-| M4 | **LOD** | Distant chunks at lower resolution; large render distance |
-| M5 | **Player & interaction** | Camera/controller, raycasting, place/break blocks |
-| M6 | **Data-driven content** | Block registry from data files, texture atlas, base block set |
-| M7 | **Simulation** | Tick system + dormant-chunk catch-up; trees/crops grow |
-| M8 | **Persistence** | Save/load the world |
-| **Alpha** | **Playable survival** | Chop trees, mine iron — a real small world |
+The M0–M8 ladder this section used to hold was a wish list: eight milestones open
+at once with no definition of done, which is why it could not answer "what should
+I work on next". It is kept here only as the record of what already landed:
 
-**After alpha** (planned separately, with synergy first): inventory/crafting,
-items, mobs, shaders, multiplayer (`net`), expanded mod API (`modding`), more
-biomes and content toward a full modern voxel game.
+| # | Milestone | Result | |
+|---|---|---|---|
+| M0 | Setup | Repo, skeleton, window + clear screen, CI green | ✅ |
+| M1 | First chunk | One chunk of cubes; **1000+ FPS** gate met | ✅ |
+| M2 | Meshing & culling | Greedy meshing, hidden-face + frustum culling, multi-chunk worldgen | ✅ |
+| M3 | Streaming | Load/unload chunks around the camera | ✅ |
+| M3.5 | GPU-driven rendering | Shared arena + `multi_draw_indirect`; compute cull parked (§10) | ✅ step 1 |
+| M4–M8, Alpha | — | Redistributed across roadmap phases 1 and 2 | → `ROADMAP.md` |
+
+This document keeps what it is good at: the technical approach (§3–§6), the chunk
+system design (§5), and recorded findings such as §10. It no longer answers
+"what next".
 
 ---
 
