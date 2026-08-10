@@ -209,7 +209,11 @@ scheduled against phase 3's needs rather than pursued on their own.
 
 | Phase 1 | Phase 2 | Engine work, scheduled against phase 3 |
 |---|---|---|
-| #83, #46, #54, #43, #44, #48, #57, #53, #38, #52 | #56, #47, #58, #59, #60 | #28, #32, #33, #42, #36 |
+| #83, #46, #54, #55, #43, #44, #48, #57, #53, #38, #52 | #56, #47, #58, #59, #60 | #28, #32, #33, #42, #36 |
+
+Each phase is the GitHub milestone of the same name, and every open issue is
+filed under one — an issue that fits no phase is unscheduled work, not a reason
+to start.
 
 [#52](../../issues/52) (selected-block highlight) rides along with phase 1's
 player work — you cannot aim at a block you cannot see you are aiming at.
