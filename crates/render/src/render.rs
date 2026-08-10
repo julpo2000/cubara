@@ -18,7 +18,7 @@ use cubara_world::{streaming, World};
 use crate::arena::ChunkArena;
 use crate::camera::FlyCamera;
 use crate::culling::Frustum;
-use crate::mesher::{BuiltChunk, MeshPool};
+use crate::mesher::{sort_batch, BuiltChunk, MeshPool};
 use crate::scene::SceneRenderer;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -298,8 +298,11 @@ impl Renderer {
     /// stays drawn until the new upload swaps it in.
     fn drain_meshes(&mut self) {
         puffin::profile_function!();
-        // Claim everything finished; mark resident now, upload over the next frames.
-        for built in self.mesh_pool.poll() {
+        // Claim everything finished this frame, in a fixed order (ascending
+        // ChunkCoord) rather than whatever order the workers happened to finish
+        // in -- see sort_batch (issue #83). Mark resident now, upload over the
+        // next frames.
+        for built in sort_batch(self.mesh_pool.poll()) {
             self.resident.insert(built.coord, built.level);
             self.upload_queue.push_back(built);
         }
