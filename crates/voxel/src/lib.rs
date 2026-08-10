@@ -14,7 +14,7 @@ pub mod voxel;
 
 pub use block::BlockId;
 pub use coord::ChunkCoord;
-pub use mesh::{Mesh, Vertex};
+pub use mesh::{Face, Mesh, Vertex};
 pub use registry::{BlockRegistry, Faces, Material, RegistryError, Shape};
 pub use storage::ChunkStorage;
-pub use voxel::Chunk;
+pub use voxel::{Chunk, MeshContext};

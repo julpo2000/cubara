@@ -12,11 +12,12 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use cubara_voxel::{BlockRegistry, ChunkCoord, Mesh};
+use cubara_voxel::{ChunkCoord, Mesh, MeshContext};
 use cubara_world::World;
 
 use crate::arena::build_chunk_mesh;
 use crate::culling::Aabb;
+use crate::materials::MeshAssets;
 
 /// A finished meshing job: the coord, the LOD `level` it was meshed at, and its
 /// geometry — or `None` if the chunk was empty (still reported so the renderer marks
@@ -46,24 +47,30 @@ pub fn sort_batch(mut batch: Vec<BuiltChunk>) -> Vec<BuiltChunk> {
 /// Generate + mesh the chunk at `coord` at LOD `level`, as the synchronous path would.
 fn mesh_coord(
     world: &World,
-    registry: &BlockRegistry,
+    assets: &MeshAssets,
     coord: ChunkCoord,
     level: u32,
 ) -> Option<(Mesh, Aabb)> {
+    let layer_of = |id| assets.layers.layer_of(id);
+    let ctx = MeshContext {
+        registry: &assets.registry,
+        layer_of: &layer_of,
+    };
     world
         .chunk_at(coord)
-        .and_then(|chunk| build_chunk_mesh(coord, &chunk, registry, level))
+        .and_then(|chunk| build_chunk_mesh(coord, &chunk, &ctx, level))
 }
 
 /// One meshing job: what to mesh, the world snapshot to mesh it from, and the
-/// registry to resolve solidity against.
+/// mesh assets (registry + texture layers) to resolve solidity and texturing
+/// against.
 ///
 /// The snapshot travels *with* the job rather than the workers reaching for shared
 /// state (`ARCHITECTURE.md` Rule 2). An edit publishes a new [`Arc`] via
 /// [`MeshPool::request`], so a job always meshes a consistent view and readers
-/// never block a writer. The registry is loaded once at startup and never
-/// changes, so sharing one `Arc` across every job is enough (no snapshot needed).
-type Job = (Arc<World>, Arc<BlockRegistry>, ChunkCoord, u32);
+/// never block a writer. The mesh assets are loaded once at startup and never
+/// change, so sharing one `Arc` across every job is enough (no snapshot needed).
+type Job = (Arc<World>, Arc<MeshAssets>, ChunkCoord, u32);
 
 /// A pool of worker threads that mesh chunks off the main thread.
 ///
@@ -102,7 +109,7 @@ impl MeshPool {
                 std::thread::Builder::new()
                     .name("cubara-mesher".into())
                     .spawn(move || loop {
-                        let (world, registry, coord, level) = {
+                        let (world, assets, coord, level) = {
                             let rx = jobs.lock().expect("mesher job lock");
                             match rx.recv() {
                                 Ok(job) => job,
@@ -113,7 +120,7 @@ impl MeshPool {
                         let built = BuiltChunk {
                             coord,
                             level,
-                            geometry: mesh_coord(&world, &registry, coord, level),
+                            geometry: mesh_coord(&world, &assets, coord, level),
                         };
                         if results.send(built).is_err() {
                             break; // renderer gone
@@ -132,7 +139,7 @@ impl MeshPool {
     }
 
     /// Queue `coord` for meshing at LOD `level` against the `world` snapshot and
-    /// `registry`, unless that exact (coord, level) is already in flight.
+    /// `assets`, unless that exact (coord, level) is already in flight.
     /// Requesting a coord already in flight at a *different* level supersedes it
     /// — the stale result is dropped on arrival.
     ///
@@ -141,7 +148,7 @@ impl MeshPool {
     pub fn request(
         &mut self,
         world: &Arc<World>,
-        registry: &Arc<BlockRegistry>,
+        assets: &Arc<MeshAssets>,
         coord: ChunkCoord,
         level: u32,
     ) {
@@ -150,7 +157,7 @@ impl MeshPool {
             // Send can only fail if all workers died; nothing useful to do if so.
             let _ = self
                 .job_tx
-                .send((Arc::clone(world), Arc::clone(registry), coord, level));
+                .send((Arc::clone(world), Arc::clone(assets), coord, level));
         }
     }
 
@@ -202,20 +209,24 @@ mod tests {
 
     /// A registry with a single solid material -- enough for meshing tests,
     /// which only care about solid-vs-air (registry mechanics are tested in
-    /// `cubara_voxel::registry`).
-    fn test_registry() -> Arc<BlockRegistry> {
-        Arc::new(
-            BlockRegistry::from_materials(vec![(
-                std::path::PathBuf::from("test-fixture.ron"),
-                Material {
-                    name: "cubara:stone".to_string(),
-                    solid: true,
-                    faces: Faces::All("stone".to_string()),
-                    shapes: vec![Shape::Full],
-                },
-            )])
-            .expect("fixture registry is valid"),
-        )
+    /// `cubara_voxel::registry`) -- paired with an empty texture-layer map,
+    /// since these tests don't care about texturing either and shouldn't need
+    /// a GPU device just to build a real texture array.
+    fn test_assets() -> Arc<MeshAssets> {
+        let registry = cubara_voxel::BlockRegistry::from_materials(vec![(
+            std::path::PathBuf::from("test-fixture.ron"),
+            Material {
+                name: "cubara:stone".to_string(),
+                solid: true,
+                faces: Faces::All("stone".to_string()),
+                shapes: vec![Shape::Full],
+            },
+        )])
+        .expect("fixture registry is valid");
+        Arc::new(MeshAssets {
+            registry,
+            layers: crate::materials::TextureLayers::empty(),
+        })
     }
 
     #[test]
@@ -224,11 +235,11 @@ mod tests {
         // for every requested coord (including empty chunks, reported as None), at
         // the requested LOD level.
         let world = Arc::new(World::new());
-        let registry = test_registry();
+        let assets = test_assets();
         let coords = streaming::desired_chunks(ChunkCoord::new(0, 0, 0), 1, 0..=2);
         let mut pool = MeshPool::with_workers(3);
         for (i, &c) in coords.iter().enumerate() {
-            pool.request(&world, &registry, c, (i % 3) as u32); // a mix of levels 0, 1, 2
+            pool.request(&world, &assets, c, (i % 3) as u32); // a mix of levels 0, 1, 2
         }
 
         let mut got: HashMap<ChunkCoord, Option<usize>> = HashMap::new();
@@ -246,7 +257,7 @@ mod tests {
         );
         for (i, &c) in coords.iter().enumerate() {
             let expect =
-                mesh_coord(&world, &registry, c, (i % 3) as u32).map(|(m, _)| m.triangle_count());
+                mesh_coord(&world, &assets, c, (i % 3) as u32).map(|(m, _)| m.triangle_count());
             assert_eq!(got.get(&c).copied().flatten(), expect, "mismatch at {c:?}");
         }
     }
@@ -254,10 +265,10 @@ mod tests {
     #[test]
     fn cancelled_coords_are_dropped_by_poll() {
         let world = Arc::new(World::new());
-        let registry = test_registry();
+        let assets = test_assets();
         let mut pool = MeshPool::with_workers(1);
         let c = ChunkCoord::new(0, 0, 0);
-        pool.request(&world, &registry, c, 0);
+        pool.request(&world, &assets, c, 0);
         pool.cancel(c);
         // Give the worker time to finish and enqueue its (now unwanted) result.
         while !pool.in_flight().is_empty() {
@@ -272,11 +283,11 @@ mod tests {
         // Re-requesting a coord at a new level before draining supersedes the old
         // one: only the current level's mesh should ever surface.
         let world = Arc::new(World::new());
-        let registry = test_registry();
+        let assets = test_assets();
         let mut pool = MeshPool::with_workers(1);
         let c = ChunkCoord::new(0, 0, 0);
-        pool.request(&world, &registry, c, 0);
-        pool.request(&world, &registry, c, 2);
+        pool.request(&world, &assets, c, 0);
+        pool.request(&world, &assets, c, 2);
         let mut levels = Vec::new();
         while !pool.in_flight().is_empty() {
             for built in pool.poll() {
@@ -339,7 +350,7 @@ mod tests {
         };
 
         let world = World::new();
-        let registry = test_registry();
+        let assets = test_assets();
         let coords = streaming::desired_chunks(ChunkCoord::new(0, 0, 0), 3, 0..=2);
 
         // Several stand-ins for different worker-scheduling outcomes: request
@@ -359,7 +370,7 @@ mod tests {
                 .map(|&coord| BuiltChunk {
                     coord,
                     level: 0,
-                    geometry: mesh_coord(&world, &registry, coord, 0),
+                    geometry: mesh_coord(&world, &assets, coord, 0),
                 })
                 .collect();
 

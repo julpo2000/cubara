@@ -10,9 +10,9 @@
 use std::time::Instant;
 
 use cubara_render::{
-    gpu_driven_features, load_registry, CameraUniform, ChunkArena, Frustum, SceneRenderer,
+    gpu_driven_features, load_mesh_assets, CameraUniform, ChunkArena, Frustum, SceneRenderer,
 };
-use cubara_voxel::ChunkCoord;
+use cubara_voxel::{ChunkCoord, MeshContext};
 use cubara_world::World;
 
 const WIDTH: u32 = 1920;
@@ -61,13 +61,18 @@ pub fn run(radius: i32) {
     // we measure a realistically heavy world instead of the tiny fixed grid. All
     // geometry goes into one shared arena, drawn with a single indirect submit.
     let world = World::new();
-    let registry = load_registry();
+    let (mesh_assets, tex_view, tex_sampler) = load_mesh_assets(&device, &queue);
+    let layer_of = |id| mesh_assets.layers.layer_of(id);
+    let ctx = MeshContext {
+        registry: &mesh_assets.registry,
+        layer_of: &layer_of,
+    };
     let mut arena = ChunkArena::from_region(
         &device,
         &queue,
         multi_draw,
         &world,
-        &registry,
+        &ctx,
         ChunkCoord::new(0, 0, 0),
         radius,
         0..=2,
@@ -90,7 +95,15 @@ pub fn run(radius: i32) {
     );
 
     // The same scene renderer the window uses — ARCHITECTURE.md Rule 5.
-    let mut scene = SceneRenderer::new(&device, &queue, COLOR_FORMAT, WIDTH, HEIGHT);
+    let mut scene = SceneRenderer::new(
+        &device,
+        &queue,
+        COLOR_FORMAT,
+        WIDTH,
+        HEIGHT,
+        &tex_view,
+        &tex_sampler,
+    );
 
     // Offscreen colour target (the window's equivalent is the surface texture).
     let color = device.create_texture(&wgpu::TextureDescriptor {

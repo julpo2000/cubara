@@ -14,7 +14,11 @@
 use glam::Mat4;
 
 use crate::arena::ChunkArena;
-use crate::render::{build_pipeline, camera_bind_group_layout, create_depth_view, CameraUniform};
+use crate::materials;
+use crate::render::{
+    build_pipeline, camera_bind_group_layout, create_depth_view, origins_bind_group_layout,
+    CameraUniform,
+};
 use crate::text::TextRenderer;
 
 /// The sky colour a frame clears to.
@@ -34,6 +38,8 @@ pub struct SceneRenderer {
     pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    /// `@group(2)` in `mesh.wgsl`: the block texture array + sampler.
+    texture_bind_group: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
     text: TextRenderer,
     width: u32,
@@ -41,12 +47,17 @@ pub struct SceneRenderer {
 }
 
 impl SceneRenderer {
+    /// `texture_view`/`texture_sampler` are the block texture array built by
+    /// [`crate::render::load_mesh_assets`] — `SceneRenderer` only binds it,
+    /// it doesn't know about the registry that produced it.
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
         width: u32,
         height: u32,
+        texture_view: &wgpu::TextureView,
+        texture_sampler: &wgpu::Sampler,
     ) -> Self {
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("camera-uniform"),
@@ -64,10 +75,16 @@ impl SceneRenderer {
             }],
         });
 
+        let origins_bgl = origins_bind_group_layout(device);
+        let textures_bgl = materials::bind_group_layout(device);
+        let texture_bind_group =
+            materials::bind_group(device, &textures_bgl, texture_view, texture_sampler);
+
         Self {
-            pipeline: build_pipeline(device, format, &camera_bgl),
+            pipeline: build_pipeline(device, format, &camera_bgl, &origins_bgl, &textures_bgl),
             camera_buffer,
             camera_bind_group,
+            texture_bind_group,
             depth_view: create_depth_view(device, width, height),
             text: TextRenderer::new(device, queue, format),
             width,
@@ -136,6 +153,8 @@ impl SceneRenderer {
 
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(1, arena.origins_bind_group(), &[]);
+            pass.set_bind_group(2, &self.texture_bind_group, &[]);
             arena.encode(&mut pass, draw_count);
         }
 

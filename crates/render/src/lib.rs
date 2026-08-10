@@ -11,6 +11,7 @@ mod arena;
 mod camera;
 pub mod culling;
 pub mod headless;
+pub mod materials;
 mod mesher;
 pub mod profiling;
 mod render;
@@ -21,10 +22,11 @@ pub use arena::{ArenaUsage, ChunkArena};
 pub use camera::FlyCamera;
 pub use culling::{Aabb, Frustum};
 pub use headless::{Frame, Shot};
+pub use materials::MeshAssets;
 pub use profiling::Profiler;
 pub use render::{
     build_pipeline, camera_bind_group_layout, create_depth_view, gpu_driven_features, grab_cursor,
-    load_registry, CameraUniform, Renderer,
+    load_mesh_assets, CameraUniform, Renderer,
 };
 pub use scene::SceneRenderer;
 pub use text::TextRenderer;

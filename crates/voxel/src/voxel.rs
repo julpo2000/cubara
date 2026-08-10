@@ -4,28 +4,47 @@
 //! neighbour is empty) and then *greedily merges* adjacent coplanar faces into
 //! large quads, so a flat surface becomes a handful of triangles instead of one
 //! quad per block. Out-of-chunk neighbours count as empty, so the outer shell is
-//! always meshed.
+//! always meshed. Merging also requires the same block id, not just the same
+//! solidity, so a stone/soil boundary never gets one quad wearing one texture.
 
 use crate::block::BlockId;
-use crate::mesh::{Mesh, Vertex};
+use crate::mesh::{Face, Mesh, Vertex};
 use crate::registry::BlockRegistry;
 use crate::storage::ChunkStorage;
 
-/// One cell of a greedy-mesh slice: the face orientation plus its four corners'
-/// ambient-occlusion levels. Two cells only merge into one quad when they are
-/// *equal* — same orientation **and** same AO — so AO discontinuities (near edges
-/// and crevices) correctly split the merge instead of interpolating wrong.
+/// What the mesher needs beyond a chunk's raw block ids: whether an id is
+/// solid, and which texture-array layer represents it. Bundled because the
+/// two always travel together and neither belongs to `cubara-voxel` alone --
+/// `layer_of` is supplied by `cubara-render`, which is the only thing that
+/// knows what a texture-array layer is (`ARCHITECTURE.md` Rule 4: this crate
+/// stays GPU-free, so it takes the mapping as a callback rather than owning
+/// it). Phase 1.4a: one layer per block id, ignoring which face -- per-face
+/// material selection is 1.4b.
+#[derive(Clone, Copy)]
+pub struct MeshContext<'a> {
+    pub registry: &'a BlockRegistry,
+    pub layer_of: &'a dyn Fn(BlockId) -> u32,
+}
+
+/// One cell of a greedy-mesh slice: the face orientation, its four corners'
+/// ambient-occlusion levels, and which block it belongs to. Two cells only
+/// merge into one quad when they are *equal* -- same orientation, same AO,
+/// **and** same block -- so AO discontinuities and material boundaries both
+/// correctly split the merge instead of blending into one wrong quad.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Face {
+struct MaskCell {
     /// 0 = no face here, +1 = faces toward +axis, -1 = toward -axis.
     sign: i8,
     /// Per-corner occlusion 0..=3 (3 = unoccluded/bright), in corner order c0..c3.
     ao: [u8; 4],
+    /// The solid block this face belongs to (meaningless when `sign == 0`).
+    block: BlockId,
 }
 
-const NO_FACE: Face = Face {
+const NO_CELL: MaskCell = MaskCell {
     sign: 0,
     ao: [0; 4],
+    block: BlockId::AIR,
 };
 
 /// Standard voxel ambient occlusion for one face corner from its three neighbouring
@@ -75,16 +94,19 @@ impl Chunk {
         registry.is_solid(self.get(x, y, z))
     }
 
-    /// Solidity with bounds handling: anything outside the chunk counts as empty.
-    fn solid_at(&self, registry: &BlockRegistry, x: i32, y: i32, z: i32) -> bool {
+    /// The block id at a local position, with bounds handling: anything
+    /// outside the chunk counts as air. The mesher's primitive -- unlike
+    /// [`is_solid`](Self::is_solid) it doesn't collapse to a bool, since a
+    /// greedy quad also needs to know *which* block it belongs to.
+    fn block_at(&self, x: i32, y: i32, z: i32) -> BlockId {
         if x < 0 || y < 0 || z < 0 {
-            return false;
+            return BlockId::AIR;
         }
         let (x, y, z) = (x as usize, y as usize, z as usize);
         if x >= Self::SIZE || y >= Self::SIZE || z >= Self::SIZE {
-            return false;
+            return BlockId::AIR;
         }
-        self.is_solid(registry, x, y, z)
+        self.get(x, y, z)
     }
 
     /// Build a chunk by asking `f` for each local block's id.
@@ -127,61 +149,77 @@ impl Chunk {
         }
     }
 
-    /// Greedy-mesh the chunk at full resolution (LOD 0). Vertices are in local chunk
-    /// space (0..SIZE); callers offset them into the world.
-    pub fn build_mesh(&self, registry: &BlockRegistry) -> Mesh {
-        greedy_mesh(Self::SIZE as i32, 1.0, |x, y, z| {
-            self.solid_at(registry, x, y, z)
-        })
+    /// Greedy-mesh the chunk at full resolution (LOD 0). Vertices are node-local
+    /// (0..SIZE); placing the chunk in the world is a GPU-side per-node origin,
+    /// not something done here.
+    pub fn build_mesh(&self, ctx: &MeshContext) -> Mesh {
+        greedy_mesh(Self::SIZE as i32, 1, |x, y, z| self.block_at(x, y, z), ctx)
     }
 
     /// Greedy-mesh a downsampled copy for distant LOD. `level` halves the resolution
     /// each step (0 = full 16³, 1 = 8³, 2 = 4³, …), capped so the grid stays ≥ 1³. A
     /// coarse cell is solid when at least half the fine cells it covers are solid
-    /// (majority, ties solid). Vertices still span 0..SIZE, so a coarse chunk keeps
-    /// the same world footprint as the full one — just with far fewer triangles.
-    pub fn build_mesh_lod(&self, registry: &BlockRegistry, level: u32) -> Mesh {
+    /// (majority, ties solid), taking on the first solid fine cell's id as its
+    /// representative material. Vertices still span 0..SIZE, so a coarse chunk
+    /// keeps the same world footprint as the full one — just with far fewer
+    /// triangles.
+    pub fn build_mesh_lod(&self, ctx: &MeshContext, level: u32) -> Mesh {
         let level = level.min(Self::SIZE.trailing_zeros()); // log2(SIZE)
         if level == 0 {
-            return self.build_mesh(registry);
+            return self.build_mesh(ctx);
         }
         let factor = 1i32 << level;
         let n = Self::SIZE as i32 / factor;
-        let coarse = self.downsample(registry, level);
-        greedy_mesh(n, factor as f32, |x, y, z| {
-            if x < 0 || y < 0 || z < 0 || x >= n || y >= n || z >= n {
-                return false;
-            }
-            coarse[((z * n + y) * n + x) as usize]
-        })
+        let coarse = self.downsample(ctx.registry, level);
+        greedy_mesh(
+            n,
+            factor,
+            |x, y, z| {
+                if x < 0 || y < 0 || z < 0 || x >= n || y >= n || z >= n {
+                    BlockId::AIR
+                } else {
+                    coarse[((z * n + y) * n + x) as usize]
+                }
+            },
+            ctx,
+        )
     }
 
-    /// Majority-downsampled solidity grid at `level` (side `SIZE >> level`): each
-    /// coarse cell is solid when ≥ half of the `factor³` fine cells it covers are.
-    fn downsample(&self, registry: &BlockRegistry, level: u32) -> Vec<bool> {
+    /// Majority-downsampled block grid at `level` (side `SIZE >> level`): each
+    /// coarse cell is solid when ≥ half of the `factor³` fine cells it covers
+    /// are, taking the first solid fine cell's id as its representative
+    /// material. Phase 1 has one non-air id in the whole world, so "first" is
+    /// exact; true majority tie-breaking across materials is untested until
+    /// real multi-material terrain lands, and isn't needed before then.
+    fn downsample(&self, registry: &BlockRegistry, level: u32) -> Vec<BlockId> {
         let factor = 1usize << level;
         let n = Self::SIZE / factor;
         let threshold = (factor * factor * factor).div_ceil(2); // ≥ half ⇒ solid
-        let mut coarse = vec![false; n * n * n];
+        let mut coarse = vec![BlockId::AIR; n * n * n];
         for cz in 0..n {
             for cy in 0..n {
                 for cx in 0..n {
-                    let mut count = 0usize;
+                    let mut solid_count = 0usize;
+                    let mut representative = BlockId::AIR;
                     for dz in 0..factor {
                         for dy in 0..factor {
                             for dx in 0..factor {
-                                if self.is_solid(
-                                    registry,
-                                    cx * factor + dx,
-                                    cy * factor + dy,
-                                    cz * factor + dz,
-                                ) {
-                                    count += 1;
+                                let id =
+                                    self.get(cx * factor + dx, cy * factor + dy, cz * factor + dz);
+                                if registry.is_solid(id) {
+                                    solid_count += 1;
+                                    if representative == BlockId::AIR {
+                                        representative = id;
+                                    }
                                 }
                             }
                         }
                     }
-                    coarse[(cz * n + cy) * n + cx] = count >= threshold;
+                    coarse[(cz * n + cy) * n + cx] = if solid_count >= threshold {
+                        representative
+                    } else {
+                        BlockId::AIR
+                    };
                 }
             }
         }
@@ -190,14 +228,22 @@ impl Chunk {
 }
 
 /// Greedy mesher over any cubic grid. Sweeps slices along each axis, builds a
-/// per-slice mask of visible faces (orientation + per-corner AO), and merges equal
-/// cells into the largest quads. `is_solid` answers solidity in grid space (out of
-/// bounds = empty); `scale` multiplies vertex positions (1 for full res, `factor`
-/// for a downsampled LOD), keeping the world footprint constant.
-fn greedy_mesh(n: i32, scale: f32, is_solid: impl Fn(i32, i32, i32) -> bool) -> Mesh {
+/// per-slice mask of visible faces (orientation + per-corner AO + block), and
+/// merges equal cells into the largest quads. `block_at` answers the block id
+/// in grid space (out of bounds = air); `scale` multiplies vertex positions (1
+/// for full res, `factor` for a downsampled LOD), keeping the world footprint
+/// constant. Positions stay integers throughout -- the packed [`Vertex`]
+/// format has no room for fractional coordinates, and greedy-meshed corners
+/// never need one.
+fn greedy_mesh(
+    n: i32,
+    scale: i32,
+    block_at: impl Fn(i32, i32, i32) -> BlockId,
+    ctx: &MeshContext,
+) -> Mesh {
     let mut mesh = Mesh::default();
     // `mask[v * n + u]`: the face at each slice cell.
-    let mut mask = vec![NO_FACE; (n * n) as usize];
+    let mut mask = vec![NO_CELL; (n * n) as usize];
 
     for d in 0..3usize {
         let u = (d + 1) % 3;
@@ -215,8 +261,10 @@ fn greedy_mesh(n: i32, scale: f32, is_solid: impl Fn(i32, i32, i32) -> bool) -> 
                 pos[v] = vv;
                 for uu in 0..n {
                     pos[u] = uu;
-                    let a = is_solid(pos[0], pos[1], pos[2]);
-                    let b = is_solid(pos[0] + step[0], pos[1] + step[1], pos[2] + step[2]);
+                    let a_id = block_at(pos[0], pos[1], pos[2]);
+                    let b_id = block_at(pos[0] + step[0], pos[1] + step[1], pos[2] + step[2]);
+                    let a = ctx.registry.is_solid(a_id);
+                    let b = ctx.registry.is_solid(b_id);
                     let sign = if a == b {
                         0
                     } else if a {
@@ -225,14 +273,16 @@ fn greedy_mesh(n: i32, scale: f32, is_solid: impl Fn(i32, i32, i32) -> bool) -> 
                         -1
                     };
                     mask[idx] = if sign == 0 {
-                        NO_FACE
+                        NO_CELL
                     } else {
                         // Occluders sit on the empty side of the face plane. pos[d]
                         // is still the pre-advance boundary here.
                         let air_d = if sign == 1 { pos[d] + 1 } else { pos[d] };
-                        Face {
+                        let block = if sign == 1 { a_id } else { b_id };
+                        MaskCell {
                             sign,
-                            ao: face_ao(&is_solid, d, u, v, air_d, uu, vv),
+                            ao: face_ao(&block_at, ctx.registry, d, u, v, air_d, uu, vv),
+                            block,
                         }
                     };
                     idx += 1;
@@ -253,7 +303,7 @@ fn greedy_mesh(n: i32, scale: f32, is_solid: impl Fn(i32, i32, i32) -> bool) -> 
                     }
 
                     // Grow the quad width along u, then height along v — only over
-                    // cells with an identical face (same orientation *and* AO).
+                    // cells with an identical face (same orientation, AO *and* block).
                     let mut w = 1i32;
                     while i + w < n && mask[(j * n + i + w) as usize] == m {
                         w += 1;
@@ -268,12 +318,14 @@ fn greedy_mesh(n: i32, scale: f32, is_solid: impl Fn(i32, i32, i32) -> bool) -> 
                         h += 1;
                     }
 
-                    push_quad(&mut mesh, d, u, v, pos[d], i, j, w, h, m.sign, m.ao, scale);
+                    push_quad(
+                        &mut mesh, d, u, v, pos[d], i, j, w, h, m.sign, m.ao, m.block, ctx, scale,
+                    );
 
                     // Consume the merged cells.
                     for l in 0..h {
                         for k in 0..w {
-                            mask[((j + l) * n + i + k) as usize] = NO_FACE;
+                            mask[((j + l) * n + i + k) as usize] = NO_CELL;
                         }
                     }
                     i += w;
@@ -288,8 +340,10 @@ fn greedy_mesh(n: i32, scale: f32, is_solid: impl Fn(i32, i32, i32) -> bool) -> 
 /// The four corners' AO for the face cell at (`uu`,`vv`) whose empty side is the
 /// `air_d` layer along axis `d`. Corner order matches `push_quad`'s c0..c3:
 /// (0,0), (1,0), (1,1), (0,1) in the (`u`,`v`) axes.
+#[allow(clippy::too_many_arguments)]
 fn face_ao(
-    is_solid: &impl Fn(i32, i32, i32) -> bool,
+    block_at: &impl Fn(i32, i32, i32) -> BlockId,
+    registry: &BlockRegistry,
     d: usize,
     u: usize,
     v: usize,
@@ -302,7 +356,7 @@ fn face_ao(
         p[d] = air_d;
         p[u] = uu + du;
         p[v] = vv + dv;
-        is_solid(p[0], p[1], p[2])
+        registry.is_solid(block_at(p[0], p[1], p[2]))
     };
     let mut ao = [3u8; 4];
     for (k, (cu, cv)) in [(0, 0), (1, 0), (1, 1), (0, 1)].iter().enumerate() {
@@ -314,9 +368,11 @@ fn face_ao(
 }
 
 /// Emit one merged quad on the plane `plane` along axis `d`, spanning `w`×`h` cells
-/// in the (`u`,`v`) axes starting at (`i`,`j`), with orientation `sign` (±1) and
-/// per-corner AO `ao` (levels 0..=3, corner order c0..c3). `scale` multiplies grid
-/// coordinates into local space (>1 for downsampled LOD meshes).
+/// in the (`u`,`v`) axes starting at (`i`,`j`), with orientation `sign` (±1), per-corner
+/// AO `ao` (levels 0..=3, corner order c0..c3), and the `block` the quad belongs to
+/// (resolved to a texture layer via `ctx`). `scale` multiplies grid coordinates into
+/// local space (>1 for downsampled LOD meshes) -- always an integer, so the result is
+/// always an exact lattice coordinate for the packed [`Vertex`] format.
 #[allow(clippy::too_many_arguments)]
 fn push_quad(
     mesh: &mut Mesh,
@@ -330,7 +386,9 @@ fn push_quad(
     h: i32,
     sign: i8,
     ao: [u8; 4],
-    scale: f32,
+    block: BlockId,
+    ctx: &MeshContext,
+    scale: i32,
 ) {
     let mut base = [0i32; 3];
     base[d] = plane;
@@ -341,16 +399,9 @@ fn push_quad(
     let mut dv = [0i32; 3];
     dv[v] = h;
 
-    let mut normal = [0.0f32; 3];
-    normal[d] = sign as f32;
+    let face = Face::from_axis_sign(d, sign);
+    let tex_layer = (ctx.layer_of)(block);
 
-    let corner = |c: [i32; 3]| -> [f32; 3] {
-        [
-            c[0] as f32 * scale,
-            c[1] as f32 * scale,
-            c[2] as f32 * scale,
-        ]
-    };
     let c0 = base;
     let c1 = [base[0] + du[0], base[1] + du[1], base[2] + du[2]];
     let c2 = [
@@ -360,21 +411,42 @@ fn push_quad(
     ];
     let c3 = [base[0] + dv[0], base[1] + dv[1], base[2] + dv[2]];
 
+    // Each corner's own texel-tile coordinate: (0,0) at the origin corner,
+    // stepping to (w,h) at the far corner -- one tile per grid cell, tiling
+    // the texture across the merged quad.
+    let uv0 = (0, 0);
+    let uv1 = (w, 0);
+    let uv2 = (w, h);
+    let uv3 = (0, h);
+
     // (du × dv) points toward +d, so keep that order for +d faces and reverse for -d
-    // faces to stay outward/CCW for back-face culling. AO follows the same reorder.
-    let (verts, vao) = if sign == 1 {
-        ([c0, c1, c2, c3], [ao[0], ao[1], ao[2], ao[3]])
+    // faces to stay outward/CCW for back-face culling. AO and UV follow the same reorder.
+    let (verts, uvs, vao) = if sign == 1 {
+        (
+            [c0, c1, c2, c3],
+            [uv0, uv1, uv2, uv3],
+            [ao[0], ao[1], ao[2], ao[3]],
+        )
     } else {
-        ([c0, c3, c2, c1], [ao[0], ao[3], ao[2], ao[1]])
+        (
+            [c0, c3, c2, c1],
+            [uv0, uv3, uv2, uv1],
+            [ao[0], ao[3], ao[2], ao[1]],
+        )
     };
 
     let start = mesh.vertices.len() as u32;
-    for (c, a) in verts.iter().zip(vao) {
-        mesh.vertices.push(Vertex {
-            position: corner(*c),
-            normal,
-            ao: a as f32 / 3.0,
-        });
+    for ((c, (cu, cv)), a) in verts.iter().zip(uvs).zip(vao) {
+        mesh.vertices.push(Vertex::new(
+            (c[0] * scale) as u32,
+            (c[1] * scale) as u32,
+            (c[2] * scale) as u32,
+            a as u32,
+            face,
+            tex_layer,
+            cu as u32,
+            cv as u32,
+        ));
     }
 
     // Pick the diagonal that connects the two most-similar corners, so the darkened
@@ -434,6 +506,19 @@ mod tests {
         .expect("fixture registry is valid")
     }
 
+    /// Every block maps to texture layer 0 -- these tests are about geometry,
+    /// not texturing (that's `mesh::tests` and the render crate).
+    fn zero_layer(_: BlockId) -> u32 {
+        0
+    }
+
+    fn ctx(registry: &BlockRegistry) -> MeshContext<'_> {
+        MeshContext {
+            registry,
+            layer_of: &zero_layer,
+        }
+    }
+
     fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
         [
             a[1] * b[2] - a[2] * b[1],
@@ -446,11 +531,16 @@ mod tests {
         [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
     }
 
+    fn position(v: Vertex) -> [f32; 3] {
+        [v.x() as f32, v.y() as f32, v.z() as f32]
+    }
+
     #[test]
     fn single_block_makes_six_quads() {
         let mut chunk = empty();
         set(&mut chunk, 5, 5, 5);
-        let mesh = chunk.build_mesh(&registry());
+        let registry = registry();
+        let mesh = chunk.build_mesh(&ctx(&registry));
         assert_eq!(mesh.vertices.len(), 24, "6 quads * 4 vertices");
         assert_eq!(mesh.triangle_count(), 12);
     }
@@ -458,7 +548,8 @@ mod tests {
     #[test]
     fn full_chunk_merges_each_face_into_one_quad() {
         let chunk = uniform(BlockId::STONE);
-        let mesh = chunk.build_mesh(&registry());
+        let registry = registry();
+        let mesh = chunk.build_mesh(&ctx(&registry));
         // Only the 6 outer faces are visible, each merged into a single quad.
         assert_eq!(mesh.triangle_count(), 12);
     }
@@ -491,9 +582,10 @@ mod tests {
     fn lone_block_is_fully_lit() {
         let mut chunk = empty();
         set(&mut chunk, 5, 5, 5);
-        let mesh = chunk.build_mesh(&registry());
+        let registry = registry();
+        let mesh = chunk.build_mesh(&ctx(&registry));
         assert!(
-            mesh.vertices.iter().all(|v| v.ao == 1.0),
+            mesh.vertices.iter().all(|v| v.ao() == 3),
             "a block with no neighbours has no occluded corners"
         );
     }
@@ -504,9 +596,10 @@ mod tests {
         let mut chunk = empty();
         set(&mut chunk, 5, 5, 5);
         set(&mut chunk, 6, 6, 5);
-        let mesh = chunk.build_mesh(&registry());
+        let registry = registry();
+        let mesh = chunk.build_mesh(&ctx(&registry));
         assert!(
-            mesh.vertices.iter().any(|v| v.ao < 1.0),
+            mesh.vertices.iter().any(|v| v.ao() < 3),
             "a diagonal neighbour should occlude at least one corner"
         );
     }
@@ -515,10 +608,11 @@ mod tests {
     fn bounds(mesh: &Mesh) -> ([f32; 3], [f32; 3]) {
         let mut min = [f32::MAX; 3];
         let mut max = [f32::MIN; 3];
-        for v in &mesh.vertices {
+        for &v in &mesh.vertices {
+            let p = position(v);
             for a in 0..3 {
-                min[a] = min[a].min(v.position[a]);
-                max[a] = max[a].max(v.position[a]);
+                min[a] = min[a].min(p[a]);
+                max[a] = max[a].max(p[a]);
             }
         }
         (min, max)
@@ -530,8 +624,9 @@ mod tests {
         // and it must occupy the same 0..16 world footprint (scale compensates).
         let chunk = uniform(BlockId::STONE);
         let registry = registry();
+        let ctx = ctx(&registry);
         for level in 1..=4 {
-            let mesh = chunk.build_mesh_lod(&registry, level);
+            let mesh = chunk.build_mesh_lod(&ctx, level);
             assert_eq!(
                 mesh.triangle_count(),
                 12,
@@ -550,7 +645,8 @@ mod tests {
         // Bottom half solid (fine y < 8) → at LOD 1 the coarse cells for y 0..4 are
         // fully solid and 4..8 empty, so it's a clean slab whose top sits at world y=8.
         let chunk = Chunk::from_fn(|_, y, _| if y < 8 { BlockId::STONE } else { BlockId::AIR });
-        let mesh = chunk.build_mesh_lod(&registry(), 1);
+        let registry = registry();
+        let mesh = chunk.build_mesh_lod(&ctx(&registry), 1);
         assert_eq!(mesh.triangle_count(), 12, "slab = six merged faces");
         let (min, max) = bounds(&mesh);
         assert_eq!((min[1], max[1]), (0.0, 8.0), "slab spans world y 0..8");
@@ -568,8 +664,9 @@ mod tests {
             }
         });
         let registry = registry();
-        let full = chunk.build_mesh(&registry).triangle_count();
-        let lod1 = chunk.build_mesh_lod(&registry, 1).triangle_count();
+        let ctx = ctx(&registry);
+        let full = chunk.build_mesh(&ctx).triangle_count();
+        let lod1 = chunk.build_mesh_lod(&ctx, 1).triangle_count();
         assert!(
             lod1 < full,
             "LOD 1 ({lod1}) should have fewer tris than LOD 0 ({full})"
@@ -580,25 +677,81 @@ mod tests {
     fn lod_level_is_capped_not_panicking() {
         // An absurd level clamps to log2(SIZE) rather than producing an empty grid.
         let chunk = uniform(BlockId::STONE);
-        assert_eq!(chunk.build_mesh_lod(&registry(), 99).triangle_count(), 12);
+        let registry = registry();
+        assert_eq!(
+            chunk.build_mesh_lod(&ctx(&registry), 99).triangle_count(),
+            12
+        );
     }
 
     #[test]
     fn quads_are_wound_outward() {
         // Back-face culling relies on every quad being wound CCW/outward, i.e. the
-        // geometric normal must agree with the stored normal.
+        // geometric normal must agree with the stored (looked-up) normal.
         let mut chunk = empty();
         set(&mut chunk, 5, 5, 5);
-        let mesh = chunk.build_mesh(&registry());
+        let registry = registry();
+        let mesh = chunk.build_mesh(&ctx(&registry));
         for quad in 0..mesh.vertices.len() / 4 {
-            let v0 = mesh.vertices[quad * 4].position;
-            let v1 = mesh.vertices[quad * 4 + 1].position;
-            let v2 = mesh.vertices[quad * 4 + 2].position;
+            let v0 = position(mesh.vertices[quad * 4]);
+            let v1 = position(mesh.vertices[quad * 4 + 1]);
+            let v2 = position(mesh.vertices[quad * 4 + 2]);
             let geo = cross(sub(v1, v0), sub(v2, v0));
-            let n = mesh.vertices[quad * 4].normal;
+            let n = mesh.vertices[quad * 4].face().normal();
             let dot = geo[0] * n[0] + geo[1] * n[1] + geo[2] * n[2];
             assert!(dot > 0.0, "quad {quad} is wound inward (geo·n = {dot})");
         }
+    }
+
+    #[test]
+    fn distinct_blocks_never_share_a_merged_quad() {
+        // Two adjacent solid materials must not be merged into one quad, even
+        // though neither emits a face at their shared boundary (both solid) --
+        // otherwise a stone/soil border would render as a single quad wearing
+        // one texture. A dedicated registry with two distinct solid materials,
+        // since the shared `registry()` fixture only has one.
+        let two_materials = BlockRegistry::from_materials(vec![
+            (
+                std::path::PathBuf::from("a.ron"),
+                Material {
+                    name: "cubara:stone".to_string(),
+                    solid: true,
+                    faces: Faces::All("stone".to_string()),
+                    shapes: vec![Shape::Full],
+                },
+            ),
+            (
+                std::path::PathBuf::from("b.ron"),
+                Material {
+                    name: "cubara:soil".to_string(),
+                    solid: true,
+                    faces: Faces::All("soil".to_string()),
+                    shapes: vec![Shape::Full],
+                },
+            ),
+        ])
+        .unwrap();
+        let stone = two_materials.id_of("cubara:stone").unwrap();
+        let soil = two_materials.id_of("cubara:soil").unwrap();
+
+        // A slab of stone next to a slab of soil, sharing an internal x=8
+        // boundary; both solid, so that boundary emits no face, but the two
+        // slabs' *outer* faces must stay as separate quads (different layers).
+        let chunk = Chunk::from_fn(|x, _, _| if x < 8 { stone } else { soil });
+        let layer_of = |id: BlockId| if id == stone { 0 } else { 1 };
+        let mesh_ctx = MeshContext {
+            registry: &two_materials,
+            layer_of: &layer_of,
+        };
+        let mesh = chunk.build_mesh(&mesh_ctx);
+
+        let layers: std::collections::HashSet<u32> =
+            mesh.vertices.iter().map(|v| v.tex_layer()).collect();
+        assert_eq!(
+            layers,
+            std::collections::HashSet::from([0, 1]),
+            "both materials' textures must appear, not just one"
+        );
     }
 
     #[test]

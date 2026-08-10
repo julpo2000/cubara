@@ -54,6 +54,8 @@ frames after 200 warmup.
 | 2026-07-22 | Deterministic draw order (BTreeMap) [#81]¹⁰ | 1,349 | 361,326 | ~1,865 | 0.364 ms | ~0.92 ms | `fix/deterministic-draw-order` |
 | 2026-08-10 | **Radius-64 baseline — the phase 1 gate, first measured** [#89]¹¹ | 25,131 | 762,516 | ~996¹¹ | 0.715 ms | ~1.14 ms | `49146ef` |
 | 2026-08-10 | `BlockId` + per-chunk palette compression [#46]¹² | 25,131 | 762,516 | ~991 | 0.720 ms | ~1.23 ms | `174a2ce` |
+| 2026-08-10 | **Packed vertex + texture array** [#43], radius 12¹³ | 1,349 | 361,326 | ~2,050 | **0.328 ms** | ~0.96 ms | *(this PR)* |
+| 2026-08-10 | **Packed vertex + texture array** [#43], radius 64¹³ | 25,131 | 762,516 | ~728 | 1.317 ms | ~1.49 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -231,6 +233,45 @@ settles in ~1.3-1.4 s (was ~250-270 ms), still under 1% of its 120 s bound.
 This block's scope was the representation change, not chasing generation speed
 further; a future block is free to revisit if chunk-load time becomes the
 binding cost somewhere.
+
+¹³ **Packed vertex + texture array (issue #43) — smaller and faster at radius
+12, slower at radius 64, and both are real.** `Vertex` moved from
+`position: [f32;3], normal: [f32;3], ao: f32` (28 bytes, world-space) to two
+packed `u32`s (8 bytes, node-local — `docs/PHASE1_ARCHITECTURE.md` §5.2): a
+**71% cut in vertex bytes**, and at the arena's fixed 4M-vertex capacity that's
+the §2 budget itself — 112 MB down to the targeted **32 MB**. Placing a chunk
+moved from a CPU-side `Mesh::translate` to a GPU-side per-node origin add,
+read via `@builtin(instance_index)` off each draw's `first_instance`
+(`INDIRECT_FIRST_INSTANCE`) — confirmed working on this machine's Metal
+backend by the golden-image tests matching their reference **exactly**
+(0.0000% differing pixels; a wrong node index would show geometry at the
+wrong world position, not just a color difference). The fragment shader also
+gained a real `texture_2d_array` sample, replacing the flat green constant.
+
+Two real, opposite deltas, both measured back-to-back on identical scenes:
+
+- **Radius 12** (1,349 chunks, 361,326 tris) — **faster**: ~1,865 → ~2,050
+  FPS, CPU/frame **0.364 → 0.328 ms (-10%)**, against the last radius-12 row
+  (footnote 10). Smaller vertices mean less GPU vertex-fetch bandwidth, and at
+  this scene size that's the effect that shows up.
+- **Radius 64** (25,131 chunks, 762,516 tris, still `MAX_DRAWS`-capped per
+  #89) — **slower**: ~991 → ~728 FPS, CPU/frame **0.720 → 1.317 ms (+83%)**,
+  against the previous row. The believable cause: at radius 64 the camera
+  frame is essentially wall-to-wall geometry, so the fragment shader runs on
+  close to every pixel of a 1920×1080 frame, and it now does a real texture
+  fetch instead of a flat multiply -- work that was simply absent before.
+  Vertex bandwidth improved at both scales; fragment cost is new at both
+  scales, but only dominates once pixel coverage is this high.
+
+The gate was already **NOT MET** at radius 64 before this PR (see the block-
+1.0 baseline); it's still not met, with a wider margin. That's not something
+this block was scoped to fix — texturing has to sample *something* once it's
+real (per-face material selection is #44, next), and 1.10's region node tree
+is what's actually meant to close radius 64's draw-count gap (§6). Recorded
+here so the fragment-side cost is a data point on the table rather than a
+surprise discovered later: worth a profiler pass if it's still the binding
+constraint once #44/#55 land real art and 1.10 changes what "resident
+geometry" means.
 
 ## Detailed run logs
 

@@ -307,8 +307,18 @@ equivalent ([wgpu#6823], noted in `PLAN.md` §10), so the index comes from
 
 Zero per-vertex cost, one code path on both backends. **If it does not behave
 under Metal's emulated multi-draw, the fallback is a `node_index: u16` in the
-vertex** (10 bytes instead of 8, still inside budget). Block 1.0 verifies which
-one applies before §6 is built on it.
+vertex** (10 bytes instead of 8, still inside budget).
+
+**Verified working, block 1.4a (issue #43):** `first_instance` reads back
+correctly as `@builtin(instance_index)` on this project's Metal machine (M3) —
+confirmed by the golden-image tests matching their reference bit-for-bit
+(0.0000% differing pixels across multiple chunks at different node origins). A
+wrong node index would show geometry at the wrong world position, which the
+pixel-exact comparison would have caught; it didn't, so the primary path
+applies and the `node_index`-in-vertex fallback was not needed. Not yet
+confirmed on Windows/Vulkan — CI runs the same golden tests there, so the
+first red golden-image diff on that runner would be the signal to revisit
+this section.
 
 ---
 

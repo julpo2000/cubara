@@ -292,6 +292,41 @@ impl BlockRegistry {
         self.by_name.get(name).copied()
     }
 
+    /// Every `BlockId` this registry assigned, air included, in ascending order.
+    /// What `cubara-render` walks to build a block-id -> texture-array-layer
+    /// table (see [`placeholder_texture`](Self::placeholder_texture)).
+    pub fn ids(&self) -> impl Iterator<Item = BlockId> + '_ {
+        (0..self.entries.len() as u16).map(BlockId)
+    }
+
+    /// Every distinct texture name any material references, in a stable
+    /// (sorted) order. `cubara-render` builds its texture array from this
+    /// list, with a texture's array layer being its position in it.
+    pub fn texture_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .entries
+            .iter()
+            .filter_map(|e| e.faces.as_ref())
+            .flat_map(Faces::texture_names)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// The one texture name to use for every face of `id`, until per-face
+    /// material selection (block 1.4b) exists. `All` materials use their one
+    /// texture; `Sided` materials use their top texture as a stand-in.
+    /// `None` for air (nothing to texture) or an id this registry doesn't
+    /// have.
+    pub fn placeholder_texture(&self, id: BlockId) -> Option<&str> {
+        let faces = self.entries.get(id.0 as usize)?.faces.as_ref()?;
+        Some(match faces {
+            Faces::All(name) => name.as_str(),
+            Faces::Sided { top, .. } => top.as_str(),
+        })
+    }
+
     /// Check every material's referenced texture names against real files in
     /// `textures_dir` (matched by file stem, extension-agnostic) — a
     /// filesystem existence check only, no image decoding (`ARCHITECTURE.md`
@@ -571,5 +606,42 @@ mod tests {
             let id = registry.id_of(name).unwrap();
             assert!(registry.is_solid(id), "{name} should be solid");
         }
+    }
+
+    #[test]
+    fn ids_covers_every_entry_in_ascending_order() {
+        let registry = BlockRegistry::from_materials(vec![stone(), grass(), soil()]).unwrap();
+        let ids: Vec<u16> = registry.ids().map(|id| id.0).collect();
+        assert_eq!(
+            ids,
+            vec![0, 1, 2, 3],
+            "air plus the three materials, in order"
+        );
+    }
+
+    #[test]
+    fn texture_names_are_sorted_and_deduplicated() {
+        // grass's bottom ("soil") repeats soil's own texture name -- must
+        // appear once, not twice.
+        let registry = BlockRegistry::from_materials(vec![stone(), grass(), soil()]).unwrap();
+        assert_eq!(
+            registry.texture_names(),
+            vec!["grass_side", "grass_top", "soil", "stone"]
+        );
+    }
+
+    #[test]
+    fn placeholder_texture_resolves_all_and_sided_materials() {
+        let registry = BlockRegistry::from_materials(vec![stone(), grass()]).unwrap();
+        assert_eq!(registry.placeholder_texture(BlockId::AIR), None);
+        assert_eq!(
+            registry.placeholder_texture(registry.id_of("cubara:stone").unwrap()),
+            Some("stone")
+        );
+        assert_eq!(
+            registry.placeholder_texture(registry.id_of("cubara:grass").unwrap()),
+            Some("grass_top"),
+            "Sided materials use their top texture until 1.4b's per-face selection"
+        );
     }
 }
