@@ -1,8 +1,8 @@
 // Packed node-local geometry, textured. Vertices carry a lattice position
 // local to their chunk ("node") plus baked AO, a texture-array layer, a face
-// direction, and this corner's own tile coordinate -- see
-// docs/PHASE1_ARCHITECTURE.md §5.2 for the bit layout. World placement is a
-// per-node origin add here, not a CPU-side translate.
+// direction, this corner's own tile coordinate, and the node index itself --
+// see docs/PHASE1_ARCHITECTURE.md §5.2 for the bit layout. World placement is
+// a per-node origin add here, not a CPU-side translate.
 
 struct Camera {
     view_proj: mat4x4<f32>,
@@ -10,18 +10,24 @@ struct Camera {
 
 @group(0) @binding(0) var<uniform> camera: Camera;
 
-// One world-space origin per resident chunk ("node"), indexed by
-// @builtin(instance_index) -- each draw's first_instance is the node index
-// (see crates/render/src/arena.rs). xyz used; w is spare.
+// One world-space origin per resident chunk ("node"), indexed by the
+// node_index packed into word 2 of each vertex (see
+// crates/render/src/arena.rs). xyz used; w is spare.
+//
+// Not @builtin(instance_index): block 1.4a tried that (first_instance set
+// per indirect draw) and found it unreliable in both directions across real
+// CI backends -- broken with multi_draw_indexed_indirect on one software
+// DX12 adapter, broken in the plain draw_indexed fallback on a virtualized
+// Metal adapter, no combination safe everywhere. §5.3 has the full story.
 @group(1) @binding(0) var<storage, read> node_origins: array<vec4<f32>>;
 
 @group(2) @binding(0) var block_textures: texture_2d_array<f32>;
 @group(2) @binding(1) var block_sampler: sampler;
 
 struct VsIn {
-    @builtin(instance_index) node_index: u32,
     @location(0) packed0: u32,
     @location(1) packed1: u32,
+    @location(2) packed2: u32,
 };
 
 struct VsOut {
@@ -57,8 +63,11 @@ fn vs_main(in: VsIn) -> VsOut {
     let u = f32((in.packed1 >> 15u) & 0xFFu);
     let v = f32((in.packed1 >> 23u) & 0xFFu);
 
+    // word 2: node_index:16 (16 spare)
+    let node_index = in.packed2 & 0xFFFFu;
+
     let local_pos = vec3<f32>(x, y, z);
-    let origin = node_origins[in.node_index].xyz;
+    let origin = node_origins[node_index].xyz;
     let world_pos = origin + local_pos;
 
     var out: VsOut;

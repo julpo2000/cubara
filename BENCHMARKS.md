@@ -54,8 +54,10 @@ frames after 200 warmup.
 | 2026-07-22 | Deterministic draw order (BTreeMap) [#81]¹⁰ | 1,349 | 361,326 | ~1,865 | 0.364 ms | ~0.92 ms | `fix/deterministic-draw-order` |
 | 2026-08-10 | **Radius-64 baseline — the phase 1 gate, first measured** [#89]¹¹ | 25,131 | 762,516 | ~996¹¹ | 0.715 ms | ~1.14 ms | `49146ef` |
 | 2026-08-10 | `BlockId` + per-chunk palette compression [#46]¹² | 25,131 | 762,516 | ~991 | 0.720 ms | ~1.23 ms | `174a2ce` |
-| 2026-08-10 | **Packed vertex + texture array** [#43], radius 12¹³ | 1,349 | 361,326 | ~2,050 | **0.328 ms** | ~0.96 ms | *(this PR)* |
-| 2026-08-10 | **Packed vertex + texture array** [#43], radius 64¹³ | 25,131 | 762,516 | ~728 | 1.317 ms | ~1.49 ms | *(this PR)* |
+| 2026-08-10 | Packed vertex + texture array [#43], radius 12 — `first_instance` mechanism, superseded¹³ | 1,349 | 361,326 | ~2,050 | 0.328 ms | ~0.96 ms | *(superseded, not merged)* |
+| 2026-08-10 | Packed vertex + texture array [#43], radius 64 — `first_instance` mechanism, superseded¹³ | 25,131 | 762,516 | ~728 | 1.317 ms | ~1.49 ms | *(superseded, not merged)* |
+| 2026-08-11 | **Packed vertex + texture array, node_index-in-vertex (final)** [#43], radius 12¹⁴ | 1,349 | 361,326 | ~2,460 | **0.273 ms** | ~0.57 ms | *(this PR)* |
+| 2026-08-11 | **Packed vertex + texture array, node_index-in-vertex (final)** [#43], radius 64¹⁴ | 25,131 | 762,516 | ~1,016 | **0.697 ms** | ~1.05 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -234,7 +236,23 @@ This block's scope was the representation change, not chasing generation speed
 further; a future block is free to revisit if chunk-load time becomes the
 binding cost somewhere.
 
-¹³ **Packed vertex + texture array (issue #43) — smaller and faster at radius
+¹³ **Superseded by¹⁴ — the mechanism this footnote describes did not survive
+CI.** These two rows were measured against a real commit in this PR's history
+that requested `wgpu::Features::INDIRECT_FIRST_INSTANCE` and used
+`@builtin(instance_index)` to look up each chunk's world origin, which worked
+correctly *on this M3* — the numbers below are honest measurements of that
+build, not fabricated. What turned out not to hold up is the "confirmed on
+both backends" claim: CI later found `multi_draw_indexed_indirect` +
+`first_instance` broken on Windows' software DX12 adapter, and the
+`draw_indexed` fallback broken on macOS CI's own *virtualized* Metal adapter
+(not the same thing as this real M3) — see `docs/PHASE1_ARCHITECTURE.md` §5.3
+for the full investigation. The rows are kept rather than deleted, per this
+file's own rule of recording the trend rather than only the final state; the
+commit they were measured against was never merged, so there's nothing to look
+up for the hash. Superseded by the vertex-embedded `node_index` rows below,
+which is the actual shipped mechanism.
+
+**Packed vertex + texture array (issue #43) — smaller and faster at radius
 12, slower at radius 64, and both are real.** `Vertex` moved from
 `position: [f32;3], normal: [f32;3], ao: f32` (28 bytes, world-space) to two
 packed `u32`s (8 bytes, node-local — `docs/PHASE1_ARCHITECTURE.md` §5.2): a
@@ -277,6 +295,38 @@ here so the fragment-side cost is a data point on the table rather than a
 surprise discovered later: worth a profiler pass if it's still the binding
 constraint once #44/#55 land real art and 1.10 changes what "resident
 geometry" means.
+
+¹⁴ **The node_index-in-vertex fallback (§5.3) — the mechanism that actually
+shipped, and it measures faster than the abandoned one at both scales.**
+`Vertex` grew a third packed `u32` (12 bytes total, not the 8 or the
+originally-hoped-for 10 — WebGPU requires a 4-byte-aligned stride, so a 16-bit
+node index costs a full word) carrying the arena `node_index` directly,
+resolved in `mesh.wgsl` as a plain vertex read instead of any
+instance-indexing mechanism. `first_instance` is now always `0` and the
+`draw_indexed` fallback's instance range is always `0..1` — both kept only
+because `multi_draw_indexed_indirect` is still worth having for collapsing
+draw calls, independent of how a vertex finds its origin.
+
+Three back-to-back runs each, same M3, same scenes as¹³:
+
+| radius | FPS (3 runs) | CPU/frame avg (3 runs) |
+|---|---|---|
+| 12 | 2,436 / 2,476 / 2,481 | 0.273 / 0.276 / 0.271 ms |
+| 64 | 1,017 / 1,012 / 1,019 | 0.698 / 0.696 / 0.698 ms |
+
+Both tighter and faster than¹³'s numbers: radius 12 **0.328 → ~0.273 ms
+(-17%)**, radius 64 **1.317 → ~0.697 ms (-47%)**. This is a real change (the
+band is tight — ±2% at both scales — not overlapping noise), but the two
+builds differ in more than just the origin-lookup mechanism (¹³'s build
+requested `INDIRECT_FIRST_INSTANCE`, wrote `first_instance` per draw, and was
+measured in an earlier session at a different thermal/clock state), so the
+full mechanism is not isolated here — recorded honestly as "faster, cause not
+fully separated" rather than attributed to a specific saving. What *is* clear:
+moving `node_index` into vertex data was not a performance tax for the
+correctness it buys — if anything the opposite showed up. Vertex memory is
+48 MB at the fixed 4M-vertex capacity (§2), not the 32 MB originally targeted;
+that budget was never the binding constraint at any measured scene (draws
+are), so the deviation is paid for without a measured cost.
 
 ## Detailed run logs
 

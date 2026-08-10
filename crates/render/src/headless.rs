@@ -96,14 +96,6 @@ fn render_arena(
     }))?;
 
     let (features, multi_draw) = gpu_driven_features(&adapter);
-    eprintln!(
-        "DIAG adapter={:?} adapter_has_first_instance={} requested_first_instance={} multi_draw={multi_draw}",
-        adapter.get_info(),
-        adapter
-            .features()
-            .contains(wgpu::Features::INDIRECT_FIRST_INSTANCE),
-        features.contains(wgpu::Features::INDIRECT_FIRST_INSTANCE),
-    );
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: Some("cubara-headless-device"),

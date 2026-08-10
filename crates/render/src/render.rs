@@ -46,11 +46,12 @@ pub fn load_mesh_assets(
     (MeshAssets { registry, layers }, view, sampler)
 }
 
-const VERTEX_ATTRS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Uint32, 1 => Uint32];
+const VERTEX_ATTRS: [wgpu::VertexAttribute; 3] =
+    wgpu::vertex_attr_array![0 => Uint32, 1 => Uint32, 2 => Uint32];
 
 /// The GPU vertex layout for [`Vertex`], which is plain data in `cubara-voxel` and
 /// knows nothing about the GPU (`ARCHITECTURE.md` Rule 3/4). The layout lives here,
-/// with the code that owns pipelines. Two `u32` words, unpacked in the shader --
+/// with the code that owns pipelines. Three `u32` words, unpacked in the shader --
 /// see `docs/PHASE1_ARCHITECTURE.md` §5.2 for the bit layout.
 ///
 /// It must stay in step with the field order of [`Vertex`]; `vertex_layout_matches_vertex`
@@ -118,20 +119,18 @@ impl CameraUniform {
 /// device. Also returns whether `MULTI_DRAW_INDIRECT` made the cut, which selects
 /// the arena's fast indirect draw path over the `draw_indexed` fallback (see the
 /// #26 spike: both target backends support it, but not all do).
+///
+/// Deliberately does **not** request `INDIRECT_FIRST_INSTANCE`: block 1.4a
+/// tried building per-node origin lookup on `first_instance` +
+/// `@builtin(instance_index)` and found it unreliable in *both* directions
+/// across real CI backends -- broken with `multi_draw_indexed_indirect` on one
+/// software DX12 adapter, broken in the plain `draw_indexed` fallback on
+/// another virtualized Metal adapter, with no combination that was safe
+/// everywhere. `node_index` is a plain vertex attribute instead (§5.3), so
+/// this feature is unused now; see the design doc for the full story.
 pub fn gpu_driven_features(adapter: &wgpu::Adapter) -> (wgpu::Features, bool) {
-    // INDIRECT_FIRST_INSTANCE gates whether a backend actually honours a
-    // non-zero `first_instance` in an indirect draw -- without requesting it,
-    // `first_instance` can be silently ignored (every draw reads
-    // node_origins[0]) even on hardware that supports it. Confirmed present
-    // on both Metal and Vulkan/DX12 by the #26 `--caps` spike; §5.3.
-    let wanted = wgpu::Features::MULTI_DRAW_INDIRECT | wgpu::Features::INDIRECT_FIRST_INSTANCE;
-    let features = adapter.features() & wanted;
-    // DIAG: temporarily force the non-indirect draw_indexed loop (the
-    // headless::render_arena DIAG line already prints this value), to isolate
-    // whether the bug is "first_instance doesn't work at all" vs "first_instance
-    // doesn't survive multi_draw_indexed_indirect specifically" on the Windows
-    // CI runner's software adapter.
-    let multi_draw = false;
+    let features = adapter.features() & wgpu::Features::MULTI_DRAW_INDIRECT;
+    let multi_draw = features.contains(wgpu::Features::MULTI_DRAW_INDIRECT);
     (features, multi_draw)
 }
 
@@ -544,11 +543,11 @@ pub fn camera_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout 
 }
 
 /// One world-space origin per resident chunk ("node"), read in the vertex
-/// shader via `@builtin(instance_index)` (`@group(1)` in `mesh.wgsl`) --
-/// what turns a node-local packed [`Vertex`] into a world position without a
-/// CPU-side translate. [`ChunkArena`] owns the actual buffer/bind group (it's
-/// tied to chunk residency); this layout is shared between that and the
-/// pipeline so the two stay structurally compatible.
+/// shader (`@group(1)` in `mesh.wgsl`) by the `node_index` baked into each
+/// [`Vertex`] -- what turns a node-local packed vertex into a world position
+/// without a CPU-side translate. [`ChunkArena`] owns the actual buffer/bind
+/// group (it's tied to chunk residency); this layout is shared between that
+/// and the pipeline so the two stay structurally compatible.
 pub fn origins_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("node-origins-bgl"),
@@ -655,11 +654,11 @@ mod tests {
             layout.array_stride,
             std::mem::size_of::<Vertex>() as wgpu::BufferAddress
         );
-        assert_eq!(layout.array_stride, 8, "two packed u32 words");
-        assert_eq!(layout.attributes.len(), 2, "packed0, packed1");
+        assert_eq!(layout.array_stride, 12, "three packed u32 words");
+        assert_eq!(layout.attributes.len(), 3, "packed0, packed1, packed2");
 
         // Offsets must land on the real field boundaries.
         let offsets: Vec<u64> = layout.attributes.iter().map(|a| a.offset).collect();
-        assert_eq!(offsets, vec![0, 4]);
+        assert_eq!(offsets, vec![0, 4, 8]);
     }
 }

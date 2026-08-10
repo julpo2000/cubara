@@ -75,10 +75,13 @@ const MAX_DRAWS: u32 = 16_384;
 const MAX_NODES: u32 = 65_536;
 
 /// A free-list index allocator over `0..MAX_NODES`, handing out the node
-/// index each resident chunk uses to find its origin in the storage buffer
-/// `mesh.wgsl` reads via `@builtin(instance_index)`. Simpler than
-/// [`SlabAllocator`]: every unit is exactly one index, so there's no
-/// coalescing to do.
+/// index each resident chunk uses to find its origin in the storage buffer.
+/// The index is baked into every vertex of that chunk's mesh (`Vertex::
+/// with_node_index`, [`insert`](ChunkArena::insert)) and read back by
+/// `mesh.wgsl` from vertex data, not `@builtin(instance_index)` — see §5.3
+/// for why neither instance-indexing mechanism survived every real backend.
+/// Simpler than [`SlabAllocator`]: every unit is exactly one index, so
+/// there's no coalescing to do.
 struct NodeIndexAllocator {
     next: u32,
     free: Vec<u32>,
@@ -170,9 +173,9 @@ struct ChunkSlot {
     first_index: u32,
     index_count: u32,
     aabb: Aabb,
-    /// This chunk's slot in the node-origins storage buffer -- set as each
-    /// draw's `first_instance`, so `mesh.wgsl` reads the right origin via
-    /// `@builtin(instance_index)`.
+    /// This chunk's slot in the node-origins storage buffer. Baked into every
+    /// vertex of this chunk's mesh at insert time ([`Vertex::with_node_index`]),
+    /// so `mesh.wgsl` reads it from vertex data rather than an instance index.
     node_index: u32,
 }
 
@@ -259,9 +262,9 @@ pub struct ChunkArena {
     index_buffer: wgpu::Buffer,
     /// One `DrawIndexedIndirect` per visible chunk, rewritten each frame.
     indirect_buffer: wgpu::Buffer,
-    /// One world-space origin per resident chunk, indexed by `node_index` --
-    /// what `mesh.wgsl` adds to a packed vertex's node-local position via
-    /// `@builtin(instance_index)` (see [`build_chunk_mesh`]).
+    /// One world-space origin per resident chunk, indexed by the `node_index`
+    /// baked into each vertex -- what `mesh.wgsl` adds to a packed vertex's
+    /// node-local position (see [`build_chunk_mesh`]).
     origins_buffer: wgpu::Buffer,
     origins_bind_group: wgpu::BindGroup,
 
@@ -416,10 +419,18 @@ impl ChunkArena {
             return false;
         };
 
+        // `node_index` is only known now (the mesh was built off-thread, before
+        // this chunk had an arena slot), so stamp it into every vertex here
+        // rather than baking it into `build_chunk_mesh`'s output.
+        let stamped: Vec<Vertex> = mesh
+            .vertices
+            .iter()
+            .map(|v| v.with_node_index(node_index))
+            .collect();
         queue.write_buffer(
             &self.vertex_buffer,
             base_vertex as u64 * std::mem::size_of::<Vertex>() as u64,
-            bytemuck::cast_slice(&mesh.vertices),
+            bytemuck::cast_slice(&stamped),
         );
         queue.write_buffer(
             &self.index_buffer,
@@ -530,11 +541,10 @@ impl ChunkArena {
                     instance_count: 1,
                     first_index: slot.first_index,
                     base_vertex: slot.base_vertex as i32,
-                    // Read back in the shader via @builtin(instance_index) to
-                    // index the node-origins storage buffer (§5.2/§5.3) --
-                    // instance_count is always 1, so instance_index ==
-                    // first_instance exactly, with no per-instance stepping.
-                    first_instance: slot.node_index,
+                    // Not used to look up the node origin -- that index is
+                    // baked into vertex data instead (§5.3) -- so this is
+                    // always the default single-instance draw.
+                    first_instance: 0,
                 });
             }
         }
@@ -564,7 +574,7 @@ impl ChunkArena {
                 pass.draw_indexed(
                     draw.first_index..draw.first_index + draw.index_count,
                     draw.base_vertex,
-                    draw.first_instance..draw.first_instance + 1,
+                    0..1,
                 );
             }
         }

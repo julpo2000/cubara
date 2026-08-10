@@ -73,14 +73,20 @@ const EXTENT_MASK: u32 = (1 << EXTENT_BITS) - 1;
 const FACE_SHIFT: u32 = TEX_LAYER_BITS;
 const U_SHIFT: u32 = TEX_LAYER_BITS + FACE_BITS;
 const V_SHIFT: u32 = TEX_LAYER_BITS + FACE_BITS + EXTENT_BITS;
+/// Matches `NodeIndexAllocator`'s `MAX_NODES` in `cubara-render`'s arena; 16
+/// bits is generous headroom over that cap.
+const NODE_INDEX_BITS: u32 = 16;
+const NODE_INDEX_MASK: u32 = (1 << NODE_INDEX_BITS) - 1;
 
-/// A single mesh vertex, packed into 8 bytes: node-local lattice position,
-/// baked ambient occlusion, texture-array layer, face direction, and this
-/// vertex's own texel-tile coordinate (`docs/PHASE1_ARCHITECTURE.md` §5.2).
+/// A single mesh vertex, packed into 12 bytes: node-local lattice position,
+/// baked ambient occlusion, texture-array layer, face direction, this
+/// vertex's own texel-tile coordinate, and the arena node it belongs to
+/// (`docs/PHASE1_ARCHITECTURE.md` §5.2/§5.3).
 ///
 /// ```text
 /// word 0:  x:10  y:10  z:10  ao:2
 /// word 1:  tex_layer:12  face:3  u:8  v:8  (1 spare)
+/// word 2:  node_index:16  (16 spare)
 /// ```
 ///
 /// `u`/`v` are *this vertex's* coordinate -- 0 or the greedy quad's extent,
@@ -88,14 +94,23 @@ const V_SHIFT: u32 = TEX_LAYER_BITS + FACE_BITS + EXTENT_BITS;
 /// whole quad. That is what makes the texture tile once per grid cell across
 /// a merged face: each corner samples at its own integer tile coordinate.
 ///
-/// Positions are node-local, not world-space -- placing a chunk in the world
-/// is a GPU-side per-node origin add (`crate::render`... `cubara-render`
-/// owns that), not something baked into vertex data here.
+/// Positions are node-local, not world-space; placing a chunk in the world is
+/// a GPU-side per-node origin add, keyed by `node_index` (word 2). That index
+/// is unknown at mesh-build time -- it is assigned when a mesh lands in the
+/// render arena -- so it starts at 0 from [`Vertex::new`] and is patched in
+/// later with [`Vertex::with_node_index`].
+///
+/// `node_index` lives in vertex data rather than `@builtin(instance_index)`
+/// because neither `first_instance` (via indirect multi-draw) nor the plain
+/// `draw_indexed` instance-range fallback proved reliable across every real
+/// backend tested in CI -- see §5.3 for the measured cross-platform failures
+/// that led here.
 #[repr(C)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
     packed0: u32,
     packed1: u32,
+    packed2: u32,
 }
 
 impl Vertex {
@@ -122,7 +137,26 @@ impl Vertex {
         debug_assert!(u <= EXTENT_MASK && v <= EXTENT_MASK, "u/v out of range");
         let packed0 = x | (y << POS_BITS) | (z << (2 * POS_BITS)) | (ao << (3 * POS_BITS));
         let packed1 = tex_layer | ((face as u32) << FACE_SHIFT) | (u << U_SHIFT) | (v << V_SHIFT);
-        Self { packed0, packed1 }
+        Self {
+            packed0,
+            packed1,
+            packed2: 0,
+        }
+    }
+
+    /// Returns a copy of this vertex with its arena node index set. Called
+    /// once per vertex when a mesh is inserted into the render arena, since
+    /// the index isn't known at mesh-build time.
+    pub fn with_node_index(self, node_index: u32) -> Self {
+        debug_assert!(node_index <= NODE_INDEX_MASK, "node index out of range");
+        Self {
+            packed2: node_index,
+            ..self
+        }
+    }
+
+    pub fn node_index(self) -> u32 {
+        self.packed2 & NODE_INDEX_MASK
     }
 
     pub fn x(self) -> u32 {
@@ -178,11 +212,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vertex_is_eight_bytes() {
-        assert_eq!(std::mem::size_of::<Vertex>(), 8);
+    fn vertex_is_twelve_bytes() {
+        assert_eq!(std::mem::size_of::<Vertex>(), 12);
     }
 
     #[test]
+    #[allow(clippy::type_complexity)]
     fn pack_unpack_round_trips_every_field_at_its_limits() {
         let faces = [
             Face::PosX,
@@ -192,8 +227,8 @@ mod tests {
             Face::PosZ,
             Face::NegZ,
         ];
-        let cases: [(u32, u32, u32, u32, u32, u32, u32); 4] = [
-            (0, 0, 0, 0, 0, 0, 0),
+        let cases: [(u32, u32, u32, u32, u32, u32, u32, u32); 4] = [
+            (0, 0, 0, 0, 0, 0, 0, 0),
             (
                 POS_MASK,
                 POS_MASK,
@@ -202,13 +237,15 @@ mod tests {
                 TEX_LAYER_MASK,
                 EXTENT_MASK,
                 EXTENT_MASK,
+                NODE_INDEX_MASK,
             ),
-            (17, 512, 999, 2, 4095, 200, 3),
-            (1, 2, 3, 1, 1, 255, 0),
+            (17, 512, 999, 2, 4095, 200, 3, 12345),
+            (1, 2, 3, 1, 1, 255, 0, 1),
         ];
-        for (x, y, z, ao, tex_layer, u, v) in cases {
+        for (x, y, z, ao, tex_layer, u, v, node_index) in cases {
             for face in faces {
-                let vertex = Vertex::new(x, y, z, ao, face, tex_layer, u, v);
+                let vertex =
+                    Vertex::new(x, y, z, ao, face, tex_layer, u, v).with_node_index(node_index);
                 assert_eq!(vertex.x(), x, "x for {face:?}");
                 assert_eq!(vertex.y(), y, "y for {face:?}");
                 assert_eq!(vertex.z(), z, "z for {face:?}");
@@ -217,6 +254,7 @@ mod tests {
                 assert_eq!(vertex.face(), face, "face round-trip");
                 assert_eq!(vertex.u(), u, "u for {face:?}");
                 assert_eq!(vertex.v(), v, "v for {face:?}");
+                assert_eq!(vertex.node_index(), node_index, "node_index for {face:?}");
             }
         }
     }
@@ -246,6 +284,22 @@ mod tests {
 
         let v_only = Vertex::new(0, 0, 0, 0, Face::PosX, 0, 0, EXTENT_MASK);
         assert_eq!((v_only.tex_layer(), v_only.u()), (0, 0));
+
+        let node_index_only =
+            Vertex::new(0, 0, 0, 0, Face::PosX, 0, 0, 0).with_node_index(NODE_INDEX_MASK);
+        assert_eq!(
+            (
+                node_index_only.x(),
+                node_index_only.y(),
+                node_index_only.z(),
+                node_index_only.ao(),
+                node_index_only.tex_layer(),
+                node_index_only.u(),
+                node_index_only.v(),
+            ),
+            (0, 0, 0, 0, 0, 0, 0)
+        );
+        assert_eq!(node_index_only.face(), Face::PosX);
     }
 
     #[test]

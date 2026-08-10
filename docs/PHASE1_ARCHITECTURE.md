@@ -116,7 +116,7 @@ instead of one per chunk — closes it. Full numbers and the `--bench 64` output
 | Budget | Value | Where it comes from |
 |---|---|---|
 | Triangles per frame | ≲ 1M | ~1 ms of GPU for a simple opaque pass on an M3. With ≤2,000 nodes that is ~500 tris/node; radius 12 measures 161 tris/chunk today, and caves will push it up — which is why caves are in phase 1, so the budget is tested honestly. |
-| Vertex memory | ≤ 32 MB | 4M-vertex arena. At today's 28-byte vertex that is 112 MB, and adding a texture layer naively makes it 160 MB. §5 packs it to 8 bytes. |
+| Vertex memory | ~48 MB (revised from ≤ 32 MB; see §5.3) | 4M-vertex arena. At the original 28-byte vertex that is 112 MB, and adding a texture layer naively makes it 160 MB. §5 packs it down, but to 12 bytes, not the 8 originally targeted — the node index that a per-vertex origin lookup needs (§5.3) doesn't fit in the 8-byte budget on top of position/AO/layer/face/uv, and WebGPU requires the stride to stay a multiple of 4 bytes, so there is no smaller packing than a third `u32` word. 4M × 12 bytes = 48 MB — over budget, but still one order of magnitude below the naive 160 MB, and vertex memory has not been the binding constraint at any measured scene (draws are, §2 above). |
 | Worldgen samples for a full load | ~8.2M | 2,000 nodes × 16³ samples each. Generating far nodes at full resolution and downsampling would be ~545M samples — a factor of 65. This is why generation is LOD-native (§8). |
 
 The triangle ceiling is an estimate, not a measurement. **Block 1.0 measured the
@@ -286,48 +286,82 @@ space**. Two problems, one immediate and one structural:
   origin. Radius 64 is fine; a world you can walk across is not. And a vertex
   format change means re-meshing everything, so it is done once, now.
 
-Phase 1 format — two `u32`, **8 bytes**, positions local to the node:
+Phase 1 format — three `u32`, **12 bytes**, positions local to the node:
 
 ```
 word 0:  x:10  y:10  z:10  ao:2          // node-local lattice coords
 word 1:  tex_layer:12  face:3  u_len:8  v_len:8  (1 spare)
+word 2:  node_index:16  (16 spare)
 ```
 
 `face` is 3 bits because greedy-meshed voxel faces are always one of six axis
 directions — the normal is a lookup, not data. `u_len`/`v_len` carry the greedy
-quad's extent so the texture tiles across a merged face.
+quad's extent so the texture tiles across a merged face. `node_index` (word 2)
+is explained in §5.3 — it was not part of the original two-word design; it is
+the outcome of that section's own investigation.
 
 ### 5.3 How the shader knows which node it is drawing
 
-Node origins live in a storage buffer indexed per draw. wgpu has no `gl_DrawID`
-equivalent ([wgpu#6823], noted in `PLAN.md` §10), so the index comes from
-**`INDIRECT_FIRST_INSTANCE`** — confirmed supported on both Metal and Vulkan by the
-`--caps` spike. Each node's indirect args set `first_instance = node_index`,
-`instance_count = 1`, and the vertex shader reads `@builtin(instance_index)`.
+Node origins live in a storage buffer, and every vertex needs to know which
+entry is its own. wgpu has no `gl_DrawID` equivalent ([wgpu#6823], noted in
+`PLAN.md` §10), so this section originally planned to get the index from
+**`INDIRECT_FIRST_INSTANCE`**: each node's indirect args set `first_instance =
+node_index`, `instance_count = 1`, and the vertex shader would read
+`@builtin(instance_index)` — zero per-vertex cost, confirmed supported on both
+Metal and Vulkan by the `--caps` spike. The fallback already named here, in
+case that misbehaved, was a `node_index` field baked into the vertex itself.
 
-Zero per-vertex cost, one code path on both backends. **If it does not behave
-under Metal's emulated multi-draw, the fallback is a `node_index: u16` in the
-vertex** (10 bytes instead of 8, still inside budget).
+**Both were tried, in block 1.4a (issue #43), against real CI hardware — and
+the instance-index mechanism failed in two different ways on two different
+backends, which is why the fallback is now the only path.**
 
-**Verified working, block 1.4a (issue #43) — the primary path applies, on
-both platforms, but it needs the feature actually requested.** The first CI
-run exposed the real failure mode this section anticipated: `first_instance`
-was silently ignored on Windows (DX12) — every draw read `node_origins[0]`,
-so all geometry rendered piled at one origin — while the *identical* code
-happened to work on macOS/Metal. Golden images caught it immediately (~30-45%
-differing pixels, not the usual near-zero cross-backend noise), including
-`edits_change_what_is_drawn` reporting a suspicious **0.000%** change, which
-is what a same-wrong-image-every-time bug looks like.
+First failure: `first_instance` was silently ignored on Windows (DX12) — every
+draw read `node_origins[0]`, so all geometry piled at one origin. Golden images
+caught it immediately (~30-45% differing pixels, not the usual near-zero
+cross-backend noise), including `edits_change_what_is_drawn` reporting a
+suspicious **0.000%** change — what a same-wrong-image-every-time bug looks
+like. The apparent cause was `wgpu::Features::INDIRECT_FIRST_INSTANCE` never
+being in `required_features` (`gpu_driven_features` only requested
+`MULTI_DRAW_INDIRECT`); Metal appeared to honour `first_instance` regardless of
+whether the feature was requested, DX12 did not.
 
-The root cause was not a backend incompatibility: `wgpu::Features::INDIRECT_FIRST_INSTANCE`
-was never in `required_features` when the device was created (`gpu_driven_features`
-only requested `MULTI_DRAW_INDIRECT`). Metal appears to honour `first_instance`
-regardless of whether the feature is requested; DX12 does not. Requesting it
-explicitly (it was already confirmed present on both backends by the #26
-`--caps` spike) fixed both platforms, confirmed by golden images matching
-their reference bit-for-bit (0.0000% differing pixels) on macOS, and green
-golden tests in CI on Windows. The `node_index`-in-vertex fallback was not
-needed — the primary path was correct, the device request was not.
+Requesting the feature explicitly did **not** fix Windows. A diagnostic build
+that logged adapter capabilities confirmed the feature *was* now present and
+requested — the bug persisted anyway, disproving "missing feature request" as
+the full explanation. Forcing the arena onto its non-indirect `draw_indexed`
+fallback (an explicit per-draw instance range instead of
+`multi_draw_indexed_indirect` + `first_instance`) made Windows pass — isolating
+the bug to `multi_draw_indexed_indirect` + `first_instance` specifically on
+Windows CI's "Microsoft Basic Render Driver" software adapter.
+
+Second failure: that same `draw_indexed` fallback, which had just fixed
+Windows, broke macOS CI — `terrain_renders_as_expected` failed at 25.33%
+differing pixels, on the complex multi-chunk scene only (the simpler 3-chunk
+`materials` scene still passed). macOS CI's adapter is "Apple Paravirtual
+device" — a virtualized GPU, not real hardware. So: real M3 hardware runs both
+mechanisms correctly; Windows CI's software DX12 adapter only accepts
+`draw_indexed`'s instance range; macOS CI's virtualized Metal adapter only
+accepts `multi_draw_indexed_indirect` + `first_instance` (at least for simple
+scenes — the exact boundary of that failure wasn't fully characterized, because
+it stopped mattering once the fallback made both moot). No single
+instance-index-based mechanism was safe on every backend actually exercised in
+CI.
+
+The fix landed is the fallback this section always named: `node_index` as a
+third packed `u32` word in the vertex (§5.2), resolved with a plain vertex
+attribute instead of any instance-indexing mechanism. `first_instance` and the
+`draw_indexed` instance range are both now always `0`/`0..1` — meaningless for
+origin lookup, kept only because `multi_draw_indexed_indirect` is still worth
+having for collapsing draw calls (§2's binding constraint), independent of how
+each vertex finds its origin. One correctness mechanism, proven identical on
+every vertex field it already carried (position/AO/layer/face/uv) across real
+M3 hardware and both CI backends.
+
+One deviation from the original plan, paid for this: WebGPU requires
+`arrayStride` to be a multiple of 4 bytes, so "10 bytes instead of 8" (this
+section's original fallback estimate) isn't a legal vertex format — the
+natural size for a 16-bit `node_index` alongside two existing `u32` words is a
+third full `u32`, i.e. 12 bytes, not 10. See §2's revised vertex-memory budget.
 
 ---
 
@@ -655,7 +689,8 @@ three additions:
 
 1. A **texture array** (16×16 tiles, one layer per texture, nearest filtering,
    mipmapped) plus its bind group.
-2. A **per-node origin storage buffer**, indexed via `instance_index` (§5.3).
+2. A **per-node origin storage buffer**, indexed via a `node_index` field packed
+   into each vertex (§5.3).
 3. The shader reads the texture layer and quad extents from the packed vertex and
    samples the array; the flat green constant in `mesh.wgsl` is deleted.
 
@@ -675,8 +710,8 @@ nothing gameplay-related — which is the seam this section exists to protect.
 | 3 | Materials authored with their **shapes**, expanded to a flat id space | one hand-written definition per material-and-shape pair | you write "oak" once and get its family; the combinatorial explosion stays in the registry |
 | 3b | Shape and block state as distinct ids, not a byte per voxel | a third byte in the voxel array | palette compression makes flattening free; a shape byte costs 4 KB/chunk for data that has one or two distinct values per chunk |
 | 3c | Only **edited** chunks are written; the rest regenerate from the seed | persisting all generated terrain | saves scale with what you built, not how far you walked — and reloading becomes a hard test of Rule 1 (guarded by `worldgen_version`) |
-| 4 | 8-byte packed, **node-local** vertex | 28-byte world-space f32 | vertex-memory budget; precision far from origin; re-meshing cost later |
-| 5 | `INDIRECT_FIRST_INSTANCE` → `instance_index` for per-node data | per-vertex node index | zero per-vertex cost, one path on both backends (fallback recorded) |
+| 4 | 12-byte packed, **node-local** vertex | 28-byte world-space f32 | vertex-memory budget (partially given back by decision 5); precision far from origin; re-meshing cost later |
+| 5 | Per-vertex `node_index`, not `instance_index`/`first_instance` | `INDIRECT_FIRST_INSTANCE` → `@builtin(instance_index)` | the instance-index route failed differently on two real CI backends (Windows software DX12, macOS virtualized Metal) with no combination safe on both — see §5.3 |
 | 6 | LOD node = 2^L chunks, one mesh, one draw, 16³ samples | per-chunk voxel downsampling | draws are the binding constraint (§2); triangle reduction alone cannot reach radius 64 |
 | 7 | Skirts at LOD seams | stitched transition geometry | local and parallel-safe; stitching serialises the mesher |
 | 8 | Density function sampled at node resolution | generate full-res, downsample | 8.2M samples vs 545M for a full radius-64 load |
