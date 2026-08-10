@@ -17,7 +17,7 @@ mod render;
 mod scene;
 mod text;
 
-pub use arena::ChunkArena;
+pub use arena::{ArenaUsage, ChunkArena};
 pub use camera::FlyCamera;
 pub use culling::{Aabb, Frustum};
 pub use headless::{Frame, Shot};
