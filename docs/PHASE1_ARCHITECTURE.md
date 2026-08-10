@@ -309,16 +309,25 @@ Zero per-vertex cost, one code path on both backends. **If it does not behave
 under Metal's emulated multi-draw, the fallback is a `node_index: u16` in the
 vertex** (10 bytes instead of 8, still inside budget).
 
-**Verified working, block 1.4a (issue #43):** `first_instance` reads back
-correctly as `@builtin(instance_index)` on this project's Metal machine (M3) —
-confirmed by the golden-image tests matching their reference bit-for-bit
-(0.0000% differing pixels across multiple chunks at different node origins). A
-wrong node index would show geometry at the wrong world position, which the
-pixel-exact comparison would have caught; it didn't, so the primary path
-applies and the `node_index`-in-vertex fallback was not needed. Not yet
-confirmed on Windows/Vulkan — CI runs the same golden tests there, so the
-first red golden-image diff on that runner would be the signal to revisit
-this section.
+**Verified working, block 1.4a (issue #43) — the primary path applies, on
+both platforms, but it needs the feature actually requested.** The first CI
+run exposed the real failure mode this section anticipated: `first_instance`
+was silently ignored on Windows (DX12) — every draw read `node_origins[0]`,
+so all geometry rendered piled at one origin — while the *identical* code
+happened to work on macOS/Metal. Golden images caught it immediately (~30-45%
+differing pixels, not the usual near-zero cross-backend noise), including
+`edits_change_what_is_drawn` reporting a suspicious **0.000%** change, which
+is what a same-wrong-image-every-time bug looks like.
+
+The root cause was not a backend incompatibility: `wgpu::Features::INDIRECT_FIRST_INSTANCE`
+was never in `required_features` when the device was created (`gpu_driven_features`
+only requested `MULTI_DRAW_INDIRECT`). Metal appears to honour `first_instance`
+regardless of whether the feature is requested; DX12 does not. Requesting it
+explicitly (it was already confirmed present on both backends by the #26
+`--caps` spike) fixed both platforms, confirmed by golden images matching
+their reference bit-for-bit (0.0000% differing pixels) on macOS, and green
+golden tests in CI on Windows. The `node_index`-in-vertex fallback was not
+needed — the primary path was correct, the device request was not.
 
 ---
 

@@ -242,11 +242,16 @@ packed `u32`s (8 bytes, node-local — `docs/PHASE1_ARCHITECTURE.md` §5.2): a
 the §2 budget itself — 112 MB down to the targeted **32 MB**. Placing a chunk
 moved from a CPU-side `Mesh::translate` to a GPU-side per-node origin add,
 read via `@builtin(instance_index)` off each draw's `first_instance`
-(`INDIRECT_FIRST_INSTANCE`) — confirmed working on this machine's Metal
-backend by the golden-image tests matching their reference **exactly**
-(0.0000% differing pixels; a wrong node index would show geometry at the
-wrong world position, not just a color difference). The fragment shader also
-gained a real `texture_2d_array` sample, replacing the flat green constant.
+(`INDIRECT_FIRST_INSTANCE`). Worked immediately on Metal; the first Windows
+CI run showed every chunk piled at one origin (`first_instance` silently
+ignored) because the feature was never in `required_features` at device
+creation -- `docs/PHASE1_ARCHITECTURE.md` §5.3 has the full story. One-line
+fix (request `INDIRECT_FIRST_INSTANCE` explicitly), confirmed on both
+backends afterward by golden images matching their reference **exactly**
+(0.0000% differing pixels; a wrong node index shows geometry at the wrong
+world position, not just a colour difference, so this is a real correctness
+check, not a coincidence). The fragment shader also gained a real
+`texture_2d_array` sample, replacing the flat green constant.
 
 Two real, opposite deltas, both measured back-to-back on identical scenes:
 

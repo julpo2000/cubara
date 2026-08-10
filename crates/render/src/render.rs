@@ -119,7 +119,13 @@ impl CameraUniform {
 /// the arena's fast indirect draw path over the `draw_indexed` fallback (see the
 /// #26 spike: both target backends support it, but not all do).
 pub fn gpu_driven_features(adapter: &wgpu::Adapter) -> (wgpu::Features, bool) {
-    let features = adapter.features() & wgpu::Features::MULTI_DRAW_INDIRECT;
+    // INDIRECT_FIRST_INSTANCE gates whether a backend actually honours a
+    // non-zero `first_instance` in an indirect draw -- without requesting it,
+    // `first_instance` can be silently ignored (every draw reads
+    // node_origins[0]) even on hardware that supports it. Confirmed present
+    // on both Metal and Vulkan/DX12 by the #26 `--caps` spike; §5.3.
+    let wanted = wgpu::Features::MULTI_DRAW_INDIRECT | wgpu::Features::INDIRECT_FIRST_INSTANCE;
+    let features = adapter.features() & wanted;
     let multi_draw = features.contains(wgpu::Features::MULTI_DRAW_INDIRECT);
     (features, multi_draw)
 }
