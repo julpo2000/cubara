@@ -27,6 +27,22 @@ pub struct BuiltChunk {
     pub geometry: Option<(Mesh, Aabb)>,
 }
 
+/// Put a batch of finished mesh jobs into a fixed order — ascending
+/// `ChunkCoord` — before anything uploads them.
+///
+/// Worker threads finish jobs in whatever order the OS happens to schedule
+/// them, which is not the same order every run, and [`ChunkArena`](crate::arena::ChunkArena)'s
+/// suballocator is first-fit: whichever job is applied first claims the
+/// earliest free slot. Left unsorted, the arena's slab layout — which coord
+/// ends up at which GPU offset — depended on thread timing instead of world
+/// state (issue #83). Sorting first makes it depend on world state alone,
+/// which is `ARCHITECTURE.md` Rule 1's requirement that a parallel step's
+/// results are merged in a fixed order.
+pub fn sort_batch(mut batch: Vec<BuiltChunk>) -> Vec<BuiltChunk> {
+    batch.sort_by_key(|b| b.coord);
+    batch
+}
+
 /// Generate + mesh the chunk at `coord` at LOD `level`, as the synchronous path would.
 fn mesh_coord(world: &World, coord: ChunkCoord, level: u32) -> Option<(Mesh, Aabb)> {
     world
@@ -164,6 +180,7 @@ impl Default for MeshPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arena::ChunkArena;
     use cubara_world::streaming;
     use std::collections::HashMap;
 
@@ -237,5 +254,96 @@ mod tests {
             !levels.contains(&0),
             "the superseded (level 0) mesh must not"
         );
+    }
+
+    /// A headless device, or `None` on a CI runner with no GPU adapter — the same
+    /// convention `crate::headless::render` uses, so this test skips loudly
+    /// instead of failing where there is nothing to test against.
+    fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..Default::default()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))?;
+        pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("cubara-test-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::Performance,
+            },
+            None,
+        ))
+        .ok()
+    }
+
+    #[test]
+    fn sorted_batch_gives_the_same_arena_layout_regardless_of_arrival_order() {
+        // Issue #83: ChunkArena::insert is first-fit, so whichever order a batch
+        // of finished mesh jobs is *applied* in decides which coord gets which
+        // slab offset. Worker completion order is not the same every run. A unit
+        // test over the allocator alone would not catch this -- the allocator is
+        // already deterministic given its input order, the bug is the pipeline
+        // feeding it that order -- so this drives the real pipeline pieces
+        // (BuiltChunk, build_chunk_mesh, ChunkArena::insert) through several
+        // different arrival orders of the *same* batch and asserts sort_batch
+        // makes all of them land on the identical layout.
+        let Some((device, queue)) = test_device() else {
+            eprintln!(
+                "SKIP sorted_batch_gives_the_same_arena_layout_regardless_of_arrival_order: \
+                 no GPU adapter"
+            );
+            return;
+        };
+
+        let world = World::new();
+        let coords = streaming::desired_chunks(ChunkCoord::new(0, 0, 0), 3, 0..=2);
+
+        // Several stand-ins for different worker-scheduling outcomes: request
+        // order, fully reversed, and a couple of arbitrary shuffles.
+        let mut reversed = coords.clone();
+        reversed.reverse();
+        let mut shuffled_a = coords.clone();
+        shuffled_a.sort_by_key(|c| (c.x * 7 + c.z * 13 + c.y * 31).rem_euclid(97));
+        let mut shuffled_b = coords.clone();
+        shuffled_b.sort_by_key(|c| -(c.x * 5 + c.z * 11 + c.y * 17));
+        let orderings = [coords.clone(), reversed, shuffled_a, shuffled_b];
+
+        let mut layouts = Vec::new();
+        for order in &orderings {
+            let batch: Vec<BuiltChunk> = order
+                .iter()
+                .map(|&coord| BuiltChunk {
+                    coord,
+                    level: 0,
+                    geometry: mesh_coord(&world, coord, 0),
+                })
+                .collect();
+
+            let mut arena = ChunkArena::new(&device, false);
+            for built in sort_batch(batch) {
+                if let Some((mesh, aabb)) = built.geometry {
+                    arena.insert(&queue, built.coord, &mesh, aabb);
+                }
+            }
+            layouts.push(arena.slot_offsets());
+        }
+
+        let reference = &layouts[0];
+        assert!(
+            reference.len() > 1,
+            "the test region must produce more than one chunk of geometry to be meaningful"
+        );
+        for (i, layout) in layouts.iter().enumerate().skip(1) {
+            assert_eq!(
+                layout, reference,
+                "arrival order {i} produced a different arena layout than sorted order 0 -- \
+                 sort_batch did not make the layout arrival-order-independent"
+            );
+        }
     }
 }

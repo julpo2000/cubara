@@ -354,6 +354,18 @@ impl ChunkArena {
         self.slots.is_empty()
     }
 
+    /// Every resident chunk's `(base_vertex, first_index)`, keyed by coord — the
+    /// arena's actual GPU-slot layout. Exposed for the issue #83 regression test:
+    /// two different *insertion* orders of the same chunk batch must land every
+    /// coord at the same offsets once both orders are sorted first.
+    #[cfg(test)]
+    pub(crate) fn slot_offsets(&self) -> std::collections::BTreeMap<ChunkCoord, (u32, u32)> {
+        self.slots
+            .iter()
+            .map(|(&coord, slot)| (coord, (slot.base_vertex, slot.first_index)))
+            .collect()
+    }
+
     /// A snapshot of how full the arena is against its fixed capacities — the
     /// "requested vs available" numbers a legible exhaustion report needs (see
     /// issue #89). Cheap: everything here is already tracked incrementally, so
