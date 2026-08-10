@@ -61,6 +61,40 @@ const INDEX_CAPACITY: u32 = 6_000_000;
 /// 16k covers a square radius of ~52 chunks across the 3-high vertical band.
 const MAX_DRAWS: u32 = 16_384;
 
+/// Capacity headroom for the arena's three fixed-size resources — vertices,
+/// indices and per-frame draws. `*_used` is a high-water mark (vertices/indices)
+/// or the resident chunk count (draws: any resident chunk could be visible in a
+/// single frame, so residency is the worst case a frame could ask for). This is
+/// the "requested vs available" figure issue #89 asks for, so a full arena is a
+/// reported number rather than a silently truncated frame.
+#[derive(Clone, Copy, Debug)]
+pub struct ArenaUsage {
+    pub vertices_used: u32,
+    pub vertices_capacity: u32,
+    pub indices_used: u32,
+    pub indices_capacity: u32,
+    pub resident_chunks: u32,
+    pub max_draws: u32,
+}
+
+impl ArenaUsage {
+    /// Names of the resources at or over capacity — empty when the arena has
+    /// headroom on all three.
+    pub fn exhausted(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.vertices_used >= self.vertices_capacity {
+            out.push("vertices");
+        }
+        if self.indices_used >= self.indices_capacity {
+            out.push("indices");
+        }
+        if self.resident_chunks >= self.max_draws {
+            out.push("draws");
+        }
+        out
+    }
+}
+
 /// One indirect draw command, matching the GPU's `DrawIndexedIndirect` layout
 /// (5 tightly-packed 32-bit words). We define our own `Pod` mirror of
 /// `wgpu::util::DrawIndexedIndirectArgs` so a whole visible-set slice can be
@@ -320,6 +354,21 @@ impl ChunkArena {
         self.slots.is_empty()
     }
 
+    /// A snapshot of how full the arena is against its fixed capacities — the
+    /// "requested vs available" numbers a legible exhaustion report needs (see
+    /// issue #89). Cheap: everything here is already tracked incrementally, so
+    /// this is safe to call after every region load, not just on failure.
+    pub fn usage(&self) -> ArenaUsage {
+        ArenaUsage {
+            vertices_used: self.vertices.high_water,
+            vertices_capacity: VERTEX_CAPACITY,
+            indices_used: self.indices.high_water,
+            indices_capacity: INDEX_CAPACITY,
+            resident_chunks: self.slots.len() as u32,
+            max_draws: MAX_DRAWS,
+        }
+    }
+
     /// World-space bounds over all resident chunks, for framing a camera.
     pub fn bounds(&self) -> Option<([f32; 3], [f32; 3])> {
         if self.slots.is_empty() {
@@ -416,15 +465,34 @@ impl ChunkArena {
                 }
             }
         }
+        let usage = arena.usage();
         log::info!(
             "region radius {radius}: {} chunks meshed (distance LOD), {total_tris} triangles \
-             (arena v {}/{}, i {}/{})",
-            arena.slots.len(),
-            arena.vertices.high_water,
-            VERTEX_CAPACITY,
-            arena.indices.high_water,
-            INDEX_CAPACITY,
+             (arena v {}/{}, i {}/{}, d {}/{})",
+            usage.resident_chunks,
+            usage.vertices_used,
+            usage.vertices_capacity,
+            usage.indices_used,
+            usage.indices_capacity,
+            usage.resident_chunks,
+            usage.max_draws,
         );
+        let exhausted = usage.exhausted();
+        if !exhausted.is_empty() {
+            log::warn!(
+                "region radius {radius} exceeds arena capacity: {} — requested {} resident \
+                 chunks (worst case {} draws) against {} vertices/{} indices/{} draws \
+                 available; excess chunks are silently dropped from whichever frame's \
+                 visible set overflows first (arena.rs MAX_DRAWS/VERTEX_CAPACITY/\
+                 INDEX_CAPACITY). See issue #89.",
+                exhausted.join(", "),
+                usage.resident_chunks,
+                usage.resident_chunks,
+                usage.vertices_capacity,
+                usage.indices_capacity,
+                usage.max_draws,
+            );
+        }
         arena
     }
 }

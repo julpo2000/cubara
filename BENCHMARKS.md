@@ -52,6 +52,7 @@ frames after 200 warmup.
 | 2026-07-21 | Rule 5 — one scene-render path⁸ | 1,349 | 361,326 | ~1,875 | 0.372 ms | ~0.87 ms | `refactor/single-scene-render-path` |
 | 2026-07-21 | **Rule 3 — renderer renders only; all rules green**⁹ | 1,349 | 361,326 | ~1,920 | **0.361 ms** | ~0.90 ms | `refactor/renderer-renders-only` |
 | 2026-07-22 | Deterministic draw order (BTreeMap) [#81]¹⁰ | 1,349 | 361,326 | ~1,865 | 0.364 ms | ~0.92 ms | `fix/deterministic-draw-order` |
+| 2026-08-10 | **Radius-64 baseline — the phase 1 gate, first measured** [#89]¹¹ | 25,131 | 762,516 | ~996¹¹ | 0.715 ms | ~1.14 ms | `49146ef` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -157,6 +158,34 @@ rows). This is *not* comparable to the rows above (different, much heavier scene
 it's the new baseline to optimize down from. The obvious next lever is the draw-call
 count: batching chunks into fewer draws (instanced / indirect / GPU-driven) should
 move this number, and it'll show up right here.
+
+¹¹ **The radius-64 baseline (issue #89) — the gate is red, and now for a legible
+reason.** `PHASE1_ARCHITECTURE.md` §2 derived its whole design budget from
+radius-12 numbers and flagged its triangle ceiling as an estimate; nobody had
+run `--bench 64` before this. It does not hang or crash — it settles in ~1s and
+prints a `SUMMARY:` line — but it exposes exactly the resource §2 predicted
+would run out first: **`MAX_DRAWS` (16,384), not vertex/index memory.** The
+region streams **25,131** resident chunks (762,516 triangles, 1,525,032
+vertices, 2,287,548 indices — comfortably inside the 4M-vertex/6M-index arena),
+but `ChunkArena::prepare` caps the per-frame visible set at `MAX_DRAWS`, so
+every measured frame draws exactly **16,384/25,131** chunks and the rest are
+silently dropped from whichever frame's visible set overflows first (now
+reported explicitly — see `ArenaUsage::exhausted` in
+`crates/render/src/arena.rs`, added in this PR). FPS lands right on the 1000
+line and swings with it: 9 back-to-back runs spanned **986–1,006 FPS** (median
+996) while CPU/frame stayed tight at 0.710–0.719 ms (mean 0.715) — the familiar
+submit-bound noise pattern (see¹), not a real margin either way. **Gate: NOT
+MET**, and per this issue's scope, this PR does not attempt to raise it — it
+measures and reports. §6's design already anticipated this: today's per-chunk
+draws (one draw per resident chunk) cannot reach the ≤~2,000-draw radius-64
+budget no matter how far LOD downsamples triangle counts, because draw count
+scales with chunk count, not triangle count. 25,131 resident chunks is **~12.6×**
+that budget; block 1.10's region node tree (one draw per 2^L³-chunk node) is
+what's meant to close this gap, not this block. The CI smoke test added in this
+PR (`crates/world/tests/radius_64_smoke.rs`) reproduces the same streamed
+region without a GPU and asserts it settles within a 120s bound and stays under
+the arena's vertex/index capacities — the substitute for the perf gate on
+GPU-less CI runners, per this issue's design decisions.
 
 ## Detailed run logs
 

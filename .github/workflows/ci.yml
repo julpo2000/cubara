@@ -64,3 +64,11 @@ jobs:
       # becomes visible while there is still headroom to react to it.
       - name: Golden image deltas
         run: cargo test -p cubara-render --test golden -- --nocapture
+      # The phase-1 perf gate (--bench 64 >= 1000 FPS) does not run here -- these
+      # runners have no representative GPU (ROADMAP.md phase 1 exit gate). This is
+      # the CPU-only substitute (issue #89): the same radius-64 region streamed
+      # and meshed with no GPU involved, bounded so a regression that turns
+      # worldgen/meshing into a hang or an unbounded blow-up fails loudly instead
+      # of quietly burning the job's time limit.
+      - name: Radius-64 world-load smoke test
+        run: cargo test -p cubara-world --test radius_64_smoke -- --nocapture

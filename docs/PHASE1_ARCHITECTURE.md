@@ -96,6 +96,21 @@ alone, or 135 FPS, with a perfect cull and zero triangles. **LOD must cut draw
 count by roughly 25×, and it can only do that by merging chunks into shared
 meshes.** That is §6, and it is the block phase 1 turns on.
 
+**Measured (block 1.0, issue #89), replacing the hypothetical above with a real
+run:** `--bench 64` over that same 3-chunk vertical band streams **25,131**
+non-empty chunks — half the full-resolution figure, since most of the top layer
+is air above the heightmap — at **762,516 triangles** total (well inside the 1M
+ceiling below, though caves, which push triangle count up, are not built yet —
+see the row below). Today's LOD (`streaming::lod_for`) reduces *triangles* per
+chunk with distance but not *draw count*: one draw per resident chunk
+regardless of its LOD level, so 25,131 resident chunks means 25,131 candidate
+draws — **~12.6× the ~2,000-draw budget**, hitting the arena's `MAX_DRAWS`
+(16,384) before it hits vertex or index memory (both sit under 40% used). The
+gate is red for exactly the reason this section predicted: draws, not
+triangles or vertices, and only §6's region node tree — one draw per node
+instead of one per chunk — closes it. Full numbers and the `--bench 64` output:
+`BENCHMARKS.md`, radius-64 row.
+
 ### The other three budgets
 
 | Budget | Value | Where it comes from |
@@ -104,8 +119,12 @@ meshes.** That is §6, and it is the block phase 1 turns on.
 | Vertex memory | ≤ 32 MB | 4M-vertex arena. At today's 28-byte vertex that is 112 MB, and adding a texture layer naively makes it 160 MB. §5 packs it to 8 bytes. |
 | Worldgen samples for a full load | ~8.2M | 2,000 nodes × 16³ samples each. Generating far nodes at full resolution and downsampling would be ~545M samples — a factor of 65. This is why generation is LOD-native (§8). |
 
-The triangle ceiling is an estimate, not a measurement. **Block 1.0 replaces it
-with a measured number before anything is built on it.**
+The triangle ceiling is an estimate, not a measurement. **Block 1.0 measured the
+binding constraint (draws) directly and confirmed it is what fails first at
+radius 64** — see above. The triangle ceiling itself is not yet stress-tested:
+today's heightmap-only terrain measures 762,516 triangles at radius 64, under
+the 1M ceiling, but caves (block 1.5) are what the original estimate expected to
+push it up, so this number is not yet the honest worst case.
 
 ---
 
