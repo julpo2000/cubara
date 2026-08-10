@@ -53,6 +53,7 @@ frames after 200 warmup.
 | 2026-07-21 | **Rule 3 — renderer renders only; all rules green**⁹ | 1,349 | 361,326 | ~1,920 | **0.361 ms** | ~0.90 ms | `refactor/renderer-renders-only` |
 | 2026-07-22 | Deterministic draw order (BTreeMap) [#81]¹⁰ | 1,349 | 361,326 | ~1,865 | 0.364 ms | ~0.92 ms | `fix/deterministic-draw-order` |
 | 2026-08-10 | **Radius-64 baseline — the phase 1 gate, first measured** [#89]¹¹ | 25,131 | 762,516 | ~996¹¹ | 0.715 ms | ~1.14 ms | `49146ef` |
+| 2026-08-10 | `BlockId` + per-chunk palette compression [#46]¹² | 25,131 | 762,516 | ~991 | 0.720 ms | ~1.23 ms | `174a2ce` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -186,6 +187,50 @@ PR (`crates/world/tests/radius_64_smoke.rs`) reproduces the same streamed
 region without a GPU and asserts it settles within a 120s bound and stays under
 the arena's vertex/index capacities — the substitute for the perf gate on
 GPU-less CI runners, per this issue's design decisions.
+
+¹² **`BlockId` + palette compression — memory down ~94%, one-time generation up
+~5-6×, draw path untouched.** `Chunk` moved from one `bool` per voxel (a flat
+4096-byte `Vec<bool>`, allocated for *every* chunk regardless of content) to
+`ChunkStorage`: `Uniform(BlockId)` with no allocation at all, or `Palette` — a
+small id table plus a packed index per voxel at the narrowest width that fits
+(1/2/4/8/16 bits). This row's scene is bit-for-bit the same geometry as the
+row above (25,131 chunks, 762,516 triangles, identical golden images) because
+representation is orthogonal to what gets drawn — so **FPS and CPU/frame are
+unchanged** (~991 FPS / 0.720 ms vs ~996 FPS / 0.715 ms, within the same
+noise band as¹) — this row only touches the one-time region-build step
+(`World::chunk_at` → `Chunk::from_fn`), not the per-frame draw loop.
+
+**Memory, measured directly** over the radius-64 region's 49,923 candidate
+chunk coordinates: 26,833 stay `Uniform` (**0 bytes** each — mostly the fully-
+air chunks above the terrain, plus fully-solid ones fully underground) and
+23,090 promote to `Palette` (516 bytes each at 1-bit packing — 2 distinct ids
+in phase 1). Total chunk-storage bytes: **11.9 MB, down from 195 MB** the old
+flat representation would have cost for the same set (**94.2% reduction**) —
+this is exactly the radius-64 memory budget `docs/PHASE1_ARCHITECTURE.md` §2/§4
+named this block as load-bearing for.
+
+**Generation time, measured directly** (`Chunk::from_fn`/`from_solid_fn` alone,
+same real terrain closure, no meshing): **old ~70-95 ms → new ~420 ms** for the
+same 49,923 chunks (~5-6×). Root cause, found by splitting the pipeline: it is
+*not* the palette bookkeeping itself (a synthetic worst case — every one of
+4096 cells a new value — costs only ~10 µs/chunk, ~480 ms total for all 49,923).
+The first version of this routed every cell through the promote/repack state
+machine (`ChunkStorage::set`) even for a chunk that never leaves `Uniform`,
+which cost **10×** on its own (fixed by splitting `set` into a tiny `#[inline]`
+fast path and an `#[inline(never)]` cold path — a large function with a rare
+slow branch was silently blocking inlining of the common no-op case). The
+remaining ~5-6× came from routing the *sampling* loop itself (which calls back
+into real worldgen — trig, not free) through that same per-cell state machine;
+restructuring `Chunk::from_fn` to sample into a flat buffer first and build the
+final `ChunkStorage` in one pass (`ChunkStorage::from_ids`, no incremental
+promotion/repack) let the sampling loop optimise the same way the old flat
+`Vec<bool>` fill did — isolated, it now costs ~97 ms, matching the old
+baseline. What's left is genuinely the palette-building pass, paid once per
+chunk at load time, not per frame: the CI smoke test (`radius_64_smoke.rs`)
+settles in ~1.3-1.4 s (was ~250-270 ms), still under 1% of its 120 s bound.
+This block's scope was the representation change, not chasing generation speed
+further; a future block is free to revisit if chunk-load time becomes the
+binding cost somewhere.
 
 ## Detailed run logs
 

@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use cubara_voxel::{Chunk, ChunkCoord};
+use cubara_voxel::{BlockId, Chunk, ChunkCoord};
 
 /// Deterministic terrain source, overlaid with player [edits](World::set_block).
 ///
@@ -85,11 +85,17 @@ impl World {
     /// `None` if it ends up with no solid blocks.
     pub fn chunk_at(&self, coord: ChunkCoord) -> Option<Chunk> {
         let size = Chunk::SIZE as i32;
-        let chunk = Chunk::from_solid_fn(|lx, ly, lz| {
+        let chunk = Chunk::from_fn(|lx, ly, lz| {
             let wx = coord.x * size + lx as i32;
             let wy = coord.y * size + ly as i32;
             let wz = coord.z * size + lz as i32;
-            self.is_solid_at(wx, wy, wz)
+            // TODO(#54): BlockId::STONE stands in for every non-air block until
+            // the registry exists -- the three-material world arrives in 1.4.
+            if self.is_solid_at(wx, wy, wz) {
+                BlockId::STONE
+            } else {
+                BlockId::AIR
+            }
         });
         (!chunk.is_empty()).then_some(chunk)
     }

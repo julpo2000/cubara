@@ -6,7 +6,9 @@
 //! quad per block. Out-of-chunk neighbours count as empty, so the outer shell is
 //! always meshed.
 
+use crate::block::BlockId;
 use crate::mesh::{Mesh, Vertex};
+use crate::storage::ChunkStorage;
 
 /// One cell of a greedy-mesh slice: the face orientation plus its four corners'
 /// ambient-occlusion levels. Two cells only merge into one quad when they are
@@ -36,21 +38,40 @@ fn vertex_ao(side1: bool, side2: bool, corner: bool) -> u8 {
     }
 }
 
-/// A cubic chunk of `SIZE³` blocks. Blocks are solid/empty for now.
+/// A cubic chunk of `SIZE³` blocks, stored palette-compressed (see
+/// [`ChunkStorage`]).
 pub struct Chunk {
-    solid: Vec<bool>,
+    storage: ChunkStorage,
 }
 
 impl Chunk {
     pub const SIZE: usize = 16;
     const VOLUME: usize = Self::SIZE * Self::SIZE * Self::SIZE;
 
+    #[inline]
     fn index(x: usize, y: usize, z: usize) -> usize {
         (z * Self::SIZE + y) * Self::SIZE + x
     }
 
+    /// The block at a local position.
+    #[inline]
+    pub fn get(&self, x: usize, y: usize, z: usize) -> BlockId {
+        self.storage.get(Self::index(x, y, z))
+    }
+
+    /// Set the block at a local position, promoting/re-packing storage as
+    /// needed (see [`ChunkStorage`]).
+    #[inline]
+    pub fn set(&mut self, x: usize, y: usize, z: usize, id: BlockId) {
+        self.storage.set(Self::index(x, y, z), id, Self::VOLUME);
+    }
+
+    // TODO(#54): once the block registry exists, this is a registry lookup --
+    // a block can be non-air and still not solid (e.g. a future transparent
+    // type). For phase 1's single non-air id, "solid" and "not air" coincide.
+    #[inline]
     pub fn is_solid(&self, x: usize, y: usize, z: usize) -> bool {
-        self.solid[Self::index(x, y, z)]
+        self.get(x, y, z) != BlockId::AIR
     }
 
     /// Solidity with bounds handling: anything outside the chunk counts as empty.
@@ -65,24 +86,44 @@ impl Chunk {
         self.is_solid(x, y, z)
     }
 
-    /// Build a chunk by asking `f` whether each local block is solid.
-    pub fn from_solid_fn(mut f: impl FnMut(usize, usize, usize) -> bool) -> Self {
-        let mut solid = vec![false; Self::VOLUME];
+    /// Build a chunk by asking `f` for each local block's id.
+    ///
+    /// Samples every cell into a flat buffer first, then chooses `Uniform` or
+    /// `Palette` from the complete set in one pass
+    /// ([`ChunkStorage::from_ids`]), rather than promoting/re-packing
+    /// incrementally through [`set`](Self::set) 4096 times. Both are correct;
+    /// this one measurably matters, because `f` is worldgen (real terrain
+    /// sampling, not free) and a simple sampling loop is what lets the
+    /// compiler optimise it the way it already did for the old all-`bool`
+    /// representation -- routing every cell through the promote/repack state
+    /// machine instead cost an **order of magnitude** on real terrain (~70ms
+    /// -> ~1.0s over a radius-64 region), not just the palette bookkeeping's
+    /// own small cost. See `BENCHMARKS.md`'s block-1.2 row.
+    pub fn from_fn(mut f: impl FnMut(usize, usize, usize) -> BlockId) -> Self {
+        let mut ids = Vec::with_capacity(Self::VOLUME);
         for z in 0..Self::SIZE {
             for y in 0..Self::SIZE {
                 for x in 0..Self::SIZE {
-                    if f(x, y, z) {
-                        solid[Self::index(x, y, z)] = true;
-                    }
+                    ids.push(f(x, y, z));
                 }
             }
         }
-        Self { solid }
+        Self {
+            storage: ChunkStorage::from_ids(&ids),
+        }
     }
 
     /// Whether the chunk has no solid blocks (nothing to mesh).
     pub fn is_empty(&self) -> bool {
-        !self.solid.iter().any(|&s| s)
+        match &self.storage {
+            ChunkStorage::Uniform(id) => *id == BlockId::AIR,
+            // A palette chunk can still end up all-air (e.g. place then break
+            // the one block that triggered promotion) -- the palette table
+            // doesn't demote, so only a full scan is honest here.
+            ChunkStorage::Palette { .. } => {
+                (0..Self::VOLUME).all(|idx| self.storage.get(idx) == BlockId::AIR)
+            }
+        }
     }
 
     /// Greedy-mesh the chunk at full resolution (LOD 0). Vertices are in local chunk
@@ -356,13 +397,18 @@ mod tests {
 
     fn empty() -> Chunk {
         Chunk {
-            solid: vec![false; Chunk::VOLUME],
+            storage: ChunkStorage::Uniform(BlockId::AIR),
+        }
+    }
+
+    fn uniform(id: BlockId) -> Chunk {
+        Chunk {
+            storage: ChunkStorage::Uniform(id),
         }
     }
 
     fn set(chunk: &mut Chunk, x: usize, y: usize, z: usize) {
-        let i = Chunk::index(x, y, z);
-        chunk.solid[i] = true;
+        chunk.set(x, y, z, BlockId::STONE);
     }
 
     fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -388,9 +434,7 @@ mod tests {
 
     #[test]
     fn full_chunk_merges_each_face_into_one_quad() {
-        let chunk = Chunk {
-            solid: vec![true; Chunk::VOLUME],
-        };
+        let chunk = uniform(BlockId::STONE);
         let mesh = chunk.build_mesh();
         // Only the 6 outer faces are visible, each merged into a single quad.
         assert_eq!(mesh.triangle_count(), 12);
@@ -461,9 +505,7 @@ mod tests {
     fn lod_keeps_footprint_and_merges_full_chunk() {
         // A full chunk downsamples to a full coarse chunk: still six merged faces,
         // and it must occupy the same 0..16 world footprint (scale compensates).
-        let chunk = Chunk {
-            solid: vec![true; Chunk::VOLUME],
-        };
+        let chunk = uniform(BlockId::STONE);
         for level in 1..=4 {
             let mesh = chunk.build_mesh_lod(level);
             assert_eq!(
@@ -483,7 +525,7 @@ mod tests {
     fn lod_downsamples_a_slab_cleanly() {
         // Bottom half solid (fine y < 8) → at LOD 1 the coarse cells for y 0..4 are
         // fully solid and 4..8 empty, so it's a clean slab whose top sits at world y=8.
-        let chunk = Chunk::from_solid_fn(|_, y, _| y < 8);
+        let chunk = Chunk::from_fn(|_, y, _| if y < 8 { BlockId::STONE } else { BlockId::AIR });
         let mesh = chunk.build_mesh_lod(1);
         assert_eq!(mesh.triangle_count(), 12, "slab = six merged faces");
         let (min, max) = bounds(&mesh);
@@ -494,7 +536,13 @@ mod tests {
     fn lod_reduces_triangles_on_stepped_terrain() {
         // A diagonal staircase has many stair-step faces at full res; downsampling
         // merges the steps into coarser ones, so LOD 1 has strictly fewer triangles.
-        let chunk = Chunk::from_solid_fn(|x, y, _| (y as i32) <= x as i32);
+        let chunk = Chunk::from_fn(|x, y, _| {
+            if (y as i32) <= x as i32 {
+                BlockId::STONE
+            } else {
+                BlockId::AIR
+            }
+        });
         let full = chunk.build_mesh().triangle_count();
         let lod1 = chunk.build_mesh_lod(1).triangle_count();
         assert!(
@@ -506,9 +554,7 @@ mod tests {
     #[test]
     fn lod_level_is_capped_not_panicking() {
         // An absurd level clamps to log2(SIZE) rather than producing an empty grid.
-        let chunk = Chunk {
-            solid: vec![true; Chunk::VOLUME],
-        };
+        let chunk = uniform(BlockId::STONE);
         assert_eq!(chunk.build_mesh_lod(99).triangle_count(), 12);
     }
 
@@ -528,5 +574,55 @@ mod tests {
             let dot = geo[0] * n[0] + geo[1] * n[1] + geo[2] * n[2];
             assert!(dot > 0.0, "quad {quad} is wound inward (geo·n = {dot})");
         }
+    }
+
+    #[test]
+    fn from_fn_of_a_constant_id_stays_uniform() {
+        // The real-world path (`World::chunk_at` builds every chunk through
+        // `from_fn`) must hit the no-allocation fast path for the common case --
+        // an entirely-air or entirely-solid chunk -- not just when constructed
+        // directly as `ChunkStorage::Uniform`.
+        let chunk = Chunk::from_fn(|_, _, _| BlockId::AIR);
+        assert!(matches!(chunk.storage, ChunkStorage::Uniform(BlockId::AIR)));
+
+        let chunk = Chunk::from_fn(|_, _, _| BlockId::STONE);
+        assert!(matches!(
+            chunk.storage,
+            ChunkStorage::Uniform(BlockId::STONE)
+        ));
+    }
+
+    #[test]
+    fn from_fn_of_varying_ids_promotes_and_round_trips() {
+        let chunk = Chunk::from_fn(|x, y, z| {
+            if x == 3 && y == 4 && z == 5 {
+                BlockId::STONE
+            } else {
+                BlockId::AIR
+            }
+        });
+        assert!(matches!(chunk.storage, ChunkStorage::Palette { .. }));
+        assert_eq!(chunk.get(3, 4, 5), BlockId::STONE);
+        assert_eq!(chunk.get(0, 0, 0), BlockId::AIR);
+        assert!(chunk.is_solid(3, 4, 5));
+        assert!(!chunk.is_solid(0, 0, 0));
+    }
+
+    #[test]
+    fn is_empty_is_true_for_a_palette_chunk_with_no_solid_cells_left() {
+        // No demotion: placing then breaking the one block that promoted the
+        // chunk leaves it Palette-backed but logically empty. `is_empty` must
+        // still report that correctly (it can't rely on the variant alone).
+        let mut chunk = empty();
+        set(&mut chunk, 1, 1, 1);
+        assert!(matches!(chunk.storage, ChunkStorage::Palette { .. }));
+        assert!(!chunk.is_empty());
+
+        chunk.set(1, 1, 1, BlockId::AIR);
+        assert!(matches!(chunk.storage, ChunkStorage::Palette { .. }));
+        assert!(
+            chunk.is_empty(),
+            "every cell is air again, just not Uniform"
+        );
     }
 }
