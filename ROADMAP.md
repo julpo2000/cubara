@@ -88,18 +88,18 @@ own PR. The order is a dependency order, not a preference.
 
 | # | Block | Why here | Existing issue |
 |---|---|---|---|
-| **1.0** | Measure the target before building for it: `--bench 64` runs at all, `scripts/check-phase-gate.sh` exists and **fails**, baseline recorded | You cannot optimise toward a number you have never measured. This block's deliverable is a red gate and a row in `BENCHMARKS.md`. | new |
+| **1.0** | Measure the target before building for it: `--bench 64` runs at all, `scripts/check-phase-gate.sh` exists and **fails**, baseline recorded | You cannot optimise toward a number you have never measured. This block's deliverable is a red gate and a row in `BENCHMARKS.md`. | [#89](../../issues/89) |
 | **1.1** | Deterministic arena slab offsets | Open bug; the LOD work rewrites everything around the arena, so it is fixed before, not during. | [#83](../../issues/83) |
 | **1.2** | `BlockId` + per-chunk palette compression — the end of `bool` | Every later system (textures, mining, inventory, saves) needs block identity. Nothing after this works without it. | [#46](../../issues/46) |
-| **1.3** | Block registry from RON, with **stable string ids** | The one decision that would poison saves, mods and multiplayer if made later. See design §3. | [#54](../../issues/54) |
-| **1.4** | Texture array + per-face texture indices + the material shader | Three original 16×16 textures; the flat green in `mesh.wgsl` goes away. Pinned by a golden-image test. | [#43](../../issues/43), [#44](../../issues/44) |
+| **1.3** | Block registry from RON — **names are identity, numbers are per-world** | The one decision that would poison saves, mods and multiplayer if made later. See design §3. | [#54](../../issues/54) |
+| **1.4** | Packed vertex + texture array, per-face materials, and the three original textures | The flat green in `mesh.wgsl` goes away. Three issues, three PRs. Pinned by golden-image tests. | [#43](../../issues/43), [#44](../../issues/44), [#55](../../issues/55) |
 | **1.5** | Seeded 3D noise worldgen with cave systems | Caves are the honest meshing load — a smooth heightmap flatters the renderer. The seed becomes world state (Rule 1). | [#48](../../issues/48) |
 | **1.6** | Fixed-timestep tick loop + seeded world RNG | ~100 lines now; a rewrite later. Rule 1 is the keystone and the only rule that cannot be retrofitted. | [#57](../../issues/57) |
 | **1.7** | Player: AABB collision, gravity, walking; free-fly becomes a debug toggle; selected-block highlight | Runs in the sim at fixed tick rate, so movement is deterministic and phase 2 inherits it. | [#53](../../issues/53), [#52](../../issues/52) |
-| **1.8** | Determinism harness: world-state hash + replay test, single- vs multi-threaded | Rule 1's missing enforcement, and the hash that block 1.9's round-trip test is built on. | new |
+| **1.8** | Determinism harness: world-state hash + replay test, single- vs multi-threaded | Rule 1's missing enforcement, and the hash that block 1.9's round-trip test is built on. | [#90](../../issues/90) |
 | **1.9** | **Save/load:** world header with the block id table, region files, chunk payload | The on-disk format and the in-memory block representation are one decision, so they are made in one phase. See design §7. | [#60](../../issues/60) |
 | **1.10** | **LOD as draw-count reduction** — the region node tree, and `cubara-render` stops depending on `cubara-world` | The block that decides whether radius 64 is reachable at all. Tracking issue with sub-issues; see design §6 and §1. | [#38](../../issues/38) |
-| **1.11** | Whatever block 1.10's measurements say is still missing — occlusion culling is the standing candidate | Deliberately unspecified: it is chosen from a profile, not from a guess. | [#42](../../issues/42) |
+| **1.11** | Whatever block 1.10's measurements say is still missing | Deliberately has no issue yet: it is written from a profile, not from a guess. Occlusion culling ([#42](../../issues/42), currently filed under phase 3) is the standing candidate to pull forward. | written after 1.10 |
 
 ### Exit gate
 
@@ -222,11 +222,12 @@ scheduled against phase 3's needs rather than pursued on their own.
 
 | Phase 1 | Phase 2 | Engine work, scheduled against phase 3 |
 |---|---|---|
-| #83, #46, #54, #55, #43, #44, #48, #57, #53, #52, #60, #38 | #56, #47, #58, #59 | #28, #32, #33, #42, #36 |
+| #89, #83, #46, #54, #43, #44, #55, #48, #57, #53, #52, #90, #60, #38 | #56, #47, #58, #59 | #28, #32, #33, #42, #36 |
 
 Each phase is the GitHub milestone of the same name, and every open issue is
 filed under one — an issue that fits no phase is unscheduled work, not a reason
-to start.
+to start. Issue titles carry their block number, and **`./scripts/next-block.sh`
+prints what to work on next** so that ordering is read rather than judged.
 
 [#52](../../issues/52) (selected-block highlight) rides along with phase 1's
 player work — you cannot aim at a block you cannot see you are aiming at.
