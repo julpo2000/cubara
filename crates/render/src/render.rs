@@ -126,7 +126,12 @@ pub fn gpu_driven_features(adapter: &wgpu::Adapter) -> (wgpu::Features, bool) {
     // on both Metal and Vulkan/DX12 by the #26 `--caps` spike; §5.3.
     let wanted = wgpu::Features::MULTI_DRAW_INDIRECT | wgpu::Features::INDIRECT_FIRST_INSTANCE;
     let features = adapter.features() & wanted;
-    let multi_draw = features.contains(wgpu::Features::MULTI_DRAW_INDIRECT);
+    // DIAG: temporarily force the non-indirect draw_indexed loop (the
+    // headless::render_arena DIAG line already prints this value), to isolate
+    // whether the bug is "first_instance doesn't work at all" vs "first_instance
+    // doesn't survive multi_draw_indexed_indirect specifically" on the Windows
+    // CI runner's software adapter.
+    let multi_draw = false;
     (features, multi_draw)
 }
 
