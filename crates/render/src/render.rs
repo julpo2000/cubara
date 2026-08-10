@@ -26,8 +26,8 @@ use crate::scene::SceneRenderer;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// Load the real `assets/blocks/*.ron` registry and build the texture array
-/// from it -- the same materials every entry point (window, `--bench`,
-/// `--screenshot`, golden tests) meshes and renders against.
+/// from `assets/textures/` -- the same materials every entry point (window,
+/// `--bench`, `--screenshot`, golden tests) meshes and renders against.
 /// `CARGO_MANIFEST_DIR` is `crates/render`, so `../..` reaches the repo root
 /// regardless of the caller's working directory.
 ///
@@ -40,9 +40,14 @@ pub fn load_mesh_assets(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
 ) -> (MeshAssets, wgpu::TextureView, wgpu::Sampler) {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/blocks");
-    let registry = BlockRegistry::load(&dir).expect("assets/blocks must be valid");
-    let (view, sampler, layers) = materials::build(device, queue, &registry);
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let registry =
+        BlockRegistry::load(&repo_root.join("assets/blocks")).expect("assets/blocks must load");
+    let textures_dir = repo_root.join("assets/textures");
+    registry
+        .validate_textures(&textures_dir)
+        .expect("assets/textures must cover every material's faces");
+    let (view, sampler, layers) = materials::build(device, queue, &registry, &textures_dir);
     (MeshAssets { registry, layers }, view, sampler)
 }
 

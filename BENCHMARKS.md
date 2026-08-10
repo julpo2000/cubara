@@ -58,8 +58,10 @@ frames after 200 warmup.
 | 2026-08-10 | Packed vertex + texture array [#43], radius 64 — `first_instance` mechanism, superseded¹³ | 25,131 | 762,516 | ~728 | 1.317 ms | ~1.49 ms | *(superseded, not merged)* |
 | 2026-08-11 | **Packed vertex + texture array, node_index-in-vertex (final)** [#43], radius 12¹⁴ | 1,349 | 361,326 | ~2,460 | **0.273 ms** | ~0.57 ms | `218eb41` |
 | 2026-08-11 | **Packed vertex + texture array, node_index-in-vertex (final)** [#43], radius 64¹⁴ | 25,131 | 762,516 | ~1,016 | **0.697 ms** | ~1.05 ms | `218eb41` |
-| 2026-08-11 | Per-face material appearance [#44], radius 12¹⁵ | 1,349 | 361,326 | ~2,452 | 0.275 ms | ~0.56 ms | *(this PR)* |
-| 2026-08-11 | Per-face material appearance [#44], radius 64¹⁵ | 25,131 | 762,516 | ~1,016 | 0.707 ms | ~1.31 ms | *(this PR)* |
+| 2026-08-11 | Per-face material appearance [#44], radius 12¹⁵ | 1,349 | 361,326 | ~2,452 | 0.275 ms | ~0.56 ms | `a13200d` |
+| 2026-08-11 | Per-face material appearance [#44], radius 64¹⁵ | 25,131 | 762,516 | ~1,016 | 0.707 ms | ~1.31 ms | `a13200d` |
+| 2026-08-11 | **The three phase-1 materials + textures, depth-layered terrain** [#55], radius 12¹⁶ | 1,349 | 439,816 | ~2,012 | 0.329 ms | ~0.81 ms | *(this PR)* |
+| 2026-08-11 | **The three phase-1 materials + textures, depth-layered terrain** [#55], radius 64¹⁶ | 25,131 | 899,840 | ~877 | 0.821 ms | ~2.06 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -380,6 +382,34 @@ bottom, the four horizontal directions → side) -- strictly more precise than
 a pixel-diff against a flat placeholder colour could be, and it doesn't need
 a new camera-override mechanism in the shared headless render path to get
 there.
+
+¹⁶ **Real art and depth-layered terrain (issue #55) — slower, and it's the
+same cause as footnote 4's AO jump: more triangles, not more expensive
+ones.** Two independent changes land together: `materials::build` loads the
+four real 16×16 PNGs from `assets/textures/` instead of a flat placeholder
+colour per name, and `World::chunk_at` stamps unedited terrain by depth
+below the surface (`cubara:grass` at the surface, `cubara:soil` for
+`SOIL_DEPTH` (3) blocks under it, `cubara:stone` below that) instead of one
+material everywhere. The first is texture-sampling cost, unchanged in shape
+from block 1.4b (still one `texture_2d_array` sample per fragment); the
+second is what actually moves the numbers, because `MaskCell` merge
+equality already requires the same block id (block 1.4a), so a
+material-layer boundary splits a greedy-merged quad exactly like an AO
+discontinuity does. Radius 12: **361,326 → 439,816 triangles (+22%)**,
+FPS ~2,452 → ~2,012, CPU/frame **0.275 → 0.329 ms (+20%)** -- proportional
+to the triangle increase, not a new per-triangle cost. Radius 64: **762,516
+→ 899,840 triangles (+18%)**, FPS ~1,016 → ~877 (dropping the bench's
+generic 1000-FPS tag to NOT MET, which is not the same thing as the formal
+radius-64 exit gate from issue #89 -- that gate is bound by `MAX_DRAWS`, was
+already NOT MET before this row, and stays exactly as NOT MET, unmoved by a
+triangle-count change), CPU/frame **0.697 → 0.821 ms (+18%)**. Both deltas
+track their triangle-count deltas closely, which is the tell that this is
+real layered geometry doing real work, not a regression to chase.
+
+`assets/textures/{stone,soil,grass_top,grass_side}.png` are original,
+procedurally-generated 16×16 pixel art authored for this PR -- not traced,
+recoloured, or sampled from any existing game (`REQUIREMENTS.md` #6). See
+the PR description for how they were made.
 
 ## Detailed run logs
 

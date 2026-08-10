@@ -13,7 +13,48 @@
 
 use std::collections::BTreeMap;
 
-use cubara_voxel::{BlockId, Chunk, ChunkCoord};
+use cubara_voxel::{BlockId, BlockRegistry, Chunk, ChunkCoord};
+
+/// The three block ids [`World::chunk_at`] stamps onto generated terrain,
+/// resolved by the caller from its own loaded registry by name (e.g.
+/// `registry.id_of("cubara:grass")`) rather than assumed as fixed numbers --
+/// see `chunk_at`'s doc comment for why a hardcoded id doesn't work here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerrainBlocks {
+    /// The exposed surface block of unedited terrain.
+    pub grass: BlockId,
+    /// The `SOIL_DEPTH` blocks directly beneath the surface.
+    pub soil: BlockId,
+    /// Everything deeper than that, and every player-placed block -- edits
+    /// don't carry a material choice yet (no inventory/build system exists
+    /// before block 1.5+), so a placed block is always this one.
+    pub stone: BlockId,
+}
+
+impl TerrainBlocks {
+    /// Resolve `cubara:grass`/`cubara:soil`/`cubara:stone` from `registry` by
+    /// name -- the one place every real caller (the live renderer, the
+    /// headless bench/screenshot paths) gets its `TerrainBlocks` from, so the
+    /// "resolve by name, not a hardcoded id" rule lives in one spot instead
+    /// of being repeated at each call site.
+    pub fn from_registry(registry: &BlockRegistry) -> Self {
+        let id = |name: &str| {
+            registry
+                .id_of(name)
+                .unwrap_or_else(|| panic!("assets/blocks must define {name}"))
+        };
+        Self {
+            grass: id("cubara:grass"),
+            soil: id("cubara:soil"),
+            stone: id("cubara:stone"),
+        }
+    }
+}
+
+/// How many blocks of soil separate the grass surface from stone beneath --
+/// a simple, fixed depth rule (block 1.4c / #55). Real layered biomes with
+/// varying depth are block 1.5 / #48's terrain, not this one.
+const SOIL_DEPTH: i32 = 3;
 
 /// Deterministic terrain source, overlaid with player [edits](World::set_block).
 ///
@@ -82,29 +123,49 @@ impl World {
     }
 
     /// Generate the chunk at `coord` from terrain overlaid with any player edits, or
-    /// `None` if it ends up with no solid blocks. Every solid cell is `solid` --
-    /// real per-voxel material variety is block 1.5's terrain, not this one -- but
-    /// the caller supplies which id that is (resolved from its own loaded registry
-    /// by name, e.g. `registry.id_of("cubara:stone")`) rather than this crate
-    /// assuming a fixed number. `BlockId`s are assigned by sorted name per registry
-    /// (§3.4), so a hardcoded id here would silently mean a different material --
-    /// or a `Sided` one with an entirely different look -- the moment the loaded
-    /// registry's material set changed; that exact mismatch (id 1 meaning
-    /// `cubara:grass`, not `cubara:stone`, in the real 3-material registry) is what
-    /// block 1.4b's per-face resolution surfaced.
-    pub fn chunk_at(&self, coord: ChunkCoord, solid: BlockId) -> Option<Chunk> {
+    /// `None` if it ends up with no solid blocks. Unedited terrain is layered by
+    /// depth below the surface (`blocks.grass`/`soil`/`stone`, `SOIL_DEPTH`) -- a
+    /// simple rule, not real biome variety (block 1.5's terrain, not this one) --
+    /// but the caller supplies which ids those are (resolved from its own loaded
+    /// registry by name, e.g. `registry.id_of("cubara:grass")`) rather than this
+    /// crate assuming fixed numbers. `BlockId`s are assigned by sorted name per
+    /// registry (§3.4), so a hardcoded id here would silently mean a different
+    /// material -- or a `Sided` one with an entirely different look -- the moment
+    /// the loaded registry's material set changed; that exact mismatch (id 1
+    /// meaning `cubara:grass`, not `cubara:stone`, in the real 3-material
+    /// registry) is what block 1.4b's per-face resolution surfaced.
+    pub fn chunk_at(&self, coord: ChunkCoord, blocks: TerrainBlocks) -> Option<Chunk> {
         let size = Chunk::SIZE as i32;
         let chunk = Chunk::from_fn(|lx, ly, lz| {
             let wx = coord.x * size + lx as i32;
             let wy = coord.y * size + ly as i32;
             let wz = coord.z * size + lz as i32;
-            if self.is_solid_at(wx, wy, wz) {
-                solid
-            } else {
-                BlockId::AIR
-            }
+            self.block_at(wx, wy, wz, blocks)
         });
         (!chunk.is_empty()).then_some(chunk)
+    }
+
+    /// The block at world `(x, y, z)`: a player edit if one exists there
+    /// (always `blocks.stone` when placed -- edits don't carry a material
+    /// choice yet), otherwise unedited terrain layered by depth below the
+    /// surface (see [`TerrainBlocks`]).
+    fn block_at(&self, x: i32, y: i32, z: i32, blocks: TerrainBlocks) -> BlockId {
+        match self.edits.get(&[x, y, z]) {
+            Some(&true) => blocks.stone,
+            Some(&false) => BlockId::AIR,
+            None => {
+                let surface = terrain_height(x, z);
+                if y > surface {
+                    BlockId::AIR
+                } else if y == surface {
+                    blocks.grass
+                } else if surface - y <= SOIL_DEPTH {
+                    blocks.soil
+                } else {
+                    blocks.stone
+                }
+            }
+        }
     }
 }
 
@@ -137,6 +198,16 @@ mod tests {
         0
     }
 
+    /// `TerrainBlocks` for tests that only care whether a chunk is empty or
+    /// not, not which material it renders as.
+    fn stone_blocks() -> TerrainBlocks {
+        TerrainBlocks {
+            grass: BlockId::STONE,
+            soil: BlockId::STONE,
+            stone: BlockId::STONE,
+        }
+    }
+
     fn test_ctx(registry: &BlockRegistry) -> MeshContext<'_> {
         MeshContext {
             registry,
@@ -157,17 +228,77 @@ mod tests {
         let world = World::new();
         let registry = test_registry();
         let ctx = test_ctx(&registry);
+        // A single-material fixture, so `TerrainBlocks` deliberately points
+        // grass/soil/stone at the *same* id -- this test pins geometry, not
+        // the depth rule (that's `terrain_layers_by_depth` below), and using
+        // one id keeps the depth boundaries from introducing new unmerged
+        // quads that would move the triangle count for the wrong reason.
         let stone = registry.id_of("cubara:stone").unwrap();
+        let blocks = TerrainBlocks {
+            grass: stone,
+            soil: stone,
+            stone,
+        };
         let coords = streaming::desired_chunks(ChunkCoord::new(0, 0, 0), 2, 0..=2);
         let mut chunks = 0usize;
         let mut tris = 0usize;
         for coord in coords {
-            if let Some(chunk) = world.chunk_at(coord, stone) {
+            if let Some(chunk) = world.chunk_at(coord, blocks) {
                 chunks += 1;
                 tris += chunk.build_mesh(&ctx).triangle_count();
             }
         }
         assert_eq!((chunks, tris), (52, 14716));
+    }
+
+    #[test]
+    fn terrain_layers_by_depth() {
+        // Block 1.4c's depth rule: grass at the surface, soil for the next
+        // SOIL_DEPTH blocks, stone beyond that -- and edits stay material-
+        // blind (always `stone`, or air when broken), since there's no
+        // inventory/build system yet to choose what a placed block is made
+        // of. Three distinct ids, unlike `region_mesh_output_is_stable`
+        // above, since this test is specifically about telling them apart.
+        let grass = BlockId(1);
+        let soil = BlockId(2);
+        let stone = BlockId(3);
+        let blocks = TerrainBlocks { grass, soil, stone };
+
+        let mut world = World::new();
+        let surface = terrain_height(0, 0);
+
+        assert_eq!(world.block_at(0, surface, 0, blocks), grass, "surface");
+        for depth in 1..=SOIL_DEPTH {
+            assert_eq!(
+                world.block_at(0, surface - depth, 0, blocks),
+                soil,
+                "depth {depth}"
+            );
+        }
+        assert_eq!(
+            world.block_at(0, surface - SOIL_DEPTH - 1, 0, blocks),
+            stone,
+            "below the soil layer"
+        );
+        assert_eq!(
+            world.block_at(0, surface + 1, 0, blocks),
+            BlockId::AIR,
+            "above the surface"
+        );
+
+        // Edits override the depth rule entirely, at any depth.
+        world.set_block(0, surface, 0, true); // re-place the surface block
+        assert_eq!(
+            world.block_at(0, surface, 0, blocks),
+            stone,
+            "a placed block is always stone -- edits carry no material choice yet"
+        );
+        world.set_block(0, surface - SOIL_DEPTH - 1, 0, false); // break deep stone
+        assert_eq!(
+            world.block_at(0, surface - SOIL_DEPTH - 1, 0, blocks),
+            BlockId::AIR,
+            "a broken block is air regardless of what the depth rule would say"
+        );
     }
 
     #[test]
@@ -223,12 +354,12 @@ mod tests {
         let mut world = World::new();
         let cc = ChunkCoord::new(0, 8, 0); // blocks y 128..143
         assert!(
-            world.chunk_at(cc, BlockId::STONE).is_none(),
+            world.chunk_at(cc, stone_blocks()).is_none(),
             "air chunk starts empty"
         );
         world.set_block(0, 130, 0, true);
         assert!(
-            world.chunk_at(cc, BlockId::STONE).is_some(),
+            world.chunk_at(cc, stone_blocks()).is_some(),
             "placing a block makes the chunk non-empty"
         );
     }

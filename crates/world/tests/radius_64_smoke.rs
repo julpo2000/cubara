@@ -21,7 +21,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cubara_voxel::{BlockRegistry, ChunkCoord, Faces, Material, MeshContext, Shape};
-use cubara_world::{streaming, World};
+use cubara_world::{streaming, TerrainBlocks, World};
 
 const RADIUS: i32 = 64;
 
@@ -73,7 +73,16 @@ fn radius_64_world_load_settles_within_budget() {
     let handle = thread::spawn(move || {
         let world = World::new();
         let registry = test_registry();
+        // Single-material fixture: point grass/soil/stone at the same id so
+        // the depth rule doesn't introduce material-boundary quads that
+        // aren't there for a real registry either at this test's scope
+        // (settling time and arena capacity, not material rendering).
         let stone = registry.id_of("cubara:stone").unwrap();
+        let blocks = TerrainBlocks {
+            grass: stone,
+            soil: stone,
+            stone,
+        };
         let ctx = MeshContext {
             registry: &registry,
             layer_of: &zero_layer,
@@ -82,7 +91,7 @@ fn radius_64_world_load_settles_within_budget() {
         let mut vertices = 0u64;
         let mut indices = 0u64;
         for coord in coords {
-            if let Some(chunk) = world.chunk_at(coord, stone) {
+            if let Some(chunk) = world.chunk_at(coord, blocks) {
                 let level = streaming::lod_for(coord, center);
                 let mesh = chunk.build_mesh_lod(&ctx, level);
                 if !mesh.indices.is_empty() {

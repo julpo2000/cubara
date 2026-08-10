@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 
 use cubara_voxel::{Chunk, ChunkCoord, Mesh, MeshContext, Vertex};
-use cubara_world::{streaming, World};
+use cubara_world::{streaming, TerrainBlocks, World};
 
 use crate::culling::{Aabb, Frustum};
 
@@ -597,15 +597,11 @@ impl ChunkArena {
     ) -> Self {
         let mut arena = Self::new(device, multi_draw);
         let mut total_tris = 0u32;
-        // TODO(#48): every solid voxel is this one id until real terrain
-        // materials (block 1.5) -- see `World::chunk_at`'s doc comment for
-        // why it's resolved by name here rather than a hardcoded `BlockId`.
-        let solid = ctx
-            .registry
-            .id_of("cubara:stone")
-            .expect("assets/blocks must define cubara:stone");
+        // TODO(#48): a simple fixed depth rule (block 1.4c) until real
+        // layered terrain (block 1.5) -- see `TerrainBlocks`.
+        let blocks = TerrainBlocks::from_registry(ctx.registry);
         for coord in streaming::desired_chunks(center, radius, y_range) {
-            if let Some(chunk) = world.chunk_at(coord, solid) {
+            if let Some(chunk) = world.chunk_at(coord, blocks) {
                 let level = streaming::lod_for(coord, center);
                 if arena.upload_chunk(queue, coord, &chunk, ctx, level) {
                     if let Some(slot) = arena.slots.get(&coord) {

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use cubara_voxel::{ChunkCoord, Mesh, MeshContext};
-use cubara_world::World;
+use cubara_world::{TerrainBlocks, World};
 
 use crate::arena::build_chunk_mesh;
 use crate::culling::Aabb;
@@ -56,15 +56,11 @@ fn mesh_coord(
         registry: &assets.registry,
         layer_of: &layer_of,
     };
-    // TODO(#48): every solid voxel is this one id until real terrain
-    // materials (block 1.5) -- see `World::chunk_at`'s doc comment for why
-    // it's resolved by name here rather than a hardcoded `BlockId`.
-    let solid = assets
-        .registry
-        .id_of("cubara:stone")
-        .expect("assets/blocks must define cubara:stone");
+    // TODO(#48): a simple fixed depth rule (block 1.4c) until real layered
+    // terrain (block 1.5) -- see `TerrainBlocks`.
+    let blocks = TerrainBlocks::from_registry(&assets.registry);
     world
-        .chunk_at(coord, solid)
+        .chunk_at(coord, blocks)
         .and_then(|chunk| build_chunk_mesh(coord, &chunk, &ctx, level))
 }
 
@@ -214,21 +210,32 @@ mod tests {
     use cubara_world::streaming;
     use std::collections::HashMap;
 
-    /// A registry with a single solid material -- enough for meshing tests,
-    /// which only care about solid-vs-air (registry mechanics are tested in
-    /// `cubara_voxel::registry`) -- paired with an empty texture-layer map,
-    /// since these tests don't care about texturing either and shouldn't need
-    /// a GPU device just to build a real texture array.
+    /// A registry with the three real material *names* -- `mesh_coord` resolves
+    /// `TerrainBlocks::from_registry` by name (block 1.4c), so a fixture missing
+    /// any of them panics inside the worker thread and the test hangs waiting
+    /// for a result that never arrives, rather than failing loudly. These tests
+    /// only care about solid-vs-air and worker-pool mechanics (registry mechanics
+    /// are tested in `cubara_voxel::registry`), so all three are plain `All`
+    /// materials -- paired with an empty texture-layer map, since these tests
+    /// don't care about texturing either and shouldn't need a GPU device just to
+    /// build a real texture array.
     fn test_assets() -> Arc<MeshAssets> {
-        let registry = cubara_voxel::BlockRegistry::from_materials(vec![(
-            std::path::PathBuf::from("test-fixture.ron"),
-            Material {
-                name: "cubara:stone".to_string(),
-                solid: true,
-                faces: Faces::All("stone".to_string()),
-                shapes: vec![Shape::Full],
-            },
-        )])
+        let material = |name: &str| {
+            (
+                std::path::PathBuf::from("test-fixture.ron"),
+                Material {
+                    name: name.to_string(),
+                    solid: true,
+                    faces: Faces::All(name.to_string()),
+                    shapes: vec![Shape::Full],
+                },
+            )
+        };
+        let registry = cubara_voxel::BlockRegistry::from_materials(vec![
+            material("cubara:grass"),
+            material("cubara:soil"),
+            material("cubara:stone"),
+        ])
         .expect("fixture registry is valid");
         Arc::new(MeshAssets {
             registry,

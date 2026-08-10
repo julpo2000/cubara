@@ -2,12 +2,14 @@
 //!
 //! Builds a `texture_2d_array` from the registry's texture names — 16×16
 //! tiles, one layer per name, nearest-filtered (pixel art), matching
-//! `docs/PHASE1_ARCHITECTURE.md` §11. The real texture art is block 1.4c;
-//! until then each layer is a flat, deterministically-derived placeholder
-//! colour, so distinct materials are visibly distinct without depending on
-//! art that doesn't exist yet.
+//! `docs/PHASE1_ARCHITECTURE.md` §11. Each name loads `{textures_dir}/
+//! {name}.png` (block 1.4c's original art, `assets/textures/`); a name with
+//! no matching file falls back to a flat, deterministically-derived
+//! placeholder colour, so a registry entry a texture file hasn't caught up
+//! to yet still renders as *something* distinct rather than failing to load.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use cubara_voxel::BlockRegistry;
 
@@ -68,15 +70,44 @@ fn solid_tile(color: [u8; 3]) -> Vec<u8> {
         .collect()
 }
 
-/// Build the texture array (view + sampler) and the block-id -> layer table
-/// from `registry`. Every texture name the registry references gets its own
-/// layer, in the same sorted order [`BlockRegistry::texture_names`] returns —
-/// deterministic, so the mapping doesn't depend on `HashMap` iteration order
-/// anywhere upstream.
+/// `{textures_dir}/{name}.png` as raw RGBA8 tile bytes, or `None` if the file
+/// doesn't exist or isn't exactly [`TILE_SIZE`]-square -- either way, the
+/// caller falls back to a placeholder rather than failing to start, since a
+/// registry entry can outpace the art that names it (a data file adding a
+/// material is meant to need no code change, per #54; it just won't have
+/// real art until someone draws it).
+fn load_tile(textures_dir: &Path, name: &str) -> Option<Vec<u8>> {
+    let path = textures_dir.join(format!("{name}.png"));
+    let img = match image::open(&path) {
+        Ok(img) => img,
+        Err(err) => {
+            log::warn!("no texture for {name:?} at {}: {err}", path.display());
+            return None;
+        }
+    };
+    if img.width() != TILE_SIZE || img.height() != TILE_SIZE {
+        log::warn!(
+            "{}: {}x{}, expected {TILE_SIZE}x{TILE_SIZE} -- using a placeholder instead",
+            path.display(),
+            img.width(),
+            img.height()
+        );
+        return None;
+    }
+    Some(img.to_rgba8().into_raw())
+}
+
+/// Build the texture array (view + sampler) and the texture-name -> layer
+/// table from `registry`. Every texture name the registry references gets
+/// its own layer, in the same sorted order [`BlockRegistry::texture_names`]
+/// returns — deterministic, so the mapping doesn't depend on `HashMap`
+/// iteration order anywhere upstream. `textures_dir` is where each name's
+/// `.png` lives (`assets/textures/` for the real app; see [`load_tile`]).
 pub fn build(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     registry: &BlockRegistry,
+    textures_dir: &Path,
 ) -> (wgpu::TextureView, wgpu::Sampler, TextureLayers) {
     let names = registry.texture_names();
     // A texture array needs at least one layer even in the (never-happens-in-
@@ -90,8 +121,9 @@ pub fn build(
             height: TILE_SIZE,
             depth_or_array_layers: layer_count,
         },
-        // TODO(#55): mip levels arrive with real art in 1.4c -- a flat
-        // placeholder colour has nothing to minify into.
+        // No mip chain: phase 1's camera never gets far enough from a block
+        // for minification aliasing to be the thing worth spending on next
+        // (draws are the binding cost at distance, §2, not texture sampling).
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -130,7 +162,10 @@ pub fn build(
         write_layer(0, &solid_tile([255, 255, 255]));
     }
     for (layer, &name) in names.iter().enumerate() {
-        write_layer(layer as u32, &solid_tile(placeholder_color(name)));
+        match load_tile(textures_dir, name) {
+            Some(pixels) => write_layer(layer as u32, &pixels),
+            None => write_layer(layer as u32, &solid_tile(placeholder_color(name))),
+        }
     }
 
     let view = texture.create_view(&wgpu::TextureViewDescriptor {

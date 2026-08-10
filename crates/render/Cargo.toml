@@ -19,9 +19,7 @@ pollster.workspace = true
 bytemuck.workspace = true
 glam.workspace = true
 log.workspace = true
+image.workspace = true
 # puffin scope macros compile to near-nothing unless scopes are enabled at runtime.
 puffin.workspace = true
 puffin_http = { workspace = true, optional = true }
-
-[dev-dependencies]
-image.workspace = true
