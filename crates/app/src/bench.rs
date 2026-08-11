@@ -25,9 +25,10 @@ const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const VIRTUAL_DT: f32 = 1.0 / 240.0;
 
 /// Run the benchmark over a streamed square region of the given chunk `radius`
-/// (default 12 = a realistically heavy world). Chunks are streamed at their
-/// distance LOD, so a larger radius shows how far render distance can grow without
-/// the triangle cost exploding.
+/// (default 12 = a realistically heavy world). The region streams as LOD nodes
+/// at their distance-based level (`ChunkArena::from_region`), so a larger
+/// radius shows how far render distance can grow without the draw/triangle
+/// cost exploding.
 pub fn run(radius: i32) {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
@@ -78,7 +79,7 @@ pub fn run(radius: i32) {
         radius,
         0..=2,
     );
-    let total_chunks = arena.len();
+    let total_nodes = arena.len();
     let (min, max) = arena.bounds().expect("bench region produced no geometry");
     let look_target = [
         (min[0] + max[0]) * 0.5,
@@ -87,7 +88,7 @@ pub fn run(radius: i32) {
     ];
     let view_radius = (max[0] - min[0]).max(max[2] - min[2]) * 0.75;
     log::info!(
-        "rendering {WIDTH}x{HEIGHT}, {total_chunks} chunks via {}",
+        "rendering {WIDTH}x{HEIGHT}, {total_nodes} nodes via {}",
         if multi_draw {
             "1 multi_draw_indirect"
         } else {
@@ -190,16 +191,10 @@ pub fn run(radius: i32) {
     let wall_secs = wall_start.elapsed().as_secs_f64();
     let avg_visible = visible_sum as f64 / MEASURE_FRAMES as f64;
 
-    report(MEASURE_FRAMES, wall_secs, cpu_ms, avg_visible, total_chunks);
+    report(MEASURE_FRAMES, wall_secs, cpu_ms, avg_visible, total_nodes);
 }
 
-fn report(
-    frames: u32,
-    wall_secs: f64,
-    mut cpu_ms: Vec<f64>,
-    avg_visible: f64,
-    total_chunks: usize,
-) {
+fn report(frames: u32, wall_secs: f64, mut cpu_ms: Vec<f64>, avg_visible: f64, total_nodes: usize) {
     let throughput = frames as f64 / wall_secs;
 
     cpu_ms.sort_by(|a, b| a.partial_cmp(b).expect("no NaN frame times"));
@@ -212,7 +207,7 @@ fn report(
     log::info!("frames            : {frames}");
     log::info!("throughput        : {throughput:.0} FPS (sustained, pipelined)");
     log::info!("CPU submit / frame: avg {cpu_avg:.3} ms | p50 {cpu_p50:.3} | p99 {cpu_p99:.3}");
-    log::info!("chunks drawn      : avg {avg_visible:.1} / {total_chunks} (frustum-culled)");
+    log::info!("nodes drawn       : avg {avg_visible:.1} / {total_nodes} (frustum-culled)");
     log::info!("========================================");
     // Lead with the numbers so every run is a data point for the performance
     // history in BENCHMARKS.md; the 1000-FPS gate is just a trailing tag now.
@@ -223,6 +218,6 @@ fn report(
     };
     log::info!(
         "SUMMARY: {throughput:.0} FPS | CPU/frame avg {cpu_avg:.3} ms (p99 {cpu_p99:.3}) | \
-         {avg_visible:.0}/{total_chunks} chunks | 1000-FPS gate {gate}"
+         {avg_visible:.0}/{total_nodes} nodes | 1000-FPS gate {gate}"
     );
 }

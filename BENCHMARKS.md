@@ -75,7 +75,9 @@ frames after 200 warmup.
 | 2026-08-11 | Save/load — regions + world header [#60], radius 12²² | 1,282 | 424,352 | ~2,215 | 0.303 ms | ~0.69 ms | `41a1152` |
 | 2026-08-11 | Save/load — regions + world header [#60], radius 64²² | 26,789 | 890,774 | ~896 | 0.785 ms | ~1.60 ms | `41a1152` |
 | 2026-08-11 | Node addressing + streaming policy [#105], radius 12²³ | 1,282 | 424,352 | ~2,249 | 0.300 ms | ~0.66 ms | `44070c1` |
-| 2026-08-11 | LOD-native node generation [#106], radius 12²⁴ | 1,282 | 424,352 | ~2,211 | 0.303 ms | ~0.75 ms | *(this PR)* |
+| 2026-08-11 | LOD-native node generation [#106], radius 12²⁴ | 1,282 | 424,352 | ~2,211 | 0.303 ms | ~0.75 ms | `a463f2a` |
+| 2026-08-11 | **Node meshing on the worker pool, one mesh per node** [#107], radius 12²⁵ | 690 | 250,982 | ~3,217 | **0.192 ms** | ~0.73 ms | *(this PR)* |
+| 2026-08-11 | **Node meshing on the worker pool, one mesh per node** [#107], radius 64²⁵ | 1,238 | 625,258 | **~1,673** | **0.408 ms** | ~1.01 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -600,6 +602,41 @@ within normal small-scene noise of the previous row (~2,249 → ~2,211 FPS,
 `cargo test -p cubara-world world::` (the new `node_at`-specific cases:
 matches `chunk_at` at level 0, matches `WorldGen::generate` directly above
 it, and does not reflect an edit at level > 0, per §4).
+
+²⁵ **Node meshing on the worker pool, one mesh per node (issue #38's tracking
+arc, sub-issue #107) — the first row where draw count actually drops.**
+`MeshPool`'s job identity becomes `NodeKey`; `mesh_node` calls `World::node_at`
++ `Chunk::build_mesh` (no downsampling — the sampling itself is already
+coarse for level > 0). `ChunkArena` is re-keyed from `ChunkCoord` to
+`NodeKey`, and the per-node origin storage buffer gained a `scale` in its
+previously-spare `.w` component (1.0 at level 0, `2^level` above it) so a
+node's `16³` lattice can represent `2^level` chunks per axis without a new
+vertex format. `ChunkArena::from_region` (what `--bench`, `--screenshot` and
+every golden test build their scene through) now streams
+[`DEFAULT_RING_SCHEDULE`](crates/world/src/node.rs), truncated at the
+requested radius, instead of a flat full-resolution region — **this is a
+real, intended change to what `--bench <radius>` measures, not just a
+relabelling**: radius 12 used to mean "1,282 chunks, all full-resolution
+(`FULL_RES` = 12 covered the whole region)"; it now means "the same ring
+schedule the live renderer uses, truncated at 12" (`[(0, 8), (1, 12)]`),
+which is why radius 12's own node/triangle count drops (1,282 chunks → 690
+nodes) rather than holding flat like sub-issues #105/#106 did. Radius 6 and
+below (every golden test) still resolves to a single `[(0, radius)]` — level
+0 only, one node per chunk — so all 6 golden images passed byte-identical,
+with no re-blessing, proving level 0 is pixel-identical to the pre-node path
+rather than merely assumed to be.
+
+The headline number is radius 64 against the previous row (issue #60's
+`41a1152`, still the accurate baseline since #105/#106 had zero runtime
+effect): **26,789 drawn chunks → 1,238 drawn nodes, a ~21.6× reduction** —
+CPU/frame **0.785 → 0.408 ms (-48%)**, throughput **~896 → ~1,673 FPS**, and
+radius 64 **clears the 1000-FPS gate for the first time** since it was first
+measured (²²). This is with `DEFAULT_RING_SCHEDULE`'s illustrative,
+*untuned* radii (§6.3) and no skirts yet (LOD-boundary cracks are expected
+and accepted at this stage, issue #108's job) — both real headroom still on
+the table, not this row's ceiling. Tuning the schedule against the real
+`<2,000`-draws budget is sub-issue #109's job once there's a number to tune
+against; this row is that number.
 
 ## Detailed run logs
 

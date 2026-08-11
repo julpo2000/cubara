@@ -1,8 +1,9 @@
 // Packed node-local geometry, textured. Vertices carry a lattice position
-// local to their chunk ("node") plus baked AO, a texture-array layer, a face
+// local to their node plus baked AO, a texture-array layer, a face
 // direction, this corner's own tile coordinate, and the node index itself --
 // see docs/PHASE1_ARCHITECTURE.md §5.2 for the bit layout. World placement is
-// a per-node origin add here, not a CPU-side translate.
+// a per-node origin add (scaled by the node's own lattice step) here, not a
+// CPU-side translate.
 
 struct Camera {
     view_proj: mat4x4<f32>,
@@ -10,9 +11,11 @@ struct Camera {
 
 @group(0) @binding(0) var<uniform> camera: Camera;
 
-// One world-space origin per resident chunk ("node"), indexed by the
-// node_index packed into word 2 of each vertex (see
-// crates/render/src/arena.rs). xyz used; w is spare.
+// One world-space origin per resident node, indexed by the node_index packed
+// into word 2 of each vertex (see crates/render/src/arena.rs). xyz is the
+// node's world-space min corner; w is its scale -- world units per lattice
+// step (1.0 at level 0, 2^level above it, since a node's mesh is always a
+// fixed 16^3 lattice regardless of how many chunks it spans, §6.2).
 //
 // Not @builtin(instance_index): block 1.4a tried that (first_instance set
 // per indirect draw) and found it unreliable in both directions across real
@@ -67,8 +70,8 @@ fn vs_main(in: VsIn) -> VsOut {
     let node_index = in.packed2 & 0xFFFFu;
 
     let local_pos = vec3<f32>(x, y, z);
-    let origin = node_origins[node_index].xyz;
-    let world_pos = origin + local_pos;
+    let node_origin = node_origins[node_index];
+    let world_pos = node_origin.xyz + local_pos * node_origin.w;
 
     var out: VsOut;
     out.clip_pos = camera.view_proj * vec4<f32>(world_pos, 1.0);
