@@ -46,7 +46,7 @@ impl ApplicationHandler for App {
         self.renderer = Some(Renderer::new(
             window.clone(),
             self.game.world(),
-            self.game.camera(),
+            self.game.camera_pose(),
         ));
         // Capture the mouse for first-person look (Esc releases it). A window
         // concern, so the app owns it rather than the renderer.
@@ -98,8 +98,11 @@ impl ApplicationHandler for App {
                     .map(|t| (now - t).as_secs_f32())
                     .unwrap_or(0.0);
                 self.last_frame = Some(now);
-                self.game.update(dt);
-                renderer.render(self.game.world(), self.game.camera());
+                // The only place `Instant::now()` appears -- `Game::advance` turns
+                // this wall-clock `dt` into fixed sim ticks without ever reading
+                // the clock itself (`ARCHITECTURE.md` Rule 1, §9).
+                self.game.advance(dt);
+                renderer.render(self.game.world(), self.game.camera_pose());
                 // Immediately queue the next frame — we render continuously.
                 renderer.window().request_redraw();
             }

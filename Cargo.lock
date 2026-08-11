@@ -434,6 +434,7 @@ version = "0.0.1"
 dependencies = [
  "bytemuck",
  "cubara-render",
+ "cubara-sim",
  "cubara-voxel",
  "cubara-world",
  "env_logger",
@@ -461,6 +462,14 @@ dependencies = [
  "puffin_http",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "cubara-sim"
+version = "0.0.1"
+dependencies = [
+ "cubara-world",
+ "glam",
 ]
 
 [[package]]

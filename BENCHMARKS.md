@@ -62,8 +62,10 @@ frames after 200 warmup.
 | 2026-08-11 | Per-face material appearance [#44], radius 64¹⁵ | 25,131 | 762,516 | ~1,016 | 0.707 ms | ~1.31 ms | `a13200d` |
 | 2026-08-11 | **The three phase-1 materials + textures, depth-layered terrain** [#55], radius 12¹⁶ | 1,349 | 439,816 | ~2,012 | 0.329 ms | ~0.81 ms | `9174d84` |
 | 2026-08-11 | **The three phase-1 materials + textures, depth-layered terrain** [#55], radius 64¹⁶ | 25,131 | 899,840 | ~877 | 0.821 ms | ~2.06 ms | `9174d84` |
-| 2026-08-11 | **Seeded noise terrain with caves** [#48], radius 12¹⁷ | 1,282 | 424,352 | ~2,224 | 0.302 ms | ~0.72 ms | *(this PR)* |
-| 2026-08-11 | **Seeded noise terrain with caves** [#48], radius 64¹⁷ | 26,789 | 890,774 | ~891 | 0.780 ms | ~1.51 ms | *(this PR)* |
+| 2026-08-11 | **Seeded noise terrain with caves** [#48], radius 12¹⁷ | 1,282 | 424,352 | ~2,224 | 0.302 ms | ~0.72 ms | `c67086c` |
+| 2026-08-11 | **Seeded noise terrain with caves** [#48], radius 64¹⁷ | 26,789 | 890,774 | ~891 | 0.780 ms | ~1.51 ms | `c67086c` |
+| 2026-08-11 | Fixed-timestep tick loop + world RNG [#57], radius 12¹⁸ | 1,282 | 424,352 | ~2,014 | 0.313 ms | ~1.54 ms | *(this PR)* |
+| 2026-08-11 | Fixed-timestep tick loop + world RNG [#57], radius 64¹⁸ | 26,789 | 890,774 | ~903 | 0.783 ms | ~1.61 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -488,6 +490,16 @@ its own slice against its own `World` (no coordination needed at all, by
 **~19.5s** (6-way parallel, 607% CPU) -- comfortable headroom even against
 a CI runner meaningfully slower per core, and a more honest measurement of
 what the smoke test is supposed to be a stand-in for.
+
+¹⁸ **Fixed-timestep tick loop and world RNG (issue #57) — render path
+untouched, numbers recorded for the trend anyway.** This block added
+`cubara-sim` (`Sim`/`Player`/`WorldRng`/`InputFrame`) and replaced
+`cubara-render`'s `FlyCamera` with a data-only `CameraPose`; nothing in it
+changes geometry, meshing, or the draw path, so chunks and triangles are
+identical to the previous row (same seed, same radius). FPS/CPU moved
+within normal small-scene noise (radius 12: ~2,224 → ~2,014 FPS, 0.302 →
+0.313 ms; radius 64: ~891 → ~903 FPS, 0.780 → 0.783 ms) -- consistent with
+"unchanged," not a regression signal.
 
 ## Detailed run logs
 
