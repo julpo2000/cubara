@@ -373,6 +373,7 @@ fn greedy_mesh(
                     push_quad(
                         &mut mesh, d, u, v, pos[d], i, j, w, h, m.sign, m.ao, m.block, ctx, scale,
                     );
+                    push_skirt(&mut mesh, d, u, v, pos[d], i, j, w, h, n, m, ctx, scale);
 
                     // Consume the merged cells.
                     for l in 0..h {
@@ -523,6 +524,86 @@ fn push_quad(
     }
 }
 
+/// §6.4 -- hide LOD seams with skirts, not stitching. Where a node meets a
+/// neighbour at a different level the two don't sample the same lattice, so
+/// a crack of background can show through at the boundary. Stitching (real
+/// transition geometry matched to the neighbour's resolution) would need to
+/// know the neighbour's level at mesh time, serialising a pipeline that's
+/// deliberately parallel; a skirt instead just extends this node's own
+/// border wall one more lattice cell downward, purely from data this node
+/// already has. Applied to every horizontal border wall regardless of
+/// level -- meshing has no way to know whether a given edge actually meets
+/// a different level or a same-level neighbour (whose lattice already lines
+/// up exactly, so its skirt is simply never visible) without a cross-node
+/// lookup, which is exactly what this must not do.
+///
+/// `(w, h, sign, ao, block)` are `m`'s merged-quad shape and appearance,
+/// already used for the real quad above; a skirt is that same wall, minus
+/// its top cell of height/width, shifted down by one. Only a `d == 0` (X)
+/// or `d == 2` (Z) wall sitting exactly on the node's own edge (`plane` is
+/// `0` or `n`) qualifies -- `d == 1` (a top/bottom face) has no "downward"
+/// that would hide a horizontal-boundary crack. No-op where the wall's own
+/// bottom is already at the lattice floor (`i`/`j` == 0): nothing there to
+/// extend into without a negative, unrepresentable coordinate, and a wall
+/// reaching the floor has no gap to hide anyway.
+#[allow(clippy::too_many_arguments)]
+fn push_skirt(
+    mesh: &mut Mesh,
+    d: usize,
+    u: usize,
+    v: usize,
+    plane: i32,
+    i: i32,
+    j: i32,
+    w: i32,
+    h: i32,
+    n: i32,
+    m: MaskCell,
+    ctx: &MeshContext,
+    scale: i32,
+) {
+    if d == 1 || (plane != 0 && plane != n) {
+        return;
+    }
+    if d == 0 {
+        if i > 0 {
+            push_quad(
+                mesh,
+                d,
+                u,
+                v,
+                plane,
+                i - 1,
+                j,
+                1,
+                h,
+                m.sign,
+                m.ao,
+                m.block,
+                ctx,
+                scale,
+            );
+        }
+    } else if j > 0 {
+        push_quad(
+            mesh,
+            d,
+            u,
+            v,
+            plane,
+            i,
+            j - 1,
+            w,
+            1,
+            m.sign,
+            m.ao,
+            m.block,
+            ctx,
+            scale,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,6 +689,61 @@ mod tests {
         let mesh = chunk.build_mesh(&ctx(&registry));
         // Only the 6 outer faces are visible, each merged into a single quad.
         assert_eq!(mesh.triangle_count(), 12);
+    }
+
+    #[test]
+    fn full_chunk_gets_no_skirts_since_every_border_wall_already_reaches_the_floor() {
+        // A skirt only adds anything when a border wall's own base sits above
+        // the lattice floor (see the doc comment on `push_skirt`) -- a fully
+        // solid chunk's four side walls all start at y=0, so this must stay
+        // exactly the 6-quad/12-triangle shell above, not 6 quads plus skirts.
+        let chunk = uniform(BlockId::STONE);
+        let registry = registry();
+        let mesh = chunk.build_mesh(&ctx(&registry));
+        assert_eq!(mesh.triangle_count(), 12, "no skirt geometry added");
+    }
+
+    #[test]
+    fn skirt_extends_a_border_wall_down_by_one_cell_above_the_floor() {
+        // A synthetic height difference at the node's own x=0 edge: solid
+        // only from y=8 up, as if this node's sampled terrain doesn't reach
+        // all the way down to the lattice floor there -- exactly the shape a
+        // coarser or finer neighbour's differently-sampled edge might not
+        // line up with, which a skirt papers over (§6.4).
+        let chunk = Chunk::from_fn(|x, y, _| {
+            if x == 0 && y >= 8 {
+                BlockId::STONE
+            } else {
+                BlockId::AIR
+            }
+        });
+        let registry = registry();
+        let mesh = chunk.build_mesh(&ctx(&registry));
+
+        // The border wall itself (NegX: outward-facing where x=0 is solid and
+        // x=-1 is treated as air) spans y in [8, 16). The skirt is the extra
+        // one-cell-tall quad directly below it, y in [7, 8).
+        let has_skirt = mesh.vertices.chunks_exact(4).any(|quad| {
+            quad.iter().all(|v| v.face() == Face::NegX)
+                && quad.iter().map(|v| v.y()).min() == Some(7)
+                && quad.iter().map(|v| v.y()).max() == Some(8)
+        });
+        assert!(has_skirt, "expected a one-cell skirt quad at y in [7, 8)");
+    }
+
+    #[test]
+    fn no_skirt_on_an_interior_wall_away_from_the_node_edge() {
+        // A block in the middle of the chunk has no face anywhere near a
+        // node-boundary plane (x/z = 0 or SIZE), so none of its faces
+        // qualify as a border wall -- the same fixture
+        // `single_block_makes_six_quads` uses, re-asserted here to make the
+        // "no skirts on interior geometry" property explicit rather than
+        // just inherited from an unrelated test staying green.
+        let mut chunk = empty();
+        set(&mut chunk, 5, 5, 5);
+        let registry = registry();
+        let mesh = chunk.build_mesh(&ctx(&registry));
+        assert_eq!(mesh.triangle_count(), 12, "6 faces, no skirts");
     }
 
     #[test]

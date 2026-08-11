@@ -300,6 +300,14 @@ mod tests {
         // changed the cave shape enough to move the triangle count again without
         // changing which chunks are non-empty (second move). Not a regression --
         // this test's job is catching an *accidental* change, and neither was.
+        //
+        // Tris only, 13,510 -> 14,068 (chunk count unchanged), with skirts (§6.4,
+        // issue #108): every chunk border wall whose base sits above the lattice
+        // floor gains a one-cell skirt quad extending it downward, purely from
+        // that chunk's own data -- `build_mesh` runs the same shared greedy mesher
+        // nodes use, so this fixture picks it up too, even though it's meshing
+        // plain chunks here, not nodes. Expected: skirts exist precisely to add a
+        // small, bounded amount of geometry at every node/chunk's own edge.
         let world = World::new();
         let registry = test_registry();
         let ctx = test_ctx(&registry);
@@ -323,7 +331,7 @@ mod tests {
                 tris += chunk.build_mesh(&ctx).triangle_count();
             }
         }
-        assert_eq!((chunks, tris), (50, 13510));
+        assert_eq!((chunks, tris), (50, 14068));
     }
 
     #[test]

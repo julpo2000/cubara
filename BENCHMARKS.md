@@ -76,8 +76,10 @@ frames after 200 warmup.
 | 2026-08-11 | Save/load — regions + world header [#60], radius 64²² | 26,789 | 890,774 | ~896 | 0.785 ms | ~1.60 ms | `41a1152` |
 | 2026-08-11 | Node addressing + streaming policy [#105], radius 12²³ | 1,282 | 424,352 | ~2,249 | 0.300 ms | ~0.66 ms | `44070c1` |
 | 2026-08-11 | LOD-native node generation [#106], radius 12²⁴ | 1,282 | 424,352 | ~2,211 | 0.303 ms | ~0.75 ms | `a463f2a` |
-| 2026-08-11 | **Node meshing on the worker pool, one mesh per node** [#107], radius 12²⁵ | 690 | 250,982 | ~3,217 | **0.192 ms** | ~0.73 ms | *(this PR)* |
-| 2026-08-11 | **Node meshing on the worker pool, one mesh per node** [#107], radius 64²⁵ | 1,238 | 625,258 | **~1,673** | **0.408 ms** | ~1.01 ms | *(this PR)* |
+| 2026-08-11 | **Node meshing on the worker pool, one mesh per node** [#107], radius 12²⁵ | 690 | 250,982 | ~3,217 | **0.192 ms** | ~0.73 ms | `444045a` |
+| 2026-08-11 | **Node meshing on the worker pool, one mesh per node** [#107], radius 64²⁵ | 1,238 | 625,258 | **~1,673** | **0.408 ms** | ~1.01 ms | `444045a` |
+| 2026-08-11 | Skirts to hide LOD seams [#108], radius 12²⁶ | 690 | 281,274 | ~2,920 | 0.214 ms | ~0.90 ms | *(this PR)* |
+| 2026-08-11 | Skirts to hide LOD seams [#108], radius 64²⁶ | 1,238 | 689,436 | ~1,558 | 0.444 ms | ~0.89 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -637,6 +639,33 @@ and accepted at this stage, issue #108's job) — both real headroom still on
 the table, not this row's ceiling. Tuning the schedule against the real
 `<2,000`-draws budget is sub-issue #109's job once there's a number to tune
 against; this row is that number.
+
+²⁶ **Skirts to hide LOD seams (issue #38's tracking arc, sub-issue #108).**
+§6.4's decision: each node/chunk extends its own border wall quads downward
+by one lattice cell, purely from that node's own data (no neighbour lookup —
+see `push_skirt` in `crates/voxel/src/voxel.rs`), rather than stitching
+transition geometry matched to a neighbour's resolution. Node/draw count is
+unchanged at both radii (690 and 1,238) — skirts add triangles inside
+existing draws, never a new draw — which is exactly the cost profile §6.4
+promises ("a handful of quads" per border, not a second meshing pass).
+
+Triangles rose radius 12: 250,982 → 281,274 (+12.1%), radius 64: 625,258 →
+689,436 (+10.3%). CPU/frame moved with it — radius 12: 0.192 → 0.214 ms,
+radius 64: 0.408 → 0.444 ms — and radius 64 throughput eased ~1,673 → ~1,558
+FPS, still clearing the 1000-FPS gate with headroom. This is the real,
+accepted cost of hiding LOD-boundary cracks: applied to *every* border wall
+regardless of level, since a node can't know whether a given edge actually
+meets a different-level neighbour or a same-level one without a cross-node
+lookup, which the design explicitly forbids. A same-level neighbour's
+lattice already lines up exactly, so its skirt is simply never visible
+(confirmed by the golden images: `terrain`/`cave_mouth`, both dense with
+same-level chunk seams, show no new artifacts) — the added cost is genuinely
+uniform per-border overhead, not concentrated at real seams alone.
+
+`crates/world/src/world.rs`'s `region_mesh_output_is_stable` (a fixed-region,
+no-GPU regression guard) moved 13,510 → 14,068 triangles for the same
+reason; updated with the same "why did this pinned number move" comment
+trail that test already keeps.
 
 ## Detailed run logs
 

@@ -208,6 +208,36 @@ fn a_cave_mouth_is_visible() {
 }
 
 #[test]
+fn no_crack_at_a_real_lod_boundary() {
+    // Issue #108's own bar: a real level-0/level-1 node boundary, in the
+    // live streamed scene (`ChunkArena::from_region`'s ring-schedule
+    // streaming, not a synthetic fixture), with no crack of background
+    // showing through -- proof the skirts added to `cubara_voxel`'s greedy
+    // mesher actually reach the render path, not just the unit tests in
+    // isolation.
+    //
+    // `DEFAULT_RING_SCHEDULE`'s first ring ends at chunk-radius 8 from the
+    // region's center, so `region_radius: 12` (giving `schedule_for_radius`
+    // `[(0, 8), (1, 12)]`) puts a real level-0-to-level-1 seam inside the
+    // framed region -- the default auto-framed orbit camera (same one
+    // `terrain_renders_as_expected` uses) frames the whole region from
+    // above, which is the honest test: a player flying/walking over this
+    // area at a normal viewing angle, not a worst-case grazing shot chosen
+    // to manufacture a crack. (An earlier, near-ground grazing version of
+    // this shot showed the skirts themselves as a visible fringe along
+    // every nearby chunk edge, not just the one LOD seam -- correct
+    // per-node behaviour, since a node can't tell a same-level neighbour
+    // from a different-level one, but a confusing shot to assert "no
+    // crack" against. This angle avoids that.)
+    let world = World::new();
+    let shot = Shot {
+        region_radius: 12,
+        ..Shot::default()
+    };
+    assert_golden("lod_boundary", &world, shot);
+}
+
+#[test]
 fn the_selected_block_shows_an_outline() {
     // Issue #52's own bar: the highlight must align to the targeted block
     // with no z-fighting against its own (flush) top face -- the coplanar
