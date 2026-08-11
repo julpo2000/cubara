@@ -1,8 +1,10 @@
 //! Cubara — entry point.
 //!
 //! Owns the window and event loop; all GPU work lives in `cubara_render`. Forwards
-//! keyboard + mouse input to the renderer's first-person camera (WASD to move,
-//! Space/Shift up/down, mouse to look, Esc to release the cursor).
+//! keyboard + mouse input to [`Game`] (WASD to move, Space to jump, mouse to look,
+//! F4 toggles the free-fly debug mode, Esc releases the cursor). Walking under
+//! gravity is the default; free-fly (Space/Shift up/down, no collision) is a
+//! debug mode inside the same sim (`docs/PHASE1_ARCHITECTURE.md` §10).
 
 mod bench;
 mod caps;

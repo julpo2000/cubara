@@ -20,4 +20,14 @@ pub struct InputFrame {
     /// applied where the rest of movement happens ([`crate::Player`]), not
     /// baked into what counts as "the input".
     pub look_delta: [f32; 2],
+    /// Jump, as a rising edge -- `true` only on the frame the key went down,
+    /// not for as long as it's held. Walking mode consumes this once; it has
+    /// no effect in free-fly. The caller (`cubara-app`) is responsible for
+    /// only setting this on the actual edge and clearing it once consumed,
+    /// so a multi-tick catch-up burst this frame doesn't apply it more than
+    /// once (see [`crate::Sim::tick`]).
+    pub jump: bool,
+    /// Toggle free-fly debug mode, also a rising edge, same one-shot
+    /// contract as [`Self::jump`].
+    pub toggle_fly: bool,
 }

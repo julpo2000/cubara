@@ -9,6 +9,7 @@
 //! window-free, so all of it is testable with no adapter and no window.
 
 mod input;
+mod physics;
 mod player;
 mod rng;
 
@@ -51,13 +52,24 @@ impl Sim {
     }
 
     /// Advance the simulation by exactly one fixed step of [`TICK_DT`]
-    /// seconds. Phase 1's scope: free-fly movement only (real player physics
-    /// is block 1.7a) -- `world` is threaded through and part of the
-    /// signature `docs/PHASE1_ARCHITECTURE.md` §9 specifies, even though
-    /// this block doesn't yet have anything that reads or writes it (block
-    /// 1.7a's collision is what will).
-    pub fn tick(&mut self, _world: &mut World, input: &InputFrame) {
-        self.player.apply_free_fly(input, TICK_DT);
+    /// seconds: a free-fly toggle edge (consumed here, exactly once, so a
+    /// multi-tick catch-up burst can't flip it more than the real key press
+    /// warrants), then either free-fly or real walking physics against
+    /// `world`, depending on which mode the player is currently in
+    /// (`docs/PHASE1_ARCHITECTURE.md` §10, issue #53).
+    pub fn tick(&mut self, world: &mut World, input: &InputFrame) {
+        if input.toggle_fly {
+            self.player.free_fly = !self.player.free_fly;
+        }
+        if self.player.free_fly {
+            self.player.velocity = glam::Vec3::ZERO;
+            self.player.on_ground = false;
+            self.player.apply_free_fly(input, TICK_DT);
+        } else {
+            physics::step(&mut self.player, input, TICK_DT, |x, y, z| {
+                world.is_solid_at(x, y, z)
+            });
+        }
         self.tick += 1;
     }
 }
@@ -88,5 +100,40 @@ mod tests {
         a.tick(&mut world, &no_input());
         b.tick(&mut world, &no_input());
         assert_eq!(a.roll(), b.roll(), "same seed, same tick, same roll");
+    }
+
+    /// Issue #53's own "Done when": walk real generated terrain -- hills,
+    /// slopes, cave mouths, ledges, not a synthetic flat floor -- for 10,000
+    /// ticks and never end a tick with the collision box inside a solid
+    /// voxel, and never fall through the world. Walks forward while slowly
+    /// turning, so the path curves across a wide, varied stretch of terrain
+    /// rather than testing one straight line (and one obstacle) repeatedly.
+    #[test]
+    fn walking_uneven_terrain_for_10_000_ticks_never_intersects_solid_or_falls_through() {
+        let mut world = World::new();
+        let ground = world
+            .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0)
+            .expect("ground below");
+        let spawn = glam::vec3(0.5, ground.block[1] as f32 + 10.0, 0.5);
+        let mut sim = Sim::new(7, Player::new(spawn, 0.0, 0.0));
+        let wander = InputFrame {
+            move_axes: [0.0, 0.0, 1.0],
+            look_delta: [2.0, 0.0],
+            ..InputFrame::default()
+        };
+
+        for i in 0..10_000u64 {
+            sim.tick(&mut world, &wander);
+            assert!(
+                !physics::player_intersects_solid(&sim.player, &|x, y, z| world
+                    .is_solid_at(x, y, z)),
+                "tick {i}: player collision box intersects a solid voxel"
+            );
+            assert!(
+                sim.player.pos.y > -1000.0,
+                "tick {i}: fell through the world, y = {}",
+                sim.player.pos.y
+            );
+        }
     }
 }
