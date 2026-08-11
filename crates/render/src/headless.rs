@@ -6,6 +6,7 @@
 //! other than what the game renders, a passing golden test would prove nothing.
 
 use cubara_voxel::{Chunk, ChunkCoord, MeshContext};
+use cubara_world::node::NodeKey;
 use cubara_world::World;
 
 use crate::arena::ChunkArena;
@@ -90,7 +91,8 @@ pub fn render_chunks(chunks: &[(ChunkCoord, Chunk)], shot: Shot) -> Option<Frame
     render_arena(shot, |device, queue, multi_draw, ctx| {
         let mut arena = ChunkArena::new(device, multi_draw);
         for (coord, chunk) in chunks {
-            arena.upload_chunk(queue, *coord, chunk, ctx, 0);
+            let node = NodeKey::containing(*coord, 0);
+            arena.upload_node(queue, node, chunk, ctx);
         }
         arena
     })

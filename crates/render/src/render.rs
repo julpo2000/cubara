@@ -6,7 +6,7 @@
 //! ones that fall out are freed). The shared building blocks (pipeline, depth view,
 //! camera) are public so the headless bench/screenshot paths build the same scene.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -14,12 +14,13 @@ use std::time::Instant;
 use winit::window::{CursorGrabMode, Window};
 
 use cubara_voxel::{BlockRegistry, ChunkCoord, Vertex};
-use cubara_world::{streaming, World};
+use cubara_world::node::{self, NodeKey};
+use cubara_world::World;
 
 use crate::arena::ChunkArena;
 use crate::culling::Frustum;
 use crate::materials::{self, MeshAssets};
-use crate::mesher::{sort_batch, BuiltChunk, MeshPool};
+use crate::mesher::{sort_batch, BuiltNode, MeshPool};
 use crate::scene::{SceneFrame, SceneRenderer};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -69,12 +70,9 @@ pub const fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
-/// How many chunks out (square radius) to keep resident around the camera. The inner
-/// core is full resolution and only the far rings drop to a coarser LOD (see
-/// [`streaming::lod_for`]), so this reaches well past the detailed core for a distant
-/// horizon without the triangle/upload cost a fully full-resolution radius would carry.
-const STREAM_RADIUS: i32 = 28;
-/// Vertical chunk band to stream — the terrain sits comfortably inside it.
+/// Vertical chunk band to stream — the terrain sits comfortably inside it. How
+/// far out (and at what LOD) is [`node::DEFAULT_RING_SCHEDULE`]'s job now,
+/// not a single radius here.
 const STREAM_Y_MIN: i32 = 0;
 const STREAM_Y_MAX: i32 = 2;
 /// Cap on chunk geometry uploads per frame. Crossing a chunk boundary re-LODs a
@@ -238,14 +236,15 @@ pub struct Renderer {
     /// once at startup, shared with every mesh job (`ARCHITECTURE.md` Rule 4:
     /// the registry half stays GPU-free; only the layer numbers came from us).
     mesh_assets: Arc<MeshAssets>,
-    /// Background worker pool that generates + meshes chunks off the main thread.
+    /// Background worker pool that generates + meshes nodes off the main thread.
     mesh_pool: MeshPool,
     /// Finished meshes waiting to be uploaded, drained at most
     /// [`MAX_UPLOADS_PER_FRAME`] per frame to avoid upload spikes.
-    upload_queue: VecDeque<BuiltChunk>,
-    /// Coords that are meshed and uploaded (or known empty), mapped to the LOD level
-    /// they're currently at — so we only re-mesh when a chunk's desired LOD changes.
-    resident: HashMap<ChunkCoord, u32>,
+    upload_queue: VecDeque<BuiltNode>,
+    /// Nodes that are meshed and uploaded (or known empty) -- a `NodeKey` already
+    /// names both position and detail level, so residency is just set membership,
+    /// unlike the old per-chunk map that tracked level as separate data.
+    resident: HashSet<NodeKey>,
     /// Chunk the camera is currently in; streaming re-runs when this changes.
     center: ChunkCoord,
 
@@ -347,7 +346,7 @@ impl Renderer {
             mesh_assets,
             mesh_pool: MeshPool::new(),
             upload_queue: VecDeque::new(),
-            resident: HashMap::new(),
+            resident: HashSet::new(),
             center,
             last_frame: Instant::now(),
             visible_chunks: 0,
@@ -361,17 +360,19 @@ impl Renderer {
         renderer
     }
 
-    /// Force a re-mesh of `cc` (e.g. after an edit): the worker re-reads the edit
-    /// overlay, and [`drain_meshes`](Self::drain_meshes) swaps the geometry in
-    /// atomically, so there's no gap.
+    /// Force a re-mesh of the chunk `cc` (e.g. after an edit): the worker re-reads
+    /// the edit overlay, and [`drain_meshes`](Self::drain_meshes) swaps the
+    /// geometry in atomically, so there's no gap.
+    ///
+    /// Always re-meshes `cc`'s level-0 node, not whatever node is currently
+    /// resident there: an edit only ever happens within player reach, which is
+    /// well inside the always-full-resolution near field the ring schedule
+    /// keeps around the player (`World::node_at`'s doc comment) -- a coarser
+    /// node can never be the one actually representing an editable chunk.
     pub fn invalidate(&mut self, world: &Arc<World>, cc: ChunkCoord) {
-        self.mesh_pool.cancel(cc);
-        self.mesh_pool.request(
-            world,
-            &self.mesh_assets,
-            cc,
-            streaming::lod_for(cc, self.center),
-        );
+        let node = NodeKey::containing(cc, 0);
+        self.mesh_pool.cancel(node);
+        self.mesh_pool.request(world, &self.mesh_assets, node);
     }
 
     pub fn window(&self) -> &Window {
@@ -388,61 +389,70 @@ impl Renderer {
         }
     }
 
-    /// Bring the streamed set in line with `center`: drop chunks that fell outside
-    /// the radius, and *request* each desired chunk at its distance-based LOD — new
-    /// ones, and resident ones whose LOD changed as the camera moved. Meshing happens
-    /// on the worker pool; results are uploaded in [`drain_meshes`](Self::drain_meshes),
-    /// so this never meshes on the main thread.
+    /// Bring the streamed set in line with `center`: drop nodes that fell outside
+    /// the ring schedule, and *request* each desired node that isn't already
+    /// resident or in flight, nearest first. Meshing happens on the worker pool;
+    /// results are uploaded in [`drain_meshes`](Self::drain_meshes), so this never
+    /// meshes on the main thread.
+    ///
+    /// A boundary crossing typically unloads some nodes and loads others at a
+    /// *different* level for the same area (a coarse node splitting into finer
+    /// ones, or the reverse) -- unlike the old per-chunk LOD change, this isn't a
+    /// same-key swap, so the outgoing node's geometry disappears from the arena
+    /// immediately rather than staying drawn until the replacement is ready. A
+    /// momentary gap at a ring boundary is an accepted, known limitation at this
+    /// stage (see issue #107) -- the same category as the LOD-boundary cracks
+    /// skirts (#108) will fix, not a correctness bug.
     fn stream_around(&mut self, world: &Arc<World>, center: ChunkCoord) {
         puffin::profile_function!();
-        let mut desired =
-            streaming::desired_chunks(center, STREAM_RADIUS, STREAM_Y_MIN..=STREAM_Y_MAX);
-        let desired_set: HashSet<ChunkCoord> = desired.iter().copied().collect();
+        let y_range = STREAM_Y_MIN..=STREAM_Y_MAX;
+        let desired_set: HashSet<NodeKey> =
+            node::desired_nodes(center, y_range.clone(), node::DEFAULT_RING_SCHEDULE)
+                .into_iter()
+                .collect();
 
         // Unload anything no longer desired — uploaded or still in flight.
-        let stale: Vec<ChunkCoord> = self
+        let stale: Vec<NodeKey> = self
             .resident
-            .keys()
-            .chain(self.mesh_pool.in_flight().keys())
-            .filter(|c| !desired_set.contains(c))
+            .iter()
+            .chain(self.mesh_pool.in_flight().iter())
+            .filter(|n| !desired_set.contains(n))
             .copied()
             .collect();
-        for coord in stale {
-            if self.resident.remove(&coord).is_some() {
-                self.arena.remove(coord);
+        for node in stale {
+            if self.resident.remove(&node) {
+                self.arena.remove(node);
             }
-            self.mesh_pool.cancel(coord);
+            self.mesh_pool.cancel(node);
         }
 
-        // Request each desired chunk at its LOD unless it's already there. Nearest
-        // first so detail around the camera streams in before the fringe.
-        desired.sort_by_key(|c| (c.x - center.x).pow(2) + (c.z - center.z).pow(2));
-        for coord in desired {
-            let level = streaming::lod_for(coord, center);
-            if self.resident.get(&coord) == Some(&level)
-                || self.mesh_pool.is_in_flight(coord, level)
-            {
+        // Request whatever's desired but not yet resident, nearest first --
+        // reuses `plan_node_updates`'s tested nearest-first ordering rather than
+        // a second distance sort here.
+        let updates =
+            node::plan_node_updates(&self.resident, center, y_range, node::DEFAULT_RING_SCHEDULE);
+        for node in updates.to_load {
+            if self.mesh_pool.is_in_flight(node) {
                 continue;
             }
-            self.mesh_pool
-                .request(world, &self.mesh_assets, coord, level);
+            self.mesh_pool.request(world, &self.mesh_assets, node);
         }
         self.center = center;
     }
 
     /// Take finished meshes from the worker pool and upload them — but at most
-    /// [`MAX_UPLOADS_PER_FRAME`] per frame, so a boundary crossing (which re-LODs a
-    /// whole ring at once) doesn't spike the frame time. Completed chunks are marked
+    /// [`MAX_UPLOADS_PER_FRAME`] per frame, so a boundary crossing (which streams a
+    /// whole ring at once) doesn't spike the frame time. Completed nodes are marked
     /// resident immediately (so they aren't re-requested) and their old geometry
     /// stays drawn until the new upload swaps it in.
     fn drain_meshes(&mut self) {
         puffin::profile_function!();
         // Claim everything finished this frame, in a fixed order (ascending
-        // ChunkCoord) rather than whatever order the workers happened to finish
+        // NodeKey) rather than whatever order the workers happened to finish
         // in -- see sort_batch (issue #83). Mark resident now, upload over the
         // next frames.
         for built in sort_batch(self.mesh_pool.poll()) {
-            self.resident.insert(built.coord, built.level);
+            self.resident.insert(built.node);
             self.upload_queue.push_back(built);
         }
 
@@ -451,13 +461,13 @@ impl Renderer {
             let Some(built) = self.upload_queue.pop_front() else {
                 break;
             };
-            // Skip if superseded/unloaded while it waited (its LOD is no longer wanted).
-            if self.resident.get(&built.coord) != Some(&built.level) {
+            // Skip if unloaded while it waited in the queue.
+            if !self.resident.contains(&built.node) {
                 continue;
             }
-            self.arena.remove(built.coord); // free any prior (coarser) LOD first
+            self.arena.remove(built.node); // free any prior slot first
             if let Some((mesh, aabb)) = built.geometry {
-                self.arena.insert(&self.queue, built.coord, &mesh, aabb);
+                self.arena.insert(&self.queue, built.node, &mesh, aabb);
             }
             uploaded += 1;
         }
@@ -550,7 +560,7 @@ impl Renderer {
              xyz  {x:.1} / {y:.1} / {z:.1}\n\
              chunk  {cx} {cy} {cz}\n\
              facing  {facing}\n\
-             chunks  {vis} drawn / {res} resident",
+             nodes  {vis} drawn / {res} resident",
             ms = self.frame_ms,
             x = p.x,
             y = p.y,
@@ -597,7 +607,7 @@ impl Renderer {
         if elapsed.as_secs_f32() >= 1.0 {
             let fps = self.frames as f32 / elapsed.as_secs_f32();
             log::info!(
-                "{fps:.0} FPS | drawn {}/{} resident chunks",
+                "{fps:.0} FPS | drawn {}/{} resident nodes",
                 self.visible_chunks,
                 self.arena.len()
             );
