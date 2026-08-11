@@ -43,24 +43,40 @@ pub struct NodeId {
     pub pos: [i32; 3],
 }
 
-/// Vertex-arena capacity, in vertices (~112 MiB at 28 bytes/vertex). The heaviest
-/// current scene — the radius-12 bench — peaks well under this, leaving ample
-/// headroom for streaming fragmentation and the denser terrain still to come.
+/// Vertex-arena capacity, in vertices (12 bytes/vertex, the packed format
+/// since #43 -- not the 28-byte figure an earlier version of this comment
+/// quoted, from before that landed). Re-derived (issue #38's tracking arc,
+/// sub-issue #111) against the real post-node-tree radius-64 peak: 1,659,216
+/// vertices used (`BENCHMARKS.md`, footnote 29), so 4,000,000 is ~2.4×
+/// headroom -- **unchanged from the #89-era value**, because that number was
+/// never really "sized for radius 12" in any binding sense, just generously
+/// picked early and left to absorb terrain growth since; measured against
+/// the real worst case for the first time here, it's still comfortably
+/// covered without needing to move.
 const VERTEX_CAPACITY: u32 = 4_000_000;
-/// Index-arena capacity, in indices (~24 MiB at 4 bytes/index). Same ~9× headroom
-/// over the radius-12 bench peak of ~653k indices.
+/// Index-arena capacity, in indices (4 bytes/index). Same story as
+/// `VERTEX_CAPACITY`: measured radius-64 peak is 2,488,824 indices used, so
+/// 6,000,000 is ~2.4× headroom, unchanged from #89.
 const INDEX_CAPACITY: u32 = 6_000_000;
-/// Max chunks the indirect-args buffer can hold (upper bound on visible chunks).
-/// 16k covers a square radius of ~52 chunks across the 3-high vertical band.
-const MAX_DRAWS: u32 = 16_384;
+/// Max nodes the indirect-args buffer can hold (upper bound on *visible*
+/// nodes in one frame). Node-based streaming (§6.1) is what finally lets
+/// this shrink: the tuned ring schedule (#109) measured 1,341 of 1,585
+/// resident nodes visible at once from a wide-open orbit camera (~85% --
+/// nearly everything resident can be visible from the right angle, so this
+/// isn't sized as a small fraction of residency). 4,096 is ~2.5× headroom
+/// over that -- matching #89's own ~2.6× precedent, just against the new,
+/// far smaller peak -- down from 16,384 (a 4× reduction, ~0.23 MiB saved).
+const MAX_DRAWS: u32 = 4_096;
 /// Max simultaneously *resident* nodes with an origin slot -- unlike
-/// `MAX_DRAWS` (a per-frame visible-set cap), this bounds the whole streamed
-/// set, which is why it's sized well above `MAX_DRAWS`: radius 64 measured
-/// 25,131 resident chunks under the old per-chunk streaming
-/// (`BENCHMARKS.md`), and node-based streaming only ever has *fewer* resident
-/// units for the same coverage (that's the whole point, §6.1), so 65,536
-/// keeps the same headroom.
-const MAX_NODES: u32 = 65_536;
+/// `MAX_DRAWS` (the per-frame visible-set cap), this bounds the whole
+/// streamed set, and is kept at the same 4× multiple over `MAX_DRAWS` #89
+/// originally used (65,536 / 16,384 = 4), so a resident-count regression
+/// still trips `ArenaUsage::exhausted`'s "draws" warning well before ever
+/// approaching this hard ceiling. Radius 64's tuned schedule measured
+/// 1,585-1,613 resident nodes across four different world positions
+/// (`BENCHMARKS.md` footnote 27) -- 16,384 leaves ~10× headroom, down from
+/// 65,536 (a 4× reduction, ~0.75 MiB saved).
+const MAX_NODES: u32 = 16_384;
 
 /// A free-list index allocator over `0..MAX_NODES`, handing out the node
 /// index each resident node uses to find its origin in the storage buffer.
