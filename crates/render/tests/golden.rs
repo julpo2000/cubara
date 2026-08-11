@@ -202,8 +202,39 @@ fn a_cave_mouth_is_visible() {
         region_radius: 3,
         orbit_t: 0.0,
         camera: Some((eye, target - eye)),
+        highlighted_block: None,
     };
     assert_golden("cave_mouth", &world, shot);
+}
+
+#[test]
+fn the_selected_block_shows_an_outline() {
+    // Issue #52's own bar: the highlight must align to the targeted block
+    // with no z-fighting against its own (flush) top face -- the coplanar
+    // case the depth bias exists for. A close, angled camera on the
+    // default-seed world, aimed at a surface block with solid neighbours on
+    // every other side: the box's other 11 edges are correctly hidden
+    // behind that solid terrain (depth-tested like any other geometry),
+    // which is why only the top face's outline shows here.
+    let world = World::new();
+    let ground = world
+        .raycast([5.5, 200.0, 5.5], [0.0, -1.0, 0.0], 400.0)
+        .expect("ground below");
+    let eye = glam::vec3(2.5, ground.block[1] as f32 + 3.0, 2.5);
+    let target = glam::vec3(5.5, ground.block[1] as f32 + 0.5, 5.5);
+    let hit = world
+        .raycast(eye.to_array(), (target - eye).to_array(), 30.0)
+        .expect("the block this shot is framed around");
+
+    let shot = Shot {
+        width: 960,
+        height: 540,
+        region_radius: 3,
+        orbit_t: 0.0,
+        camera: Some((eye, target - eye)),
+        highlighted_block: Some(hit.block),
+    };
+    assert_golden("outline", &world, shot);
 }
 
 #[test]
@@ -242,6 +273,7 @@ fn distinct_materials_render_with_distinct_textures() {
         region_radius: 0, // unused by render_chunks -- the chunk list is explicit
         orbit_t: 5.0,
         camera: None,
+        highlighted_block: None,
     };
 
     let Some(frame) = headless::render_chunks(&chunks, shot) else {

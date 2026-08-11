@@ -10,7 +10,8 @@
 use std::time::Instant;
 
 use cubara_render::{
-    gpu_driven_features, load_mesh_assets, CameraUniform, ChunkArena, Frustum, SceneRenderer,
+    gpu_driven_features, load_mesh_assets, CameraUniform, ChunkArena, Frustum, SceneFrame,
+    SceneRenderer,
 };
 use cubara_voxel::{ChunkCoord, MeshContext};
 use cubara_world::World;
@@ -144,8 +145,19 @@ pub fn run(radius: i32) {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("bench-encoder"),
             });
-            // No overlay: the bench measures the world, not the debug HUD.
-            scene.encode_scene(&queue, &mut encoder, &color_view, arena, draw_count, None);
+            // No selected block, no overlay: the bench measures the world,
+            // not a UI highlight or the debug HUD.
+            scene.encode_scene(
+                &queue,
+                &mut encoder,
+                &color_view,
+                SceneFrame {
+                    arena,
+                    draw_count,
+                    selected_block: None,
+                    overlay: None,
+                },
+            );
             queue.submit(std::iter::once(encoder.finish()));
             (
                 cpu_start.elapsed().as_secs_f64() * 1000.0,

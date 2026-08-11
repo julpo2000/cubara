@@ -20,7 +20,7 @@ use crate::arena::ChunkArena;
 use crate::culling::Frustum;
 use crate::materials::{self, MeshAssets};
 use crate::mesher::{sort_batch, BuiltChunk, MeshPool};
-use crate::scene::SceneRenderer;
+use crate::scene::{SceneFrame, SceneRenderer};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -136,6 +136,69 @@ impl CameraPose {
         CameraUniform::look_view_proj(aspect, self.eye, self.look_dir)
     }
 }
+
+/// Uniform block shared with `outline.wgsl`: the highlighted voxel's
+/// world-space min corner. `origin` is `[f32; 4]`, not `[f32; 3]` -- WGSL's
+/// uniform address space requires 16-byte alignment for a `vec3<f32>`
+/// member, so a plain `vec3` here would need hand-rolled padding to match;
+/// a `vec4` with `.w` unused sidesteps that entirely.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct OutlineUniform {
+    origin: [f32; 4],
+}
+
+impl OutlineUniform {
+    pub fn new(origin: [f32; 3]) -> Self {
+        Self {
+            origin: [origin[0], origin[1], origin[2], 0.0],
+        }
+    }
+}
+
+const OUTLINE_VERTEX_ATTRS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x3];
+
+pub const fn outline_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: (3 * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &OUTLINE_VERTEX_ATTRS,
+    }
+}
+
+/// The 12 edges of a unit cube (`0.0..1.0` on each axis, matching one
+/// voxel's extent), as 24 line-list vertex positions local to the targeted
+/// block. Uploaded once ([`SceneRenderer::new`](crate::scene::SceneRenderer::new));
+/// only [`OutlineUniform::origin`] varies per frame.
+pub const OUTLINE_CUBE_EDGES: [[f32; 3]; 24] = [
+    // Bottom face (y = 0).
+    [0.0, 0.0, 0.0],
+    [1.0, 0.0, 0.0],
+    [1.0, 0.0, 0.0],
+    [1.0, 0.0, 1.0],
+    [1.0, 0.0, 1.0],
+    [0.0, 0.0, 1.0],
+    [0.0, 0.0, 1.0],
+    [0.0, 0.0, 0.0],
+    // Top face (y = 1).
+    [0.0, 1.0, 0.0],
+    [1.0, 1.0, 0.0],
+    [1.0, 1.0, 0.0],
+    [1.0, 1.0, 1.0],
+    [1.0, 1.0, 1.0],
+    [0.0, 1.0, 1.0],
+    [0.0, 1.0, 1.0],
+    [0.0, 1.0, 0.0],
+    // The four vertical edges connecting them.
+    [0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [1.0, 0.0, 0.0],
+    [1.0, 1.0, 0.0],
+    [1.0, 0.0, 1.0],
+    [1.0, 1.0, 1.0],
+    [0.0, 0.0, 1.0],
+    [0.0, 1.0, 1.0],
+];
 
 /// The wgpu features the GPU-driven path wants, intersected with what `adapter`
 /// actually offers — pass the result as `required_features` when requesting the
@@ -400,7 +463,12 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self, world: &Arc<World>, camera: CameraPose) {
+    pub fn render(
+        &mut self,
+        world: &Arc<World>,
+        camera: CameraPose,
+        selected_block: Option<[i32; 3]>,
+    ) {
         crate::profiling::Profiler::new_frame();
         puffin::profile_function!();
         self.update(world, camera);
@@ -435,9 +503,12 @@ impl Renderer {
                 &self.queue,
                 &mut encoder,
                 &view,
-                &self.arena,
-                draw_count,
-                overlay.as_deref(),
+                SceneFrame {
+                    arena: &self.arena,
+                    draw_count,
+                    selected_block,
+                    overlay: overlay.as_deref(),
+                },
             );
         }
 
@@ -589,6 +660,27 @@ pub fn origins_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout
     })
 }
 
+/// `@group(1)` in `outline.wgsl`: the highlighted voxel's world-space
+/// origin. A separate, tiny bind group rather than folding into the camera
+/// one (`@group(0)`, reused unchanged) -- it varies with the selection, the
+/// camera uniform doesn't, and the outline pipeline has no use for the mesh
+/// pipeline's origins/texture groups at all.
+pub fn outline_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("outline-bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    })
+}
+
 pub fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth-texture"),
@@ -657,6 +749,70 @@ pub fn build_pipeline(
             depth_compare: wgpu::CompareFunction::Less,
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    })
+}
+
+/// The selected-block outline's pipeline: a line list, sharing the mesh
+/// pipeline's depth buffer and format so it's correctly occluded by terrain
+/// in front of it, but with a small negative depth bias so it wins the
+/// exact tie against the *targeted* block's own coplanar face instead of
+/// z-fighting it (issue #52's Design decisions). Doesn't write depth --
+/// nothing needs to be occluded by a wireframe -- and doesn't cull (lines
+/// have no winding).
+pub fn build_outline_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    camera_bgl: &wgpu::BindGroupLayout,
+    outline_bgl: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("outline-shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/outline.wgsl").into()),
+    });
+
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("outline-layout"),
+        bind_group_layouts: &[camera_bgl, outline_bgl],
+        push_constant_ranges: &[],
+    });
+
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("outline-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[outline_vertex_layout()],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineList,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState {
+                constant: -4,
+                slope_scale: -2.0,
+                clamp: 0.0,
+            },
         }),
         multisample: wgpu::MultisampleState::default(),
         multiview: None,

@@ -11,7 +11,7 @@ use cubara_world::World;
 use crate::arena::ChunkArena;
 use crate::culling::Frustum;
 use crate::render::{gpu_driven_features, load_mesh_assets, CameraUniform};
-use crate::scene::SceneRenderer;
+use crate::scene::{SceneFrame, SceneRenderer};
 
 /// A rendered frame: tightly-packed RGBA8, `width * height * 4` bytes.
 pub struct Frame {
@@ -40,6 +40,11 @@ pub struct Shot {
     /// as its distance, so the angle never changes) — which a shot that needs to
     /// look *into* something at ground level, like a cave mouth, needs.
     pub camera: Option<(glam::Vec3, glam::Vec3)>,
+    /// A block to draw the selected-block outline around (issue #52), or
+    /// `None` for no outline. In the real game this is `cubara_sim::Sim::target`
+    /// (the sim's own raycast); a golden test sets it explicitly to whatever
+    /// block its `camera` is known to be looking at.
+    pub highlighted_block: Option<[i32; 3]>,
 }
 
 impl Default for Shot {
@@ -50,6 +55,7 @@ impl Default for Shot {
             region_radius: 6,
             orbit_t: 6.0,
             camera: None,
+            highlighted_block: None,
         }
     }
 }
@@ -124,6 +130,7 @@ fn render_arena(
         region_radius: _,
         orbit_t,
         camera,
+        highlighted_block,
     } = shot;
 
     let (mesh_assets, tex_view, tex_sampler) = load_mesh_assets(&device, &queue);
@@ -198,8 +205,19 @@ fn render_arena(
         label: Some("headless-encoder"),
     });
     // No overlay: the debug HUD shows live FPS, which would make any golden
-    // reference differ on every run.
-    scene.encode_scene(&queue, &mut encoder, &color_view, &arena, draw_count, None);
+    // reference differ on every run. `highlighted_block` does go through --
+    // a golden test needs to be able to show the outline.
+    scene.encode_scene(
+        &queue,
+        &mut encoder,
+        &color_view,
+        SceneFrame {
+            arena: &arena,
+            draw_count,
+            selected_block: highlighted_block,
+            overlay: None,
+        },
+    );
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: &color,

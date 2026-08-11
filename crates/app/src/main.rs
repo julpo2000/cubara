@@ -104,7 +104,11 @@ impl ApplicationHandler for App {
                 // this wall-clock `dt` into fixed sim ticks without ever reading
                 // the clock itself (`ARCHITECTURE.md` Rule 1, §9).
                 self.game.advance(dt);
-                renderer.render(self.game.world(), self.game.camera_pose());
+                renderer.render(
+                    self.game.world(),
+                    self.game.camera_pose(),
+                    self.game.selected_block(),
+                );
                 // Immediately queue the next frame — we render continuously.
                 renderer.window().request_redraw();
             }

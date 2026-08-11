@@ -22,16 +22,29 @@ use cubara_world::World;
 /// One fixed simulation step, in seconds. 60 Hz.
 pub const TICK_DT: f32 = 1.0 / 60.0;
 
+/// How far the player can target a block, in blocks -- shared by selection
+/// (this block, #52) and editing (`cubara-app::Game::edit_block`), so the
+/// highlighted block and the one an edit actually lands on can never drift
+/// apart into two different reach distances.
+pub const REACH: f32 = 6.0;
+
 /// Everything the player *is* and *does*, plus the world's own randomness --
 /// the whole of what phase 1 considers "the game state" outside `World`
-/// itself. `tick`/`player` are `pub`: read freely (rendering interpolates
-/// against `player`, a save file will want `tick`), but the only way to
-/// *change* any of this is [`Sim::tick`].
+/// itself. `tick`/`player`/`target` are `pub`: read freely (rendering
+/// interpolates against `player` and draws the outline at `target`, a save
+/// file will want `tick`), but the only way to *change* any of this is
+/// [`Sim::tick`].
 pub struct Sim {
     /// How many fixed steps have run since this `Sim` was created.
     pub tick: u64,
     rng: WorldRng,
     pub player: Player,
+    /// The block the player is currently looking at, within [`REACH`] --
+    /// recomputed every tick from the player's own raycast. `None` when
+    /// nothing solid is in reach. The renderer draws the outline; it does
+    /// not decide what's selected (issue #52's Rule 3 boundary) -- this
+    /// field is the seam.
+    pub target: Option<[i32; 3]>,
 }
 
 impl Sim {
@@ -40,6 +53,7 @@ impl Sim {
             tick: 0,
             rng: WorldRng::new(seed, 0),
             player,
+            target: None,
         }
     }
 
@@ -56,7 +70,8 @@ impl Sim {
     /// multi-tick catch-up burst can't flip it more than the real key press
     /// warrants), then either free-fly or real walking physics against
     /// `world`, depending on which mode the player is currently in
-    /// (`docs/PHASE1_ARCHITECTURE.md` §10, issue #53).
+    /// (`docs/PHASE1_ARCHITECTURE.md` §10, issue #53), then re-targets from
+    /// the resulting pose (issue #52).
     pub fn tick(&mut self, world: &mut World, input: &InputFrame) {
         if input.toggle_fly {
             self.player.free_fly = !self.player.free_fly;
@@ -70,6 +85,13 @@ impl Sim {
                 world.is_solid_at(x, y, z)
             });
         }
+        self.target = world
+            .raycast(
+                self.player.pos.to_array(),
+                self.player.look_dir().to_array(),
+                REACH,
+            )
+            .map(|hit| hit.block);
         self.tick += 1;
     }
 }
@@ -90,6 +112,31 @@ mod tests {
             sim.tick(&mut world, &no_input());
             assert_eq!(sim.tick, expected);
         }
+    }
+
+    #[test]
+    fn tick_targets_the_block_the_player_is_looking_at() {
+        let mut world = World::new();
+        let ground = world
+            .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0)
+            .expect("ground below");
+        // Hover just above the surface, looking straight down at it.
+        let eye = glam::vec3(0.5, ground.block[1] as f32 + 3.5, 0.5);
+        let mut sim = Sim::new(0, Player::new(eye, 0.0, -std::f32::consts::FRAC_PI_2));
+        sim.player.free_fly = true; // hold position -- only the raycast matters here
+        sim.tick(&mut world, &no_input());
+        assert_eq!(sim.target, Some(ground.block));
+    }
+
+    #[test]
+    fn tick_leaves_target_none_when_nothing_is_in_reach() {
+        let mut world = World::new();
+        // High above the terrain, looking straight up into open sky: nothing
+        // solid within REACH in either direction.
+        let mut sim = Sim::new(0, Player::new(glam::vec3(0.5, 500.0, 0.5), 0.0, 0.0));
+        sim.player.free_fly = true;
+        sim.tick(&mut world, &no_input());
+        assert_eq!(sim.target, None);
     }
 
     #[test]
