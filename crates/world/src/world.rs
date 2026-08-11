@@ -90,7 +90,7 @@ impl World {
     /// contains the block, so the caller can re-mesh it.
     pub fn set_block(&mut self, x: i32, y: i32, z: i32, solid: bool) -> ChunkCoord {
         self.edits.insert([x, y, z], solid);
-        ChunkCoord::from_world_pos([x as f32, y as f32, z as f32])
+        ChunkCoord::from_block(x, y, z)
     }
 
     /// Cast a ray through the world (terrain + edits) and return the first solid
@@ -115,14 +115,77 @@ impl World {
     /// meaning `cubara:grass`, not `cubara:stone`, in the real 3-material
     /// registry) is what block 1.4b's per-face resolution surfaced.
     pub fn chunk_at(&self, coord: ChunkCoord, blocks: TerrainBlocks) -> Option<Chunk> {
+        let chunk = self.build_chunk(coord, blocks);
+        (!chunk.is_empty()).then_some(chunk)
+    }
+
+    /// Like [`chunk_at`](Self::chunk_at), but always materializes the chunk
+    /// -- never `None` for an empty one. Save/load (block 1.9) needs this
+    /// for a *dirty* chunk that edits have carved down to nothing: writing
+    /// it explicitly is how "edited to empty" is told apart from "never
+    /// touched" on the next load, which `chunk_at`'s `None` can't express
+    /// (it means both).
+    pub fn edited_chunk_at(&self, coord: ChunkCoord, blocks: TerrainBlocks) -> Chunk {
+        self.build_chunk(coord, blocks)
+    }
+
+    fn build_chunk(&self, coord: ChunkCoord, blocks: TerrainBlocks) -> Chunk {
         let size = Chunk::SIZE as i32;
-        let chunk = Chunk::from_fn(|lx, ly, lz| {
+        Chunk::from_fn(|lx, ly, lz| {
             let wx = coord.x * size + lx as i32;
             let wy = coord.y * size + ly as i32;
             let wz = coord.z * size + lz as i32;
             self.block_at(wx, wy, wz, blocks)
-        });
-        (!chunk.is_empty()).then_some(chunk)
+        })
+    }
+
+    /// Every chunk touched by at least one edit, in ascending order -- what
+    /// save/load (block 1.9, §7.4) writes to disk; everything else
+    /// regenerates from the seed instead. Derived from the edit overlay
+    /// itself rather than tracked separately, so there is nothing to keep
+    /// in sync: a chunk is dirty exactly when [`set_block`](Self::set_block)
+    /// has ever touched a voxel inside it.
+    pub fn dirty_chunks(&self) -> Vec<ChunkCoord> {
+        let mut coords: Vec<ChunkCoord> = self
+            .edits
+            .keys()
+            .map(|&[x, y, z]| ChunkCoord::from_block(x, y, z))
+            .collect();
+        coords.sort();
+        coords.dedup();
+        coords
+    }
+
+    /// Record `chunk`'s content at `coord` as edits, but only the voxels
+    /// that actually differ from pure, edit-free generation -- save/load's
+    /// (block 1.9) load path, reconstructing exactly the overlay entries a
+    /// live session would have produced to reach this content, not "every
+    /// voxel of a touched chunk" (which would also overwrite untouched
+    /// grass/soil next to an edit with whatever the loaded chunk happens to
+    /// show there -- itself just the regenerated value, but there's no
+    /// reason to store it as an edit). Lossless for anything
+    /// [`set_block`](Self::set_block) can actually produce, since an edit
+    /// only ever resolves to `blocks.stone` or air (`block_at`'s doc
+    /// comment) -- exactly what a "differs from generation and is solid"
+    /// voxel in `chunk` already is, by construction of how it got saved.
+    pub fn load_chunk_edits(&mut self, coord: ChunkCoord, chunk: &Chunk, blocks: TerrainBlocks) {
+        let size = Chunk::SIZE as i32;
+        let origin = [coord.x * size, coord.y * size, coord.z * size];
+        let generated = self.worldgen.generate(origin, 1, blocks);
+        for lz in 0..Chunk::SIZE {
+            for ly in 0..Chunk::SIZE {
+                for lx in 0..Chunk::SIZE {
+                    let loaded = chunk.get(lx, ly, lz);
+                    let generated = generated.get(lx, ly, lz);
+                    if loaded != generated {
+                        let wx = origin[0] + lx as i32;
+                        let wy = origin[1] + ly as i32;
+                        let wz = origin[2] + lz as i32;
+                        self.set_block(wx, wy, wz, loaded != BlockId::AIR);
+                    }
+                }
+            }
+        }
     }
 
     /// The block at world `(x, y, z)`: a player edit if one exists there
@@ -357,5 +420,109 @@ mod tests {
         let keys = |w: &World| w.edits.keys().copied().collect::<Vec<_>>();
         assert_eq!(keys(&a), keys(&b));
         assert_eq!(a, b, "same edits in any order produce equal worlds");
+    }
+
+    #[test]
+    fn dirty_chunks_is_empty_for_a_fresh_world() {
+        let world = World::new();
+        assert_eq!(world.dirty_chunks(), Vec::new());
+    }
+
+    #[test]
+    fn dirty_chunks_reports_every_touched_chunk_once_in_order() {
+        let mut world = World::new();
+        // Two edits in chunk (0,0,0), one each in (1,0,0) and (-1,0,0).
+        world.set_block(0, 0, 0, true);
+        world.set_block(1, 1, 1, false);
+        world.set_block(16, 0, 0, true);
+        world.set_block(-1, 0, 0, false);
+        assert_eq!(
+            world.dirty_chunks(),
+            vec![
+                ChunkCoord::new(-1, 0, 0),
+                ChunkCoord::new(0, 0, 0),
+                ChunkCoord::new(1, 0, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn edited_chunk_at_materializes_even_when_fully_empty() {
+        // A chunk edited down to nothing: chunk_at reports None (matching
+        // "nothing to mesh"), but edited_chunk_at (save's own primitive)
+        // must still produce a real, explicitly-empty Chunk -- the whole
+        // point being to distinguish "edited to empty" from "never touched"
+        // on the next load.
+        let mut world = World::new();
+        let cc = ChunkCoord::new(0, 8, 0); // high in the air, starts empty
+        world.set_block(0, 130, 0, true);
+        assert!(world.chunk_at(cc, stone_blocks()).is_some());
+        world.set_block(0, 130, 0, false); // undo it -- back to fully air
+        assert!(
+            world.chunk_at(cc, stone_blocks()).is_none(),
+            "chunk_at reports empty as None"
+        );
+        let chunk = world.edited_chunk_at(cc, stone_blocks());
+        assert!(
+            chunk.is_empty(),
+            "still materialized as an actual empty Chunk"
+        );
+    }
+
+    #[test]
+    fn load_chunk_edits_reconstructs_exactly_the_original_overlay_content() {
+        // Round trip through the save-format's own reconstruction path: an
+        // edit made on `original`, replayed onto a fresh `loaded` world via
+        // load_chunk_edits, must resolve identically everywhere in that
+        // chunk -- not just at the edited voxel.
+        let mut original = World::new();
+        let cc = ChunkCoord::new(0, 8, 0);
+        original.set_block(0, 130, 5, true);
+        original.set_block(3, 129, 2, true);
+
+        let blocks = stone_blocks();
+        let edited_chunk = original.edited_chunk_at(cc, blocks);
+
+        let mut loaded = World::new();
+        loaded.load_chunk_edits(cc, &edited_chunk, blocks);
+
+        for x in 0..16 {
+            for y in 0..16 {
+                for z in 0..16 {
+                    let wx = cc.x * 16 + x;
+                    let wy = cc.y * 16 + y;
+                    let wz = cc.z * 16 + z;
+                    assert_eq!(
+                        original.is_solid_at(wx, wy, wz),
+                        loaded.is_solid_at(wx, wy, wz),
+                        "({wx},{wy},{wz})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn load_chunk_edits_does_not_record_voxels_that_already_matched_generation() {
+        // The property that keeps a loaded world's overlay from bloating:
+        // untouched terrain within an otherwise-dirty chunk must not become
+        // an explicit edit entry.
+        let mut original = World::new();
+        let cc = ChunkCoord::new(0, 0, 0); // deep underground -- confirmed solid, no ambiguity
+        assert!(
+            original.is_solid_at(0, 0, 0),
+            "test assumes this cell starts solid"
+        );
+        original.set_block(0, 0, 0, false); // one genuine edit: break confirmed-solid ground
+
+        let blocks = stone_blocks();
+        let edited_chunk = original.edited_chunk_at(cc, blocks);
+
+        let mut loaded = World::new();
+        let edits_before = loaded.edit_count();
+        loaded.load_chunk_edits(cc, &edited_chunk, blocks);
+        // Exactly one voxel in this chunk differs from pure generation (the
+        // one edit above), so exactly one new overlay entry should appear.
+        assert_eq!(loaded.edit_count(), edits_before + 1);
     }
 }

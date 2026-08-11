@@ -16,5 +16,5 @@ pub use block::BlockId;
 pub use coord::ChunkCoord;
 pub use mesh::{Face, Mesh, Vertex};
 pub use registry::{BlockRegistry, Faces, Material, RegistryError, Shape};
-pub use storage::ChunkStorage;
+pub use storage::{ChunkPayloadError, ChunkStorage};
 pub use voxel::{Chunk, MeshContext};

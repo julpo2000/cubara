@@ -471,6 +471,8 @@ dependencies = [
  "cubara-voxel",
  "cubara-world",
  "glam",
+ "ron",
+ "serde",
 ]
 
 [[package]]

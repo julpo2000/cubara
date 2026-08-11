@@ -13,11 +13,13 @@ mod input;
 mod physics;
 mod player;
 mod rng;
+mod save;
 
 pub use hash::{hash_region, WorldHash};
 pub use input::InputFrame;
 pub use player::Player;
 pub use rng::WorldRng;
+pub use save::{load_world, save_world, LoadError, SaveError, FORMAT_VERSION};
 
 use cubara_world::World;
 
@@ -36,6 +38,7 @@ pub const REACH: f32 = 6.0;
 /// interpolates against `player` and draws the outline at `target`, a save
 /// file will want `tick`), but the only way to *change* any of this is
 /// [`Sim::tick`].
+#[derive(Debug)]
 pub struct Sim {
     /// How many fixed steps have run since this `Sim` was created.
     pub tick: u64,

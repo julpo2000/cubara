@@ -307,6 +307,16 @@ impl BlockRegistry {
         self.by_name.get(name).copied()
     }
 
+    /// The block name for a runtime id, if this registry has it -- the
+    /// inverse of [`id_of`](Self::id_of). `name_of(BlockId::AIR)` is always
+    /// `"cubara:air"`. What save/load (block 1.9) uses to build a world's id
+    /// table (`level.ron`'s `blocks` field, §7.2): the names in force when
+    /// the world was saved, so a later load can remap them to whatever ids
+    /// the registry assigns them next time, even if that's changed.
+    pub fn name_of(&self, id: BlockId) -> Option<&str> {
+        self.entries.get(id.0 as usize).map(|e| e.name.as_str())
+    }
+
     /// Every `BlockId` this registry assigned, air included, in ascending order.
     pub fn ids(&self) -> impl Iterator<Item = BlockId> + '_ {
         (0..self.entries.len() as u16).map(BlockId)
@@ -426,6 +436,20 @@ mod tests {
         let registry = BlockRegistry::from_materials(vec![stone()]).unwrap();
         assert_eq!(registry.id_of("cubara:air"), Some(BlockId::AIR));
         assert!(!registry.is_solid(BlockId::AIR));
+    }
+
+    #[test]
+    fn name_of_is_the_inverse_of_id_of() {
+        let registry = BlockRegistry::from_materials(vec![stone(), grass(), soil()]).unwrap();
+        for name in ["cubara:air", "cubara:stone", "cubara:grass", "cubara:soil"] {
+            let id = registry.id_of(name).unwrap();
+            assert_eq!(registry.name_of(id), Some(name));
+        }
+        assert_eq!(
+            registry.name_of(BlockId(999)),
+            None,
+            "an id this registry never assigned"
+        );
     }
 
     #[test]

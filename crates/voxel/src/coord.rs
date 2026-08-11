@@ -47,6 +47,18 @@ impl ChunkCoord {
             (pos[2] / size).floor() as i32,
         )
     }
+
+    /// The chunk that contains an integer world-block coordinate. Exact --
+    /// `div_euclid` floors toward negative infinity for negative inputs the
+    /// same way [`from_world_pos`](Self::from_world_pos) does, but without a
+    /// float round-trip, which is what save/load's dirty-chunk bookkeeping
+    /// (block 1.9) needs: an edit's coordinate is already an `i32`, and nothing
+    /// about "which chunk owns this voxel" should ever depend on floating-point
+    /// rounding.
+    pub fn from_block(x: i32, y: i32, z: i32) -> Self {
+        let size = Chunk::SIZE as i32;
+        Self::new(x.div_euclid(size), y.div_euclid(size), z.div_euclid(size))
+    }
 }
 
 #[cfg(test)]
@@ -76,5 +88,31 @@ mod tests {
             ChunkCoord::from_world_pos([-0.1, -16.0, -17.0]),
             ChunkCoord::new(-1, -1, -2)
         );
+    }
+
+    #[test]
+    fn from_block_matches_from_world_pos_exactly() {
+        // The integer and float paths must agree everywhere -- this is the
+        // property that makes `from_block` a safe, exact substitute, not
+        // just "close enough."
+        for x in -40..40 {
+            for z in [-33, -17, -1, 0, 1, 16, 31, 32] {
+                let y = x * 3 - z;
+                assert_eq!(
+                    ChunkCoord::from_block(x, y, z),
+                    ChunkCoord::from_world_pos([x as f32, y as f32, z as f32]),
+                    "x={x} y={y} z={z}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn from_block_floors_toward_negative_infinity() {
+        assert_eq!(
+            ChunkCoord::from_block(-1, -16, -17),
+            ChunkCoord::new(-1, -1, -2)
+        );
+        assert_eq!(ChunkCoord::from_block(0, 15, 16), ChunkCoord::new(0, 0, 1));
     }
 }
