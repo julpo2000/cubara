@@ -16,14 +16,11 @@
 use std::sync::Arc;
 
 use cubara_render::CameraPose;
-use cubara_sim::{InputFrame, Player, Sim, TICK_DT};
+use cubara_sim::{InputFrame, Player, Sim, REACH, TICK_DT};
 use cubara_voxel::ChunkCoord;
 use cubara_world::World;
 
 use winit::keyboard::KeyCode;
-
-/// How far the block-editing ray reaches, in blocks.
-const EDIT_REACH: f32 = 6.0;
 
 /// Caps how many fixed steps a single [`Game::advance`] call runs -- a stalled or
 /// backgrounded window can hand back a huge `dt` (seconds, not milliseconds), and
@@ -118,6 +115,14 @@ impl Game {
         }
     }
 
+    /// The block the player is currently looking at, within [`REACH`], for
+    /// the renderer to outline -- computed by the sim's own raycast each
+    /// tick (`cubara_sim::Sim::tick`), not here. The renderer draws it; it
+    /// does not decide it (`ARCHITECTURE.md` Rule 3, issue #52).
+    pub fn selected_block(&self) -> Option<[i32; 3]> {
+        self.sim.target
+    }
+
     /// Record a movement key going down/up. Unmapped keys are ignored (returns
     /// whether the key was one the game cares about).
     ///
@@ -204,17 +209,20 @@ impl Game {
     }
 
     /// Break (`place = false`) or place (`true`) the block the player is looking
-    /// at, within [`EDIT_REACH`]. Returns the [`ChunkCoord`] whose geometry is now
+    /// at, within [`REACH`]. Returns the [`ChunkCoord`] whose geometry is now
     /// stale so the caller can re-mesh it, or `None` if nothing was in reach.
     ///
     /// Placing puts the block against the hit face. Uses the sim's current
     /// (non-interpolated) pose -- editing is a gameplay decision, and
     /// interpolation is a render-only concern (§9) that must never feed back
-    /// into it.
+    /// into it. Raycasts fresh rather than reusing [`Sim::target`](cubara_sim::Sim)
+    /// -- that field only updates on the next tick, so it can go stale
+    /// against `self.world` after an edit lands (e.g. two edits between
+    /// ticks); issue #52 scoped out any change to raycasting itself anyway.
     pub fn edit_block(&mut self, place: bool) -> Option<ChunkCoord> {
         let origin = self.sim.player.pos.to_array();
         let dir = self.sim.player.look_dir().to_array();
-        let hit = self.world.raycast(origin, dir, EDIT_REACH)?;
+        let hit = self.world.raycast(origin, dir, REACH)?;
         let target = if place {
             [
                 hit.block[0] + hit.normal[0],

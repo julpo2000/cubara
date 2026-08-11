@@ -66,8 +66,10 @@ frames after 200 warmup.
 | 2026-08-11 | **Seeded noise terrain with caves** [#48], radius 64¹⁷ | 26,789 | 890,774 | ~891 | 0.780 ms | ~1.51 ms | `c67086c` |
 | 2026-08-11 | Fixed-timestep tick loop + world RNG [#57], radius 12¹⁸ | 1,282 | 424,352 | ~2,014 | 0.313 ms | ~1.54 ms | `1283002` |
 | 2026-08-11 | Fixed-timestep tick loop + world RNG [#57], radius 64¹⁸ | 26,789 | 890,774 | ~903 | 0.783 ms | ~1.61 ms | `1283002` |
-| 2026-08-11 | Player AABB collision, gravity and walking [#53], radius 12¹⁹ | 1,282 | 424,352 | ~2,221 | 0.301 ms | ~0.71 ms | *(this PR)* |
-| 2026-08-11 | Player AABB collision, gravity and walking [#53], radius 64¹⁹ | 26,789 | 890,774 | ~898 | 0.785 ms | ~1.43 ms | *(this PR)* |
+| 2026-08-11 | Player AABB collision, gravity and walking [#53], radius 12¹⁹ | 1,282 | 424,352 | ~2,221 | 0.301 ms | ~0.71 ms | `3ba4c2d` |
+| 2026-08-11 | Player AABB collision, gravity and walking [#53], radius 64¹⁹ | 26,789 | 890,774 | ~898 | 0.785 ms | ~1.43 ms | `3ba4c2d` |
+| 2026-08-11 | Selected-block outline [#52], radius 12²⁰ | 1,282 | 424,352 | ~2,194 | 0.304 ms | ~0.81 ms | *(this PR)* |
+| 2026-08-11 | Selected-block outline [#52], radius 64²⁰ | 26,789 | 890,774 | ~905 | 0.774 ms | ~1.55 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -514,6 +516,25 @@ about meshing, the arena, or the draw path changed. Chunks/triangles
 identical to the previous row; FPS/CPU within normal small-scene noise
 (radius 12: ~2,014 → ~2,221 FPS, 0.313 → 0.301 ms; radius 64: ~903 → ~898
 FPS, 0.783 → 0.785 ms).
+
+²⁰ **Selected-block outline (issue #52) — a real, if small, addition to the
+render path this time.** A second pipeline (line list, `crates/render/src/
+shaders/outline.wgsl`), drawn in the same pass right after the arena's
+indirect submit when a block is targeted -- gravity/walking (#53) made
+"which block is targeted" sim state worth showing, computed once per tick
+from the player's own raycast (`Sim::target`), never in the renderer
+(`ARCHITECTURE.md` Rule 3).
+
+**These numbers don't exercise it.** `--bench` deliberately renders with no
+selected block (it measures the world, not a UI highlight -- see its own
+comment in `crates/app/src/bench.rs`), so the outline's `if
+selected_block.is_some()` branch is untaken here and chunks/triangles/FPS/CPU
+are, as expected, within normal small-scene noise of the previous row
+(radius 12: ~2,221 → ~2,194 FPS, 0.301 → 0.304 ms; radius 64: ~898 → ~905
+FPS, 0.785 → 0.774 ms). The golden test (`the_selected_block_shows_an_outline`)
+is what actually exercises the new pipeline; it's a correctness check, not
+a perf one, and this row is recorded per the "every feature is measured"
+rule rather than because it's expected to move anything.
 
 ## Detailed run logs
 
