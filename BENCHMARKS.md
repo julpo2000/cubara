@@ -64,8 +64,10 @@ frames after 200 warmup.
 | 2026-08-11 | **The three phase-1 materials + textures, depth-layered terrain** [#55], radius 64¹⁶ | 25,131 | 899,840 | ~877 | 0.821 ms | ~2.06 ms | `9174d84` |
 | 2026-08-11 | **Seeded noise terrain with caves** [#48], radius 12¹⁷ | 1,282 | 424,352 | ~2,224 | 0.302 ms | ~0.72 ms | `c67086c` |
 | 2026-08-11 | **Seeded noise terrain with caves** [#48], radius 64¹⁷ | 26,789 | 890,774 | ~891 | 0.780 ms | ~1.51 ms | `c67086c` |
-| 2026-08-11 | Fixed-timestep tick loop + world RNG [#57], radius 12¹⁸ | 1,282 | 424,352 | ~2,014 | 0.313 ms | ~1.54 ms | *(this PR)* |
-| 2026-08-11 | Fixed-timestep tick loop + world RNG [#57], radius 64¹⁸ | 26,789 | 890,774 | ~903 | 0.783 ms | ~1.61 ms | *(this PR)* |
+| 2026-08-11 | Fixed-timestep tick loop + world RNG [#57], radius 12¹⁸ | 1,282 | 424,352 | ~2,014 | 0.313 ms | ~1.54 ms | `1283002` |
+| 2026-08-11 | Fixed-timestep tick loop + world RNG [#57], radius 64¹⁸ | 26,789 | 890,774 | ~903 | 0.783 ms | ~1.61 ms | `1283002` |
+| 2026-08-11 | Player AABB collision, gravity and walking [#53], radius 12¹⁹ | 1,282 | 424,352 | ~2,221 | 0.301 ms | ~0.71 ms | *(this PR)* |
+| 2026-08-11 | Player AABB collision, gravity and walking [#53], radius 64¹⁹ | 26,789 | 890,774 | ~898 | 0.785 ms | ~1.43 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -500,6 +502,18 @@ identical to the previous row (same seed, same radius). FPS/CPU moved
 within normal small-scene noise (radius 12: ~2,224 → ~2,014 FPS, 0.302 →
 0.313 ms; radius 64: ~891 → ~903 FPS, 0.780 → 0.783 ms) -- consistent with
 "unchanged," not a regression signal.
+
+¹⁹ **Player AABB collision, gravity and walking (issue #53) — another
+render-path-untouched block.** Added a swept-AABB-vs-voxel physics module
+(`crates/sim/src/physics.rs`): gravity, jump, one-block step-up, resolved
+axis by axis in a fixed Y, X, Z order, running inside `Sim::tick` instead of
+the renderer. `World::is_solid_at` (already registry-resolved to a plain
+bool, block 1.5's edit overlay) is the only thing physics reads from the
+world -- no new dependency on `cubara-voxel`/`BlockRegistry`, and nothing
+about meshing, the arena, or the draw path changed. Chunks/triangles
+identical to the previous row; FPS/CPU within normal small-scene noise
+(radius 12: ~2,014 → ~2,221 FPS, 0.313 → 0.301 ms; radius 64: ~903 → ~898
+FPS, 0.783 → 0.785 ms).
 
 ## Detailed run logs
 

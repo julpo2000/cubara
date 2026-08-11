@@ -62,13 +62,26 @@ pub struct Game {
     right: bool,
     up: bool,
     down: bool,
+    /// Whether the free-fly toggle key is currently held -- tracked so
+    /// `key_input` can tell a fresh press from OS key-repeat and only raise
+    /// `fly_toggle_pending` on the rising edge.
+    fly_toggle_held: bool,
+    /// Jump / fly-toggle: `true` from the tick they were pressed until the
+    /// next `advance` call hands them to `Sim::tick` as an `InputFrame`
+    /// button edge, then cleared -- see `advance`'s doc comment for why
+    /// they're consumed by only the first tick of a catch-up burst.
+    jump_pending: bool,
+    fly_toggle_pending: bool,
     /// Mouse motion (pixels) accumulated since the last `advance` call.
     look_delta: (f32, f32),
 }
 
 impl Game {
     /// Start above the terrain near the origin, looking out over it and slightly
-    /// down (yaw ~35°, gentle downward pitch).
+    /// down (yaw ~35°, gentle downward pitch). Walking mode by default (not
+    /// free-fly, per issue #53's Context: the point of this block is a world
+    /// you land in and walk, not one you start already flying over) -- gravity
+    /// carries the player down onto the terrain below.
     pub fn new() -> Self {
         let player = Player::new(glam::vec3(0.0, 48.0, 0.0), 0.6, -0.3);
         Self {
@@ -82,6 +95,9 @@ impl Game {
             right: false,
             up: false,
             down: false,
+            fly_toggle_held: false,
+            jump_pending: false,
+            fly_toggle_pending: false,
             look_delta: (0.0, 0.0),
         }
     }
@@ -104,17 +120,34 @@ impl Game {
 
     /// Record a movement key going down/up. Unmapped keys are ignored (returns
     /// whether the key was one the game cares about).
+    ///
+    /// Space and F4 double as both a *held* signal (free-fly's vertical axis,
+    /// respectively nothing) and a *rising-edge* signal (jump; the free-fly
+    /// toggle) -- `cubara-sim` decides which one applies, based on which mode
+    /// the player is currently in, so this method just reports both truthfully
+    /// rather than guessing the mode here (Rule 3: no gameplay decisions on
+    /// this side of the seam beyond packaging raw input).
     pub fn key_input(&mut self, key: KeyCode, pressed: bool) -> bool {
-        let slot = match key {
-            KeyCode::KeyW | KeyCode::ArrowUp => &mut self.forward,
-            KeyCode::KeyS | KeyCode::ArrowDown => &mut self.back,
-            KeyCode::KeyA | KeyCode::ArrowLeft => &mut self.left,
-            KeyCode::KeyD | KeyCode::ArrowRight => &mut self.right,
-            KeyCode::Space => &mut self.up,
-            KeyCode::ShiftLeft | KeyCode::ShiftRight | KeyCode::ControlLeft => &mut self.down,
+        match key {
+            KeyCode::KeyW | KeyCode::ArrowUp => self.forward = pressed,
+            KeyCode::KeyS | KeyCode::ArrowDown => self.back = pressed,
+            KeyCode::KeyA | KeyCode::ArrowLeft => self.left = pressed,
+            KeyCode::KeyD | KeyCode::ArrowRight => self.right = pressed,
+            KeyCode::Space => {
+                if pressed && !self.up {
+                    self.jump_pending = true;
+                }
+                self.up = pressed;
+            }
+            KeyCode::ShiftLeft | KeyCode::ShiftRight | KeyCode::ControlLeft => self.down = pressed,
+            KeyCode::F4 => {
+                if pressed && !self.fly_toggle_held {
+                    self.fly_toggle_pending = true;
+                }
+                self.fly_toggle_held = pressed;
+            }
             _ => return false,
-        };
-        *slot = pressed;
+        }
         true
     }
 
@@ -130,22 +163,34 @@ impl Game {
     /// same [`InputFrame`] drives every step this call runs -- ticks never read
     /// live input themselves, so a scripted/replayed input sequence (block 1.8)
     /// reproduces exactly.
+    ///
+    /// `jump`/`toggle_fly` are cleared after the *first* tick of a catch-up
+    /// burst, unlike the continuous fields -- they're rising edges from a
+    /// single real key press, and reusing the unmodified `InputFrame` for
+    /// every backlog tick (as the continuous fields correctly do) would
+    /// otherwise replay that one press once per catch-up tick.
     pub fn advance(&mut self, dt: f32) {
-        let input = InputFrame {
+        let mut input = InputFrame {
             move_axes: [
                 (self.right as i32 - self.left as i32) as f32,
                 (self.up as i32 - self.down as i32) as f32,
                 (self.forward as i32 - self.back as i32) as f32,
             ],
             look_delta: [self.look_delta.0, self.look_delta.1],
+            jump: self.jump_pending,
+            toggle_fly: self.fly_toggle_pending,
         };
         self.look_delta = (0.0, 0.0);
+        self.jump_pending = false;
+        self.fly_toggle_pending = false;
 
         self.accumulator += dt as f64;
         let mut ticks = 0;
         while self.accumulator >= TICK_DT as f64 {
             self.prev_player = self.sim.player;
             self.sim.tick(Arc::make_mut(&mut self.world), &input);
+            input.jump = false;
+            input.toggle_fly = false;
             self.accumulator -= TICK_DT as f64;
             ticks += 1;
             if ticks >= MAX_TICKS_PER_FRAME {
@@ -243,7 +288,39 @@ mod tests {
     fn key_input_reports_whether_the_key_was_mapped() {
         let mut game = Game::new();
         assert!(game.key_input(KeyCode::KeyW, true));
+        assert!(game.key_input(KeyCode::F4, true), "the free-fly toggle key");
         assert!(!game.key_input(KeyCode::KeyP, true), "unmapped key");
+    }
+
+    #[test]
+    fn fly_toggle_flips_the_mode_on_a_single_press() {
+        let mut game = Game::new();
+        assert!(
+            !game.sim.player.is_free_fly(),
+            "walking is the default mode"
+        );
+        game.key_input(KeyCode::F4, true);
+        game.advance(TICK_DT);
+        assert!(game.sim.player.is_free_fly());
+    }
+
+    #[test]
+    fn fly_toggle_edge_is_consumed_once_not_once_per_catchup_tick() {
+        // A single key press must flip the mode exactly once, even when it
+        // lands in a frame whose accumulator backlog forces several ticks to
+        // run in one `advance` call -- reusing the same `InputFrame` across a
+        // catch-up burst is correct for held movement, but a button edge
+        // reapplied on every one of those ticks would flip the mode back and
+        // forth instead of once. Two ticks makes a naive double-application
+        // observable: it would leave the mode back at `false`.
+        let mut game = Game::new();
+        game.key_input(KeyCode::F4, true);
+        game.advance(2.0 * TICK_DT);
+        assert_eq!(game.sim.tick, 2);
+        assert!(
+            game.sim.player.is_free_fly(),
+            "one press should flip the mode once (false -> true), not twice (-> false)"
+        );
     }
 
     #[test]
