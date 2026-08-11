@@ -78,8 +78,10 @@ frames after 200 warmup.
 | 2026-08-11 | LOD-native node generation [#106], radius 12²⁴ | 1,282 | 424,352 | ~2,211 | 0.303 ms | ~0.75 ms | `a463f2a` |
 | 2026-08-11 | **Node meshing on the worker pool, one mesh per node** [#107], radius 12²⁵ | 690 | 250,982 | ~3,217 | **0.192 ms** | ~0.73 ms | `444045a` |
 | 2026-08-11 | **Node meshing on the worker pool, one mesh per node** [#107], radius 64²⁵ | 1,238 | 625,258 | **~1,673** | **0.408 ms** | ~1.01 ms | `444045a` |
-| 2026-08-11 | Skirts to hide LOD seams [#108], radius 12²⁶ | 690 | 281,274 | ~2,920 | 0.214 ms | ~0.90 ms | *(this PR)* |
-| 2026-08-11 | Skirts to hide LOD seams [#108], radius 64²⁶ | 1,238 | 689,436 | ~1,558 | 0.444 ms | ~0.89 ms | *(this PR)* |
+| 2026-08-11 | Skirts to hide LOD seams [#108], radius 12²⁶ | 690 | 281,274 | ~2,920 | 0.214 ms | ~0.90 ms | `d518f53` |
+| 2026-08-11 | Skirts to hide LOD seams [#108], radius 64²⁶ | 1,238 | 689,436 | ~1,558 | 0.444 ms | ~0.89 ms | `d518f53` |
+| 2026-08-11 | **Ring schedule tuned to the <2,000-draw budget** [#109], radius 12²⁷ | 957 | 367,026 | ~2,357 | 0.280 ms | ~0.88 ms | *(this PR)* |
+| 2026-08-11 | **Ring schedule tuned to the <2,000-draw budget** [#109], radius 64²⁷ | **1,585** | 829,608 | ~1,295 | 0.526 ms | ~1.12 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -666,6 +668,42 @@ uniform per-border overhead, not concentrated at real seams alone.
 no-GPU regression guard) moved 13,510 → 14,068 triangles for the same
 reason; updated with the same "why did this pinned number move" comment
 trail that test already keeps.
+
+²⁷ **Ring schedule tuned to the <2,000-draw budget (issue #38's tracking arc,
+sub-issue #109).** §6.3's placeholder table (`[(0,8),(1,16),(2,32),(3,64)]`,
+sub-issue #105) was never tuned against a real measurement; this is that
+pass. Widened the full-resolution near field from chunk-radius 8 to 10 and
+level 1 from 16 to 18 (levels 2/3 and the radius-64 ceiling untouched — far
+enough out that widening them buys much less visible quality per node than
+widening the near field does), landing at **1,585 resident nodes at radius
+64**, measured consistently (1,585-1,613) across four different world
+positions, not just the origin. A tighter table (11/19/33/64, 1,935-1,956
+resident) was tried and rejected: technically still under 2,000, but only a
+2-3% margin — too close to trust across world positions and seeds it wasn't
+measured against, and §6.3/issue #109 are explicit that the 2,000 ceiling is
+not the agent's to relax under any circumstance, so margin against
+measurement noise matters more than squeezing out the last few hundred
+nodes. The near field is **not** visibly coarser than before this PR — it's
+wider than the placeholder table gave it, the opposite finding from the one
+issue #109 asks to be reported honestly if it occurred.
+
+Against the immediately preceding row (issue #108, `d518f53`, same 1000-FPS
+gate check): radius 64 nodes **1,238 → 1,585** (+28%, using headroom the
+skirts row didn't touch), tris 689,436 → 829,608, CPU/frame 0.444 → 0.526
+ms, throughput ~1,558 → ~1,295 FPS — still clearing the gate.
+
+Against the **original issue #89 baseline** (`49146ef`, the number this
+whole sub-arc exists to fix): radius-64 draws **25,131 → 1,585, a 15.9×
+reduction** (not yet the full ~25× §6.1 projects, since skirts add geometry
+but no draws, and the schedule still has ~20% margin left below 2,000 that
+favours robustness over squeezing out the theoretical maximum), CPU/frame
+**0.715 → 0.526 ms (-26%)**, throughput **~996 → ~1,295 FPS (+30%)**. Radius
+64 now clears the 1000-FPS gate with real margin, not just barely, on the
+same scene issue #89 first measured it failing on.
+
+Windows numbers not yet recorded for this row — per this file's own
+convention, the macOS M3 row lands with the PR and the Windows row is added
+when next run there.
 
 ## Detailed run logs
 

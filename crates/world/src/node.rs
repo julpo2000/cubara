@@ -95,11 +95,23 @@ pub struct NodeStreamUpdates {
 /// to 8, level 1 to 16, level 2 to 32, level 3 to 64).
 pub type RingSchedule = [(u32, i32)];
 
-/// §6.3's own illustrative starting table. **Not yet tuned** — issue #38's
-/// sub-issue #109 is where these numbers get measured against the real
-/// `<2,000`-drawn-nodes-at-radius-64 budget (§2); this table only needs to
-/// exercise the ring mechanism correctly.
-pub const DEFAULT_RING_SCHEDULE: &[(u32, i32)] = &[(0, 8), (1, 16), (2, 32), (3, 64)];
+/// Tuned against the real radius-64 draw budget (§2, issue #109): resident
+/// node count at radius 64 must stay under 2,000. Measured (not guessed) at
+/// four different world positions -- origin plus three far-apart points, to
+/// rule out a schedule that only happens to work near `(0,0,0)` -- landing
+/// at **1,585-1,613 resident nodes**, a comfortable ~20% margin under
+/// budget while widening the full-resolution near field from chunk-radius 8
+/// (§6.3's illustrative example) to 10 and level 1 from 16 to 18, the two
+/// changes that matter most for how coarse the ground right around the
+/// player looks. Levels 2/3 (and the radius-64 ceiling itself) are
+/// untouched: they're already far enough out that widening them buys much
+/// less visible quality per node than widening the near field does. A
+/// tighter table (11/19/33/64) measured 1,935-1,956 -- technically still
+/// under 2,000, but only a 2-3% margin, too close to the edge to trust
+/// across world positions and seeds this table wasn't measured against; not
+/// used for exactly that reason. See `BENCHMARKS.md`'s issue-#109 rows for
+/// the full `--bench 64` numbers this table produces.
+pub const DEFAULT_RING_SCHEDULE: &[(u32, i32)] = &[(0, 10), (1, 18), (2, 32), (3, 64)];
 
 /// Every node that should be resident around `center`, across the vertical
 /// band `y_range` (in chunks, same convention as
