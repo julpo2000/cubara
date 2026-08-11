@@ -20,9 +20,60 @@
 
 use std::path::{Path, PathBuf};
 
-use cubara_render::headless::{self, Shot};
+use cubara_render::headless::{self, Frame, Shot};
+use cubara_render::materials::TextureLayers;
+use cubara_render::{MeshedNode, NodeId};
 use cubara_voxel::{BlockRegistry, Chunk, ChunkCoord};
+use cubara_world::mesh::mesh_region;
+use cubara_world::node::schedule_for_radius;
 use cubara_world::World;
+
+/// The real `assets/blocks` registry -- the same one every entry point
+/// (window, `--bench`, `--screenshot`, these tests) meshes and renders
+/// against.
+fn real_registry() -> BlockRegistry {
+    let assets_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/blocks");
+    BlockRegistry::load(&assets_dir).expect("assets/blocks must be valid")
+}
+
+/// Mesh `world` out to `shot.region_radius` (the same ring-schedule
+/// truncation the live renderer streams, `schedule_for_radius`) and render
+/// it. `cubara-render` never touches a `World` (`ARCHITECTURE.md` §1), so
+/// this is the test-side equivalent of what `cubara-app` does every frame:
+/// mesh via `cubara_world::mesh`, then hand the result to
+/// `headless::render`. `TextureLayers::from_registry` resolves texture
+/// layers deterministically without needing a GPU device for this step --
+/// `headless::render` builds the real texture array afterwards, and the two
+/// are guaranteed to agree on layer numbers (see its doc comment).
+fn render_world(world: &World, shot: Shot) -> Option<Frame> {
+    let registry = real_registry();
+    let layers = TextureLayers::from_registry(&registry);
+    let layer_of = |name: &str| layers.layer_of(name);
+    let schedule = schedule_for_radius(shot.region_radius);
+    let meshed = mesh_region(
+        world,
+        &registry,
+        &layer_of,
+        ChunkCoord::new(0, 0, 0),
+        0..=2,
+        &schedule,
+    )
+    .into_iter()
+    .filter_map(|built| {
+        let geometry = built.geometry?;
+        Some(MeshedNode {
+            id: NodeId {
+                level: built.node.level,
+                pos: built.node.pos,
+            },
+            origin: geometry.origin,
+            scale: geometry.scale,
+            mesh: geometry.mesh,
+            aabb: geometry.aabb,
+        })
+    });
+    headless::render(meshed, shot)
+}
 
 /// Per-channel difference treated as equal. The same scene rasterises slightly
 /// differently across backends and driver versions; an exact match would fire
@@ -71,7 +122,7 @@ fn save_png(path: &Path, w: u32, h: u32, pixels: &[u8]) {
 
 /// Render `shot` and compare against `tests/golden/<name>.png`.
 fn assert_golden(name: &str, world: &World, shot: Shot) {
-    let Some(frame) = headless::render(world, shot) else {
+    let Some(frame) = render_world(world, shot) else {
         // No adapter (a GPU-less CI runner). Skipping is honest here — the
         // alternative is a red build that says nothing about the code — but it is
         // reported loudly so a silently-never-running test is noticeable.
@@ -143,19 +194,19 @@ fn the_same_scene_renders_byte_identically() {
     // a worker pool, so "whatever order results arrived in" was leaking into the
     // rendered frame.
     //
-    // Scope, stated honestly: `from_region` meshes synchronously, so this pins
-    // *draw-order* determinism, not worker-arrival determinism. Arrival order still
-    // decides which slab offsets a chunk lands in (`ChunkArena::insert` is first-fit),
-    // which no longer changes the image — the draw list is coord-sorted and the
-    // geometry content is identical — but does mean the arena's internal layout is
-    // not reproducible. That matters the moment world state is hashed or saved; see
-    // issue #83.
+    // Scope, stated honestly: `render_world`/`mesh_region` mesh synchronously, so
+    // this pins *draw-order* determinism, not worker-arrival determinism. Arrival
+    // order still decides which slab offsets a chunk lands in (`ChunkArena::insert`
+    // is first-fit), which no longer changes the image — the draw list is
+    // coord-sorted and the geometry content is identical — but does mean the
+    // arena's internal layout is not reproducible. That matters the moment world
+    // state is hashed or saved; see issue #83.
     let shot = Shot::default();
-    let Some(a) = headless::render(&World::new(), shot) else {
+    let Some(a) = render_world(&World::new(), shot) else {
         eprintln!("SKIP the_same_scene_renders_byte_identically: no GPU adapter");
         return;
     };
-    let b = headless::render(&World::new(), shot).expect("adapter was available a moment ago");
+    let b = render_world(&World::new(), shot).expect("adapter was available a moment ago");
 
     // Tolerance 0: this is exactness, not similarity.
     let diff = headless::compare(&a.pixels, &b.pixels, 0);
@@ -210,7 +261,7 @@ fn a_cave_mouth_is_visible() {
 #[test]
 fn no_crack_at_a_real_lod_boundary() {
     // Issue #108's own bar: a real level-0/level-1 node boundary, in the
-    // live streamed scene (`ChunkArena::from_region`'s ring-schedule
+    // live streamed scene (`render_world`/`mesh_region`'s ring-schedule
     // streaming, not a synthetic fixture), with no crack of background
     // showing through -- proof the skirts added to `cubara_voxel`'s greedy
     // mesher actually reach the render path, not just the unit tests in
@@ -358,7 +409,7 @@ fn edits_change_what_is_drawn() {
     // cannot fail is worse than none, because it reads as coverage.
     let shot = Shot::default();
     let mut world = World::new();
-    let Some(base) = headless::render(&World::new(), shot) else {
+    let Some(base) = render_world(&World::new(), shot) else {
         eprintln!("SKIP edits_change_what_is_drawn: no GPU adapter");
         return;
     };
@@ -372,7 +423,7 @@ fn edits_change_what_is_drawn() {
             }
         }
     }
-    let edited = headless::render(&world, shot).expect("adapter was available a moment ago");
+    let edited = render_world(&world, shot).expect("adapter was available a moment ago");
 
     let diff = headless::compare(&edited.pixels, &base.pixels, TOLERANCE);
     eprintln!(

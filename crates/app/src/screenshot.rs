@@ -8,12 +8,33 @@
 //!
 //! Run with: `cargo run --release -- --screenshot out.png`
 
-use cubara_render::{headless, Shot};
+use cubara_render::materials::TextureLayers;
+use cubara_render::{headless, load_registry, Shot};
+use cubara_voxel::ChunkCoord;
+use cubara_world::mesh::mesh_region;
+use cubara_world::node::schedule_for_radius;
 use cubara_world::World;
+
+use crate::streaming::to_meshed_node;
 
 pub fn run(path: &str) {
     let shot = Shot::default();
-    let Some(frame) = headless::render(&World::new(), shot) else {
+    let world = World::new();
+    let registry = load_registry();
+    let layers = TextureLayers::from_registry(&registry);
+    let layer_of = |name: &str| layers.layer_of(name);
+    let schedule = schedule_for_radius(shot.region_radius);
+    let meshed = mesh_region(
+        &world,
+        &registry,
+        &layer_of,
+        ChunkCoord::new(0, 0, 0),
+        0..=2,
+        &schedule,
+    )
+    .into_iter()
+    .filter_map(to_meshed_node);
+    let Some(frame) = headless::render(meshed, shot) else {
         log::error!("no suitable GPU adapter — cannot render a screenshot");
         return;
     };

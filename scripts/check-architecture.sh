@@ -55,6 +55,19 @@ done | report "Rule 3/4" "GPU/windowing types in a data or simulation crate"
 grep -n -E "pub fn (key_input|mouse_look|set_cursor_captured|edit_block)" crates/render/src/render.rs \
     | report "Rule 3" "input/gameplay on the renderer — if it can place a block, the boundary is wrong"
 
+# The renderer's own dependency graph must not include the world -- its inputs
+# are meshes, origins and a camera, never a `World` (§1 of the phase 1 design
+# doc). `cubara-world` is a legitimate *dev*-dependency (golden-image tests
+# build real scenes through it), so this scans only the `[dependencies]`
+# table -- from that header to the next `[...]` one -- not the whole file,
+# and prints real file line numbers (not the filtered stream's) via `NR`.
+awk '
+    /^\[dependencies\]/ { in_deps = 1; next }
+    /^\[/ { in_deps = 0 }
+    in_deps && /^cubara-world/ { print NR": "$0 }
+' crates/render/Cargo.toml | sed 's|^|crates/render/Cargo.toml:|' \
+    | report "Rule 3" "cubara-render depends on cubara-world — its inputs must stay meshes, origins and a camera"
+
 if [ -s "$failures" ]; then
     echo
     echo "$(wc -l <"$failures" | tr -d ' ') architecture rule(s) violated."

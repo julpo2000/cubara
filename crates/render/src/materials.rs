@@ -31,17 +31,36 @@ impl TextureLayers {
         self.layer_of.get(name).copied().unwrap_or(0)
     }
 
-    /// An empty mapping -- every name falls through to layer 0 via
-    /// [`layer_of`](Self::layer_of)'s default. For tests that need a
-    /// [`MeshAssets`] but don't care about texturing (geometry/pooling logic
-    /// tests, which shouldn't need a GPU device just to build a real texture
-    /// array via [`build`]).
-    #[cfg(test)]
-    pub(crate) fn empty() -> Self {
+    /// The same deterministic name → layer mapping [`build`] produces,
+    /// without needing a GPU device to get it. `build`'s own mapping is a
+    /// pure function of `registry.texture_names()`'s sorted order (see its
+    /// doc comment) with no GPU calls mixed in, so this and a `build`'s
+    /// worth of texture array agree on every layer number by construction —
+    /// for a caller that needs to resolve `tex_layer` per quad (mesh a node)
+    /// before, or entirely without, building the actual texture array: e.g.
+    /// `cubara-app`'s mesh-worker pool (which must stay `wgpu`-free,
+    /// `ARCHITECTURE.md` §1), or a headless test meshing ahead of a separate
+    /// `render_arena` call that builds its own array later.
+    pub fn from_registry(registry: &BlockRegistry) -> Self {
         Self {
-            layer_of: HashMap::new(),
+            layer_of: name_to_layer(registry),
         }
     }
+}
+
+/// Every texture name the registry references, mapped to its layer, in the
+/// same sorted order [`BlockRegistry::texture_names`] returns — deterministic,
+/// so the mapping doesn't depend on `HashMap` iteration order anywhere
+/// upstream. The one place this number is decided; both [`build`] and
+/// [`TextureLayers::from_registry`] call this rather than each computing
+/// their own copy.
+fn name_to_layer(registry: &BlockRegistry) -> HashMap<String, u32> {
+    registry
+        .texture_names()
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| (n.to_string(), i as u32))
+        .collect()
 }
 
 /// A deterministic placeholder colour for a texture name — stands in for real
@@ -184,13 +203,7 @@ pub fn build(
         ..Default::default()
     });
 
-    let layer_of: HashMap<String, u32> = names
-        .iter()
-        .enumerate()
-        .map(|(i, &n)| (n.to_string(), i as u32))
-        .collect();
-
-    (view, sampler, TextureLayers { layer_of })
+    (view, sampler, TextureLayers::from_registry(registry))
 }
 
 /// The bind group layout for the texture array + sampler (`@group(2)` in

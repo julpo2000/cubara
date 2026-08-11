@@ -6,10 +6,8 @@
 //! other than what the game renders, a passing golden test would prove nothing.
 
 use cubara_voxel::{Chunk, ChunkCoord, MeshContext};
-use cubara_world::node::NodeKey;
-use cubara_world::World;
 
-use crate::arena::ChunkArena;
+use crate::arena::{ChunkArena, MeshedNode, NodeId};
 use crate::culling::Frustum;
 use crate::render::{gpu_driven_features, load_mesh_assets, CameraUniform};
 use crate::scene::{SceneFrame, SceneRenderer};
@@ -63,36 +61,36 @@ impl Default for Shot {
 
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-/// Render `world` offscreen and read the pixels back.
+/// Render an already-meshed scene offscreen and read the pixels back.
 ///
-/// Returns `None` if no GPU adapter is available, so callers can decide whether
-/// that is a skip or a failure.
-pub fn render(world: &World, shot: Shot) -> Option<Frame> {
-    render_arena(shot, |device, queue, multi_draw, ctx| {
-        ChunkArena::from_region(
-            device,
-            queue,
-            multi_draw,
-            world,
-            ctx,
-            ChunkCoord::new(0, 0, 0),
-            shot.region_radius,
-            0..=2,
-        )
+/// This crate never touches a `World` (`ARCHITECTURE.md` §1): a caller that
+/// wants to render a real world region meshes it first --
+/// `cubara_world::mesh::mesh_region` for a whole region synchronously (what
+/// `--screenshot` and the golden-image tests do), or the live renderer's own
+/// `cubara_world::mesh::MeshPool` for the incremental case -- and hands the
+/// result here. Returns `None` if no GPU adapter is available, so callers can
+/// decide whether that is a skip or a failure.
+pub fn render(meshed: impl IntoIterator<Item = MeshedNode>, shot: Shot) -> Option<Frame> {
+    render_arena(shot, |device, queue, multi_draw, _ctx| {
+        ChunkArena::from_meshed(device, queue, multi_draw, meshed)
     })
 }
 
-/// Render explicit `(coord, chunk)` pairs offscreen -- for scenes `World`
-/// can't produce yet, e.g. several distinct block ids side by side (`World`
-/// only ever assigns `BlockId::STONE`/air until real multi-material worldgen,
-/// block 1.5). Otherwise identical to [`render`]: same device setup, same
-/// [`SceneRenderer::encode_scene`] path (`ARCHITECTURE.md` Rule 5).
+/// Render explicit `(coord, chunk)` pairs offscreen -- for scenes worldgen
+/// can't produce yet, e.g. several distinct block ids side by side. Otherwise
+/// identical to [`render`]: same device setup, same
+/// [`SceneRenderer::encode_scene`] path (`ARCHITECTURE.md` Rule 5). Each
+/// chunk is its own level-0 node (`scale` 1.0, one lattice cell = one world
+/// block), placed at its own `ChunkCoord::world_offset`.
 pub fn render_chunks(chunks: &[(ChunkCoord, Chunk)], shot: Shot) -> Option<Frame> {
     render_arena(shot, |device, queue, multi_draw, ctx| {
         let mut arena = ChunkArena::new(device, multi_draw);
         for (coord, chunk) in chunks {
-            let node = NodeKey::containing(*coord, 0);
-            arena.upload_node(queue, node, chunk, ctx);
+            let id = NodeId {
+                level: 0,
+                pos: [coord.x, coord.y, coord.z],
+            };
+            arena.upload_node(queue, id, coord.world_offset(), 1.0, chunk, ctx);
         }
         arena
     })

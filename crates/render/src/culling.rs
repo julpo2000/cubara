@@ -5,42 +5,8 @@
 //! (Gribb/Hartmann method, adapted for wgpu's column-vector, `[0, w]` depth-range
 //! clip space — matching `glam::Mat4::perspective_rh`).
 
+pub use cubara_voxel::Aabb;
 use glam::{Mat4, Vec3, Vec4};
-
-/// An axis-aligned bounding box in world space.
-#[derive(Clone, Copy, Debug)]
-pub struct Aabb {
-    pub min: Vec3,
-    pub max: Vec3,
-}
-
-impl Aabb {
-    pub fn new(min: Vec3, max: Vec3) -> Self {
-        Self { min, max }
-    }
-
-    /// The corner that extends furthest in the direction of `normal` — the corner
-    /// most likely to remain inside the half-space `normal` points into.
-    fn positive_vertex(&self, normal: Vec3) -> Vec3 {
-        Vec3::new(
-            if normal.x >= 0.0 {
-                self.max.x
-            } else {
-                self.min.x
-            },
-            if normal.y >= 0.0 {
-                self.max.y
-            } else {
-                self.min.y
-            },
-            if normal.z >= 0.0 {
-                self.max.z
-            } else {
-                self.min.z
-            },
-        )
-    }
-}
 
 /// A camera view frustum as 6 planes (`ax + by + cz + d >= 0` means "inside"),
 /// extracted from a view*projection matrix.
