@@ -74,7 +74,8 @@ frames after 200 warmup.
 | 2026-08-11 | Determinism harness [#90], radius 64²¹ | 26,789 | 890,774 | ~903 | 0.771 ms | ~1.82 ms | `71d739d` |
 | 2026-08-11 | Save/load — regions + world header [#60], radius 12²² | 1,282 | 424,352 | ~2,215 | 0.303 ms | ~0.69 ms | `41a1152` |
 | 2026-08-11 | Save/load — regions + world header [#60], radius 64²² | 26,789 | 890,774 | ~896 | 0.785 ms | ~1.60 ms | `41a1152` |
-| 2026-08-11 | Node addressing + streaming policy [#105], radius 12²³ | 1,282 | 424,352 | ~2,249 | 0.300 ms | ~0.66 ms | *(this PR)* |
+| 2026-08-11 | Node addressing + streaming policy [#105], radius 12²³ | 1,282 | 424,352 | ~2,249 | 0.300 ms | ~0.66 ms | `44070c1` |
+| 2026-08-11 | LOD-native node generation [#106], radius 12²⁴ | 1,282 | 424,352 | ~2,211 | 0.303 ms | ~0.75 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -587,6 +588,18 @@ path changed. Radius 12 confirms the same, within normal small-scene noise
 (~2,215 → ~2,249 FPS, 0.303 → 0.300 ms). Recorded per the "every feature is
 measured" rule; the actual bar this sub-issue clears is
 `cargo test -p cubara-world node::`.
+
+²⁴ **LOD-native node generation (issue #38's tracking arc, sub-issue #106) —
+also zero runtime effect.** Adds `World::node_at`, wiring `WorldGen::generate`
+to run at a node's real step (`2^level`) instead of the unit step every
+production call site still uses today. Still nothing calls it outside its own
+tests — `World::chunk_at`/`build_chunk` (what the live renderer actually
+streams through) are untouched, so radius 12's numbers are, as expected,
+within normal small-scene noise of the previous row (~2,249 → ~2,211 FPS,
+0.300 → 0.303 ms). No radius-64 row, same reasoning as ²³. The real bar is
+`cargo test -p cubara-world world::` (the new `node_at`-specific cases:
+matches `chunk_at` at level 0, matches `WorldGen::generate` directly above
+it, and does not reflect an edit at level > 0, per §4).
 
 ## Detailed run logs
 
