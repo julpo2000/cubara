@@ -1,0 +1,23 @@
+//! Input, as a value.
+//!
+//! `InputFrame` exists so [`crate::Sim::tick`] never touches a keyboard or a
+//! window: `cubara-app` translates whatever the platform handed it (winit
+//! key codes, raw mouse deltas) into this plain, platform-free value once
+//! per frame, and the same value drives every fixed step that frame's catch-up
+//! loop runs. Recording input as a value rather than reading live device
+//! state is what makes a future replay (block 1.8) possible at all — a
+//! recorded sequence of `InputFrame`s reproduces a session exactly, and it's
+//! also the shape netcode eventually wants (send the input, not the result).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct InputFrame {
+    /// Movement input this frame, each axis in `-1.0..=1.0`: `[0]` strafe
+    /// (+right), `[1]` vertical (+up, free-fly only), `[2]` forward (+look
+    /// direction). Not a raw key snapshot -- opposing keys held together are
+    /// already cancelled out (`right - left`, etc.) by whoever builds this.
+    pub move_axes: [f32; 3],
+    /// Raw mouse motion this frame, in pixels: `[0]` right, `[1]` down.
+    /// Deliberately unscaled -- look sensitivity is a gameplay tuning value,
+    /// applied where the rest of movement happens ([`crate::Player`]), not
+    /// baked into what counts as "the input".
+    pub look_delta: [f32; 2],
+}

@@ -18,6 +18,7 @@ profile = ["cubara-render/profile"]
 cubara-voxel = { path = "../voxel" }
 cubara-render = { path = "../render" }
 cubara-world = { path = "../world" }
+cubara-sim = { path = "../sim" }
 winit.workspace = true
 wgpu.workspace = true
 pollster.workspace = true

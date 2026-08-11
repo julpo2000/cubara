@@ -17,7 +17,6 @@ use cubara_voxel::{BlockRegistry, ChunkCoord, Vertex};
 use cubara_world::{streaming, World};
 
 use crate::arena::ChunkArena;
-use crate::camera::FlyCamera;
 use crate::culling::Frustum;
 use crate::materials::{self, MeshAssets};
 use crate::mesher::{sort_batch, BuiltChunk, MeshPool};
@@ -119,6 +118,25 @@ impl CameraUniform {
     }
 }
 
+/// A camera position and facing to render from -- the renderer's *entire*
+/// idea of "the camera": no input, no movement, no keys held
+/// (`ARCHITECTURE.md` Rule 3 -- if the renderer could move the player, the
+/// boundary would be wrong). `cubara-app` computes one of these each frame
+/// by interpolating the sim's previous and current tick
+/// (`docs/PHASE1_ARCHITECTURE.md` §9) and hands it in; headless callers
+/// (bench, screenshot, golden tests) build one directly.
+#[derive(Clone, Copy, Debug)]
+pub struct CameraPose {
+    pub eye: glam::Vec3,
+    pub look_dir: glam::Vec3,
+}
+
+impl CameraPose {
+    pub fn view_proj(&self, aspect: f32) -> glam::Mat4 {
+        CameraUniform::look_view_proj(aspect, self.eye, self.look_dir)
+    }
+}
+
 /// The wgpu features the GPU-driven path wants, intersected with what `adapter`
 /// actually offers — pass the result as `required_features` when requesting the
 /// device. Also returns whether `MULTI_DRAW_INDIRECT` made the cut, which selects
@@ -180,7 +198,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(window: Arc<Window>, world: &Arc<World>, camera: &FlyCamera) -> Self {
+    pub fn new(window: Arc<Window>, world: &Arc<World>, camera: CameraPose) -> Self {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -250,7 +268,7 @@ impl Renderer {
 
         let aspect = config.width as f32 / config.height as f32;
         let frustum = Frustum::from_view_proj(camera.view_proj(aspect));
-        let center = ChunkCoord::from_world_pos(camera.pos.to_array());
+        let center = ChunkCoord::from_world_pos(camera.eye.to_array());
 
         let arena = ChunkArena::new(&device, multi_draw);
 
@@ -382,7 +400,7 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self, world: &Arc<World>, camera: &FlyCamera) {
+    pub fn render(&mut self, world: &Arc<World>, camera: CameraPose) {
         crate::profiling::Profiler::new_frame();
         puffin::profile_function!();
         self.update(world, camera);
@@ -436,9 +454,9 @@ impl Renderer {
 
     /// Build this frame's debug text. The overlay's drawing (including its drop
     /// shadow) belongs to the shared scene path, so this only produces the string.
-    fn debug_text(&self, camera: &FlyCamera) -> String {
-        let p = camera.pos;
-        let d = camera.look_dir();
+    fn debug_text(&self, camera: CameraPose) -> String {
+        let p = camera.eye;
+        let d = camera.look_dir;
         let facing = if d.x.abs() > d.z.abs() {
             if d.x > 0.0 {
                 "east (+x)"
@@ -474,9 +492,11 @@ impl Renderer {
         )
     }
 
-    /// Advance the flying camera, stream if we crossed a chunk boundary, and upload
-    /// the new camera matrix + frustum.
-    fn update(&mut self, world: &Arc<World>, camera: &FlyCamera) {
+    /// Stream if the camera crossed a chunk boundary, and upload the new
+    /// camera matrix + frustum. The camera's own motion no longer happens
+    /// here -- it's `cubara-sim`'s job now (block 1.6); this just tracks
+    /// frame time for the on-screen FPS reading.
+    fn update(&mut self, world: &Arc<World>, camera: CameraPose) {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -487,7 +507,7 @@ impl Renderer {
         } else {
             self.frame_ms * 0.9 + ms * 0.1
         };
-        let center = ChunkCoord::from_world_pos(camera.pos.to_array());
+        let center = ChunkCoord::from_world_pos(camera.eye.to_array());
         if center != self.center {
             self.stream_around(world, center);
         }

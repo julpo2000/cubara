@@ -27,7 +27,7 @@ report() { # report <rule> <message>; reads offenders on stdin
 # ── Rule 1 — deterministic simulation ────────────────────────────────────────
 # The sim advances by tick, never by elapsed seconds. Wall-clock belongs to the
 # renderer and the profiler. (SIM_CRATES grows as the sim lands.)
-SIM_CRATES="crates/voxel/src crates/world/src"
+SIM_CRATES="crates/voxel/src crates/world/src crates/sim/src"
 for d in $SIM_CRATES; do [ -d "$d" ] || continue
     grep -rn --include='*.rs' -E "Instant::now|SystemTime::now" "$d"
 done | report "Rule 1" "wall-clock time in a simulation crate — advance by tick instead"
@@ -43,11 +43,11 @@ grep -rn --include='*.rs' -E "static +[A-Z_]+ *: *(OnceLock|Mutex|RwLock|LazyLoc
 
 # ── Rule 3 / 4 — dependency direction, and the sim runs without a GPU ────────
 # Data and simulation crates must not know the GPU exists.
-for c in voxel world; do [ -f "crates/$c/Cargo.toml" ] || continue
+for c in voxel world sim; do [ -f "crates/$c/Cargo.toml" ] || continue
     grep -n -E "^(wgpu|winit|pollster)" "crates/$c/Cargo.toml" | sed "s|^|crates/$c/Cargo.toml:|"
 done | report "Rule 3/4" "GPU/windowing dependency in a data or simulation crate"
 
-for c in voxel world; do [ -d "crates/$c/src" ] || continue
+for c in voxel world sim; do [ -d "crates/$c/src" ] || continue
     grep -rn --include='*.rs' -E "\bwgpu::|\bwinit::" "crates/$c/src"
 done | report "Rule 3/4" "GPU/windowing types in a data or simulation crate"
 
