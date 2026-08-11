@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 
 use cubara_voxel::{BlockId, Chunk, ChunkCoord};
 
+use crate::node::NodeKey;
 use crate::worldgen::{TerrainBlocks, WorldGen};
 
 /// The seed [`World::new`] uses -- a fixed constant, so callers that don't
@@ -127,6 +128,31 @@ impl World {
     /// (it means both).
     pub fn edited_chunk_at(&self, coord: ChunkCoord, blocks: TerrainBlocks) -> Chunk {
         self.build_chunk(coord, blocks)
+    }
+
+    /// The LOD node's contents (`docs/PHASE1_ARCHITECTURE.md` §6, issue #38),
+    /// or `None` if its whole sampled volume ends up empty.
+    ///
+    /// A level-0 node is exactly a chunk, so it delegates to
+    /// [`chunk_at`](Self::chunk_at) unchanged -- edit-aware, same as ever.
+    /// A `level > 0` node calls [`WorldGen::generate`] directly, at its own
+    /// step (`2^level` blocks per lattice sample -- one node-lattice cell
+    /// spans one chunk-width per level), sampling the fixed 16³ lattice
+    /// natively rather than generating full resolution and downsampling
+    /// (§6.2). It deliberately does **not** consult the edit overlay: §4
+    /// already states LOD nodes "hold no voxel data at all... the far
+    /// field is geometry, not a world you can edit," and block 1.9's
+    /// save/load leans on the same principle (LOD nodes are never written
+    /// to disk). A player's edit is only ever visible in the always-present
+    /// full-resolution near field the ring schedule keeps around them.
+    pub fn node_at(&self, node: NodeKey, blocks: TerrainBlocks) -> Option<Chunk> {
+        if node.level == 0 {
+            return self.chunk_at(node.chunk_origin(), blocks);
+        }
+        let chunk = self
+            .worldgen
+            .generate(node.world_origin(), node.extent_chunks(), blocks);
+        (!chunk.is_empty()).then_some(chunk)
     }
 
     fn build_chunk(&self, coord: ChunkCoord, blocks: TerrainBlocks) -> Chunk {
@@ -524,5 +550,100 @@ mod tests {
         // Exactly one voxel in this chunk differs from pure generation (the
         // one edit above), so exactly one new overlay entry should appear.
         assert_eq!(loaded.edit_count(), edits_before + 1);
+    }
+
+    #[test]
+    fn level_0_node_at_matches_chunk_at() {
+        let mut world = World::new();
+        world.set_block(3, 1, 2, true); // an edit, so this also proves it's edit-aware
+        let node = NodeKey::new(0, [0, 0, 0]);
+        let blocks = stone_blocks();
+
+        let from_node = world.node_at(node, blocks);
+        let from_chunk = world.chunk_at(node.chunk_origin(), blocks);
+        assert_eq!(
+            from_node.is_some(),
+            from_chunk.is_some(),
+            "node_at and chunk_at disagree on emptiness"
+        );
+        match (from_node, from_chunk) {
+            (Some(a), Some(b)) => {
+                for x in 0..Chunk::SIZE {
+                    for y in 0..Chunk::SIZE {
+                        for z in 0..Chunk::SIZE {
+                            assert_eq!(a.get(x, y, z), b.get(x, y, z), "x={x} y={y} z={z}");
+                        }
+                    }
+                }
+            }
+            (None, None) => {}
+            _ => unreachable!("checked above"),
+        }
+    }
+
+    #[test]
+    fn level_above_zero_matches_worldgen_generate_directly() {
+        let world = World::new();
+        let blocks = stone_blocks();
+        let node = NodeKey::new(2, [0, 0, 0]); // extent 4 chunks
+
+        let from_node = world.node_at(node, blocks).expect("non-empty at origin");
+        let direct = world
+            .worldgen
+            .generate(node.world_origin(), node.extent_chunks(), blocks);
+
+        for x in 0..Chunk::SIZE {
+            for y in 0..Chunk::SIZE {
+                for z in 0..Chunk::SIZE {
+                    assert_eq!(
+                        from_node.get(x, y, z),
+                        direct.get(x, y, z),
+                        "x={x} y={y} z={z}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coarse_nodes_do_not_reflect_edits() {
+        // A level>0 node samples the same seeded generation regardless of
+        // an edit that would change the result at level 0 -- §4's "the far
+        // field is geometry, not a world you can edit," made concrete.
+        let mut world = World::new();
+        let node = NodeKey::new(3, [0, 0, 0]); // extent 8 chunks, well above level 0
+        let blocks = stone_blocks();
+
+        let before = world.node_at(node, blocks);
+        // An edit deep inside this node's volume, far from any chunk
+        // boundary the sampling lattice would skip regardless.
+        world.set_block(0, 0, 0, false);
+        let after = world.node_at(node, blocks);
+
+        assert_eq!(
+            before.is_some(),
+            after.is_some(),
+            "an edit changed a coarse node's emptiness"
+        );
+        match (before, after) {
+            (Some(a), Some(b)) => {
+                for x in 0..Chunk::SIZE {
+                    for y in 0..Chunk::SIZE {
+                        for z in 0..Chunk::SIZE {
+                            assert_eq!(a.get(x, y, z), b.get(x, y, z), "x={x} y={y} z={z}");
+                        }
+                    }
+                }
+            }
+            (None, None) => {}
+            _ => unreachable!("checked above"),
+        }
+    }
+
+    #[test]
+    fn a_node_entirely_above_the_terrain_is_none() {
+        let world = World::new();
+        let node = NodeKey::new(2, [0, 100, 0]); // far above any plausible surface
+        assert!(world.node_at(node, stone_blocks()).is_none());
     }
 }
