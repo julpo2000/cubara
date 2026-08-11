@@ -42,10 +42,14 @@ pub struct Player {
     /// a replay (block 1.8) needs to reproduce -- not a side channel outside
     /// it.
     pub(crate) free_fly: bool,
-    /// Heading around +Y, radians. 0 looks toward −Z.
-    yaw: f32,
-    /// Up/down angle, radians, clamped to [`PITCH_LIMIT`].
-    pitch: f32,
+    /// Heading around +Y, radians. 0 looks toward −Z. `pub(crate)`, not
+    /// private: `crate::hash::WorldHash` needs the raw angle (`look_dir()`
+    /// only exposes the derived unit vector) to include orientation in the
+    /// world-state hash (issue #90).
+    pub(crate) yaw: f32,
+    /// Up/down angle, radians, clamped to [`PITCH_LIMIT`]. Same reason as
+    /// [`Self::yaw`].
+    pub(crate) pitch: f32,
 }
 
 impl Player {

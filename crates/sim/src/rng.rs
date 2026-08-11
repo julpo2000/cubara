@@ -16,11 +16,14 @@ const MULTIPLIER: u64 = 6364136223846793005;
 /// integer arithmetic throughout).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorldRng {
-    state: u64,
+    /// `pub(crate)`, not private: `crate::hash::WorldHash` reads this raw
+    /// state directly to include "the RNG" in the world-state hash
+    /// (issue #90) -- there is deliberately no other accessor.
+    pub(crate) state: u64,
     /// Odd by construction (`(stream << 1) | 1`) — PCG's stream selector,
     /// each odd value producing a distinct, statistically independent
     /// sequence from the same `seed`.
-    inc: u64,
+    pub(crate) inc: u64,
 }
 
 impl WorldRng {

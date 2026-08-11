@@ -468,6 +468,7 @@ dependencies = [
 name = "cubara-sim"
 version = "0.0.1"
 dependencies = [
+ "cubara-voxel",
  "cubara-world",
  "glam",
 ]
