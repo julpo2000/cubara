@@ -72,12 +72,22 @@ else
     fail=$((fail + 1))
 fi
 
-not_implemented "determinism replay test: single- vs multi-threaded, identical world-state hash"
-not_implemented "golden images: all three block types textured, a cave mouth, an LOD boundary"
-not_implemented "unit test: a player AABB never passes through a solid voxel"
-not_implemented "unit test: the same seed produces a bit-identical chunk on both platforms"
-not_implemented "isolation test: a chunk generated alone == the same chunk after shuffled neighbours"
-not_implemented "save round-trip test, plus a fixture world hashing identically on Windows and macOS"
+run "determinism replay test: single- vs multi-threaded, identical world-state hash" \
+    cargo test -p cubara-sim --test determinism the_fixture_reaches_a_known_hash_regardless_of_worker_count
+run "golden images: all three block types textured, a cave mouth, an LOD boundary" \
+    cargo test -p cubara-render --test golden -- distinct_materials_render_with_distinct_textures a_cave_mouth_is_visible no_crack_at_a_real_lod_boundary
+run "unit test: a player AABB never passes through a solid voxel" \
+    cargo test -p cubara-sim --lib never_tunnels_through_the_floor_across_a_spread_of_velocities
+run "unit test: the same seed produces a bit-identical chunk on both platforms" \
+    cargo test -p cubara-world --lib cross_platform_block_array_is_bit_identical
+run "isolation test: a chunk generated alone == the same chunk after shuffled neighbours" \
+    cargo test -p cubara-world --lib generation_is_isolated_from_neighbours
+# The "identically on Windows and macOS" half isn't this one command's job --
+# it's the same fixture-hash test passing in CI on both windows-latest and
+# macos-latest runners (every merged PR's required checks), not something a
+# single local run can prove either way.
+run "save round-trip test, plus a fixture world hashing identically on Windows and macOS" \
+    cargo test -p cubara-sim --test save_load the_committed_fixture_loads_to_a_known_hash
 
 echo
 echo "$pass passed, $fail failed."
