@@ -84,6 +84,15 @@ const CAVE_THRESHOLD: f32 = 0.6;
 const CAVE_CARVE_AMOUNT: f32 = 1_000_000.0;
 const CAVE_SEED_MIX: u64 = 0xD6E8_FEB8_6659_FD93;
 
+/// Bumped whenever a change in this file could change already-generated
+/// terrain's shape -- any of the constants above, `density_at`,
+/// `surface_height`, or the noise functions themselves. Save/load (block
+/// 1.9, §7.2) refuses to load a world whose header disagrees with this: an
+/// old save's *unedited* chunks are regenerated on load (§7.4), so a
+/// changed generator would silently reshape the world around the player's
+/// edits if this weren't checked -- the failure mode §7.4 names directly.
+pub const WORLDGEN_VERSION: u32 = 1;
+
 /// Seeded terrain + cave generator. See the module docs and
 /// `docs/PHASE1_ARCHITECTURE.md` §8 for the contract this must hold to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

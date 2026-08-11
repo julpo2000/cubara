@@ -70,8 +70,10 @@ frames after 200 warmup.
 | 2026-08-11 | Player AABB collision, gravity and walking [#53], radius 64¹⁹ | 26,789 | 890,774 | ~898 | 0.785 ms | ~1.43 ms | `3ba4c2d` |
 | 2026-08-11 | Selected-block outline [#52], radius 12²⁰ | 1,282 | 424,352 | ~2,194 | 0.304 ms | ~0.81 ms | `1d16c5d` |
 | 2026-08-11 | Selected-block outline [#52], radius 64²⁰ | 26,789 | 890,774 | ~905 | 0.774 ms | ~1.55 ms | `1d16c5d` |
-| 2026-08-11 | Determinism harness [#90], radius 12²¹ | 1,282 | 424,352 | ~2,173 | 0.307 ms | ~0.96 ms | *(this PR)* |
-| 2026-08-11 | Determinism harness [#90], radius 64²¹ | 26,789 | 890,774 | ~903 | 0.771 ms | ~1.82 ms | *(this PR)* |
+| 2026-08-11 | Determinism harness [#90], radius 12²¹ | 1,282 | 424,352 | ~2,173 | 0.307 ms | ~0.96 ms | `71d739d` |
+| 2026-08-11 | Determinism harness [#90], radius 64²¹ | 26,789 | 890,774 | ~903 | 0.771 ms | ~1.82 ms | `71d739d` |
+| 2026-08-11 | Save/load — regions + world header [#60], radius 12²² | 1,282 | 424,352 | ~2,215 | 0.303 ms | ~0.69 ms | *(this PR)* |
+| 2026-08-11 | Save/load — regions + world header [#60], radius 64²² | 26,789 | 890,774 | ~896 | 0.785 ms | ~1.60 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -551,6 +553,25 @@ recorded per the "every feature is measured" rule. The real bar this block
 clears is `cargo test -p cubara-sim --test determinism`, not this table --
 see the PR for the manual verification that a deliberately-reintroduced
 merge-order bug actually fails it.
+
+²² **Save/load — region files and the world header (issue #60) — voxel/world/sim
+crates only, render path untouched.** Chunk payload (de)serialisation lives with
+`ChunkStorage` in `cubara-voxel`; region files (`.cbr`, §7.1/§7.3) live in
+`cubara-world`; `level.ron` (the RON header -- seed, tick, RNG, player, the
+block id table, §7.2) lives in `cubara-sim`, next to `WorldHash` (block 1.8)
+for the same reason: `cubara-world` must never know about the player. Only
+edited chunks are ever written (§7.4) -- `cargo run --release -- --bench`
+never touches `cubara-sim`/save-load at all, so chunks/triangles/FPS/CPU are
+within normal small-scene noise of the previous row (radius 12: ~2,173 →
+~2,215 FPS, 0.307 → 0.303 ms; radius 64: ~903 → ~896 FPS, 0.771 → 0.785 ms).
+The real bar is `cargo test -p cubara-sim --test save_load`: round trip
+(edit → hash → save → load → hash, equal), a committed fixture
+(`tests/fixtures/save_fixture/`) that loads to the same known hash on macOS
+and Windows CI, an unedited chunk regenerating bit-identical after a real
+save/load round trip (not just calling `WorldGen` twice), saving the same
+state twice producing byte-identical files, and the two hard-error guards
+(an unknown block name; a `worldgen_version` mismatch) each firing with a
+message that names the problem.
 
 ## Detailed run logs
 

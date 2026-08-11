@@ -10,3 +10,5 @@ authors.workspace = true
 cubara-voxel = { path = "../voxel" }
 cubara-world = { path = "../world" }
 glam.workspace = true
+serde.workspace = true
+ron.workspace = true

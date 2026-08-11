@@ -10,7 +10,7 @@
 use crate::block::BlockId;
 use crate::mesh::{Face, Mesh, Vertex};
 use crate::registry::BlockRegistry;
-use crate::storage::ChunkStorage;
+use crate::storage::{ChunkPayloadError, ChunkStorage};
 
 /// What the mesher needs beyond a chunk's raw block ids: whether an id is
 /// solid, and which texture-array layer a texture *name* occupies. Bundled
@@ -150,6 +150,55 @@ impl Chunk {
                 (0..Self::VOLUME).all(|idx| self.storage.get(idx) == BlockId::AIR)
             }
         }
+    }
+
+    /// Encode this chunk's contents exactly as
+    /// `docs/PHASE1_ARCHITECTURE.md` §7.3 specifies -- the in-memory
+    /// [`ChunkStorage`] representation, and nothing else (save/load, block
+    /// 1.9). Errors are [`ChunkPayloadError`]; see
+    /// [`ChunkStorage::write_payload`].
+    pub fn write_payload(&self) -> Result<Vec<u8>, ChunkPayloadError> {
+        let mut out = Vec::new();
+        self.storage.write_payload(&mut out)?;
+        Ok(out)
+    }
+
+    /// Decode a payload [`write_payload`](Self::write_payload) produced.
+    pub fn read_payload(bytes: &[u8]) -> Result<Self, ChunkPayloadError> {
+        Ok(Self {
+            storage: ChunkStorage::read_payload(bytes, Self::VOLUME)?,
+        })
+    }
+
+    /// Rebuild this chunk with every id passed through `remap`, without
+    /// touching the packed voxel index data at all -- only a palette's (or a
+    /// uniform chunk's single) id values ever need translating, since an
+    /// index only ever points *into* the palette, never names an id
+    /// directly. Used by save/load (block 1.9) to translate a loaded
+    /// chunk's saved ids into this process's current runtime ids (§7.2's
+    /// `saved_id → runtime_id` remap). `None` from `remap` for any id
+    /// present fails the whole chunk -- a corrupt or foreign save file, not
+    /// something to patch over with air.
+    pub fn remap_ids(&self, remap: impl Fn(BlockId) -> Option<BlockId>) -> Option<Chunk> {
+        let storage = match &self.storage {
+            ChunkStorage::Uniform(id) => ChunkStorage::Uniform(remap(*id)?),
+            ChunkStorage::Palette {
+                palette,
+                bits,
+                data,
+            } => {
+                let mut new_palette = Vec::with_capacity(palette.len());
+                for &id in palette {
+                    new_palette.push(remap(id)?);
+                }
+                ChunkStorage::Palette {
+                    palette: new_palette,
+                    bits: *bits,
+                    data: data.clone(),
+                }
+            }
+        };
+        Some(Chunk { storage })
     }
 
     /// Greedy-mesh the chunk at full resolution (LOD 0). Vertices are node-local
@@ -846,6 +895,53 @@ mod tests {
         let registry = registry();
         assert!(chunk.is_solid(&registry, 3, 4, 5));
         assert!(!chunk.is_solid(&registry, 0, 0, 0));
+    }
+
+    #[test]
+    fn chunk_payload_round_trips_uniform_and_palette() {
+        let uniform = Chunk::from_fn(|_, _, _| BlockId::STONE);
+        let bytes = uniform.write_payload().unwrap();
+        let back = Chunk::read_payload(&bytes).unwrap();
+        for x in 0..Chunk::SIZE {
+            for y in 0..Chunk::SIZE {
+                for z in 0..Chunk::SIZE {
+                    assert_eq!(back.get(x, y, z), uniform.get(x, y, z));
+                }
+            }
+        }
+
+        let palette = Chunk::from_fn(|x, y, z| BlockId(((x + y * 2 + z * 3) % 5) as u16 + 1));
+        let bytes = palette.write_payload().unwrap();
+        let back = Chunk::read_payload(&bytes).unwrap();
+        for x in 0..Chunk::SIZE {
+            for y in 0..Chunk::SIZE {
+                for z in 0..Chunk::SIZE {
+                    assert_eq!(back.get(x, y, z), palette.get(x, y, z), "x={x} y={y} z={z}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn remap_ids_translates_every_id_without_touching_indices() {
+        let chunk = Chunk::from_fn(|x, y, z| BlockId(((x + y + z) % 3) as u16 + 1));
+        let remapped = chunk
+            .remap_ids(|id| Some(BlockId(id.0 + 100)))
+            .expect("every id present has a mapping");
+        for x in 0..Chunk::SIZE {
+            for y in 0..Chunk::SIZE {
+                for z in 0..Chunk::SIZE {
+                    assert_eq!(remapped.get(x, y, z).0, chunk.get(x, y, z).0 + 100);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn remap_ids_fails_the_whole_chunk_on_one_unmapped_id() {
+        let chunk = Chunk::from_fn(|x, y, z| BlockId(((x + y + z) % 3) as u16 + 1));
+        let remapped = chunk.remap_ids(|id| if id.0 == 2 { None } else { Some(id) });
+        assert!(remapped.is_none());
     }
 
     #[test]

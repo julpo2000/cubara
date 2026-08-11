@@ -15,6 +15,7 @@ use crate::block::BlockId;
 
 /// One chunk's blocks: every voxel the same id (no allocation), or a palette
 /// of the distinct ids present plus a packed index per voxel.
+#[derive(Debug)]
 pub enum ChunkStorage {
     Uniform(BlockId),
     Palette {
@@ -196,6 +197,159 @@ impl ChunkStorage {
             }
         }
     }
+
+    /// Encode this storage exactly as `docs/PHASE1_ARCHITECTURE.md` §7.3
+    /// specifies: `u8 tag` (0 = uniform, 1 = palette), then either a `u16`
+    /// block id or a palette + packed index array. All integers
+    /// little-endian, so a world saved on one platform loads on another.
+    ///
+    /// The format's palette length is a `u8` (max 255 entries) -- narrower
+    /// than the 65,536 a runtime [`ChunkStorage::Palette`] can actually
+    /// reach, which the phase-1 registry (a handful of materials) never gets
+    /// remotely close to. A palette that did overflow it fails loudly here
+    /// rather than truncating the table into silent corruption.
+    pub fn write_payload(&self, out: &mut Vec<u8>) -> Result<(), ChunkPayloadError> {
+        match self {
+            ChunkStorage::Uniform(id) => {
+                out.push(0);
+                out.extend_from_slice(&id.0.to_le_bytes());
+            }
+            ChunkStorage::Palette {
+                palette,
+                bits,
+                data,
+            } => {
+                if palette.len() > u8::MAX as usize {
+                    return Err(ChunkPayloadError::PaletteTooLarge(palette.len()));
+                }
+                out.push(1);
+                out.push(palette.len() as u8);
+                for id in palette {
+                    out.extend_from_slice(&id.0.to_le_bytes());
+                }
+                out.push(*bits);
+                for word in data.iter() {
+                    out.extend_from_slice(&word.to_le_bytes());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode a payload [`write_payload`](Self::write_payload) produced, for
+    /// a chunk of `volume` cells (always [`crate::Chunk::SIZE`]³ in
+    /// practice; taken as a parameter so this type stays agnostic of the
+    /// constant that owns it, same reasoning as [`Self::set`]). Every
+    /// failure is a named [`ChunkPayloadError`] -- a corrupt or truncated
+    /// payload is a hard error, never a best-effort partial read.
+    pub fn read_payload(bytes: &[u8], volume: usize) -> Result<Self, ChunkPayloadError> {
+        let mut cursor = PayloadCursor { bytes, pos: 0 };
+        match cursor.u8()? {
+            0 => Ok(ChunkStorage::Uniform(BlockId(cursor.u16()?))),
+            1 => {
+                let len = cursor.u8()? as usize;
+                let mut palette = Vec::with_capacity(len);
+                for _ in 0..len {
+                    palette.push(BlockId(cursor.u16()?));
+                }
+                let bits = cursor.u8()?;
+                if !WIDTHS.contains(&bits) {
+                    return Err(ChunkPayloadError::InvalidBits(bits));
+                }
+                let words = word_count(bits, volume);
+                let mut data = Vec::with_capacity(words);
+                for _ in 0..words {
+                    data.push(cursor.u64()?);
+                }
+                Ok(ChunkStorage::Palette {
+                    palette,
+                    bits,
+                    data: data.into_boxed_slice(),
+                })
+            }
+            tag => Err(ChunkPayloadError::UnknownStorageTag(tag)),
+        }
+    }
+}
+
+/// A chunk payload failed to decode -- truncated, an unrecognised storage
+/// tag, a palette width the packer never produces, or (see
+/// [`ChunkStorage::write_payload`]) a palette too large for the format's
+/// `u8` length field. Corruption is always a hard error
+/// (`docs/PHASE1_ARCHITECTURE.md` §7.2's "never silent damage"), never a
+/// best-effort partial read -- in particular, an out-of-range `bits` is
+/// rejected explicitly rather than risking a shift-amount panic/UB in
+/// [`get_packed`] on a hand-corrupted file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkPayloadError {
+    Truncated,
+    UnknownStorageTag(u8),
+    InvalidBits(u8),
+    PaletteTooLarge(usize),
+}
+
+impl std::fmt::Display for ChunkPayloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChunkPayloadError::Truncated => write!(f, "chunk payload is truncated"),
+            ChunkPayloadError::UnknownStorageTag(tag) => {
+                write!(f, "chunk payload has unknown storage tag {tag} (expected 0 or 1)")
+            }
+            ChunkPayloadError::InvalidBits(bits) => write!(
+                f,
+                "chunk payload has invalid palette width {bits} bits (expected one of {WIDTHS:?})"
+            ),
+            ChunkPayloadError::PaletteTooLarge(len) => write!(
+                f,
+                "chunk palette has {len} entries, over the format's 255-entry limit (u8 length field)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ChunkPayloadError {}
+
+/// A tiny little-endian byte reader with bounds-checked primitives, local to
+/// [`ChunkStorage::read_payload`] -- there is no `std::io::Read` here since
+/// a payload is always a plain in-memory `&[u8]` slice of known length
+/// (region files hand it one already sliced to its directory-recorded
+/// length), so the extra generality would cost more than it buys.
+struct PayloadCursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl PayloadCursor<'_> {
+    fn u8(&mut self) -> Result<u8, ChunkPayloadError> {
+        let b = *self
+            .bytes
+            .get(self.pos)
+            .ok_or(ChunkPayloadError::Truncated)?;
+        self.pos += 1;
+        Ok(b)
+    }
+
+    fn u16(&mut self) -> Result<u16, ChunkPayloadError> {
+        let bytes: [u8; 2] = self
+            .bytes
+            .get(self.pos..self.pos + 2)
+            .ok_or(ChunkPayloadError::Truncated)?
+            .try_into()
+            .unwrap();
+        self.pos += 2;
+        Ok(u16::from_le_bytes(bytes))
+    }
+
+    fn u64(&mut self) -> Result<u64, ChunkPayloadError> {
+        let bytes: [u8; 8] = self
+            .bytes
+            .get(self.pos..self.pos + 8)
+            .ok_or(ChunkPayloadError::Truncated)?
+            .try_into()
+            .unwrap();
+        self.pos += 8;
+        Ok(u64::from_le_bytes(bytes))
+    }
 }
 
 impl Default for ChunkStorage {
@@ -319,5 +473,96 @@ mod tests {
         for (idx, &id) in ids.iter().enumerate() {
             assert_eq!(storage.get(idx), id, "idx {idx} after repacking");
         }
+    }
+
+    fn round_trip(storage: &ChunkStorage, volume: usize) -> ChunkStorage {
+        let mut bytes = Vec::new();
+        storage.write_payload(&mut bytes).expect("write payload");
+        ChunkStorage::read_payload(&bytes, volume).expect("read payload")
+    }
+
+    fn assert_same_content(a: &ChunkStorage, b: &ChunkStorage, volume: usize) {
+        for idx in 0..volume {
+            assert_eq!(a.get(idx), b.get(idx), "idx {idx}");
+        }
+    }
+
+    #[test]
+    fn uniform_payload_round_trips() {
+        let storage = ChunkStorage::Uniform(BlockId(7));
+        let mut bytes = Vec::new();
+        storage.write_payload(&mut bytes).unwrap();
+        assert_eq!(bytes, [0, 7, 0], "tag 0, then u16 id 7 little-endian");
+        let back = round_trip(&storage, 4096);
+        assert!(matches!(back, ChunkStorage::Uniform(BlockId(7))));
+    }
+
+    #[test]
+    fn palette_payload_round_trips_every_width() {
+        for &bits in &WIDTHS {
+            let volume = 300;
+            let len = 1usize << bits.min(7); // stay under the format's 255-entry palette cap
+            let mut storage = ChunkStorage::new();
+            for idx in 0..volume {
+                storage.set(idx, BlockId((idx % len) as u16 + 1), volume);
+            }
+            let expected_bits = match &storage {
+                ChunkStorage::Palette { bits, .. } => *bits,
+                ChunkStorage::Uniform(_) => panic!("expected Palette (bits={bits})"),
+            };
+
+            let back = round_trip(&storage, volume);
+            assert_same_content(&storage, &back, volume);
+            match &back {
+                ChunkStorage::Palette { bits: got, .. } => assert_eq!(*got, expected_bits),
+                ChunkStorage::Uniform(_) => panic!("expected Palette after round-trip"),
+            }
+        }
+    }
+
+    #[test]
+    fn palette_too_large_is_a_named_error() {
+        let volume = 300;
+        let palette: Vec<BlockId> = (0..300).map(|i| BlockId(i as u16)).collect(); // > u8::MAX
+        let storage = ChunkStorage::Palette {
+            palette,
+            bits: 16,
+            data: zero_words(16, volume),
+        };
+        assert_eq!(
+            storage.write_payload(&mut Vec::new()),
+            Err(ChunkPayloadError::PaletteTooLarge(300))
+        );
+    }
+
+    #[test]
+    fn truncated_payload_is_a_named_error() {
+        assert_eq!(
+            ChunkStorage::read_payload(&[], 4096).unwrap_err(),
+            ChunkPayloadError::Truncated
+        );
+        assert_eq!(
+            ChunkStorage::read_payload(&[0, 7], 4096).unwrap_err(), // tag + one byte of a u16
+            ChunkPayloadError::Truncated
+        );
+    }
+
+    #[test]
+    fn unknown_storage_tag_is_a_named_error() {
+        assert_eq!(
+            ChunkStorage::read_payload(&[2, 0, 0], 4096).unwrap_err(),
+            ChunkPayloadError::UnknownStorageTag(2)
+        );
+    }
+
+    #[test]
+    fn invalid_palette_bits_is_a_named_error_not_a_panic() {
+        // tag 1, len 1, one u16 id, then an out-of-range bits byte -- must
+        // error, not shift by an amount that would panic/UB downstream.
+        let bytes = [1, 1, 0, 0, 3];
+        assert_eq!(
+            ChunkStorage::read_payload(&bytes, 4096).unwrap_err(),
+            ChunkPayloadError::InvalidBits(3)
+        );
     }
 }
