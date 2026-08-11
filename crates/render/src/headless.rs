@@ -29,7 +29,17 @@ pub struct Shot {
     /// Square chunk radius of the region to build.
     pub region_radius: i32,
     /// Virtual time for the orbit camera — fixes the viewpoint deterministically.
+    /// Ignored when `camera` overrides the viewpoint.
     pub orbit_t: f32,
+    /// An explicit `(eye, look_dir)` camera, overriding the default auto-framed
+    /// orbit. `None` (the default) keeps the orbit: frame the whole scene's AABB
+    /// and view it from `orbit_t`'s angle, always somewhat above it (`eye.y =
+    /// center.y + radius * 0.45` — see `CameraUniform::view_proj_matrix`). That
+    /// fixed elevation can't produce a grazing, near-ground viewpoint at any
+    /// scale (shrinking the region shrinks the eye's height by the same factor
+    /// as its distance, so the angle never changes) — which a shot that needs to
+    /// look *into* something at ground level, like a cave mouth, needs.
+    pub camera: Option<(glam::Vec3, glam::Vec3)>,
 }
 
 impl Default for Shot {
@@ -39,6 +49,7 @@ impl Default for Shot {
             height: 720,
             region_radius: 6,
             orbit_t: 6.0,
+            camera: None,
         }
     }
 }
@@ -112,6 +123,7 @@ fn render_arena(
         height,
         region_radius: _,
         orbit_t,
+        camera,
     } = shot;
 
     let (mesh_assets, tex_view, tex_sampler) = load_mesh_assets(&device, &queue);
@@ -122,19 +134,26 @@ fn render_arena(
     };
     let mut arena = build_arena(&device, &queue, multi_draw, &ctx);
     let (min, max) = arena.bounds()?;
-    let look_target = [
-        (min[0] + max[0]) * 0.5,
-        (min[1] + max[1]) * 0.5,
-        (min[2] + max[2]) * 0.5,
-    ];
-    let view_radius = (max[0] - min[0]).max(max[2] - min[2]) * 0.75;
 
-    let vp = CameraUniform::view_proj_matrix(
-        width as f32 / height as f32,
-        orbit_t,
-        look_target,
-        view_radius,
-    );
+    let vp = match camera {
+        Some((eye, look_dir)) => {
+            CameraUniform::look_view_proj(width as f32 / height as f32, eye, look_dir)
+        }
+        None => {
+            let look_target = [
+                (min[0] + max[0]) * 0.5,
+                (min[1] + max[1]) * 0.5,
+                (min[2] + max[2]) * 0.5,
+            ];
+            let view_radius = (max[0] - min[0]).max(max[2] - min[2]) * 0.75;
+            CameraUniform::view_proj_matrix(
+                width as f32 / height as f32,
+                orbit_t,
+                look_target,
+                view_radius,
+            )
+        }
+    };
     let draw_count = arena.prepare(&queue, &Frustum::from_view_proj(vp));
 
     let mut scene = SceneRenderer::new(

@@ -60,8 +60,10 @@ frames after 200 warmup.
 | 2026-08-11 | **Packed vertex + texture array, node_index-in-vertex (final)** [#43], radius 64¹⁴ | 25,131 | 762,516 | ~1,016 | **0.697 ms** | ~1.05 ms | `218eb41` |
 | 2026-08-11 | Per-face material appearance [#44], radius 12¹⁵ | 1,349 | 361,326 | ~2,452 | 0.275 ms | ~0.56 ms | `a13200d` |
 | 2026-08-11 | Per-face material appearance [#44], radius 64¹⁵ | 25,131 | 762,516 | ~1,016 | 0.707 ms | ~1.31 ms | `a13200d` |
-| 2026-08-11 | **The three phase-1 materials + textures, depth-layered terrain** [#55], radius 12¹⁶ | 1,349 | 439,816 | ~2,012 | 0.329 ms | ~0.81 ms | *(this PR)* |
-| 2026-08-11 | **The three phase-1 materials + textures, depth-layered terrain** [#55], radius 64¹⁶ | 25,131 | 899,840 | ~877 | 0.821 ms | ~2.06 ms | *(this PR)* |
+| 2026-08-11 | **The three phase-1 materials + textures, depth-layered terrain** [#55], radius 12¹⁶ | 1,349 | 439,816 | ~2,012 | 0.329 ms | ~0.81 ms | `9174d84` |
+| 2026-08-11 | **The three phase-1 materials + textures, depth-layered terrain** [#55], radius 64¹⁶ | 25,131 | 899,840 | ~877 | 0.821 ms | ~2.06 ms | `9174d84` |
+| 2026-08-11 | **Seeded noise terrain with caves** [#48], radius 12¹⁷ | 1,282 | 424,352 | ~2,224 | 0.302 ms | ~0.72 ms | *(this PR)* |
+| 2026-08-11 | **Seeded noise terrain with caves** [#48], radius 64¹⁷ | 26,789 | 890,774 | ~891 | 0.780 ms | ~1.51 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -410,6 +412,65 @@ real layered geometry doing real work, not a regression to chase.
 procedurally-generated 16×16 pixel art authored for this PR -- not traced,
 recoloured, or sampled from any existing game (`REQUIREMENTS.md` #6). See
 the PR description for how they were made.
+
+¹⁷ **Seeded noise terrain with caves (issue #48) — flat-to-slightly-faster at
+both scales, and a real generation-time regression found and fixed along
+the way.** `World`'s terrain moved from a fixed, unseeded sin/cos formula to
+`WorldGen`: a seeded 2D height field (fractal value noise, §8) for the
+surface, plus a second 3D noise field subtracted from density for caves
+(§8.3) -- caves are what block 1.0's own §2 flagged as the thing that would
+make the radius-64 gate honest, since a smooth heightmap flatters the
+renderer.
+
+**Render-side numbers, back-to-back against the previous row:** radius 12
+1,349 → 1,282 chunks (caves hollow some fully-underground chunks down to
+nothing), 439,816 → 424,352 triangles (net *fewer*, despite caves adding
+wall geometry -- fewer solid chunks overall dominates), FPS ~2,012 → ~2,224,
+CPU/frame **0.329 → 0.302 ms**. Radius 64: 25,131 → 26,789 chunks (opposite
+direction here -- caves carve internal surfaces into chunks that were
+previously fully enclosed and had nothing to mesh, so more chunks now have
+*some* visible geometry even though fewer are solid throughout), 899,840 →
+890,774 triangles (about flat), FPS ~877 → ~891, CPU/frame **0.821 → 0.780
+ms**. Both scenes are within normal run-to-run noise of "unchanged" -- caves
+redistribute where geometry is, they don't add a large net amount of it at
+these radii, so this isn't the "expected to cost" delta the issue's own
+"Done when" checklist anticipated. Recorded anyway, honestly, rather than
+assumed.
+
+**Where the real cost showed up instead: generation time, not render time.**
+The CI-facing regression guard for this (`crates/world/tests/
+radius_64_smoke.rs`, issue #89 -- a debug-build, GPU-less scan of a
+radius-64 region, budgeted at 120s) went from finishing in ~1.3-1.4s to not
+finishing in 120s at all once real per-voxel noise sampling replaced three
+`sin`/`cos` calls per column. Root-caused to two stacked, fixable causes,
+not a fundamental cost of noise-based terrain:
+
+1. **Redundant work**: the naive per-voxel implementation computed
+   `surface_height` (an expensive multi-octave 2D noise sample) up to twice
+   per voxel -- once for `density`, once for material selection -- 8,192
+   calls per chunk for what is only ever 256 *distinct* values (one per
+   `(x, z)` column). Fixed by having `WorldGen::generate` precompute the
+   16×16 column grid once and thread it through.
+2. **Unnecessary work**: cave noise (three octaves of 3D value noise, 8
+   hashed lattice corners each -- by far the most expensive term) was
+   sampled for every voxel, including the roughly half of any region that's
+   plainly above the terrain surface already. Caves only ever *subtract*
+   from density, so they can never turn an already-air cell solid --
+   `density_at` now returns early for those cells without touching the cave
+   field at all.
+
+Those two together, measured in isolation before any other change: smoke
+test still did not finish in 120s (reached further, but not all the way).
+The remaining gap was closed by tuning `CAVE_OCTAVES` down from 3 to 1 --
+one octave of 3D value noise still reads as real, organic-looking caves
+(see the `cave_mouth` golden and `terrain.png`, both of which now show
+visible cave openings), just cheaper per sample. With both fixes and the
+octave reduction: the smoke test settles in **~87s locally** (M3, debug
+build) -- real headroom under the 120s budget, not a near-miss. None of
+this touched the *shape* of the trade a golden-image change makes visible;
+it only removed CPU work the original implementation didn't need to do,
+which is why the render-side FPS/CPU numbers above moved by noise rather
+than by a fixed cost.
 
 ## Detailed run logs
 

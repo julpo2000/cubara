@@ -175,14 +175,48 @@ fn terrain_renders_as_expected() {
 }
 
 #[test]
+fn a_cave_mouth_is_visible() {
+    // Block 1.5 (#48)'s own bar: caves are a real, cross-chunk 3D noise
+    // field carved into the terrain (§8.3), not just a promise buried in
+    // `density`'s implementation -- this proves one is actually reachable
+    // and visible from outside, at ground level.
+    //
+    // The default orbit camera can't show this: it always looks down at a
+    // fixed shallow angle from above (`Shot::camera`'s doc comment), which
+    // can show a cave's roof but never see *into* an opening at ground
+    // level, at any scene scale. This shot uses an explicit low, grazing
+    // camera instead.
+    //
+    // Seed 119 and this exact eye/target are the result of scanning a small
+    // region around the world origin for a cave chamber that breaches the
+    // surface close enough to frame directly (see the PR description for
+    // how) -- not hand-placed, and not the only one; caves are common
+    // enough that most seeds have several within a couple of hundred blocks
+    // of any point.
+    let world = World::with_seed(119);
+    let eye = glam::vec3(-6.0, 27.0, -2.0);
+    let target = glam::vec3(-15.0, 29.0, -2.0);
+    let shot = Shot {
+        width: 960,
+        height: 540,
+        region_radius: 3,
+        orbit_t: 0.0,
+        camera: Some((eye, target - eye)),
+    };
+    assert_golden("cave_mouth", &world, shot);
+}
+
+#[test]
 fn distinct_materials_render_with_distinct_textures() {
     // Block 1.4a's own bar: the packed vertex format carries a texture-array
     // layer per quad, resolved from the block registry -- this must actually
     // show up as visibly different colours on different materials, not just
     // "the flat green constant became a flat placeholder constant". `World`
-    // can't produce mixed materials yet (worldgen is still `BlockId::STONE`-
-    // only until block 1.5), so this goes through `render_chunks` with
-    // explicit chunks instead.
+    // can produce mixed materials since block 1.5, but only as noise-shaped
+    // patches at whatever depth the terrain happens to expose them -- an
+    // explicit, controlled block of each material is still the clearer test
+    // of per-material appearance on its own, so this goes through
+    // `render_chunks` with explicit chunks instead.
     let assets_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/blocks");
     let registry = BlockRegistry::load(&assets_dir).expect("assets/blocks must be valid");
     let stone = registry
@@ -207,6 +241,7 @@ fn distinct_materials_render_with_distinct_textures() {
         height: 540,
         region_radius: 0, // unused by render_chunks -- the chunk list is explicit
         orbit_t: 5.0,
+        camera: None,
     };
 
     let Some(frame) = headless::render_chunks(&chunks, shot) else {

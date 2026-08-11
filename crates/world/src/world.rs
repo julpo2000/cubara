@@ -13,55 +13,27 @@
 
 use std::collections::BTreeMap;
 
-use cubara_voxel::{BlockId, BlockRegistry, Chunk, ChunkCoord};
+use cubara_voxel::{BlockId, Chunk, ChunkCoord};
 
-/// The three block ids [`World::chunk_at`] stamps onto generated terrain,
-/// resolved by the caller from its own loaded registry by name (e.g.
-/// `registry.id_of("cubara:grass")`) rather than assumed as fixed numbers --
-/// see `chunk_at`'s doc comment for why a hardcoded id doesn't work here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TerrainBlocks {
-    /// The exposed surface block of unedited terrain.
-    pub grass: BlockId,
-    /// The `SOIL_DEPTH` blocks directly beneath the surface.
-    pub soil: BlockId,
-    /// Everything deeper than that, and every player-placed block -- edits
-    /// don't carry a material choice yet (no inventory/build system exists
-    /// before block 1.5+), so a placed block is always this one.
-    pub stone: BlockId,
-}
+use crate::worldgen::{TerrainBlocks, WorldGen};
 
-impl TerrainBlocks {
-    /// Resolve `cubara:grass`/`cubara:soil`/`cubara:stone` from `registry` by
-    /// name -- the one place every real caller (the live renderer, the
-    /// headless bench/screenshot paths) gets its `TerrainBlocks` from, so the
-    /// "resolve by name, not a hardcoded id" rule lives in one spot instead
-    /// of being repeated at each call site.
-    pub fn from_registry(registry: &BlockRegistry) -> Self {
-        let id = |name: &str| {
-            registry
-                .id_of(name)
-                .unwrap_or_else(|| panic!("assets/blocks must define {name}"))
-        };
-        Self {
-            grass: id("cubara:grass"),
-            soil: id("cubara:soil"),
-            stone: id("cubara:stone"),
-        }
-    }
-}
-
-/// How many blocks of soil separate the grass surface from stone beneath --
-/// a simple, fixed depth rule (block 1.4c / #55). Real layered biomes with
-/// varying depth are block 1.5 / #48's terrain, not this one.
-const SOIL_DEPTH: i32 = 3;
+/// The seed [`World::new`] uses -- a fixed constant, so callers that don't
+/// need a *specific* seed (most tests, the benches, and the live game, which
+/// has no "new game" seed picker yet) still get fully deterministic terrain
+/// without threading a seed through call sites that have no business
+/// choosing one. [`World::with_seed`] is the escape hatch for the ones that
+/// do -- a future new-game flow, save/load (§7.2's `seed` header field), and
+/// tests that want a specific, named seed.
+#[allow(clippy::unusual_byte_groupings)] // grouped to spell "seed" / "coffee", not by nibble
+const DEFAULT_SEED: u64 = 0x5EED_0000_C0FF_EE;
 
 /// Deterministic terrain source, overlaid with player [edits](World::set_block).
 ///
 /// Cloning is how an edit publishes a new snapshot to readers; the overlay is the
 /// only owned state, so a clone costs one map copy.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct World {
+    worldgen: WorldGen,
     /// World block coord → solid?, overriding terrain.
     ///
     /// `BTreeMap`, not `HashMap`: iteration order is part of the world's
@@ -70,21 +42,29 @@ pub struct World {
     edits: BTreeMap<[i32; 3], bool>,
 }
 
-/// Deterministic rolling-hills height (in blocks) for a world column.
-fn terrain_height(x: i32, z: i32) -> i32 {
-    let fx = x as f32;
-    let fz = z as f32;
-    let h = 22.0
-        + 7.0 * (fx * 0.045).sin() * (fz * 0.045).cos()
-        + 4.0 * (fx * 0.11 + 1.7).sin()
-        + 4.0 * (fz * 0.09 + 0.5).cos();
-    h.round() as i32
+impl Default for World {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl World {
-    /// An unedited world — pure terrain.
+    /// An unedited world with the default seed (see [`DEFAULT_SEED`]).
     pub fn new() -> Self {
-        Self::default()
+        Self::with_seed(DEFAULT_SEED)
+    }
+
+    /// An unedited world with a specific seed.
+    pub fn with_seed(seed: u64) -> Self {
+        Self {
+            worldgen: WorldGen::new(seed),
+            edits: BTreeMap::new(),
+        }
+    }
+
+    /// The seed this world's terrain is generated from.
+    pub fn seed(&self) -> u64 {
+        self.worldgen.seed()
     }
 
     /// How many blocks the player has placed or broken. The only owned state, so
@@ -100,7 +80,7 @@ impl World {
     pub fn is_solid_at(&self, x: i32, y: i32, z: i32) -> bool {
         match self.edits.get(&[x, y, z]) {
             Some(&solid) => solid,
-            None => y <= terrain_height(x, z),
+            None => self.worldgen.is_solid(x, y, z),
         }
     }
 
@@ -123,12 +103,12 @@ impl World {
     }
 
     /// Generate the chunk at `coord` from terrain overlaid with any player edits, or
-    /// `None` if it ends up with no solid blocks. Unedited terrain is layered by
-    /// depth below the surface (`blocks.grass`/`soil`/`stone`, `SOIL_DEPTH`) -- a
-    /// simple rule, not real biome variety (block 1.5's terrain, not this one) --
-    /// but the caller supplies which ids those are (resolved from its own loaded
-    /// registry by name, e.g. `registry.id_of("cubara:grass")`) rather than this
-    /// crate assuming fixed numbers. `BlockId`s are assigned by sorted name per
+    /// `None` if it ends up with no solid blocks. Unedited terrain comes from this
+    /// world's [`WorldGen`] (seeded noise + caves, block 1.5), layered by depth
+    /// below the surface into `blocks.grass`/`soil`/`stone` -- but the caller
+    /// supplies which ids those are (resolved from its own loaded registry by
+    /// name, e.g. `registry.id_of("cubara:grass")`) rather than this crate
+    /// assuming fixed numbers. `BlockId`s are assigned by sorted name per
     /// registry (§3.4), so a hardcoded id here would silently mean a different
     /// material -- or a `Sided` one with an entirely different look -- the moment
     /// the loaded registry's material set changed; that exact mismatch (id 1
@@ -147,24 +127,20 @@ impl World {
 
     /// The block at world `(x, y, z)`: a player edit if one exists there
     /// (always `blocks.stone` when placed -- edits don't carry a material
-    /// choice yet), otherwise unedited terrain layered by depth below the
-    /// surface (see [`TerrainBlocks`]).
+    /// choice yet), otherwise this world's [`WorldGen`] at that position.
+    ///
+    /// Kept as a per-cell method (not built from [`WorldGen::generate`],
+    /// which knows nothing about edits) so `chunk_at`'s edit overlay stays a
+    /// single per-cell lookup, matching how [`is_solid_at`](Self::is_solid_at)
+    /// already does it -- not a second pass over `self.edits` per chunk.
     fn block_at(&self, x: i32, y: i32, z: i32, blocks: TerrainBlocks) -> BlockId {
         match self.edits.get(&[x, y, z]) {
             Some(&true) => blocks.stone,
             Some(&false) => BlockId::AIR,
-            None => {
-                let surface = terrain_height(x, z);
-                if y > surface {
-                    BlockId::AIR
-                } else if y == surface {
-                    blocks.grass
-                } else if surface - y <= SOIL_DEPTH {
-                    blocks.soil
-                } else {
-                    blocks.stone
-                }
-            }
+            None => self
+                .worldgen
+                .block_at(x, y, z, blocks)
+                .unwrap_or(BlockId::AIR),
         }
     }
 }
@@ -225,6 +201,16 @@ mod tests {
         // Triangle count jumped from 8,482 with per-vertex ambient occlusion (#45):
         // AO-varying cells can no longer merge into the same quad, so bumpy terrain
         // splits into more, smaller quads. Expected and accepted for the AO quality.
+        //
+        // Chunks/tris moved again, 52/14,716 -> 50/11,682 -> 50/13,510, with seeded
+        // noise terrain (grass/soil/stone height field, plus caves) replacing the
+        // fixed sin/cos rolling-hills formula (block 1.5 / #48): a different height
+        // field at the same `World::new()` default seed changed which chunks in
+        // this fixed 5x5x3 region have solid blocks at all (first move), and tuning
+        // `CAVE_OCTAVES` down from 3 to 1 for generation speed (see BENCHMARKS.md)
+        // changed the cave shape enough to move the triangle count again without
+        // changing which chunks are non-empty (second move). Not a regression --
+        // this test's job is catching an *accidental* change, and neither was.
         let world = World::new();
         let registry = test_registry();
         let ctx = test_ctx(&registry);
@@ -248,56 +234,37 @@ mod tests {
                 tris += chunk.build_mesh(&ctx).triangle_count();
             }
         }
-        assert_eq!((chunks, tris), (52, 14716));
+        assert_eq!((chunks, tris), (50, 13510));
     }
 
     #[test]
-    fn terrain_layers_by_depth() {
-        // Block 1.4c's depth rule: grass at the surface, soil for the next
-        // SOIL_DEPTH blocks, stone beyond that -- and edits stay material-
-        // blind (always `stone`, or air when broken), since there's no
-        // inventory/build system yet to choose what a placed block is made
-        // of. Three distinct ids, unlike `region_mesh_output_is_stable`
-        // above, since this test is specifically about telling them apart.
-        let grass = BlockId(1);
-        let soil = BlockId(2);
+    fn edits_override_worldgen_regardless_of_underlying_terrain() {
+        // World::block_at's edit branch matches the overlay first, before
+        // ever consulting WorldGen -- so a placed/broken block's material is
+        // exactly `blocks.stone`/air regardless of what the underlying
+        // terrain there actually is. The depth rule itself (grass/soil/stone
+        // by depth) is WorldGen's own contract, pinned in
+        // `worldgen::tests::terrain_layers_by_depth`.
         let stone = BlockId(3);
-        let blocks = TerrainBlocks { grass, soil, stone };
+        let other = BlockId(4);
+        let blocks = TerrainBlocks {
+            grass: other,
+            soil: other,
+            stone,
+        };
 
         let mut world = World::new();
-        let surface = terrain_height(0, 0);
-
-        assert_eq!(world.block_at(0, surface, 0, blocks), grass, "surface");
-        for depth in 1..=SOIL_DEPTH {
-            assert_eq!(
-                world.block_at(0, surface - depth, 0, blocks),
-                soil,
-                "depth {depth}"
-            );
-        }
+        world.set_block(0, 500, 0, true); // "place" -- far above any plausible surface
         assert_eq!(
-            world.block_at(0, surface - SOIL_DEPTH - 1, 0, blocks),
-            stone,
-            "below the soil layer"
-        );
-        assert_eq!(
-            world.block_at(0, surface + 1, 0, blocks),
-            BlockId::AIR,
-            "above the surface"
-        );
-
-        // Edits override the depth rule entirely, at any depth.
-        world.set_block(0, surface, 0, true); // re-place the surface block
-        assert_eq!(
-            world.block_at(0, surface, 0, blocks),
+            world.block_at(0, 500, 0, blocks),
             stone,
             "a placed block is always stone -- edits carry no material choice yet"
         );
-        world.set_block(0, surface - SOIL_DEPTH - 1, 0, false); // break deep stone
+        world.set_block(0, -500, 0, false); // "break" -- far below any plausible surface
         assert_eq!(
-            world.block_at(0, surface - SOIL_DEPTH - 1, 0, blocks),
+            world.block_at(0, -500, 0, blocks),
             BlockId::AIR,
-            "a broken block is air regardless of what the depth rule would say"
+            "a broken block is air regardless of what worldgen would say"
         );
     }
 
