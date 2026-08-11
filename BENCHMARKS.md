@@ -82,8 +82,10 @@ frames after 200 warmup.
 | 2026-08-11 | Skirts to hide LOD seams [#108], radius 64²⁶ | 1,238 | 689,436 | ~1,558 | 0.444 ms | ~0.89 ms | `d518f53` |
 | 2026-08-11 | **Ring schedule tuned to the <2,000-draw budget** [#109], radius 12²⁷ | 957 | 367,026 | ~2,357 | 0.280 ms | ~0.88 ms | `1e84478` |
 | 2026-08-11 | **Ring schedule tuned to the <2,000-draw budget** [#109], radius 64²⁷ | **1,585** | 829,608 | ~1,295 | 0.526 ms | ~1.12 ms | `1e84478` |
-| 2026-08-11 | `cubara-render` drops its `cubara-world` dependency [#110], radius 12²⁸ | 957 | 367,026 | ~2,402 | 0.265 ms | ~1.10 ms | *(this PR)* |
-| 2026-08-11 | `cubara-render` drops its `cubara-world` dependency [#110], radius 64²⁸ | 1,585 | 829,608 | ~1,291 | 0.531 ms | ~1.11 ms | *(this PR)* |
+| 2026-08-11 | `cubara-render` drops its `cubara-world` dependency [#110], radius 12²⁸ | 957 | 367,026 | ~2,402 | 0.265 ms | ~1.10 ms | `0fe7e7d` |
+| 2026-08-11 | `cubara-render` drops its `cubara-world` dependency [#110], radius 64²⁸ | 1,585 | 829,608 | ~1,291 | 0.531 ms | ~1.11 ms | `0fe7e7d` |
+| 2026-08-11 | Arena capacity re-sized for the node tree [#111], radius 12²⁹ | 957 | 367,026 | ~2,474 | 0.270 ms | ~0.92 ms | *(this PR)* |
+| 2026-08-11 | Arena capacity re-sized for the node tree [#111], radius 64²⁹ | 1,585 | 829,608 | ~1,275 | 0.535 ms | ~1.50 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -728,6 +730,52 @@ than the FPS figures — this PR could not have changed the meshed scene at
 all without a bug, and it didn't. All 7 golden-image tests pass byte-for-byte
 unmodified (no `CUBARA_BLESS`), the strongest evidence available that this
 is a true no-op relocation, not just numerically close.
+
+²⁹ **Arena capacity re-sized for the node tree (issue #38's tracking arc,
+sub-issue #111, deferred from #89).** `VERTEX_CAPACITY`/`INDEX_CAPACITY`/
+`MAX_DRAWS`/`MAX_NODES` were sized in block 1.0 for a per-*chunk* resident
+set (25,131 chunks at radius 64); #89 explicitly deferred re-sizing until
+real node-tree numbers existed. They do now (#109):
+
+| Constant | #89-era | New | Measured peak it's sized against | Headroom |
+|---|---|---|---|---|
+| `VERTEX_CAPACITY` | 4,000,000 | **4,000,000 (unchanged)** | 1,659,216 vertices used | ~2.4× |
+| `INDEX_CAPACITY` | 6,000,000 | **6,000,000 (unchanged)** | 2,488,824 indices used | ~2.4× |
+| `MAX_DRAWS` | 16,384 | **4,096** | 1,341/1,585 visible from a wide-open orbit (~85%) | ~2.5× |
+| `MAX_NODES` | 65,536 | **16,384** | 1,585-1,613 resident (4 world positions) | ~10× |
+
+The honest finding here, stated plainly rather than assumed: **node/draw
+count dropped 4-16×, but vertex/index memory did not drop at all.** Total
+triangle volume is a property of how much terrain is visible, not how many
+draws it takes to submit — the node tree's whole point (§6.1) is fewer,
+larger draws covering the *same* geometry, not less geometry. `VERTEX_CAPACITY`/
+`INDEX_CAPACITY` were never really "sized for radius 12" in any binding
+sense (that was just the reference scene available in block 1.0); measured
+against the real, current radius-64 worst case for the first time here, the
+#89-era numbers turn out to already be correctly sized (~2.4× headroom) and
+don't move.
+
+GPU memory footprint (vertex 12 B/vertex, index 4 B/index, indirect-args 20
+B/entry, origins 16 B/entry): **70.0 → 69.0 MiB total** (~1.4% smaller,
+because vertex/index dominate and didn't shrink) — but the two buffers that
+actually scale with draw/node count shrink **75% each**: indirect-args 0.31
+→ 0.08 MiB, origins 1.00 → 0.25 MiB. Modest in absolute bytes (both were
+already tiny), but real, and it tightens the worst-case bound instead of
+leaving 4-16× more slack than the measured peak justifies.
+
+Re-verified `ArenaUsage::exhausted`'s warning path is still correct and
+reachable at the new sizes: temporarily set `MAX_DRAWS` to 1,000 (below the
+measured 1,585 peak) and confirmed `--bench 64` logs the expected `WARN
+region exceeds arena capacity: draws` line and correctly clamps the drawn
+set to 1,000/1,585 rather than silently corrupting anything — then reverted.
+`--bench 64` at the real (4,096) capacity logs zero exhaustion warnings, as
+required.
+
+Both radii land within measurement noise of the immediately preceding row
+(#110, `0fe7e7d`): radius 12 nodes/tris unchanged (957/367,026), FPS ~2,402 →
+~2,474; radius 64 nodes/tris unchanged (1,585/829,608), FPS ~1,291 → ~1,275.
+As expected for a sizing-only change — the constants only bind when a scene
+is *close to* the old capacities, and this scene never was.
 
 ## Detailed run logs
 
