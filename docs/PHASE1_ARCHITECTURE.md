@@ -573,6 +573,31 @@ again after generating a shuffled selection of its neighbours, and asserts the t
 are bit-identical. It is cheap, and it fails the moment someone reaches for a
 neighbour.
 
+**Implemented, block 1.5 (#48), two small deviations from the sketch above,
+both reasoned, neither load-bearing:**
+
+- `generate` returns [`Chunk`], not `ChunkStorage`. `ChunkStorage::from_ids`
+  (the fast direct-construction path the sketch implies) is deliberately
+  crate-private inside `cubara-voxel` — see its own doc comment — and
+  `Chunk::from_fn` is the existing public entry point that already does
+  exactly this. Punching a new hole in that encapsulation for a marginal
+  gain wasn't worth it.
+- `generate`/`density` also take a `TerrainBlocks { grass, soil, stone }` (or
+  resolve it, for the single-block queries `World` needs) — the sketch above
+  predates block 1.4's `TerrainBlocks`/registry-by-name work, which per §3.4
+  is how a `BlockId` is obtained at all; `WorldGen` has no ids to hand out on
+  its own.
+
+`step` is honoured and tested (`generate` at `step = 4` samples the same
+lattice `density`/`block_at` would at each scaled position, not a downsampled
+copy), but nothing in the live streamed scene calls it at a non-unit `step`
+yet — `World::chunk_at` always requests full resolution, and
+`Chunk::build_mesh_lod` still downsamples an already-generated chunk for
+distant LOD, exactly the factor-of-65 this section names. Wiring far nodes to
+call `generate` directly at their target `step` is block 1.10's region node
+tree (§6), not this block's job — this one's job was making `step` correct
+and tested, ready for that to call.
+
 ### 8.2 Positional hashing, never a stream
 
 Where generation needs randomness it uses a **hash of the position and the seed** —
@@ -592,6 +617,16 @@ specifically because it breaks §8.1: a tunnel that starts in one chunk and ends
 four chunks away makes generating one chunk require knowing about a walker that
 began somewhere else. Noise is positional, so a cave crosses chunk boundaries for
 free and every chunk agrees about it without anyone being asked.
+
+**Implemented at one octave of 3D value noise**, down from an initial three —
+not a quality ceiling, a tuning choice forced by a real generation-time
+regression the radius-64 CI smoke test (issue #89) caught: cave noise is by
+far the most expensive term in `density`, sampled per voxel, and three
+octaves pushed a debug-build radius-64 scan from ~1.3s past its 120s budget
+entirely. One octave still reads as real, organic-looking cave chambers (see
+the `cave_mouth` golden image and the visible openings in `terrain.png`) at a
+fraction of the cost; the full story, including a real redundant-computation
+bug fixed alongside the octave count, is `BENCHMARKS.md` footnote 17.
 
 ### 8.4 Structures (phase 2's trees) keep the contract
 
@@ -629,6 +664,12 @@ determinism test asserts that the same seed produces a **bit-identical block arr
 on Windows and macOS** — both of which CI already runs. If that test ever fails,
 the fix is fixed-point noise, and we will know in phase 1 rather than discovering
 it in multiplayer.
+
+Implemented as `worldgen::tests::cross_platform_block_array_is_bit_identical`
+(block 1.5, #48): an FNV-1a hash over a fixed chunk's block array at a fixed
+seed, asserted against a constant computed on macOS. Passes there by
+construction; whether Windows CI agrees is the actual question this test
+exists to answer, checked on every push rather than assumed.
 
 ---
 
