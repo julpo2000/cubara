@@ -80,8 +80,10 @@ frames after 200 warmup.
 | 2026-08-11 | **Node meshing on the worker pool, one mesh per node** [#107], radius 64²⁵ | 1,238 | 625,258 | **~1,673** | **0.408 ms** | ~1.01 ms | `444045a` |
 | 2026-08-11 | Skirts to hide LOD seams [#108], radius 12²⁶ | 690 | 281,274 | ~2,920 | 0.214 ms | ~0.90 ms | `d518f53` |
 | 2026-08-11 | Skirts to hide LOD seams [#108], radius 64²⁶ | 1,238 | 689,436 | ~1,558 | 0.444 ms | ~0.89 ms | `d518f53` |
-| 2026-08-11 | **Ring schedule tuned to the <2,000-draw budget** [#109], radius 12²⁷ | 957 | 367,026 | ~2,357 | 0.280 ms | ~0.88 ms | *(this PR)* |
-| 2026-08-11 | **Ring schedule tuned to the <2,000-draw budget** [#109], radius 64²⁷ | **1,585** | 829,608 | ~1,295 | 0.526 ms | ~1.12 ms | *(this PR)* |
+| 2026-08-11 | **Ring schedule tuned to the <2,000-draw budget** [#109], radius 12²⁷ | 957 | 367,026 | ~2,357 | 0.280 ms | ~0.88 ms | `1e84478` |
+| 2026-08-11 | **Ring schedule tuned to the <2,000-draw budget** [#109], radius 64²⁷ | **1,585** | 829,608 | ~1,295 | 0.526 ms | ~1.12 ms | `1e84478` |
+| 2026-08-11 | `cubara-render` drops its `cubara-world` dependency [#110], radius 12²⁸ | 957 | 367,026 | ~2,402 | 0.265 ms | ~1.10 ms | *(this PR)* |
+| 2026-08-11 | `cubara-render` drops its `cubara-world` dependency [#110], radius 64²⁸ | 1,585 | 829,608 | ~1,291 | 0.531 ms | ~1.11 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -704,6 +706,28 @@ same scene issue #89 first measured it failing on.
 Windows numbers not yet recorded for this row — per this file's own
 convention, the macOS M3 row lands with the PR and the Windows row is added
 when next run there.
+
+²⁸ **`cubara-render` drops its `cubara-world` dependency (issue #38's
+tracking arc, sub-issue #110) — a pure relocation, and the numbers confirm
+it.** Node meshing (`MeshPool`/`mesh_node`/`sort_batch`, the ring-schedule
+streaming policy) moved into a new `cubara_world::mesh` module; `cubara-render`
+now takes already-meshed geometry (`MeshedNode`, keyed by an opaque `NodeId`
+it defines itself) and never imports `cubara_world` in production code again
+(`crates/render/Cargo.toml`'s `[dependencies]` — enforced by a new
+`scripts/check-architecture.sh` check; `cubara-world` stays a legitimate
+`[dev-dependencies]` entry for golden-image tests, which build real scenes).
+`cubara-app` is the new glue (`crates/app/src/streaming.rs`), since it's the
+one crate meant to depend on both.
+
+Both radii land within measurement noise of the immediately preceding row
+(#109, `1e84478`): radius 12 nodes/tris **unchanged** (957/367,026), FPS
+~2,357 → ~2,402, CPU/frame 0.280 → 0.265 ms; radius 64 nodes/tris
+**unchanged** (1,585/829,608), FPS ~1,295 → ~1,291, CPU/frame 0.526 → 0.531
+ms. Node/triangle counts matching exactly is the real evidence here, more
+than the FPS figures — this PR could not have changed the meshed scene at
+all without a bug, and it didn't. All 7 golden-image tests pass byte-for-byte
+unmodified (no `CUBARA_BLESS`), the strongest evidence available that this
+is a true no-op relocation, not just numerically close.
 
 ## Detailed run logs
 

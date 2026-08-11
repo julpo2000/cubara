@@ -12,7 +12,6 @@ profile = ["dep:puffin_http"]
 
 [dependencies]
 cubara-voxel = { path = "../voxel" }
-cubara-world = { path = "../world" }
 wgpu.workspace = true
 winit.workspace = true
 pollster.workspace = true
@@ -23,3 +22,10 @@ image.workspace = true
 # puffin scope macros compile to near-nothing unless scopes are enabled at runtime.
 puffin.workspace = true
 puffin_http = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Integration tests (golden images) build realistic scenes through a real
+# `World` -- production code (`src/`) never touches this crate
+# (`ARCHITECTURE.md` §1; `scripts/check-architecture.sh` enforces it against
+# `[dependencies]` specifically, not this section).
+cubara-world = { path = "../world" }

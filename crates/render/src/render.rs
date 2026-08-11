@@ -1,10 +1,14 @@
 //! GPU bring-up and per-frame rendering.
 //!
-//! Owns the wgpu surface/device/queue and the render pipeline. All resident chunk
-//! geometry lives in a shared [`ChunkArena`], drawn with a single indirect submit;
-//! the arena streams as the camera flies (chunks in range are meshed + uploaded,
-//! ones that fall out are freed). The shared building blocks (pipeline, depth view,
-//! camera) are public so the headless bench/screenshot paths build the same scene.
+//! Owns the wgpu surface/device/queue and the render pipeline. All resident
+//! node geometry lives in a shared [`ChunkArena`], drawn with a single
+//! indirect submit. The renderer does not decide what to stream in --
+//! `ARCHITECTURE.md` §1: its inputs are meshes, origins and a camera, nothing
+//! that knows what a chunk or a `World` is. The caller (`cubara-app`) works
+//! out which nodes are wanted (via `cubara_world`), meshes them, and hands
+//! the results to [`Renderer::apply_node_updates`]. The shared building
+//! blocks (pipeline, depth view, camera) are public so the headless
+//! bench/screenshot paths build the same scene.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
@@ -14,22 +18,36 @@ use std::time::Instant;
 use winit::window::{CursorGrabMode, Window};
 
 use cubara_voxel::{BlockRegistry, ChunkCoord, Vertex};
-use cubara_world::node::{self, NodeKey};
-use cubara_world::World;
 
-use crate::arena::ChunkArena;
+use crate::arena::{ChunkArena, MeshedNode, NodeId};
 use crate::culling::Frustum;
 use crate::materials::{self, MeshAssets};
-use crate::mesher::{sort_batch, BuiltNode, MeshPool};
 use crate::scene::{SceneFrame, SceneRenderer};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// Load the real `assets/blocks/*.ron` registry and build the texture array
-/// from `assets/textures/` -- the same materials every entry point (window,
-/// `--bench`, `--screenshot`, golden tests) meshes and renders against.
-/// `CARGO_MANIFEST_DIR` is `crates/render`, so `../..` reaches the repo root
-/// regardless of the caller's working directory.
+/// Load the real `assets/blocks/*.ron` registry, validated against
+/// `assets/textures/` -- the GPU-free half of [`load_mesh_assets`], for a
+/// caller that needs to mesh nodes (`cubara_world::mesh`, resolving
+/// `tex_layer` via `materials::TextureLayers::from_registry`) before, or
+/// entirely without, ever building the actual texture array -- e.g.
+/// `cubara-app`'s `--screenshot` mode, or a headless test meshing ahead of a
+/// separate call that builds the array later. `CARGO_MANIFEST_DIR` is
+/// `crates/render`, so `../..` reaches the repo root regardless of the
+/// caller's working directory.
+pub fn load_registry() -> BlockRegistry {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let registry =
+        BlockRegistry::load(&repo_root.join("assets/blocks")).expect("assets/blocks must load");
+    registry
+        .validate_textures(&repo_root.join("assets/textures"))
+        .expect("assets/textures must cover every material's faces");
+    registry
+}
+
+/// [`load_registry`] plus the GPU texture array built from it -- the same
+/// materials every entry point (window, `--bench`, `--screenshot`, golden
+/// tests) meshes and renders against.
 ///
 /// Returns the CPU-side [`MeshAssets`] (what meshing needs -- ready to `Arc`
 /// and share with worker threads) plus the texture array's view and sampler
@@ -40,13 +58,9 @@ pub fn load_mesh_assets(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
 ) -> (MeshAssets, wgpu::TextureView, wgpu::Sampler) {
+    let registry = load_registry();
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let registry =
-        BlockRegistry::load(&repo_root.join("assets/blocks")).expect("assets/blocks must load");
     let textures_dir = repo_root.join("assets/textures");
-    registry
-        .validate_textures(&textures_dir)
-        .expect("assets/textures must cover every material's faces");
     let (view, sampler, layers) = materials::build(device, queue, &registry, &textures_dir);
     (MeshAssets { registry, layers }, view, sampler)
 }
@@ -70,14 +84,13 @@ pub const fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
-/// Vertical chunk band to stream — the terrain sits comfortably inside it. How
-/// far out (and at what LOD) is [`node::DEFAULT_RING_SCHEDULE`]'s job now,
-/// not a single radius here.
-const STREAM_Y_MIN: i32 = 0;
-const STREAM_Y_MAX: i32 = 2;
-/// Cap on chunk geometry uploads per frame. Crossing a chunk boundary re-LODs a
-/// whole ring at once; spreading the GPU uploads over a few frames avoids the
-/// resulting frame-time spike (chunks pop in a hair later, imperceptibly).
+/// Cap on node geometry uploads per frame. A streaming update can hand over a
+/// whole ring's worth of newly-meshed nodes at once; spreading the GPU
+/// uploads over a few frames avoids the resulting frame-time spike (nodes pop
+/// in a hair later, imperceptibly). *What* to stream is the caller's
+/// decision (`ARCHITECTURE.md` §1); this is purely about not spiking the
+/// frame while applying it, which is why it stays here rather than moving
+/// out with the streaming policy.
 const MAX_UPLOADS_PER_FRAME: usize = 32;
 
 /// Uniform block shared with `mesh.wgsl`: one column-major view*projection matrix.
@@ -219,6 +232,13 @@ pub fn gpu_driven_features(adapter: &wgpu::Adapter) -> (wgpu::Features, bool) {
 }
 
 /// All GPU + window state. Created once the event loop has `resumed`.
+///
+/// Owns no `World`, no streaming policy, no mesh-generation pool -- what to
+/// stream in is decided entirely by the caller (`cubara-app`, via
+/// `cubara_world`), which hands finished node geometry to
+/// [`apply_node_updates`](Self::apply_node_updates). This is what makes the
+/// renderer rebuildable on its own: its whole vocabulary is meshes, origins,
+/// and a camera (`ARCHITECTURE.md` §1).
 pub struct Renderer {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -230,23 +250,17 @@ pub struct Renderer {
     scene: SceneRenderer,
     frustum: Frustum,
 
-    /// All resident chunk geometry in shared buffers, drawn with one indirect submit.
+    /// All resident node geometry in shared buffers, drawn with one indirect submit.
     arena: ChunkArena,
-    /// Which blocks exist and what texture layer represents each -- loaded
-    /// once at startup, shared with every mesh job (`ARCHITECTURE.md` Rule 4:
-    /// the registry half stays GPU-free; only the layer numbers came from us).
-    mesh_assets: Arc<MeshAssets>,
-    /// Background worker pool that generates + meshes nodes off the main thread.
-    mesh_pool: MeshPool,
+    /// Which node ids are currently meant to be resident (uploaded, or queued
+    /// to become so) -- lets [`drain_uploads`](Self::drain_uploads) skip a
+    /// queued upload for a node a newer [`apply_node_updates`](Self::apply_node_updates)
+    /// call already unloaded, without this crate needing to know what a node
+    /// id actually means.
+    desired: HashSet<NodeId>,
     /// Finished meshes waiting to be uploaded, drained at most
     /// [`MAX_UPLOADS_PER_FRAME`] per frame to avoid upload spikes.
-    upload_queue: VecDeque<BuiltNode>,
-    /// Nodes that are meshed and uploaded (or known empty) -- a `NodeKey` already
-    /// names both position and detail level, so residency is just set membership,
-    /// unlike the old per-chunk map that tracked level as separate data.
-    resident: HashSet<NodeKey>,
-    /// Chunk the camera is currently in; streaming re-runs when this changes.
-    center: ChunkCoord,
+    upload_queue: VecDeque<MeshedNode>,
 
     last_frame: Instant,
     visible_chunks: usize,
@@ -260,7 +274,18 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(window: Arc<Window>, world: &Arc<World>, camera: CameraPose) -> Self {
+    /// Bring up the window's GPU surface/device/pipelines and return the
+    /// renderer alongside the [`MeshAssets`] its texture array was built
+    /// from -- the caller needs those to mesh nodes against the same
+    /// registry/texture-layer mapping (`cubara_world::mesh`'s `registry`/
+    /// `layer_of` parameters), and building the texture array twice would
+    /// waste a real upload, so this is the one place it happens.
+    ///
+    /// Starts with nothing resident -- no `World`, no priming region. The
+    /// caller streams the initial view in via
+    /// [`apply_node_updates`](Self::apply_node_updates) exactly like every
+    /// later frame.
+    pub fn new(window: Arc<Window>, camera: CameraPose) -> (Self, MeshAssets) {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -317,7 +342,6 @@ impl Renderer {
         surface.configure(&device, &config);
 
         let (mesh_assets, tex_view, tex_sampler) = load_mesh_assets(&device, &queue);
-        let mesh_assets = Arc::new(mesh_assets);
         let scene = SceneRenderer::new(
             &device,
             &queue,
@@ -330,11 +354,10 @@ impl Renderer {
 
         let aspect = config.width as f32 / config.height as f32;
         let frustum = Frustum::from_view_proj(camera.view_proj(aspect));
-        let center = ChunkCoord::from_world_pos(camera.eye.to_array());
 
         let arena = ChunkArena::new(&device, multi_draw);
 
-        let mut renderer = Self {
+        let renderer = Self {
             window,
             surface,
             device,
@@ -343,11 +366,8 @@ impl Renderer {
             scene,
             frustum,
             arena,
-            mesh_assets,
-            mesh_pool: MeshPool::new(),
+            desired: HashSet::new(),
             upload_queue: VecDeque::new(),
-            resident: HashSet::new(),
-            center,
             last_frame: Instant::now(),
             visible_chunks: 0,
             frames: 0,
@@ -355,24 +375,41 @@ impl Renderer {
             show_debug: true,
             frame_ms: 0.0,
         };
-        // Prime the initial region so the first frame has something to draw.
-        renderer.stream_around(world, center);
-        renderer
+        (renderer, mesh_assets)
     }
 
-    /// Force a re-mesh of the chunk `cc` (e.g. after an edit): the worker re-reads
-    /// the edit overlay, and [`drain_meshes`](Self::drain_meshes) swaps the
-    /// geometry in atomically, so there's no gap.
-    ///
-    /// Always re-meshes `cc`'s level-0 node, not whatever node is currently
-    /// resident there: an edit only ever happens within player reach, which is
-    /// well inside the always-full-resolution near field the ring schedule
-    /// keeps around the player (`World::node_at`'s doc comment) -- a coarser
-    /// node can never be the one actually representing an editable chunk.
-    pub fn invalidate(&mut self, world: &Arc<World>, cc: ChunkCoord) {
-        let node = NodeKey::containing(cc, 0);
-        self.mesh_pool.cancel(node);
-        self.mesh_pool.request(world, &self.mesh_assets, node);
+    /// The device and queue backing this renderer -- what a caller needs to
+    /// mesh nodes against the same GPU context (e.g. resolving texture
+    /// layers via the [`MeshAssets`] returned alongside this renderer by
+    /// [`new`](Self::new)), without this crate needing to know why.
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// Apply a batch of streaming updates the caller has already decided on:
+    /// drop `to_unload`'s geometry immediately, and queue `meshed`'s for
+    /// upload (paced at [`MAX_UPLOADS_PER_FRAME`] per frame by
+    /// [`drain_uploads`](Self::drain_uploads), called every [`render`](Self::render)).
+    /// This is the entire streaming surface the renderer exposes -- *which*
+    /// nodes to load/unload is the caller's decision (`ARCHITECTURE.md` §1);
+    /// an edit is no different from ordinary streaming from here, just a
+    /// single-node update.
+    pub fn apply_node_updates(
+        &mut self,
+        to_unload: impl IntoIterator<Item = NodeId>,
+        meshed: impl IntoIterator<Item = MeshedNode>,
+    ) {
+        for id in to_unload {
+            self.desired.remove(&id);
+            self.arena.remove(id);
+        }
+        for node in meshed {
+            self.desired.insert(node.id);
+            self.upload_queue.push_back(node);
+        }
     }
 
     pub fn window(&self) -> &Window {
@@ -389,99 +426,40 @@ impl Renderer {
         }
     }
 
-    /// Bring the streamed set in line with `center`: drop nodes that fell outside
-    /// the ring schedule, and *request* each desired node that isn't already
-    /// resident or in flight, nearest first. Meshing happens on the worker pool;
-    /// results are uploaded in [`drain_meshes`](Self::drain_meshes), so this never
-    /// meshes on the main thread.
-    ///
-    /// A boundary crossing typically unloads some nodes and loads others at a
-    /// *different* level for the same area (a coarse node splitting into finer
-    /// ones, or the reverse) -- unlike the old per-chunk LOD change, this isn't a
-    /// same-key swap, so the outgoing node's geometry disappears from the arena
-    /// immediately rather than staying drawn until the replacement is ready. A
-    /// momentary gap at a ring boundary is an accepted, known limitation at this
-    /// stage (see issue #107) -- the same category as the LOD-boundary cracks
-    /// skirts (#108) will fix, not a correctness bug.
-    fn stream_around(&mut self, world: &Arc<World>, center: ChunkCoord) {
+    /// Upload queued nodes from [`apply_node_updates`](Self::apply_node_updates) —
+    /// at most [`MAX_UPLOADS_PER_FRAME`] per frame, so a caller handing over a
+    /// whole ring's worth of newly-streamed nodes at once doesn't spike the
+    /// frame time. Called every [`render`](Self::render); a node's old
+    /// geometry (if any) stays drawn until its queued replacement's turn
+    /// comes up.
+    fn drain_uploads(&mut self) {
         puffin::profile_function!();
-        let y_range = STREAM_Y_MIN..=STREAM_Y_MAX;
-        let desired_set: HashSet<NodeKey> =
-            node::desired_nodes(center, y_range.clone(), node::DEFAULT_RING_SCHEDULE)
-                .into_iter()
-                .collect();
-
-        // Unload anything no longer desired — uploaded or still in flight.
-        let stale: Vec<NodeKey> = self
-            .resident
-            .iter()
-            .chain(self.mesh_pool.in_flight().iter())
-            .filter(|n| !desired_set.contains(n))
-            .copied()
-            .collect();
-        for node in stale {
-            if self.resident.remove(&node) {
-                self.arena.remove(node);
-            }
-            self.mesh_pool.cancel(node);
-        }
-
-        // Request whatever's desired but not yet resident, nearest first --
-        // reuses `plan_node_updates`'s tested nearest-first ordering rather than
-        // a second distance sort here.
-        let updates =
-            node::plan_node_updates(&self.resident, center, y_range, node::DEFAULT_RING_SCHEDULE);
-        for node in updates.to_load {
-            if self.mesh_pool.is_in_flight(node) {
-                continue;
-            }
-            self.mesh_pool.request(world, &self.mesh_assets, node);
-        }
-        self.center = center;
-    }
-
-    /// Take finished meshes from the worker pool and upload them — but at most
-    /// [`MAX_UPLOADS_PER_FRAME`] per frame, so a boundary crossing (which streams a
-    /// whole ring at once) doesn't spike the frame time. Completed nodes are marked
-    /// resident immediately (so they aren't re-requested) and their old geometry
-    /// stays drawn until the new upload swaps it in.
-    fn drain_meshes(&mut self) {
-        puffin::profile_function!();
-        // Claim everything finished this frame, in a fixed order (ascending
-        // NodeKey) rather than whatever order the workers happened to finish
-        // in -- see sort_batch (issue #83). Mark resident now, upload over the
-        // next frames.
-        for built in sort_batch(self.mesh_pool.poll()) {
-            self.resident.insert(built.node);
-            self.upload_queue.push_back(built);
-        }
-
         let mut uploaded = 0;
         while uploaded < MAX_UPLOADS_PER_FRAME {
-            let Some(built) = self.upload_queue.pop_front() else {
+            let Some(node) = self.upload_queue.pop_front() else {
                 break;
             };
             // Skip if unloaded while it waited in the queue.
-            if !self.resident.contains(&built.node) {
+            if !self.desired.contains(&node.id) {
                 continue;
             }
-            self.arena.remove(built.node); // free any prior slot first
-            if let Some((mesh, aabb)) = built.geometry {
-                self.arena.insert(&self.queue, built.node, &mesh, aabb);
-            }
+            self.arena.remove(node.id); // free any prior slot first
+            self.arena.insert(
+                &self.queue,
+                node.id,
+                node.origin,
+                node.scale,
+                &node.mesh,
+                node.aabb,
+            );
             uploaded += 1;
         }
     }
 
-    pub fn render(
-        &mut self,
-        world: &Arc<World>,
-        camera: CameraPose,
-        selected_block: Option<[i32; 3]>,
-    ) {
+    pub fn render(&mut self, camera: CameraPose, selected_block: Option<[i32; 3]>) {
         crate::profiling::Profiler::new_frame();
         puffin::profile_function!();
-        self.update(world, camera);
+        self.update(camera);
 
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
@@ -554,6 +532,7 @@ impl Renderer {
         } else {
             0.0
         };
+        let c = ChunkCoord::from_world_pos(p.to_array());
         format!(
             "Cubara  (F3)\n\
              {fps:.0} fps  ({ms:.2} ms)\n\
@@ -565,19 +544,20 @@ impl Renderer {
             x = p.x,
             y = p.y,
             z = p.z,
-            cx = self.center.x,
-            cy = self.center.y,
-            cz = self.center.z,
+            cx = c.x,
+            cy = c.y,
+            cz = c.z,
             vis = self.visible_chunks,
             res = self.arena.len(),
         )
     }
 
-    /// Stream if the camera crossed a chunk boundary, and upload the new
-    /// camera matrix + frustum. The camera's own motion no longer happens
-    /// here -- it's `cubara-sim`'s job now (block 1.6); this just tracks
-    /// frame time for the on-screen FPS reading.
-    fn update(&mut self, world: &Arc<World>, camera: CameraPose) {
+    /// Upload whatever's been queued since last frame and refresh the camera
+    /// matrix + frustum. The camera's own motion doesn't happen here -- it's
+    /// `cubara-sim`'s job (block 1.6); this just tracks frame time for the
+    /// on-screen FPS reading and applies streaming the caller already decided
+    /// on via [`apply_node_updates`](Self::apply_node_updates).
+    fn update(&mut self, camera: CameraPose) {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -588,12 +568,7 @@ impl Renderer {
         } else {
             self.frame_ms * 0.9 + ms * 0.1
         };
-        let center = ChunkCoord::from_world_pos(camera.eye.to_array());
-        if center != self.center {
-            self.stream_around(world, center);
-        }
-        // Take whatever the workers finished meshing since last frame.
-        self.drain_meshes();
+        self.drain_uploads();
 
         let vp = camera.view_proj(self.scene.aspect());
         self.frustum = Frustum::from_view_proj(vp);

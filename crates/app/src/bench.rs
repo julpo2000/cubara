@@ -13,8 +13,12 @@ use cubara_render::{
     gpu_driven_features, load_mesh_assets, CameraUniform, ChunkArena, Frustum, SceneFrame,
     SceneRenderer,
 };
-use cubara_voxel::{ChunkCoord, MeshContext};
+use cubara_voxel::ChunkCoord;
+use cubara_world::mesh::mesh_region;
+use cubara_world::node::schedule_for_radius;
 use cubara_world::World;
+
+use crate::streaming::to_meshed_node;
 
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
@@ -26,9 +30,9 @@ const VIRTUAL_DT: f32 = 1.0 / 240.0;
 
 /// Run the benchmark over a streamed square region of the given chunk `radius`
 /// (default 12 = a realistically heavy world). The region streams as LOD nodes
-/// at their distance-based level (`ChunkArena::from_region`), so a larger
-/// radius shows how far render distance can grow without the draw/triangle
-/// cost exploding.
+/// at their distance-based level (`cubara_world::mesh::mesh_region`,
+/// `schedule_for_radius`), so a larger radius shows how far render distance
+/// can grow without the draw/triangle cost exploding.
 pub fn run(radius: i32) {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
@@ -62,23 +66,24 @@ pub fn run(radius: i32) {
     // Scene: a streamed square region (the same path the live renderer uses), so
     // we measure a realistically heavy world instead of the tiny fixed grid. All
     // geometry goes into one shared arena, drawn with a single indirect submit.
+    // Meshing happens through `cubara_world::mesh` (this crate is the one place
+    // allowed to depend on both `cubara-render` and `cubara-world`,
+    // `ARCHITECTURE.md` §1) and hands the renderer already-built geometry.
     let world = World::new();
     let (mesh_assets, tex_view, tex_sampler) = load_mesh_assets(&device, &queue);
     let layer_of = |name: &str| mesh_assets.layers.layer_of(name);
-    let ctx = MeshContext {
-        registry: &mesh_assets.registry,
-        layer_of: &layer_of,
-    };
-    let mut arena = ChunkArena::from_region(
-        &device,
-        &queue,
-        multi_draw,
+    let schedule = schedule_for_radius(radius);
+    let meshed = mesh_region(
         &world,
-        &ctx,
+        &mesh_assets.registry,
+        &layer_of,
         ChunkCoord::new(0, 0, 0),
-        radius,
         0..=2,
-    );
+        &schedule,
+    )
+    .into_iter()
+    .filter_map(to_meshed_node);
+    let mut arena = ChunkArena::from_meshed(&device, &queue, multi_draw, meshed);
     let total_nodes = arena.len();
     let (min, max) = arena.bounds().expect("bench region produced no geometry");
     let look_target = [

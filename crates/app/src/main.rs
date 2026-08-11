@@ -10,12 +10,14 @@ mod bench;
 mod caps;
 mod game;
 mod screenshot;
+mod streaming;
 
 use std::sync::Arc;
 
 use cubara_render::{grab_cursor, Profiler, Renderer};
 
 use crate::game::Game;
+use crate::streaming::NodeStreaming;
 
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
@@ -29,6 +31,10 @@ struct App {
     /// not own it (`ARCHITECTURE.md` Rule 3).
     game: Game,
     renderer: Option<Renderer>,
+    /// Which nodes are streamed in around the camera -- shares `renderer`'s
+    /// lifecycle (both created together in `resumed`, since streaming exists
+    /// to feed the renderer and needs its own `MeshAssets`).
+    streaming: Option<NodeStreaming>,
     /// Whether the mouse is captured for first-person look (toggled with Escape).
     cursor_captured: bool,
     /// Kept alive for the program's lifetime when built with `--features profile`.
@@ -45,11 +51,13 @@ impl ApplicationHandler for App {
         }
         let attrs = Window::default_attributes().with_title("Cubara");
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        self.renderer = Some(Renderer::new(
-            window.clone(),
-            self.game.world(),
-            self.game.camera_pose(),
+        let (renderer, mesh_assets) = Renderer::new(window.clone(), self.game.camera_pose());
+        let layers = mesh_assets.layers;
+        self.streaming = Some(NodeStreaming::new(
+            mesh_assets.registry,
+            move |name: &str| layers.layer_of(name),
         ));
+        self.renderer = Some(renderer);
         // Capture the mouse for first-person look (Esc releases it). A window
         // concern, so the app owns it rather than the renderer.
         grab_cursor(&window, true);
@@ -58,6 +66,9 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let Some(streaming) = self.streaming.as_mut() else {
             return;
         };
 
@@ -87,9 +98,9 @@ impl ApplicationHandler for App {
                         MouseButton::Right => self.game.edit_block(true),
                         _ => None,
                     };
-                    // The game decides what changed; the renderer re-meshes it.
+                    // The game decides what changed; streaming re-meshes it.
                     if let Some(cc) = edit {
-                        renderer.invalidate(self.game.world(), cc);
+                        streaming.invalidate(self.game.world(), cc);
                     }
                 }
             }
@@ -104,11 +115,9 @@ impl ApplicationHandler for App {
                 // this wall-clock `dt` into fixed sim ticks without ever reading
                 // the clock itself (`ARCHITECTURE.md` Rule 1, §9).
                 self.game.advance(dt);
-                renderer.render(
-                    self.game.world(),
-                    self.game.camera_pose(),
-                    self.game.selected_block(),
-                );
+                let camera = self.game.camera_pose();
+                streaming.update(renderer, self.game.world(), camera.eye.to_array());
+                renderer.render(camera, self.game.selected_block());
                 // Immediately queue the next frame — we render continuously.
                 renderer.window().request_redraw();
             }

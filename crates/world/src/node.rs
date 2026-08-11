@@ -207,6 +207,31 @@ pub fn plan_node_updates(
     NodeStreamUpdates { to_load, to_unload }
 }
 
+/// [`DEFAULT_RING_SCHEDULE`], truncated at `radius`: every ring whose outer
+/// radius is under `radius` is kept as-is, and the first ring that would
+/// reach or exceed it is clamped to end exactly at `radius` instead. Turns a
+/// single flat `radius` parameter (what a bench/screenshot/golden-test scene
+/// asks for) into a real, distance-falloff node schedule rather than a flat
+/// level-0 one -- `radius` under the first ring's own outer radius collapses
+/// to a single `[(0, radius)]` entry (a small scene stays level-0 only,
+/// pixel-identical to meshing it as plain chunks), while a large `radius`
+/// (e.g. matching the schedule's own outer ring) reproduces
+/// `DEFAULT_RING_SCHEDULE` exactly.
+pub fn schedule_for_radius(radius: i32) -> Vec<(u32, i32)> {
+    let mut schedule = Vec::new();
+    for &(level, outer) in DEFAULT_RING_SCHEDULE {
+        if outer >= radius {
+            schedule.push((level, radius));
+            break;
+        }
+        schedule.push((level, outer));
+    }
+    if schedule.is_empty() {
+        schedule.push((0, radius));
+    }
+    schedule
+}
+
 /// Squared horizontal chunk-space distance from a node's own center to the
 /// center of `center` (the player's chunk, not its minimum corner) -- the
 /// sort key [`plan_node_updates`] loads nearest-first by. Both centers are
@@ -377,5 +402,29 @@ mod tests {
         let updates = plan_node_updates(&resident, ChunkCoord::new(5, 0, 5), 0..=0, &schedule);
         assert!(!updates.to_unload.is_empty());
         assert!(updates.to_unload.iter().all(|n| resident.contains(n)));
+    }
+
+    #[test]
+    fn schedule_for_radius_collapses_to_level_0_under_the_first_ring() {
+        // Every current golden test uses a radius well under the first ring's
+        // own outer radius (10) -- this must stay a single level-0 entry, so
+        // meshing that region as nodes is pixel-identical to meshing it as
+        // plain chunks.
+        assert_eq!(schedule_for_radius(6), vec![(0, 6)]);
+        assert_eq!(schedule_for_radius(0), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn schedule_for_radius_reproduces_the_default_schedule_at_its_own_outer_radius() {
+        let last = DEFAULT_RING_SCHEDULE.last().unwrap();
+        assert_eq!(schedule_for_radius(last.1), DEFAULT_RING_SCHEDULE.to_vec());
+    }
+
+    #[test]
+    fn schedule_for_radius_clamps_the_ring_it_lands_in() {
+        // A radius strictly inside a later ring keeps every earlier ring
+        // untouched and clamps only the one it falls in.
+        let schedule = schedule_for_radius(15);
+        assert_eq!(schedule, vec![(0, 10), (1, 15)]);
     }
 }
