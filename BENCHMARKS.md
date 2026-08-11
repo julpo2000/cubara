@@ -68,8 +68,10 @@ frames after 200 warmup.
 | 2026-08-11 | Fixed-timestep tick loop + world RNG [#57], radius 64¹⁸ | 26,789 | 890,774 | ~903 | 0.783 ms | ~1.61 ms | `1283002` |
 | 2026-08-11 | Player AABB collision, gravity and walking [#53], radius 12¹⁹ | 1,282 | 424,352 | ~2,221 | 0.301 ms | ~0.71 ms | `3ba4c2d` |
 | 2026-08-11 | Player AABB collision, gravity and walking [#53], radius 64¹⁹ | 26,789 | 890,774 | ~898 | 0.785 ms | ~1.43 ms | `3ba4c2d` |
-| 2026-08-11 | Selected-block outline [#52], radius 12²⁰ | 1,282 | 424,352 | ~2,194 | 0.304 ms | ~0.81 ms | *(this PR)* |
-| 2026-08-11 | Selected-block outline [#52], radius 64²⁰ | 26,789 | 890,774 | ~905 | 0.774 ms | ~1.55 ms | *(this PR)* |
+| 2026-08-11 | Selected-block outline [#52], radius 12²⁰ | 1,282 | 424,352 | ~2,194 | 0.304 ms | ~0.81 ms | `1d16c5d` |
+| 2026-08-11 | Selected-block outline [#52], radius 64²⁰ | 26,789 | 890,774 | ~905 | 0.774 ms | ~1.55 ms | `1d16c5d` |
+| 2026-08-11 | Determinism harness [#90], radius 12²¹ | 1,282 | 424,352 | ~2,173 | 0.307 ms | ~0.96 ms | *(this PR)* |
+| 2026-08-11 | Determinism harness [#90], radius 64²¹ | 26,789 | 890,774 | ~903 | 0.771 ms | ~1.82 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -535,6 +537,20 @@ FPS, 0.785 → 0.774 ms). The golden test (`the_selected_block_shows_an_outline`
 is what actually exercises the new pipeline; it's a correctness check, not
 a perf one, and this row is recorded per the "every feature is measured"
 rule rather than because it's expected to move anything.
+
+²¹ **Determinism harness (issue #90) — sim/world crates only, render path
+untouched.** Adds `WorldHash` (FNV-1a over tick/RNG/player state and every
+chunk in an explicit region, in fixed ascending-`ChunkCoord` order) plus a
+committed replay fixture (`crates/sim/tests/determinism.rs`) that reaches
+the same known-constant hash whether its chunk hashing runs on one thread
+or several. None of this runs anywhere near `cargo run --release --
+--bench`, which never touches `cubara-sim` at all -- chunks/triangles/FPS/CPU
+are within normal small-scene noise of the previous row (radius 12: ~2,194 →
+~2,173 FPS, 0.304 → 0.307 ms; radius 64: ~905 → ~903 FPS, 0.774 → 0.771 ms),
+recorded per the "every feature is measured" rule. The real bar this block
+clears is `cargo test -p cubara-sim --test determinism`, not this table --
+see the PR for the manual verification that a deliberately-reintroduced
+merge-order bug actually fails it.
 
 ## Detailed run logs
 

@@ -8,11 +8,13 @@
 //! source (`scripts/check-architecture.sh` greps for both). GPU-free and
 //! window-free, so all of it is testable with no adapter and no window.
 
+mod hash;
 mod input;
 mod physics;
 mod player;
 mod rng;
 
+pub use hash::{hash_region, WorldHash};
 pub use input::InputFrame;
 pub use player::Player;
 pub use rng::WorldRng;
