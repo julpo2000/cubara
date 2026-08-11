@@ -46,10 +46,14 @@ fn zero_layer(_: &str) -> u32 {
     0
 }
 
-/// Local measurement (Apple M3, release build): a radius-64 load settles in
-/// ~1.3-1.4 seconds (see `BENCHMARKS.md`'s block-1.2 row for why that moved
-/// from ~250-270 ms). 120s leaves generous headroom for a slower or loaded CI
-/// runner without masking a genuine hang.
+/// Local measurement (Apple M3, debug build): a radius-64 load settles in
+/// ~87s since block 1.5's seeded noise + caves replaced the old sin/cos
+/// formula (see `BENCHMARKS.md` footnote 17 -- real per-voxel noise sampling
+/// costs real CPU, unlike three cheap trig calls per column). 120s is no
+/// longer "generous" at that baseline, so this scan runs on multiple threads
+/// (below) -- matching how the live game actually streams chunks (a worker
+/// pool, not one serial loop), which this budget should have been
+/// measuring against all along.
 const TIME_BUDGET: Duration = Duration::from_secs(120);
 
 /// Mirrors `cubara_render::arena::{VERTEX_CAPACITY, INDEX_CAPACITY}`. If those
@@ -63,52 +67,68 @@ fn radius_64_world_load_settles_within_budget() {
     let coords = streaming::desired_chunks(center, RADIUS, 0..=2);
     let total = coords.len() as u64;
 
-    // A plain atomic counter, polled from the test thread, so a timeout can
-    // report how far the background thread actually got instead of just that it
-    // didn't finish (the "report the number reached rather than hanging" design
-    // decision in issue #89).
+    // A plain atomic counter, incremented by every worker and polled from the
+    // test thread, so a timeout can report how far the workers actually got
+    // instead of just that they didn't finish (the "report the number
+    // reached rather than hanging" design decision in issue #89).
     let scanned = Arc::new(AtomicU64::new(0));
-    let scanned_writer = scanned.clone();
 
-    let handle = thread::spawn(move || {
-        let world = World::new();
-        let registry = test_registry();
-        // Single-material fixture: point grass/soil/stone at the same id so
-        // the depth rule doesn't introduce material-boundary quads that
-        // aren't there for a real registry either at this test's scope
-        // (settling time and arena capacity, not material rendering).
-        let stone = registry.id_of("cubara:stone").unwrap();
-        let blocks = TerrainBlocks {
-            grass: stone,
-            soil: stone,
-            stone,
-        };
-        let ctx = MeshContext {
-            registry: &registry,
-            layer_of: &zero_layer,
-        };
-        let mut chunks = 0u64;
-        let mut vertices = 0u64;
-        let mut indices = 0u64;
-        for coord in coords {
-            if let Some(chunk) = world.chunk_at(coord, blocks) {
-                let level = streaming::lod_for(coord, center);
-                let mesh = chunk.build_mesh_lod(&ctx, level);
-                if !mesh.indices.is_empty() {
-                    chunks += 1;
-                    vertices += mesh.vertices.len() as u64;
-                    indices += mesh.indices.len() as u64;
+    // Split the region across a worker per core, each generating + meshing
+    // its own slice against its own `World`/registry -- generation is a pure
+    // function of `(seed, coord)` (§8.1), so this needs no coordination
+    // between workers at all, the same property that lets the live game
+    // stream chunks off a background pool instead of the main thread.
+    let worker_count = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let slice_len = coords.len().div_ceil(worker_count);
+    let handles: Vec<_> = coords
+        .chunks(slice_len)
+        .map(|slice| slice.to_vec())
+        .map(|slice| {
+            let scanned = scanned.clone();
+            thread::spawn(move || {
+                let world = World::new();
+                let registry = test_registry();
+                // Single-material fixture: point grass/soil/stone at the same
+                // id so the depth rule doesn't introduce material-boundary
+                // quads that aren't there for a real registry either at this
+                // test's scope (settling time and arena capacity, not
+                // material rendering).
+                let stone = registry.id_of("cubara:stone").unwrap();
+                let blocks = TerrainBlocks {
+                    grass: stone,
+                    soil: stone,
+                    stone,
+                };
+                let ctx = MeshContext {
+                    registry: &registry,
+                    layer_of: &zero_layer,
+                };
+                let mut chunks = 0u64;
+                let mut vertices = 0u64;
+                let mut indices = 0u64;
+                for coord in slice {
+                    if let Some(chunk) = world.chunk_at(coord, blocks) {
+                        let level = streaming::lod_for(coord, center);
+                        let mesh = chunk.build_mesh_lod(&ctx, level);
+                        if !mesh.indices.is_empty() {
+                            chunks += 1;
+                            vertices += mesh.vertices.len() as u64;
+                            indices += mesh.indices.len() as u64;
+                        }
+                    }
+                    scanned.fetch_add(1, Ordering::Relaxed);
                 }
-            }
-            scanned_writer.fetch_add(1, Ordering::Relaxed);
-        }
-        (chunks, vertices, indices)
-    });
+                (chunks, vertices, indices)
+            })
+        })
+        .collect();
 
     let start = Instant::now();
-    let (chunks, vertices, indices) = loop {
-        if handle.is_finished() {
-            break handle.join().expect("world-load thread panicked");
+    loop {
+        if handles.iter().all(|h| h.is_finished()) {
+            break;
         }
         let elapsed = start.elapsed();
         if elapsed > TIME_BUDGET {
@@ -121,7 +141,13 @@ fn radius_64_world_load_settles_within_budget() {
             );
         }
         thread::sleep(Duration::from_millis(20));
-    };
+    }
+    let (chunks, vertices, indices) = handles
+        .into_iter()
+        .map(|h| h.join().expect("world-load thread panicked"))
+        .fold((0u64, 0u64, 0u64), |(ac, av, ai), (c, v, i)| {
+            (ac + c, av + v, ai + i)
+        });
 
     eprintln!(
         "radius {RADIUS} settled in {:?}: {chunks}/{total} chunks meshed, {vertices} vertices, \

@@ -465,12 +465,29 @@ The remaining gap was closed by tuning `CAVE_OCTAVES` down from 3 to 1 --
 one octave of 3D value noise still reads as real, organic-looking caves
 (see the `cave_mouth` golden and `terrain.png`, both of which now show
 visible cave openings), just cheaper per sample. With both fixes and the
-octave reduction: the smoke test settles in **~87s locally** (M3, debug
-build) -- real headroom under the 120s budget, not a near-miss. None of
-this touched the *shape* of the trade a golden-image change makes visible;
-it only removed CPU work the original implementation didn't need to do,
-which is why the render-side FPS/CPU numbers above moved by noise rather
-than by a fixed cost.
+octave reduction: the smoke test settled in **~87s locally** (M3, debug
+build) -- read as real headroom under the 120s budget, and it was, *for
+this machine*.
+
+**It wasn't enough on either CI runner.** First CI push: both macOS and
+Windows timed out at exactly 120s, ~40-41k/49,923 coordinates scanned on
+each -- consistent, not a flake, and both runners were measurably slower
+than the M3 for this workload (a software/virtualized-adapter story similar
+to block 1.4a's, this time about raw CPU rather than GPU). Squeezing more
+out of the noise itself (fewer octaves, cheaper hashing) was the wrong next
+lever: it trades further into visual quality for a machine-speed problem,
+not an algorithmic one. The actual fix was making the *smoke test* use more
+than one core: it was scanning its 49,923 coordinates on a single thread,
+which is not how the live game generates terrain at all (that's a worker
+pool, `cubara_render::mesher::MeshPool`, specifically so streaming doesn't
+block a frame) -- the single-threaded scan was measuring a workload shape
+nothing downstream of it actually has. Splitting the same scan across
+`std::thread::available_parallelism()` workers, each generating + meshing
+its own slice against its own `World` (no coordination needed at all, by
+§8.1's own pure-function contract), took the local M3 time from ~87s to
+**~19.5s** (6-way parallel, 607% CPU) -- comfortable headroom even against
+a CI runner meaningfully slower per core, and a more honest measurement of
+what the smoke test is supposed to be a stand-in for.
 
 ## Detailed run logs
 
