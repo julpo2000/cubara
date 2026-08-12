@@ -169,11 +169,18 @@ impl Game {
     /// live input themselves, so a scripted/replayed input sequence (block 1.8)
     /// reproduces exactly.
     ///
-    /// `jump`/`toggle_fly` are cleared after the *first* tick of a catch-up
-    /// burst, unlike the continuous fields -- they're rising edges from a
-    /// single real key press, and reusing the unmodified `InputFrame` for
-    /// every backlog tick (as the continuous fields correctly do) would
-    /// otherwise replay that one press once per catch-up tick.
+    /// `jump`/`toggle_fly`/`look_delta` are all cleared after the *first* tick
+    /// of a catch-up burst, unlike `move_axes` -- `move_axes` is a genuinely
+    /// continuous *held* state, correctly worth reapplying once per backlog
+    /// tick (N ticks of a key held down should move you N ticks' worth). The
+    /// other three are one-shot *accumulated totals* since the last call --
+    /// `jump`/`toggle_fly` from a single key press, `look_delta` from however
+    /// much the mouse moved -- and replaying an unmodified total on every tick
+    /// of a multi-tick burst would apply it that many times over. That bug
+    /// existed for `look_delta` until it was caught here: a frame-pacing
+    /// hiccup (more common on a laptop, e.g. under trackpad-driven input)
+    /// forces two or more ticks into one `advance` call, and every extra tick
+    /// silently multiplied that frame's mouse-look turn.
     pub fn advance(&mut self, dt: f32) {
         let mut input = InputFrame {
             move_axes: [
@@ -196,6 +203,7 @@ impl Game {
             self.sim.tick(Arc::make_mut(&mut self.world), &input);
             input.jump = false;
             input.toggle_fly = false;
+            input.look_delta = [0.0, 0.0];
             self.accumulator -= TICK_DT as f64;
             ticks += 1;
             if ticks >= MAX_TICKS_PER_FRAME {
@@ -346,6 +354,34 @@ mod tests {
         assert_eq!(game.sim.tick, 0, "half a tick's worth of time isn't a tick");
         game.advance(TICK_DT * 0.5);
         assert_eq!(game.sim.tick, 1, "the other half completes it");
+    }
+
+    #[test]
+    fn a_multi_tick_catch_up_burst_applies_mouse_look_only_once() {
+        // `look_delta` is a one-shot accumulated total (however far the mouse
+        // moved since the last frame), not a continuous held state like
+        // `move_axes` -- reusing the unmodified `InputFrame` across every
+        // tick of a catch-up burst (correct for `move_axes`) would multiply
+        // one frame's mouse motion by however many ticks ran. A frame-pacing
+        // hiccup forcing 2+ ticks into one `advance` call is more common on a
+        // laptop, which is exactly the symptom this bug produced: sporadic,
+        // inconsistent-feeling extra turns.
+        let mut single = Game::new();
+        single.mouse_look(1000.0, 0.0);
+        single.advance(TICK_DT); // exactly one tick
+
+        let mut burst = Game::new();
+        burst.mouse_look(1000.0, 0.0);
+        burst.advance(3.0 * TICK_DT); // three ticks in one catch-up burst
+
+        assert_eq!(single.sim.tick, 1);
+        assert_eq!(burst.sim.tick, 3);
+        assert_eq!(
+            single.sim.player.look_dir(),
+            burst.sim.player.look_dir(),
+            "the same single mouse-look delta must turn the player by the same \
+             amount regardless of how many ticks ran in the same `advance` call"
+        );
     }
 
     #[test]
