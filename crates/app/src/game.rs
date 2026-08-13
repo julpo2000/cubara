@@ -169,12 +169,36 @@ impl Game {
     /// live input themselves, so a scripted/replayed input sequence (block 1.8)
     /// reproduces exactly.
     ///
-    /// `jump`/`toggle_fly` are cleared after the *first* tick of a catch-up
-    /// burst, unlike the continuous fields -- they're rising edges from a
-    /// single real key press, and reusing the unmodified `InputFrame` for
-    /// every backlog tick (as the continuous fields correctly do) would
-    /// otherwise replay that one press once per catch-up tick.
+    /// The one-shot accumulated inputs -- `look_delta` (however far the mouse
+    /// moved since the last tick) and the `jump`/`toggle_fly` key edges -- are
+    /// held until a tick actually consumes them, and cleared after the *first*
+    /// tick of any catch-up burst. Two failure modes both come from getting
+    /// that wrong, and only `move_axes` (a genuinely *held* continuous state,
+    /// correctly re-applied once per backlog tick) is exempt:
+    ///
+    /// - **Draining them on a sub-tick frame drops them.** The renderer runs
+    ///   uncapped, so on a fast machine most frames are shorter than one 60 Hz
+    ///   tick and run zero ticks. Sampling+clearing the accumulators every
+    ///   frame (as this did) threw away ~59 of every 60 frames' mouse motion --
+    ///   you could barely look around at high FPS. So: bail out before touching
+    ///   them when there isn't a tick's worth of time yet.
+    /// - **Re-applying them on every tick of a burst multiplies them.** A
+    ///   frame-pacing hiccup forces 2+ ticks into one call; reusing the
+    ///   unmodified total each time (correct for held `move_axes`) would turn
+    ///   one frame's mouse motion, or one key press, into N. So: clear them
+    ///   after the first tick.
     pub fn advance(&mut self, dt: f32) {
+        self.accumulator += dt as f64;
+
+        // Not a tick's worth of time yet: leave the accumulated one-shot inputs
+        // alone so a later frame's tick can consume them, rather than sampling
+        // and clearing them here where no tick would apply them. `move_axes` is
+        // re-read from live held state on the frame that does tick, so nothing
+        // is lost by returning early.
+        if self.accumulator < TICK_DT as f64 {
+            return;
+        }
+
         let mut input = InputFrame {
             move_axes: [
                 (self.right as i32 - self.left as i32) as f32,
@@ -185,17 +209,18 @@ impl Game {
             jump: self.jump_pending,
             toggle_fly: self.fly_toggle_pending,
         };
+        // A tick below will consume these, so it's safe to clear them now.
         self.look_delta = (0.0, 0.0);
         self.jump_pending = false;
         self.fly_toggle_pending = false;
 
-        self.accumulator += dt as f64;
         let mut ticks = 0;
         while self.accumulator >= TICK_DT as f64 {
             self.prev_player = self.sim.player;
             self.sim.tick(Arc::make_mut(&mut self.world), &input);
             input.jump = false;
             input.toggle_fly = false;
+            input.look_delta = [0.0, 0.0];
             self.accumulator -= TICK_DT as f64;
             ticks += 1;
             if ticks >= MAX_TICKS_PER_FRAME {
@@ -346,6 +371,63 @@ mod tests {
         assert_eq!(game.sim.tick, 0, "half a tick's worth of time isn't a tick");
         game.advance(TICK_DT * 0.5);
         assert_eq!(game.sim.tick, 1, "the other half completes it");
+    }
+
+    #[test]
+    fn mouse_look_across_sub_tick_frames_is_not_dropped() {
+        // The reported "can't look around on a fast machine" bug. The renderer
+        // runs uncapped, so at high FPS most frames are shorter than one 60 Hz
+        // tick and run zero ticks. Mouse motion arriving on those frames must
+        // accumulate until a tick consumes it -- not be sampled and discarded
+        // frame by frame, which dropped nearly all of it on a fast GPU.
+        let mut spread = Game::new();
+        for _ in 0..5 {
+            spread.mouse_look(100.0, 0.0);
+            spread.advance(TICK_DT * 0.1); // sub-tick: no tick runs yet
+        }
+        assert_eq!(
+            spread.sim.tick, 0,
+            "5 * 0.1 tick < one tick: nothing simulated"
+        );
+        spread.advance(TICK_DT); // now cross the threshold -> exactly one tick
+        assert_eq!(spread.sim.tick, 1);
+
+        // The same 500 px of motion delivered in a single tick-sized frame.
+        let mut once = Game::new();
+        once.mouse_look(500.0, 0.0);
+        once.advance(TICK_DT);
+        assert_eq!(once.sim.tick, 1);
+
+        assert_eq!(
+            spread.sim.player.look_dir(),
+            once.sim.player.look_dir(),
+            "mouse motion spread over sub-tick frames must turn the player by \
+             the same total as the same motion in one frame -- none dropped"
+        );
+    }
+
+    #[test]
+    fn a_multi_tick_catch_up_burst_applies_mouse_look_only_once() {
+        // The opposite failure: `look_delta` is a one-shot accumulated total,
+        // not a held state like `move_axes`. Reusing the unmodified frame across
+        // every tick of a catch-up burst would multiply one frame's mouse motion
+        // by however many ticks ran -- sporadic, inconsistent-feeling turns.
+        let mut single = Game::new();
+        single.mouse_look(1000.0, 0.0);
+        single.advance(TICK_DT); // exactly one tick
+
+        let mut burst = Game::new();
+        burst.mouse_look(1000.0, 0.0);
+        burst.advance(3.0 * TICK_DT); // three ticks in one catch-up burst
+
+        assert_eq!(single.sim.tick, 1);
+        assert_eq!(burst.sim.tick, 3);
+        assert_eq!(
+            single.sim.player.look_dir(),
+            burst.sim.player.look_dir(),
+            "the same single mouse-look delta must turn the player by the same \
+             amount regardless of how many ticks ran in the same `advance` call"
+        );
     }
 
     #[test]
