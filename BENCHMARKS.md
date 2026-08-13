@@ -84,8 +84,9 @@ frames after 200 warmup.
 | 2026-08-11 | **Ring schedule tuned to the <2,000-draw budget** [#109], radius 64²⁷ | **1,585** | 829,608 | ~1,295 | 0.526 ms | ~1.12 ms | `1e84478` |
 | 2026-08-11 | `cubara-render` drops its `cubara-world` dependency [#110], radius 12²⁸ | 957 | 367,026 | ~2,402 | 0.265 ms | ~1.10 ms | `0fe7e7d` |
 | 2026-08-11 | `cubara-render` drops its `cubara-world` dependency [#110], radius 64²⁸ | 1,585 | 829,608 | ~1,291 | 0.531 ms | ~1.11 ms | `0fe7e7d` |
-| 2026-08-11 | Arena capacity re-sized for the node tree [#111], radius 12²⁹ | 957 | 367,026 | ~2,474 | 0.270 ms | ~0.92 ms | *(this PR)* |
-| 2026-08-11 | Arena capacity re-sized for the node tree [#111], radius 64²⁹ | 1,585 | 829,608 | ~1,275 | 0.535 ms | ~1.50 ms | *(this PR)* |
+| 2026-08-11 | Arena capacity re-sized for the node tree [#111], radius 12²⁹ | 957 | 367,026 | ~2,474 | 0.270 ms | ~0.92 ms | `da55704` |
+| 2026-08-11 | Arena capacity re-sized for the node tree [#111], radius 64²⁹ | 1,585 | 829,608 | ~1,275 | 0.535 ms | ~1.50 ms | `da55704` |
+| 2026-08-13 | **Block 1.10 complete — node-tree closeout / phase-gate verification** [#38], radius 64³⁰ | 1,585 | 829,608 | ~3,300 | **0.126 ms** | ~0.49 ms | `851e639` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -770,6 +771,32 @@ region exceeds arena capacity: draws` line and correctly clamps the drawn
 set to 1,000/1,585 rather than silently corrupting anything — then reverted.
 `--bench 64` at the real (4,096) capacity logs zero exhaustion warnings, as
 required.
+
+³⁰ **Block 1.10 closeout — the phase-1 gate verified end to end (issue #38,
+all 7 sub-issues merged).** Not new code — HEAD (`851e639`) is `da55704`
+plus one CI-script fix (#119), so the scene is byte-identical to the #111
+rows above. This row records the acceptance run for the tracking issue:
+
+- `./scripts/check-phase-gate.sh 1` → **12 passed, 0 failed** (`cargo test
+  --all`, clippy, fmt, both architecture checks, determinism replay, all
+  three golden images incl. the LOD boundary, player-AABB, cross-platform
+  bit-identical chunk, neighbour isolation, save round-trip).
+- **Drawn-node count at radius 64: 1,341 / 1,585 — decisively under the
+  2,000-draw budget** that §2/§6 named as the whole point of the block
+  (down 16× from the #89 baseline's 25,131 per-chunk draws).
+- Golden `no_crack_at_a_real_lod_boundary` green → skirts hide the LOD seam.
+
+**Honest measurement discrepancy, flagged not smoothed:** three back-to-back
+`--bench 64` runs here read a *tight* 3,153–3,580 FPS / 0.123–0.129 ms
+CPU/frame — roughly **4× faster on CPU/frame than the #111 radius-64 row
+(0.535 ms) two days earlier, on effectively identical code.** That gap is far
+larger than clock-ramp noise (CLAUDE.md: FPS ramps, but CPU/frame is meant to
+be the *stable* metric), so it is a warm-burst-vs-cold or machine-state
+measurement-condition difference, **not a claimed speedup** — the node tree
+changes nothing here since #110/#111. Recorded ~3,300 / 0.126 ms as the
+representative of this burst; the owner's macOS M3 cold row is the tie-breaker
+on which regime is real. The load-bearing number for the block — drawn nodes
+< 2,000 — holds under every run regardless.
 
 Both radii land within measurement noise of the immediately preceding row
 (#110, `0fe7e7d`): radius 12 nodes/tris unchanged (957/367,026), FPS ~2,402 →
