@@ -296,6 +296,10 @@ fn greedy_mesh(
     let mut mesh = Mesh::default();
     // `mask[v * n + u]`: the face at each slice cell.
     let mut mask = vec![NO_CELL; (n * n) as usize];
+    // The same grid, captured before the merge loop consumes `mask`: does
+    // this cell own a real face? A skirt must never cover a cell that does
+    // -- see `push_skirt`.
+    let mut has_own_face = vec![false; (n * n) as usize];
 
     for d in 0..3usize {
         let u = (d + 1) % 3;
@@ -343,6 +347,10 @@ fn greedy_mesh(
 
             pos[d] += 1; // advance to the face plane
 
+            for (owns, cell) in has_own_face.iter_mut().zip(mask.iter()) {
+                *owns = cell.sign != 0;
+            }
+
             // Greedily merge the mask into quads.
             let mut j = 0i32;
             while j < n {
@@ -373,7 +381,22 @@ fn greedy_mesh(
                     push_quad(
                         &mut mesh, d, u, v, pos[d], i, j, w, h, m.sign, m.ao, m.block, ctx, scale,
                     );
-                    push_skirt(&mut mesh, d, u, v, pos[d], i, j, w, h, n, m, ctx, scale);
+                    push_skirt(
+                        &mut mesh,
+                        d,
+                        u,
+                        v,
+                        pos[d],
+                        i,
+                        j,
+                        w,
+                        h,
+                        n,
+                        m,
+                        ctx,
+                        scale,
+                        &has_own_face,
+                    );
 
                     // Consume the merged cells.
                     for l in 0..h {
@@ -546,6 +569,19 @@ fn push_quad(
 /// bottom is already at the lattice floor (`i`/`j` == 0): nothing there to
 /// extend into without a negative, unrepresentable coordinate, and a wall
 /// reaching the floor has no gap to hide anyway.
+///
+/// **And no-op over any cell that already owns a face** (`has_own_face`,
+/// the mask snapshotted before the merge loop consumed it). "Base above the
+/// lattice floor" is not the same question as "there is a crack here". A
+/// node's own border plane treats the outside as air, so *every* solid cell
+/// on it emits a face; a material change (dirt over stone) splits the greedy
+/// mask there, leaving the upper quad's base above the floor with the lower
+/// material's own real face directly beneath it. Skirting into that cell
+/// puts two coplanar, same-facing quads over it -- a z-fight that shows
+/// in-game as two textures flickering through each other along a node
+/// boundary. The cells below a quad are checked individually and the skirt
+/// is emitted only over the contiguous runs that are genuinely uncovered,
+/// so a wall that is part-exposed still gets a skirt where it needs one.
 #[allow(clippy::too_many_arguments)]
 fn push_skirt(
     mesh: &mut Mesh,
@@ -561,45 +597,46 @@ fn push_skirt(
     m: MaskCell,
     ctx: &MeshContext,
     scale: i32,
+    has_own_face: &[bool],
 ) {
     if d == 1 || (plane != 0 && plane != n) {
         return;
     }
-    if d == 0 {
-        if i > 0 {
-            push_quad(
-                mesh,
-                d,
-                u,
-                v,
-                plane,
-                i - 1,
-                j,
-                1,
-                h,
-                m.sign,
-                m.ao,
-                m.block,
-                ctx,
-                scale,
-            );
+
+    // The strip of cells one step below the quad, in mask coordinates, and
+    // the length of that strip. `d == 0` walls extend down the u axis (a
+    // 1-by-run quad); `d == 2` walls extend down the v axis (run-by-1).
+    if (d == 0 && i == 0) || (d != 0 && j == 0) {
+        return;
+    }
+    let span = if d == 0 { h } else { w };
+    let cell = |k: i32| -> usize {
+        if d == 0 {
+            ((j + k) * n + (i - 1)) as usize
+        } else {
+            ((j - 1) * n + (i + k)) as usize
         }
-    } else if j > 0 {
+    };
+
+    // Emit only over contiguous runs of cells that own no face of their own.
+    let mut k = 0i32;
+    while k < span {
+        if has_own_face[cell(k)] {
+            k += 1;
+            continue;
+        }
+        let start = k;
+        while k < span && !has_own_face[cell(k)] {
+            k += 1;
+        }
+        let run = k - start;
+        let (qi, qj, qw, qh) = if d == 0 {
+            (i - 1, j + start, 1, run)
+        } else {
+            (i + start, j - 1, run, 1)
+        };
         push_quad(
-            mesh,
-            d,
-            u,
-            v,
-            plane,
-            i,
-            j - 1,
-            w,
-            1,
-            m.sign,
-            m.ao,
-            m.block,
-            ctx,
-            scale,
+            mesh, d, u, v, plane, qi, qj, qw, qh, m.sign, m.ao, m.block, ctx, scale,
         );
     }
 }
@@ -729,6 +766,109 @@ mod tests {
                 && quad.iter().map(|v| v.y()).max() == Some(8)
         });
         assert!(has_skirt, "expected a one-cell skirt quad at y in [7, 8)");
+    }
+
+    /// A registry with two distinct materials, so a stacked pair of blocks
+    /// splits the greedy mask instead of merging into one quad -- which is
+    /// what real terrain (dirt over stone) does at every node edge.
+    fn two_material_registry() -> BlockRegistry {
+        let mat = |name: &str, tex: &str| {
+            (
+                std::path::PathBuf::from("test-fixture.ron"),
+                Material {
+                    name: name.to_string(),
+                    solid: true,
+                    faces: Faces::All(tex.to_string()),
+                    shapes: vec![Shape::Full],
+                },
+            )
+        };
+        BlockRegistry::from_materials(vec![
+            mat("cubara:stone", "stone"),
+            mat("cubara:dirt", "dirt"),
+        ])
+        .expect("fixture registry is valid")
+    }
+
+    fn layer_per_texture(name: &str) -> u32 {
+        match name {
+            "stone" => 0,
+            "dirt" => 1,
+            other => panic!("unexpected texture {other}"),
+        }
+    }
+
+    /// Every (face, cell) a quad covers, with the texture layer that covers
+    /// it. Two entries under one key means two coplanar, same-facing quads
+    /// overlap -- which is exactly what z-fights on the GPU.
+    fn coverage(mesh: &Mesh) -> std::collections::HashMap<(Face, u32, u32, u32), Vec<u32>> {
+        let mut covered: std::collections::HashMap<(Face, u32, u32, u32), Vec<u32>> =
+            std::collections::HashMap::new();
+        for quad in mesh.vertices.as_chunks::<4>().0 {
+            let face = quad[0].face();
+            let layer = quad[0].tex_layer();
+            let (xs, ys, zs) = (
+                quad.iter().map(|v| v.x()),
+                quad.iter().map(|v| v.y()),
+                quad.iter().map(|v| v.z()),
+            );
+            let (x0, x1) = (xs.clone().min().unwrap(), xs.max().unwrap());
+            let (y0, y1) = (ys.clone().min().unwrap(), ys.max().unwrap());
+            let (z0, z1) = (zs.clone().min().unwrap(), zs.max().unwrap());
+            // A quad is flat in one axis; the cells it covers span the other
+            // two. `max` is the far corner, so the cell range is `min..max`.
+            for x in x0..x1.max(x0 + 1) {
+                for y in y0..y1.max(y0 + 1) {
+                    for z in z0..z1.max(z0 + 1) {
+                        covered.entry((face, x, y, z)).or_default().push(layer);
+                    }
+                }
+            }
+        }
+        covered
+    }
+
+    #[test]
+    fn a_skirt_never_covers_a_cell_that_already_has_its_own_face() {
+        // Real terrain at a node edge is not solid-over-air; it is one
+        // material stacked on another, and *both* are exposed, because a
+        // node's own border plane treats the outside as air and so emits a
+        // face for every solid cell on it.
+        //
+        // The greedy mask splits at the material change, so the upper quad's
+        // base sits above the lattice floor -- which is precisely the
+        // condition `push_skirt` reads as "this wall needs a skirt". It then
+        // extends the upper material one cell down, over a cell the lower
+        // material already covers with a real face of its own. Two coplanar,
+        // same-facing quads with different textures is a z-fight, and it is
+        // what shows up in-game as dirt and stone flickering through each
+        // other along a node boundary.
+        let chunk = Chunk::from_fn(|x, y, _| {
+            if x != 0 {
+                BlockId::AIR
+            } else if y >= 8 {
+                BlockId(2) // dirt
+            } else {
+                BlockId(1) // stone
+            }
+        });
+        let registry = two_material_registry();
+        let ctx = MeshContext {
+            registry: &registry,
+            layer_of: &layer_per_texture,
+        };
+        let mesh = chunk.build_mesh(&ctx);
+
+        let overlaps: Vec<_> = coverage(&mesh)
+            .into_iter()
+            .filter(|(_, layers)| layers.len() > 1)
+            .collect();
+        assert!(
+            overlaps.is_empty(),
+            "{} cells are covered by more than one coplanar quad, e.g. {:?}",
+            overlaps.len(),
+            overlaps.first().unwrap()
+        );
     }
 
     #[test]
