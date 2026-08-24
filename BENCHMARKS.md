@@ -43,6 +43,8 @@ frames after 200 warmup.
 | 2026-08-13 | Block 1.10 complete — node-tree closeout / phase-gate verification [#38], radius 64³⁰ | 1,585 | 829,608 | ~3,300 | 0.126 ms | ~0.49 ms | `851e639` |
 | 2026-08-24 | **Phase 1 exit gate — 12/12 on Windows** [#38], radius 12³¹ | 957 | 367,026 | ~4,888 | **0.088 ms** | ~0.39 ms | `e60e9c2` |
 | 2026-08-24 | **Phase 1 exit gate — 12/12 on Windows** [#38], radius 64³¹ | **1,585** | 829,608 | **~3,579** | **0.102 ms** | ~0.38 ms | `e60e9c2` |
+| 2026-08-24 | Skirt no longer overlaps a real face [#125], radius 12³² | 957 | **331,510** | ~4,771 | 0.089 ms | ~0.42 ms | `3af8d3b` |
+| 2026-08-24 | **Skirt no longer overlaps a real face** [#125], radius 64³² | 1,585 | **758,754** | ~3,665 | 0.112 ms | ~0.45 ms | `3af8d3b` |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -852,6 +854,34 @@ after frustum cull — under the 2,000-draw budget). The only code since is
 `e60e9c2`, the sub-tick mouse-look fix (#122), which touches input handling in
 the app and not the render or streaming path; the identical node/triangle counts
 confirm it.
+
+³² **The skirt overlap fix (#125) — ~9% of the geometry was redundant, and the
+frame cost did not notice.** Reported in-game as dirt and stone flickering
+through each other along node boundaries: skirts were being emitted over cells
+that already had a real face, so two coplanar same-facing quads z-fought. Those
+skirts hid no crack; they were duplicates.
+
+| Radius | Tris before | Tris after | Delta | FPS | CPU/frame |
+|---|---|---|---|---|---|
+| 12 | 367,026 | **331,510** | **-35,516 (-9.7%)** | ~4,888 → ~4,771 | 0.088 → 0.089 ms |
+| 64 | 829,608 | **758,754** | **-70,854 (-8.5%)** | ~3,579 → ~3,665 | 0.102 → 0.112 ms |
+
+**The triangle counts are the real number here; the FPS and CPU/frame columns
+are not.** Triangle count is deterministic — it reads identically on every run,
+and ≈8-10% of the scene's geometry was duplicate quads. CPU/frame moved by
+0.001-0.010 ms, which is inside the spread the same binary produces run to run
+(radius 64 read 0.105-0.113 ms across three runs here, against 0.102-0.156 ms
+for the pre-fix rows), so **no speedup is claimed** — this scene is submit-bound
+and 70k triangles is not what binds it. Node and draw counts are unchanged
+(1,585 / 1,341 drawn), which is the expected shape: the fix removes geometry
+*within* nodes, and draw count is what this scene is actually sensitive to.
+
+The correctness result is the point, and it is pinned by a test rather than by
+this row: `a_skirt_never_covers_a_cell_that_already_has_its_own_face` fails on
+the old code with 18 doubly-covered cells. No golden image was regenerated —
+`no_crack_at_a_real_lod_boundary` passes against the committed reference
+unchanged, on both CI backends, so the crack-hiding the skirts exist for is
+intact.
 
 ## Detailed run logs
 
