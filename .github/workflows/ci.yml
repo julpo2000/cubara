@@ -55,8 +55,13 @@ jobs:
         run: cargo clippy --all-targets --all-features
       - name: Build
         run: cargo build --all-targets
+      # `--skip`: the radius-64 smoke test gets its own step below, which runs it
+      # with output shown. Without the skip it ran *twice* per job -- once here
+      # silently, once there -- doubling both its cost (the slowest single test
+      # in CI, ~79s on the macOS runner) and its exposure to a timing flake, for
+      # no extra coverage. See issue #138.
       - name: Test
-        run: cargo test --all
+        run: cargo test --all -- --skip radius_64_world_load_settles_within_budget
       # Re-run just the golden tests with output shown. `cargo test` captures
       # stderr for *passing* tests, so without this the measured image deltas are
       # invisible until something already fails. The reference is generated on one
@@ -70,5 +75,10 @@ jobs:
       # and meshed with no GPU involved, bounded so a regression that turns
       # worldgen/meshing into a hang or an unbounded blow-up fails loudly instead
       # of quietly burning the job's time limit.
+      #
+      # --nocapture so the settle time is printed on a *passing* run, not only
+      # when it fails: "is the margin shrinking?" should be a question with an
+      # answer in the log. That is how the current budget was derived (#138).
+      # This is the only place this test runs -- see the skip above.
       - name: Radius-64 world-load smoke test
         run: cargo test -p cubara-world --test radius_64_smoke -- --nocapture

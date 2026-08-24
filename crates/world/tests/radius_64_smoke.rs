@@ -46,15 +46,34 @@ fn zero_layer(_: &str) -> u32 {
     0
 }
 
-/// Local measurement (Apple M3, debug build): a radius-64 load settles in
-/// ~87s since block 1.5's seeded noise + caves replaced the old sin/cos
-/// formula (see `BENCHMARKS.md` footnote 17 -- real per-voxel noise sampling
-/// costs real CPU, unlike three cheap trig calls per column). 120s is no
-/// longer "generous" at that baseline, so this scan runs on multiple threads
-/// (below) -- matching how the live game actually streams chunks (a worker
-/// pool, not one serial loop), which this budget should have been
-/// measuring against all along.
-const TIME_BUDGET: Duration = Duration::from_secs(120);
+/// What this bound is for: catching a change that turns worldgen or meshing
+/// into a **hang or an unbounded blow-up**, loudly, instead of quietly burning
+/// the CI job's own time limit (issue #89). It is not a performance budget --
+/// the perf gate is `--bench 64`, and it deliberately does not run in CI
+/// because these runners have no representative GPU.
+///
+/// **Derived from measurement, not from taste** (issue #138). The number that
+/// matters is the slowest machine it has to pass on:
+///
+/// | Where | Settle time, debug build |
+/// |---|---|
+/// | Win11 / i7-12650H | 11.2s |
+/// | macOS M3, when this test was first tuned | ~19.5s |
+/// | **macOS CI runner** | **79s** |
+///
+/// The old 120s left ~1.5x margin over that CI figure, and it flaked twice on
+/// 2026-08-24 -- both times on PRs that could not have caused it (one was
+/// docs-only). A test that fires spuriously gets re-run by reflex, and the
+/// reflex outlives the reason; this project treats a muted test as worse than
+/// no test.
+///
+/// 300s is ~3.8x the slowest measurement, and still nowhere near what it is
+/// actually watching for: a hang does not finish in 300s either.
+///
+/// The scan runs on multiple threads (below), matching how the live game
+/// streams chunks -- a worker pool, not one serial loop -- which is the
+/// workload shape this should have been measuring all along.
+const TIME_BUDGET: Duration = Duration::from_secs(300);
 
 /// Mirrors `cubara_render::arena::{VERTEX_CAPACITY, INDEX_CAPACITY}`. If those
 /// change, check whether this bound should move too.
@@ -134,10 +153,17 @@ fn radius_64_world_load_settles_within_budget() {
         if elapsed > TIME_BUDGET {
             let reached = scanned.load(Ordering::Relaxed);
             panic!(
-                "radius-{RADIUS} world load did not settle within {TIME_BUDGET:?} -- reached \
-                 {reached}/{total} coordinates scanned before the bound tripped. This is the \
-                 bound issue #89 exists to enforce, not a spurious CI flake: worldgen or \
-                 meshing has regressed into a hang or a severe slowdown."
+                "radius-{RADIUS} world load did not settle within {TIME_BUDGET:?} -- \
+                 reached {reached}/{total} coordinates scanned before the bound \
+                 tripped.\n\n\
+                 Two readings, and the progress figure tells them apart:\n\
+                 - far short of {total}: worldgen or meshing has regressed into a \
+                 hang or an unbounded blow-up. That is what issue #89 put this \
+                 bound here to catch.\n\
+                 - close to {total}: the machine was slower than the budget \
+                 assumes. TIME_BUDGET is derived from a measured worst case, so \
+                 this should be rare -- if it recurs, re-measure and move the \
+                 number with the data, rather than re-running until it passes."
             );
         }
         thread::sleep(Duration::from_millis(20));
