@@ -114,6 +114,19 @@ const TOLERANCE: u8 = 12;
 /// question whether the shot should be that grazing, not to keep nudging the
 /// number.
 ///
+/// **The rule this number now lives under, so the next person does not have to
+/// re-derive it:** raising this threshold is spending the sensitivity of the
+/// only automated test that covers rendering at all. It is worth spending to
+/// fix a defect — the mip bump above bought the horizon not shimmering. It is
+/// not worth spending on something that only looks nicer, because a threshold
+/// wide enough to admit cosmetic churn is a threshold too wide to catch the
+/// regression it exists for.
+///
+/// 4x MSAA is the concrete case that was declined on exactly this basis; see
+/// issue #132 for the numbers and the argument, including why "render the
+/// goldens without it" is not a way out (it makes two render paths, which
+/// `ARCHITECTURE.md` Rule 5 and `scripts/check-single-render-path.sh` forbid).
+///
 /// **The reference set moved from macOS/Metal to Windows/Vulkan** when the mip
 /// chain landed, because that is the machine it was re-blessed on. The whole
 /// set moved together rather than splitting across two backends: two of the
