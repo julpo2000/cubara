@@ -20,9 +20,12 @@ cargo run --release -- --bench
 ```
 
 The run ends with a `SUMMARY:` line (FPS, CPU/frame avg + p99, chunks, gate).
-Add a row to the history table for the machine it ran on, with the milestone/
-feature and the commit (`git rev-parse --short HEAD`). New feature PRs should
-append a Windows row; the macOS M3 machine gets a row when it's run there.
+Add a row to the history table **for the machine it actually ran on**, with the
+milestone/feature and the commit (`git rev-parse --short HEAD`) — the two tables
+are different hardware, so a row in the wrong one turns a machine difference into
+a phantom regression or speedup (this happened once; see footnote ³⁰). A session
+records a row for whichever machine it is on; the other machine's row lands when
+the work is next run there.
 
 ## Performance history
 
@@ -37,6 +40,9 @@ frames after 200 warmup.
 | 2026-07-18 | M2 — frustum culling (baseline) | 137 | 22,788 | 8097 | 0.083 ms | 0.350 ms | `0ab6034` |
 | 2026-07-18 | M3 — streaming foundation (no scene change) | 137 | 22,788 | ~11,100¹ | 0.077 ms | ~0.29 ms | `7a249d2` |
 | 2026-07-19 | M3 — streaming renderer (heavy scene) | 1,349 | 217,550 | ~1,980² | ~0.49 ms | ~1.16 ms | `ae0ebea` |
+| 2026-08-13 | Block 1.10 complete — node-tree closeout / phase-gate verification [#38], radius 64³⁰ | 1,585 | 829,608 | ~3,300 | 0.126 ms | ~0.49 ms | `851e639` |
+| 2026-08-24 | **Phase 1 exit gate — 12/12 on Windows** [#38], radius 12³¹ | 957 | 367,026 | ~4,888 | **0.088 ms** | ~0.39 ms | `e60e9c2` |
+| 2026-08-24 | **Phase 1 exit gate — 12/12 on Windows** [#38], radius 64³¹ | **1,585** | 829,608 | **~3,579** | **0.102 ms** | ~0.38 ms | `e60e9c2` |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -86,7 +92,6 @@ frames after 200 warmup.
 | 2026-08-11 | `cubara-render` drops its `cubara-world` dependency [#110], radius 64²⁸ | 1,585 | 829,608 | ~1,291 | 0.531 ms | ~1.11 ms | `0fe7e7d` |
 | 2026-08-11 | Arena capacity re-sized for the node tree [#111], radius 12²⁹ | 957 | 367,026 | ~2,474 | 0.270 ms | ~0.92 ms | `da55704` |
 | 2026-08-11 | Arena capacity re-sized for the node tree [#111], radius 64²⁹ | 1,585 | 829,608 | ~1,275 | 0.535 ms | ~1.50 ms | `da55704` |
-| 2026-08-13 | **Block 1.10 complete — node-tree closeout / phase-gate verification** [#38], radius 64³⁰ | 1,585 | 829,608 | ~3,300 | **0.126 ms** | ~0.49 ms | `851e639` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -772,6 +777,12 @@ set to 1,000/1,585 rather than silently corrupting anything — then reverted.
 `--bench 64` at the real (4,096) capacity logs zero exhaustion warnings, as
 required.
 
+Both radii land within measurement noise of the immediately preceding row
+(#110, `0fe7e7d`): radius 12 nodes/tris unchanged (957/367,026), FPS ~2,402 →
+~2,474; radius 64 nodes/tris unchanged (1,585/829,608), FPS ~1,291 → ~1,275.
+As expected for a sizing-only change — the constants only bind when a scene
+is *close to* the old capacities, and this scene never was.
+
 ³⁰ **Block 1.10 closeout — the phase-1 gate verified end to end (issue #38,
 all 7 sub-issues merged).** Not new code — HEAD (`851e639`) is `da55704`
 plus one CI-script fix (#119), so the scene is byte-identical to the #111
@@ -786,23 +797,61 @@ rows above. This row records the acceptance run for the tracking issue:
   (down 16× from the #89 baseline's 25,131 per-chunk draws).
 - Golden `no_crack_at_a_real_lod_boundary` green → skirts hide the LOD seam.
 
-**Honest measurement discrepancy, flagged not smoothed:** three back-to-back
-`--bench 64` runs here read a *tight* 3,153–3,580 FPS / 0.123–0.129 ms
-CPU/frame — roughly **4× faster on CPU/frame than the #111 radius-64 row
-(0.535 ms) two days earlier, on effectively identical code.** That gap is far
-larger than clock-ramp noise (CLAUDE.md: FPS ramps, but CPU/frame is meant to
-be the *stable* metric), so it is a warm-burst-vs-cold or machine-state
-measurement-condition difference, **not a claimed speedup** — the node tree
-changes nothing here since #110/#111. Recorded ~3,300 / 0.126 ms as the
-representative of this burst; the owner's macOS M3 cold row is the tie-breaker
-on which regime is real. The load-bearing number for the block — drawn nodes
-< 2,000 — holds under every run regardless.
+**The "unexplained 4× discrepancy" this footnote originally flagged is
+resolved: it was a different machine.** As first written, this row sat in the
+macOS M3 table and reported a *tight* 3,153–3,580 FPS / 0.123–0.129 ms
+CPU/frame — ~4× faster on CPU/frame than the #111 radius-64 row (0.535 ms) two
+days earlier on effectively identical code — which the footnote attributed,
+honestly but wrongly, to a warm-burst-vs-cold measurement regime. It was not a
+measurement regime. PR #121's own body records the run as *"this machine —
+Win11, i7-12650H / RTX 4060"*: it is a **Windows** measurement that was
+appended to the **macOS** table, where the M3 rows around it made it look like
+a 4× speedup out of nowhere. The row has been moved to the Windows table above,
+and the 2026-08-24 gate rows confirm the reading — a *cold* Windows run at the
+same scene and effectively the same code lands at 3,311–3,739 FPS / 0.102–0.156
+ms, i.e. exactly the "warm burst" regime, first run after idle. Windows/RTX 4060
+is simply ~4-5× cheaper per frame than M3 on this scene. Nothing regressed and
+nothing sped up. The load-bearing number for the block — drawn nodes < 2,000 —
+held under every run regardless, which is why the block's conclusion is
+unaffected.
 
-Both radii land within measurement noise of the immediately preceding row
-(#110, `0fe7e7d`): radius 12 nodes/tris unchanged (957/367,026), FPS ~2,402 →
-~2,474; radius 64 nodes/tris unchanged (1,585/829,608), FPS ~1,291 → ~1,275.
-As expected for a sizing-only change — the constants only bind when a scene
-is *close to* the old capacities, and this scene never was.
+³¹ **Phase 1's exit gate, run on the Windows machine — the half that was
+missing.** Every phase-1 feature row above sits in the macOS M3 table because
+that is where the work was done; the Windows table had nothing newer than July.
+ROADMAP.md's gate says *run on both machines, with a `BENCHMARKS.md` row for
+each*, so these two rows are that second machine, at HEAD `e60e9c2`.
+
+```
+./scripts/check-phase-gate.sh 1  →  12 passed, 0 failed
+GPU: NVIDIA GeForce RTX 4060 Laptop GPU (Vulkan, driver 581.42)
+SUMMARY: 3579 FPS | CPU/frame avg 0.102 ms (p99 0.384) | 1341/1585 nodes | 1000-FPS gate MET
+```
+
+All twelve criteria pass: `cargo test --all`, clippy, fmt, both architecture
+checks, `--bench 64` ≥ 1000 FPS, the determinism replay (single- vs
+multi-threaded, identical hash), all three golden images including the LOD
+boundary, player-AABB tunnelling, the cross-platform bit-identical chunk,
+neighbour isolation, and the save round-trip.
+
+**Spread (cold, first-run-after-idle, then back-to-back):** radius 64 read
+3,311–3,739 FPS / 0.102–0.156 ms CPU/frame across four runs (median ~3,579 FPS; the
+recorded run is 0.102 ms / p99 0.384); radius 12 read 4,774–5,053 FPS / 0.086–0.090 ms across
+three (recorded ~4,888 / 0.088 ms). The one 0.156 ms outlier carries a p99 of
+1.398 ms against ~0.39 ms elsewhere — a scheduling hiccup in that run, not a
+regime.
+
+**Against the macOS M3 rows for the same commit-era scene** (`da55704`, byte-identical
+scene: 1,585 nodes / 829,608 tris): M3 ~1,275 FPS / 0.535 ms → Windows ~3,579 FPS
+/ 0.102 ms. That is a **machine** difference (discrete RTX 4060 vs integrated M3
+at a scene that is submit-bound), not a change in the engine — see ³⁰, where the
+same gap was briefly mistaken for a speedup. Both machines clear the 1000-FPS
+gate at radius 64: M3 with ~1.3× margin, Windows with ~3.6×.
+
+Scene is unchanged from `da55704` (1,585 nodes, 829,608 triangles, 1,341 drawn
+after frustum cull — under the 2,000-draw budget). The only code since is
+`e60e9c2`, the sub-tick mouse-look fix (#122), which touches input handling in
+the app and not the render or streaming path; the identical node/triangle counts
+confirm it.
 
 ## Detailed run logs
 
