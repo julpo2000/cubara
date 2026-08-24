@@ -49,7 +49,7 @@ Phase $phase — next block:
 
 Before writing code:
   - ROADMAP.md, the phase $phase block table -- what this block is for
-  - docs/PHASE1_ARCHITECTURE.md -- the decisions it implements, already made
+  - docs/PHASE${phase}_ARCHITECTURE.md -- the decisions it implements, already made
   - the issue itself: its Design decisions section is binding, not advisory
 
 Then: branch, implement, test, PR, wait for CI, merge. One block, one arc.

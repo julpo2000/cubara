@@ -46,7 +46,10 @@ blocks inside it, and the **exit gate** that decides when it is finished. Phase 
 also has a full design in
 [`docs/PHASE1_ARCHITECTURE.md`](docs/PHASE1_ARCHITECTURE.md) — read it before
 touching blocks, meshing, LOD or the tick loop; it has already made those
-decisions, with the reasons.
+decisions, with the reasons. Phase 2's blocks 2.1 – 2.4 have the same thing in
+[`docs/PHASE2_ARCHITECTURE.md`](docs/PHASE2_ARCHITECTURE.md) — items, inventory,
+crafting, drops and tool tiers, trees, and the furnace. **The active phase has a
+design doc; read that one.**
 
 This is written here for the same reason the architecture standard is: the file
 that gets read at the start of the work is the only place a rule actually holds.
@@ -84,7 +87,7 @@ hit a stop condition.** Concretely, and in this order:
 - A gameplay or content decision the roadmap and design docs do not settle.
 - The exit gate is unreachable and the levers in the design doc are exhausted.
 - A block turns out to need a decision that contradicts
-  `docs/PHASE1_ARCHITECTURE.md`. Say so in the PR and change the design doc in
+  the active phase's design doc. Say so in the PR and change the design doc in
   that PR, with reasoning — do not silently diverge from it.
 - CI fails for a reason you do not understand. Flag it; do not disable the check.
 

@@ -183,6 +183,14 @@ a licence to build it.
 inventory first, then the content that gives it something to hold, which is what
 forces the simulation to become a real game loop.
 
+Blocks 2.1 – 2.4 are designed in
+[`docs/PHASE2_ARCHITECTURE.md`](docs/PHASE2_ARCHITECTURE.md), which plays the
+same role phase 1's design doc does: it is not a summary of the list below, it
+is the architecture the list implements, and its decisions are binding. Read it
+before touching items, inventory, crafting, drops, trees or the furnace. Blocks
+2.5 – 2.9 are designed when they are reached, against what 2.1 – 2.4 actually
+produced.
+
 ### Ordered blocks
 
 | # | Block | Note |
