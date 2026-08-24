@@ -190,7 +190,23 @@ fn saving_the_same_world_twice_produces_byte_identical_files() {
 /// pinned here, same as `cubara_sim::tests::determinism`'s own fixture. Not
 /// cross-checked against another implementation; what matters is that it
 /// stays exactly this value on every future run, on every platform.
-const FIXTURE_HASH: u64 = 0x2a6e_809c_6c6c_8930;
+///
+/// **Changed once, deliberately, in block 2.1b (#136):** the player's
+/// inventory joined the world-state hash. The committed fixture file itself is
+/// untouched -- what moved is the digest taken over the world it loads to, and
+/// a loaded player now hashes an (empty) inventory that did not exist before.
+/// Note the fixture's *bytes* are unchanged, so this is not a save-format
+/// change; block 2.8 is what will make the inventory survive a round trip.
+///
+/// That is the only reason this may be re-blessed: a stated change to what is
+/// hashed. If it moves without one, save/load has diverged and blessing it is
+/// the same mistake as blessing a golden image to make a rendering test pass.
+///
+/// | Value | Why it changed |
+/// |---|---|
+/// | `0x2a6e_809c_6c6c_8930` | block 1.9 (#60), the original pin |
+/// | `0xf1cf_74d0_987d_efb4` | block 2.1b (#136), inventory added to the hash |
+const FIXTURE_HASH: u64 = 0xf1cf_74d0_987d_efb4;
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/save_fixture")

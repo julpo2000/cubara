@@ -6,6 +6,7 @@
 //! (`ARCHITECTURE.md` Rule 1). The renderer no longer owns any of this --
 //! it receives a pose to render from, which is the boundary Rule 3 draws.
 
+use crate::inventory::Inventory;
 use glam::Vec3;
 
 use crate::input::InputFrame;
@@ -50,6 +51,10 @@ pub struct Player {
     /// Up/down angle, radians, clamped to [`PITCH_LIMIT`]. Same reason as
     /// [`Self::yaw`].
     pub(crate) pitch: f32,
+    /// What the player is carrying. Part of world state, so it is hashed with
+    /// everything else (`crate::hash`) -- block 2.9's survival replay test
+    /// asserts on the result.
+    pub inventory: Inventory,
 }
 
 impl Player {
@@ -61,6 +66,7 @@ impl Player {
             free_fly: false,
             yaw,
             pitch: pitch.clamp(-PITCH_LIMIT, PITCH_LIMIT),
+            inventory: Inventory::new(),
         }
     }
 
@@ -130,6 +136,9 @@ impl Player {
             free_fly: other.free_fly,
             yaw: self.yaw + (other.yaw - self.yaw) * t,
             pitch: self.pitch + (other.pitch - self.pitch) * t,
+            // Not interpolatable and not rendered from here: the current
+            // tick's inventory passes through, like velocity above.
+            inventory: other.inventory,
         }
     }
 }

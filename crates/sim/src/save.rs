@@ -14,6 +14,7 @@
 //! reasoning [`crate::WorldHash`] (block 1.8) already established for why
 //! this crate, not that one.
 
+use crate::inventory::Inventory;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -260,6 +261,11 @@ pub fn load_world(
         free_fly: header.player.free_fly,
         yaw: header.player.yaw,
         pitch: header.player.pitch,
+        // Not in the format yet -- the save extension is block 2.8, which adds
+        // the item id table this needs (PHASE2_ARCHITECTURE.md §8). A loaded
+        // world starts empty-handed until then, deliberately and visibly,
+        // rather than silently half-restoring an inventory.
+        inventory: Inventory::new(),
     };
 
     let sim = Sim {
