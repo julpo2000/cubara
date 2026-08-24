@@ -26,6 +26,41 @@ use crate::scene::{SceneFrame, SceneRenderer};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
+/// Camera near/far planes. The far plane covers radius 64's diagonal
+/// (64 chunks x 16 blocks = 1,024, so ~1,448 corner to corner) with room over.
+const NEAR_PLANE: f32 = 0.1;
+const FAR_PLANE: f32 = 2000.0;
+
+/// Depth cleared at the *far* plane, since [`reverse_z`] puts it at 0.
+pub const DEPTH_CLEAR: f64 = 0.0;
+
+/// Flip a projection's depth so it runs 1 at the near plane down to 0 at the
+/// far plane -- "reversed-Z".
+///
+/// Paired with a float depth buffer (`DEPTH_FORMAT` is `Depth32Float`) this is
+/// close to the best depth precision available, and it is nearly free. A
+/// float's precision is concentrated near zero. The conventional mapping
+/// spends that precision on the *near* plane, where it is least needed --
+/// everything there is close and large -- and leaves almost none for the
+/// distance. Reversing it puts the far plane at zero instead.
+///
+/// That matters here specifically because the near/far ratio is
+/// 0.1 : 2,000, i.e. 20,000:1, and block 1.10 made the far end of that range
+/// somewhere the player actually looks.
+///
+/// Built by flipping a standard projection's depth (`z' = w - z`) rather than
+/// by swapping the near and far arguments to `perspective_rh`, which produces
+/// the same matrix far less obviously.
+pub fn reverse_z(proj: glam::Mat4) -> glam::Mat4 {
+    let flip = glam::Mat4::from_cols(
+        glam::vec4(1.0, 0.0, 0.0, 0.0),
+        glam::vec4(0.0, 1.0, 0.0, 0.0),
+        glam::vec4(0.0, 0.0, -1.0, 0.0),
+        glam::vec4(0.0, 0.0, 1.0, 1.0),
+    );
+    flip * proj
+}
+
 /// Load the real `assets/blocks/*.ron` registry, validated against
 /// `assets/textures/` -- the GPU-free half of [`load_mesh_assets`], for a
 /// caller that needs to mesh nodes (`cubara_world::mesh`, resolving
@@ -115,9 +150,15 @@ impl CameraUniform {
         Self::look_view_proj(aspect, eye, center - eye)
     }
 
-    /// View*projection for a camera at `eye` looking along `look_dir`.
+    /// View*projection for a camera at `eye` looking along `look_dir`, with
+    /// reversed-Z depth (see [`reverse_z`]).
     pub fn look_view_proj(aspect: f32, eye: glam::Vec3, look_dir: glam::Vec3) -> glam::Mat4 {
-        let proj = glam::Mat4::perspective_rh(60f32.to_radians(), aspect, 0.1, 2000.0);
+        let proj = reverse_z(glam::Mat4::perspective_rh(
+            60f32.to_radians(),
+            aspect,
+            NEAR_PLANE,
+            FAR_PLANE,
+        ));
         let view = glam::Mat4::look_at_rh(eye, eye + look_dir, glam::Vec3::Y);
         proj * view
     }
@@ -731,7 +772,8 @@ pub fn build_pipeline(
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
             depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
+            // Reversed-Z: nearer fragments have *greater* depth.
+            depth_compare: wgpu::CompareFunction::Greater,
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
@@ -791,7 +833,9 @@ pub fn build_outline_pipeline(
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
             depth_write_enabled: false,
-            depth_compare: wgpu::CompareFunction::LessEqual,
+            // Reversed-Z counterpart of LessEqual -- the outline must draw
+            // at exactly the depth of the face it outlines, not be rejected by it.
+            depth_compare: wgpu::CompareFunction::GreaterEqual,
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState {
                 constant: -4,

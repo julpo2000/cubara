@@ -45,6 +45,7 @@ frames after 200 warmup.
 | 2026-08-24 | **Phase 1 exit gate — 12/12 on Windows** [#38], radius 64³¹ | **1,585** | 829,608 | **~3,579** | **0.102 ms** | ~0.38 ms | `e60e9c2` |
 | 2026-08-24 | Skirt no longer overlaps a real face [#125], radius 12³² | 957 | **331,510** | ~4,771 | 0.089 ms | ~0.42 ms | `3af8d3b` |
 | 2026-08-24 | **Skirt no longer overlaps a real face** [#125], radius 64³² | 1,585 | **758,754** | ~3,665 | 0.112 ms | ~0.45 ms | `3af8d3b` |
+| 2026-08-24 | Reversed-Z depth [#129], radius 64³³ | 1,585 | 758,754 | ~3,952 | 0.100 ms | ~0.40 ms | `reversed-z` |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -882,6 +883,34 @@ the old code with 18 doubly-covered cells. No golden image was regenerated —
 `no_crack_at_a_real_lod_boundary` passes against the committed reference
 unchanged, on both CI backends, so the crack-hiding the skirts exist for is
 intact.
+
+³³ **Reversed-Z depth (#129) — precision, not speed, and one node changed
+sides.** Depth now runs 1 at the near plane to 0 at the far plane. Paired with
+the existing `Depth32Float` buffer this is close to the best depth precision
+available: float precision clusters near zero, and the conventional mapping
+spends it all on the near plane where everything is already close and large.
+With a near/far ratio of 0.1 : 2,000 and a horizon block 1.10 made worth
+looking at, that was the wrong way round.
+
+Three runs read **3,851–4,095 FPS / 0.098–0.103 ms** against **3,639–3,705 /
+0.105–0.113 ms** for the pre-change row. That looks like a small win and is
+**not claimed as one** — the ranges nearly touch, and nothing about reversing a
+matrix should make the frame cheaper. Treat it as the same performance.
+
+**Drawn nodes moved 1,341 → 1,342.** Reversing depth swaps which row
+combination of the view-projection yields the near plane and which yields the
+far one; the resulting six planes are the same six planes mathematically, but
+not bit-identical after normalisation, so a node sitting exactly on a frustum
+boundary can classify differently. The cull is conservative, so the flip is
+toward drawing rather than dropping — the safe direction. Determinism is
+unaffected (`the_same_scene_renders_byte_identically` still passes), and
+`a_reversed_z_frustum_culls_identically` pins that the two extractions agree on
+every non-borderline case.
+
+**No golden image was regenerated**, which is the useful signal here: every
+reference still passes, at 0.0012%–0.139% differing pixels against a 0.2%
+threshold. Only fragments at depth ties moved, which is exactly what a
+precision change should touch and nothing else.
 
 ## Detailed run logs
 
