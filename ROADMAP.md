@@ -17,11 +17,11 @@ So the work is cut into **three phases**, and each phase has an **exit gate that
 script answers**, not a judgement someone makes. The project's standing rule
 applies to phases too: *a requirement that isn't enforced by machinery is a wish.*
 
-| Phase | Name | The one-sentence result |
-|---|---|---|
-| **1** | The engine stands | A textured, walkable, cave-riddled world at render distance 64 that runs at 1000+ FPS — and is still there after you close it. |
-| **2** | The first survival world | You can survive in it: gather, craft, smelt, eat, and be attacked — and it is still there tomorrow. |
-| **3** | Modern depth, with synergy | The features of a full modern voxel game, each admitted only if it connects to what already exists. |
+| Phase | Name | The one-sentence result | Status |
+|---|---|---|---|
+| **1** | The engine stands | A textured, walkable, cave-riddled world at render distance 64 that runs at 1000+ FPS — and is still there after you close it. | **Complete — 2026-08-24** (gate 12/12 on both machines) |
+| **2** | The first survival world | You can survive in it: gather, craft, smelt, eat, and be attacked — and it is still there tomorrow. | **Active** |
+| **3** | Modern depth, with synergy | The features of a full modern voxel game, each admitted only if it connects to what already exists. | Not started |
 
 Phases are strictly sequential. Phase *n+1* does not start until phase *n*'s gate
 passes **and** the project owner has played it.
@@ -99,7 +99,7 @@ own PR. The order is a dependency order, not a preference.
 | **1.8** | Determinism harness: world-state hash + replay test, single- vs multi-threaded | Rule 1's missing enforcement, and the hash that block 1.9's round-trip test is built on. | [#90](../../issues/90) |
 | **1.9** | **Save/load:** world header with the block id table, region files, chunk payload | The on-disk format and the in-memory block representation are one decision, so they are made in one phase. See design §7. | [#60](../../issues/60) |
 | **1.10** | **LOD as draw-count reduction** — the region node tree, and `cubara-render` stops depending on `cubara-world` | The block that decides whether radius 64 is reachable at all. Tracking issue with sub-issues; see design §6 and §1. | [#38](../../issues/38) |
-| **1.11** | Whatever block 1.10's measurements say is still missing | Deliberately has no issue yet: it is written from a profile, not from a guess. Occlusion culling ([#42](../../issues/42), currently filed under phase 3) is the standing candidate to pull forward. | written after 1.10 |
+| **1.11** | Whatever block 1.10's measurements say is still missing | **Closed empty — the measurements said nothing was missing.** Radius 64 clears the gate on both machines with margin (M3 ~1.3×, Windows ~3.6×) and draws 1,341 nodes against the 2,000 budget §6.1 set. Occlusion culling ([#42](../../issues/42)) was the standing candidate and was **not** pulled forward: this block exists to be written from a profile, and the profile did not ask for it. It stays in phase 3. | none — see closeout |
 
 ### Exit gate
 
@@ -131,6 +131,41 @@ GitHub's runners have no representative GPU, and a perf gate that measures noise
 is worse than none. CI instead gets a smoke test that a radius-64 world loads
 headless inside a fixed memory and time bound, which is what would actually break
 silently.
+
+### Closeout — 2026-08-24
+
+`./scripts/check-phase-gate.sh 1` at `90f764b`, **12 passed, 0 failed**, on both
+machines. The perf criterion, radius 64:
+
+| Machine | Nodes | Tris | FPS | CPU/frame | Gate margin |
+|---|---|---|---|---|---|
+| Win11 / RTX 4060 (Vulkan) | 1,585 | 758,754 | ~3,591 | ~0.11 ms | ~3.6× |
+| macOS / Apple M3 (Metal) | 1,585 | 829,608 | ~1,275 | 0.535 ms | ~1.3× |
+
+The M3 row predates the skirt-overlap fix (#125), which removed ~9% of the
+geometry; it is the last measured M3 figure, not a stale claim about current
+code. Draw count is what this scene is bound by, and it is unchanged at 1,341.
+
+Block 1.11 closed empty — see its row above. The gate ran green *before* the
+block existed to be written, which is the outcome the block was shaped to allow
+for; writing something into it anyway would have been the freelancing the phase
+contract forbids.
+
+Two defects were found by running the gate rather than by a test, and both are
+worth recording because neither was a code bug:
+
+- **CI was red on `main` with no commit responsible** (#124). The workflow pins
+  `dtolnay/rust-toolchain@stable`, so Rust 1.98 arrived on its own and brought a
+  lint that `-D warnings` turned into an error. An unpinned toolchain means the
+  build can break with no change to the repo; left unpinned, flagged here.
+- **A benchmark row sat in the wrong machine's table** (#123), which made a
+  hardware difference read as an unexplained 4× speedup on identical code. The
+  recording instruction has been sharpened, but the general lesson is the one
+  this file already argues: a number without its machine attached is not a
+  measurement.
+
+**Not started: phase 2.** Per the autonomy contract above, a phase ends with a
+report and the owner playing it.
 
 ### Explicitly not in phase 1
 
