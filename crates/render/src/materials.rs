@@ -1,7 +1,8 @@
 //! Texture array + per-block texture-layer resolution.
 //!
 //! Builds a `texture_2d_array` from the registry's texture names — 16×16
-//! tiles, one layer per name, nearest-filtered (pixel art), matching
+//! tiles, one layer per name, magnified nearest (pixel art) and minified
+//! trilinearly through a full mip chain, matching
 //! `docs/PHASE1_ARCHITECTURE.md` §11. Each name loads `{textures_dir}/
 //! {name}.png` (block 1.4c's original art, `assets/textures/`); a name with
 //! no matching file falls back to a flat, deterministically-derived
@@ -15,6 +16,8 @@ use cubara_voxel::BlockRegistry;
 
 const TILE_SIZE: u32 = 16;
 const TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+/// Mip levels per tile: 16×16 down to 1×1 inclusive.
+const MIP_LEVELS: u32 = TILE_SIZE.ilog2() + 1;
 
 /// Maps a texture *name* (as authored in a material's `faces`) to its
 /// texture-array layer. Keyed by name rather than `BlockId` because face
@@ -89,6 +92,79 @@ fn solid_tile(color: [u8; 3]) -> Vec<u8> {
         .collect()
 }
 
+/// The sRGB transfer function, both directions.
+///
+/// [`TEXTURE_FORMAT`] is `Rgba8UnormSrgb`, so a tile's bytes are *encoded*
+/// values, not light. Box-filtering them directly -- the obvious way to build
+/// a mip -- averages in the wrong space and comes out visibly darker than the
+/// surface it is standing in for, which reads as the terrain dimming with
+/// distance. Decode to linear, average there, re-encode.
+fn srgb_to_linear(b: u8) -> f32 {
+    let c = b as f32 / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(c: f32) -> u8 {
+    let v = if c <= 0.0031308 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    };
+    (v.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// One 2×2 box-filter step: `src` is `size`×`size` RGBA8, the result is half
+/// that on each axis. RGB is averaged in linear light (see [`srgb_to_linear`]);
+/// alpha is already linear and is averaged as-is.
+fn downsample(src: &[u8], size: u32) -> Vec<u8> {
+    let half = size / 2;
+    let mut out = Vec::with_capacity((half * half * 4) as usize);
+    for y in 0..half {
+        for x in 0..half {
+            let mut rgb = [0f32; 3];
+            let mut alpha = 0f32;
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let i = (((y * 2 + dy) * size + (x * 2 + dx)) * 4) as usize;
+                    for (c, acc) in rgb.iter_mut().enumerate() {
+                        *acc += srgb_to_linear(src[i + c]);
+                    }
+                    alpha += src[i + 3] as f32;
+                }
+            }
+            out.extend_from_slice(&[
+                linear_to_srgb(rgb[0] / 4.0),
+                linear_to_srgb(rgb[1] / 4.0),
+                linear_to_srgb(rgb[2] / 4.0),
+                (alpha / 4.0).round() as u8,
+            ]);
+        }
+    }
+    out
+}
+
+/// The full mip chain for one tile, level 0 (the source) first.
+///
+/// Generated on the CPU rather than with a GPU blit pass: the tiles are 16×16
+/// and this runs once at startup, so the whole chain for every layer is a few
+/// microseconds of work -- and doing it here keeps it a pure function that
+/// unit tests can check, instead of something only observable by rendering.
+fn mip_chain(base: Vec<u8>) -> Vec<Vec<u8>> {
+    let mut levels = vec![base];
+    let mut size = TILE_SIZE;
+    while size > 1 {
+        let next = downsample(levels.last().expect("chain is never empty"), size);
+        size /= 2;
+        levels.push(next);
+    }
+    debug_assert_eq!(levels.len() as u32, MIP_LEVELS);
+    levels
+}
+
 /// `{textures_dir}/{name}.png` as raw RGBA8 tile bytes, or `None` if the file
 /// doesn't exist or isn't exactly [`TILE_SIZE`]-square -- either way, the
 /// caller falls back to a placeholder rather than failing to start, since a
@@ -140,10 +216,14 @@ pub fn build(
             height: TILE_SIZE,
             depth_or_array_layers: layer_count,
         },
-        // No mip chain: phase 1's camera never gets far enough from a block
-        // for minification aliasing to be the thing worth spending on next
-        // (draws are the binding cost at distance, §2, not texture sampling).
-        mip_level_count: 1,
+        // A full mip chain. The comment that stood here said phase 1's camera
+        // never gets far enough from a block for minification aliasing to be
+        // worth spending on -- true when it was written against radius 12, and
+        // no longer true since block 1.10 made the horizon 64 chunks (1,024
+        // blocks) away. At that range a 16x16 tile covers well under a pixel,
+        // and sampling it with no mip chain is textbook minification aliasing:
+        // it shimmers under movement, which a screenshot does not show.
+        mip_level_count: MIP_LEVELS,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: TEXTURE_FORMAT,
@@ -151,40 +231,44 @@ pub fn build(
         view_formats: &[],
     });
 
-    let write_layer = |layer: u32, pixels: &[u8]| {
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: 0,
-                    y: 0,
-                    z: layer,
+    // Uploads level 0 *and* every mip below it, so no caller can add a layer
+    // and leave its chain undefined.
+    let write_layer = |layer: u32, pixels: Vec<u8>| {
+        for (level, data) in mip_chain(pixels).iter().enumerate() {
+            let size = TILE_SIZE >> level;
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: layer,
+                    },
+                    aspect: wgpu::TextureAspect::All,
                 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            pixels,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(TILE_SIZE * 4),
-                rows_per_image: Some(TILE_SIZE),
-            },
-            wgpu::Extent3d {
-                width: TILE_SIZE,
-                height: TILE_SIZE,
-                depth_or_array_layers: 1,
-            },
-        );
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(size * 4),
+                    rows_per_image: Some(size),
+                },
+                wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
     };
 
     if names.is_empty() {
-        write_layer(0, &solid_tile([255, 255, 255]));
+        write_layer(0, solid_tile([255, 255, 255]));
     }
     for (layer, &name) in names.iter().enumerate() {
-        match load_tile(textures_dir, name) {
-            Some(pixels) => write_layer(layer as u32, &pixels),
-            None => write_layer(layer as u32, &solid_tile(placeholder_color(name))),
-        }
+        let pixels =
+            load_tile(textures_dir, name).unwrap_or_else(|| solid_tile(placeholder_color(name)));
+        write_layer(layer as u32, pixels);
     }
 
     let view = texture.create_view(&wgpu::TextureViewDescriptor {
@@ -197,6 +281,15 @@ pub fn build(
         address_mode_u: wgpu::AddressMode::Repeat,
         address_mode_v: wgpu::AddressMode::Repeat,
         address_mode_w: wgpu::AddressMode::Repeat,
+        // Nearest magnification keeps the pixel-art look up close; linear
+        // min + mipmap filtering makes that trilinear at distance, which is
+        // what the mip chain above is for. These two lines were already here
+        // before the chain existed, where they were inert -- filtering
+        // settings that looked configured and did nothing.
+        //
+        // No `anisotropy_clamp`: wgpu requires min, mag *and* mipmap filters
+        // all be Linear for it, and Nearest magnification is a deliberate
+        // look, not an oversight.
         mag_filter: wgpu::FilterMode::Nearest,
         min_filter: wgpu::FilterMode::Linear,
         mipmap_filter: wgpu::FilterMode::Linear,
@@ -280,5 +373,71 @@ mod tests {
     fn placeholder_color_is_deterministic_and_distinguishes_names() {
         assert_eq!(placeholder_color("stone"), placeholder_color("stone"));
         assert_ne!(placeholder_color("stone"), placeholder_color("soil"));
+    }
+
+    #[test]
+    fn mip_chain_halves_down_to_one_pixel() {
+        let chain = mip_chain(solid_tile([10, 20, 30]));
+        assert_eq!(chain.len() as u32, MIP_LEVELS);
+        for (level, data) in chain.iter().enumerate() {
+            let size = TILE_SIZE >> level;
+            assert_eq!(
+                data.len() as u32,
+                size * size * 4,
+                "level {level} should be {size}x{size} RGBA"
+            );
+        }
+        assert_eq!(
+            chain.last().unwrap().len(),
+            4,
+            "last level is a single texel"
+        );
+    }
+
+    #[test]
+    fn a_flat_tile_keeps_its_colour_all_the_way_down() {
+        // Nothing to average away, so every level must be the same colour --
+        // any drift here is the filter losing energy, not detail.
+        let chain = mip_chain(solid_tile([200, 100, 50]));
+        for (level, data) in chain.iter().enumerate() {
+            assert_eq!(
+                &data[..4],
+                &[200, 100, 50, 255],
+                "level {level} shifted colour"
+            );
+        }
+    }
+
+    #[test]
+    fn downsampling_averages_in_linear_light_not_srgb() {
+        // The whole reason `downsample` decodes and re-encodes. A 2x2 of two
+        // black and two white texels is half the light, and half of full
+        // brightness encodes to sRGB ~188 -- not 127. Averaging the *encoded*
+        // bytes directly gives 127, a mip visibly darker than the surface it
+        // stands in for, which reads in-game as terrain dimming with distance.
+        let black_white = [
+            0, 0, 0, 255, 255, 255, 255, 255, // row 0
+            255, 255, 255, 255, 0, 0, 0, 255, // row 1
+        ];
+        let out = downsample(&black_white, 2);
+        assert_eq!(out.len(), 4, "2x2 downsamples to a single texel");
+        let grey = out[0];
+        assert!(
+            (186..=190).contains(&grey),
+            "expected the linear-light average (~188), got {grey}              ({} is what averaging sRGB bytes gives)",
+            127
+        );
+        assert_eq!(out[3], 255, "alpha is averaged as-is and stays opaque");
+    }
+
+    #[test]
+    fn srgb_round_trips_through_linear() {
+        for b in [0u8, 1, 37, 128, 200, 254, 255] {
+            assert_eq!(
+                linear_to_srgb(srgb_to_linear(b)),
+                b,
+                "byte {b} did not survive"
+            );
+        }
     }
 }
