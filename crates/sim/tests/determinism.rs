@@ -133,7 +133,23 @@ fn fixture_edits() -> Vec<(usize, [i32; 3], bool)> {
 /// `cubara_world::worldgen`'s own known-sequence/known-hash tests). What
 /// matters is that it stays exactly this value on every future run, on
 /// every platform.
-const KNOWN_FIXTURE_HASH: u64 = 0x84d6_5897_33af_263a;
+///
+/// **Changed once, deliberately, in block 2.1b (#136):** the player's
+/// inventory joined the world-state hash, so the digest over the same fixture
+/// legitimately moved. That is the *only* reason this constant may be edited --
+/// a change to what state is hashed, stated in the PR that makes it. If it
+/// moves without such a change, the sim has become non-deterministic and this
+/// test is doing its job; re-pinning it then is the same mistake as blessing a
+/// golden image to make a rendering test pass.
+///
+/// Previous values, so a bisect can tell "hash definition changed" apart from
+/// "sim diverged":
+///
+/// | Value | Why it changed |
+/// |---|---|
+/// | `0x84d6_5897_33af_263a` | block 1.8 (#90), the original pin |
+/// | `0xede5_39f2_ee54_4d2a` | block 2.1b (#136), inventory added to the hash |
+const KNOWN_FIXTURE_HASH: u64 = 0xede5_39f2_ee54_4d2a;
 
 #[test]
 fn replay_of_the_same_seed_and_script_is_deterministic() {

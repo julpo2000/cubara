@@ -18,9 +18,10 @@
 //! block-array hash test: `z`-outer/`y`-mid/`x`-inner voxel order, each
 //! value's little-endian bytes fed in one at a time.
 
-use cubara_voxel::{BlockId, Chunk, ChunkCoord};
+use cubara_voxel::{BlockId, Chunk, ChunkCoord, ItemState};
 use cubara_world::{TerrainBlocks, World};
 
+use crate::inventory::Inventory;
 use crate::Sim;
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -98,6 +99,33 @@ impl WorldHash {
         self.write_bool(p.free_fly);
         self.write_f32(p.yaw);
         self.write_f32(p.pitch);
+        self.write_inventory(&p.inventory);
+    }
+
+    /// Every slot in index order, present-or-not first so an empty slot is
+    /// distinct from a slot holding zero of something (which cannot exist --
+    /// `ItemStack` rejects a zero count -- but the encoding should not depend
+    /// on that staying true).
+    ///
+    /// `ItemState` is written as a discriminant byte plus its payload rather
+    /// than only the payload: without the byte, a stateless item and a tool at
+    /// zero remaining would hash identically, and those are very different
+    /// worlds.
+    fn write_inventory(&mut self, inv: &Inventory) {
+        self.write_u8(inv.selected_slot());
+        for slot in inv.slots() {
+            self.write_bool(slot.is_some());
+            let Some(stack) = slot else { continue };
+            self.write_u16(stack.item().0);
+            self.write_u8(stack.count());
+            match stack.state() {
+                ItemState::None => self.write_u8(0),
+                ItemState::Durability { remaining } => {
+                    self.write_u8(1);
+                    self.write_u16(remaining);
+                }
+            }
+        }
     }
 
     /// One chunk's contents: its coordinate, then every voxel's [`BlockId`]

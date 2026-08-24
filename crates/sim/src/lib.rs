@@ -10,6 +10,7 @@
 
 mod hash;
 mod input;
+mod inventory;
 mod physics;
 mod player;
 mod rng;
@@ -17,6 +18,7 @@ mod save;
 
 pub use hash::{hash_region, WorldHash};
 pub use input::InputFrame;
+pub use inventory::{Inventory, HOTBAR_WIDTH, SLOT_COUNT};
 pub use player::Player;
 pub use rng::WorldRng;
 pub use save::{load_world, save_world, LoadError, SaveError, FORMAT_VERSION};
