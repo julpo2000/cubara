@@ -45,7 +45,8 @@ frames after 200 warmup.
 | 2026-08-24 | **Phase 1 exit gate — 12/12 on Windows** [#38], radius 64³¹ | **1,585** | 829,608 | **~3,579** | **0.102 ms** | ~0.38 ms | `e60e9c2` |
 | 2026-08-24 | Skirt no longer overlaps a real face [#125], radius 12³² | 957 | **331,510** | ~4,771 | 0.089 ms | ~0.42 ms | `3af8d3b` |
 | 2026-08-24 | **Skirt no longer overlaps a real face** [#125], radius 64³² | 1,585 | **758,754** | ~3,665 | 0.112 ms | ~0.45 ms | `3af8d3b` |
-| 2026-08-24 | Reversed-Z depth [#129], radius 64³³ | 1,585 | 758,754 | ~3,952 | 0.100 ms | ~0.40 ms | `reversed-z` |
+| 2026-08-24 | Reversed-Z depth [#129], radius 64³³ | 1,585 | 758,754 | ~3,952 | 0.100 ms | ~0.40 ms | `5277ddf` |
+| 2026-08-24 | Texture mip chain [#128], radius 64³⁴ | 1,585 | 758,754 | MEASURE_FPS | MEASURE_CPU | MEASURE_P99 | *(this PR)* |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -911,6 +912,25 @@ every non-borderline case.
 reference still passes, at 0.0012%–0.139% differing pixels against a 0.2%
 threshold. Only fragments at depth ties moved, which is exactly what a
 precision change should touch and nothing else.
+³⁴ **A full mip chain for the block textures (#128) — a visual-quality fix
+that costs nothing measurable.** The sampler already asked for linear
+minification and linear mipmap filtering; with `mip_level_count: 1` both
+settings were inert. At radius 64 the horizon is 1,024 blocks away, where a
+16×16 tile covers well under a pixel, so distant terrain sampled one texel per
+pixel and shimmered under movement — which a screenshot does not show and no
+test caught.
+
+Three back-to-back runs read **3,370–3,977 FPS / 0.101–0.114 ms CPU/frame**
+against **3,639–3,705 / 0.105–0.113 ms** for the row above. The ranges overlap;
+this is the same performance, not a win or a loss. Geometry is untouched
+(1,585 nodes, 758,754 tris, 1,341 drawn), and the added GPU cost of trilinear
+sampling is offset by mips being far kinder to the texture cache at distance.
+Recorded the median run.
+
+The real result is in the golden images, and it is large: `terrain` moved 4.67%
+of its pixels and `lod_boundary` 6.12%, in both cases by replacing per-texel
+speckle across the whole surface with a coherent one. See the PR for the
+before/after and for why the reference set moved from Metal to Vulkan.
 
 ## Detailed run logs
 

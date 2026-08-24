@@ -82,20 +82,31 @@ const TOLERANCE: u8 = 12;
 
 /// Fraction of pixels allowed to exceed [`TOLERANCE`].
 ///
-/// Calibrated from measurement, not taste. The reference is blessed on macOS/Metal
-/// and checked everywhere, so the number that matters is the *cross-backend* delta:
+/// Calibrated from measurement, not taste. The reference is blessed on one
+/// backend and checked everywhere, so the number that matters is the
+/// *cross-backend* delta:
 ///
 /// | Signal | Differing pixels |
 /// |---|---|
 /// | Same machine, same scene, twice | **0.0000%** (exact, since #81) |
-/// | macOS CI runner vs the reference | 0.0000% (max channel delta 1) |
-/// | **Windows CI runner (DX12) vs the reference** | **0.0215%** (max delta 79) |
+/// | Cross-backend, when the set was Metal-blessed: macOS CI | 0.0000% (max channel delta 1) |
+/// | Cross-backend, when the set was Metal-blessed: Windows CI (DX12) | **0.0215%** (max delta 79) |
 /// | A gash carved across the framed region | **4.07%** |
 /// | This threshold | 0.2% |
 ///
 /// ~9x above the worst measured backend difference, and ~20x below an obvious
-/// regression. The Windows delta is silhouette-edge pixels rasterising differently
-/// between DX12 and Metal — inherent, not a bug, and it will not go to zero.
+/// regression. The cross-backend delta is silhouette-edge pixels rasterising
+/// differently between APIs — inherent, not a bug, and it will not go to zero.
+///
+/// **The reference set moved from macOS/Metal to Windows/Vulkan** when the mip
+/// chain landed, because that is the machine it was re-blessed on. The whole
+/// set moved together rather than splitting across two backends: two of the
+/// five images (`cave_mouth`, `outline`) are unaffected by mips and were
+/// re-blessed *only* to keep the set on one backend — they measured 0.055% and
+/// 0.054% against the Metal reference, already inside this threshold. CI
+/// checking Metal and DX12 against a Vulkan reference is what now holds the
+/// numbers above honest; the `Golden image deltas` workflow step prints them
+/// on every run.
 ///
 /// Do not tighten this to hug the measured number. A golden test that fires on a
 /// driver update gets muted, and a muted test is worse than no test.
