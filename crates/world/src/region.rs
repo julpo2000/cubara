@@ -193,7 +193,7 @@ pub fn decode_region(
     let directory = bytes.get(pos..dir_end).ok_or(RegionError::Truncated)?;
 
     let mut result = Vec::with_capacity(entry_count);
-    for entry in directory.chunks_exact(DIR_ENTRY_SIZE) {
+    for entry in directory.as_chunks::<DIR_ENTRY_SIZE>().0 {
         let local = u16::from_le_bytes(entry[0..2].try_into().unwrap());
         let offset = u32::from_le_bytes(entry[2..6].try_into().unwrap()) as usize;
         let length = u32::from_le_bytes(entry[6..10].try_into().unwrap()) as usize;

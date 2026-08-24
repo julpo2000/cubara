@@ -281,7 +281,12 @@ pub fn compare(actual: &[u8], expected: &[u8], tolerance: u8) -> Diff {
     debug_assert_eq!(actual.len(), expected.len());
     let mut differing = 0u64;
     let mut max_delta = 0u8;
-    for (a, e) in actual.chunks_exact(4).zip(expected.chunks_exact(4)) {
+    for (a, e) in actual
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(expected.as_chunks::<4>().0)
+    {
         let mut over = false;
         for c in 0..4 {
             let d = a[c].abs_diff(e[c]);
