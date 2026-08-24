@@ -282,7 +282,14 @@ pub struct ChunkArena {
     multi_draw: bool,
     /// Per-frame scratch: the visible draw list built by [`prepare`](Self::prepare).
     visible: Vec<DrawIndexedIndirect>,
-    /// True once we've warned about a full arena, so we log it only once.
+    /// Per-insert scratch: this node's vertices with `node_index` stamped in.
+    /// Reused across inserts so streaming churn doesn't allocate and free a
+    /// whole mesh's worth of vertices per node ([`insert`](Self::insert)).
+    stamped: Vec<Vertex>,
+    /// True while we've already warned about the *current* exhaustion episode,
+    /// so a full arena logs once rather than once per rejected node. Cleared
+    /// by the next successful insert, so a later episode is reported again
+    /// instead of being silently swallowed for the rest of the process.
     warned_full: bool,
 }
 
@@ -340,6 +347,7 @@ impl ChunkArena {
             slots: BTreeMap::new(),
             multi_draw,
             visible: Vec::new(),
+            stamped: Vec::new(),
             warned_full: false,
         }
     }
@@ -434,16 +442,17 @@ impl ChunkArena {
 
         // `node_index` is only known now (the mesh was built off-thread, before
         // this node had an arena slot), so stamp it into every vertex here
-        // rather than baking it into the mesh's own output.
-        let stamped: Vec<Vertex> = mesh
-            .vertices
-            .iter()
-            .map(|v| v.with_node_index(node_index))
-            .collect();
+        // rather than baking it into the mesh's own output. Into a reused
+        // buffer: streaming churn calls this for every node that arrives, and
+        // a fresh `Vec` per call would allocate, copy and free a whole mesh's
+        // vertices each time, for a value that is one field wide.
+        self.stamped.clear();
+        self.stamped
+            .extend(mesh.vertices.iter().map(|v| v.with_node_index(node_index)));
         queue.write_buffer(
             &self.vertex_buffer,
             base_vertex as u64 * std::mem::size_of::<Vertex>() as u64,
-            bytemuck::cast_slice(&stamped),
+            bytemuck::cast_slice(&self.stamped),
         );
         queue.write_buffer(
             &self.index_buffer,
@@ -461,6 +470,9 @@ impl ChunkArena {
             bytemuck::bytes_of(&[ox, oy, oz, scale]),
         );
 
+        // The arena took a node, so whatever episode of exhaustion the latch
+        // was suppressing is over; arm it again for the next one.
+        self.warned_full = false;
         self.slots.insert(
             id,
             NodeSlot {
@@ -552,6 +564,16 @@ impl ChunkArena {
         // list — and therefore the rendered frame — deterministic (issue #81), and
         // also makes the MAX_DRAWS cap below drop a stable set of nodes rather than
         // whichever ones a hash happened to visit last.
+        //
+        // Stable is the weaker half of it. `NodeId` compares `level` before `pos`,
+        // so the tail this truncates is the *highest levels* — the coarsest nodes,
+        // each covering 2^level chunks per axis out at the horizon (§6.1). Running
+        // out of draws therefore sheds the most distant, least detailed geometry
+        // first, which is the graceful direction to fail in. That property is
+        // load-bearing and lives entirely in the field order of a struct with a
+        // derived `Ord`, so it is pinned by
+        // `node_ids_sort_by_level_first_so_truncation_drops_the_coarsest` rather
+        // than by this comment.
         for slot in self.slots.values() {
             if self.visible.len() as u32 >= MAX_DRAWS {
                 break;
@@ -733,6 +755,57 @@ mod tests {
         a.free(x, 10);
         assert_eq!(a.free.len(), 1);
         assert_eq!(a.free[0], (0, 20));
+    }
+
+    #[test]
+    fn node_ids_sort_by_level_first_so_truncation_drops_the_coarsest() {
+        // `prepare` walks `slots` (a BTreeMap keyed by NodeId) in order and
+        // stops at MAX_DRAWS. *Which* nodes that drops is decided entirely by
+        // NodeId's derived `Ord`, which compares `level` before `pos` -- so
+        // the truncated tail is the highest levels, and a higher level is a
+        // coarser node covering more world further away. Shedding the horizon
+        // is the graceful failure; shedding the ground under the player is the
+        // opposite one.
+        //
+        // This holds *only* because `level` is declared before `pos`. Swapping
+        // those two fields still compiles, still derives `Ord`, and still
+        // passes every other test in this crate -- while silently inverting
+        // which geometry survives a full draw list. Nothing else pins it.
+        let near_fine = NodeId {
+            level: 0,
+            pos: [i32::MAX, i32::MAX, i32::MAX],
+        };
+        let far_coarse = NodeId {
+            level: 1,
+            pos: [i32::MIN, i32::MIN, i32::MIN],
+        };
+        assert!(
+            near_fine < far_coarse,
+            "a level-0 node must sort before any level-1 node, whatever their positions"
+        );
+    }
+
+    #[test]
+    fn truncating_the_slot_order_keeps_the_finest_levels() {
+        // The same walk `prepare` does, against a mixed-level set: iterate in
+        // key order, stop at a cap, and check what survived.
+        let mut slots = BTreeMap::new();
+        for level in 0..4u32 {
+            for x in 0..4i32 {
+                slots.insert(
+                    NodeId {
+                        level,
+                        pos: [x, 0, 0],
+                    },
+                    (),
+                );
+            }
+        }
+        let kept: Vec<NodeId> = slots.keys().copied().take(6).collect();
+        assert!(
+            kept.iter().all(|n| n.level <= 1),
+            "a truncated draw list must keep the finest levels, got {kept:?}"
+        );
     }
 
     #[test]
