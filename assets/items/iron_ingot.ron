@@ -1,0 +1,11 @@
+// Smelted iron. The end of the alpha ladder.
+//
+// max_stack and durability are tuning, not structure: change them here,
+// no recompile (REQUIREMENTS.md #3). An item declaring durability must
+// declare max_stack: 1 -- the registry rejects the combination, because
+// ItemStack's invariant makes a stack of two worn tools unbuildable.
+ItemDef(
+    name:       "cubara:iron_ingot",
+    max_stack:  64,
+    durability: None,
+)

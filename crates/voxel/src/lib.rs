@@ -8,6 +8,7 @@
 pub mod block;
 pub mod bounds;
 pub mod coord;
+pub mod item;
 pub mod mesh;
 pub mod registry;
 pub mod storage;
@@ -16,6 +17,9 @@ pub mod voxel;
 pub use block::BlockId;
 pub use bounds::{build_mesh_bounded, Aabb};
 pub use coord::ChunkCoord;
+pub use item::{
+    ItemDef, ItemId, ItemRegistry, ItemRegistryError, ItemStack, ItemState, StackError,
+};
 pub use mesh::{Face, Mesh, Vertex};
 pub use registry::{BlockRegistry, Faces, Material, RegistryError, Shape};
 pub use storage::{ChunkPayloadError, ChunkStorage};
