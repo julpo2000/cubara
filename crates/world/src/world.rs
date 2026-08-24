@@ -308,6 +308,20 @@ mod tests {
         // nodes use, so this fixture picks it up too, even though it's meshing
         // plain chunks here, not nodes. Expected: skirts exist precisely to add a
         // small, bounded amount of geometry at every node/chunk's own edge.
+        //
+        // Tris only, 14,068 -> 13,590 (chunk count unchanged), with the skirt
+        // overlap fix: a skirt is no longer emitted over a cell that already
+        // owns a real face of its own. Those skirts were not hiding a crack --
+        // there was no crack to hide -- they were laying a second coplanar,
+        // same-facing quad over one the mesher had already emitted, which
+        // z-fights on the GPU. Note this fixture is deliberately
+        // single-material, so the split that stranded a quad's base above the
+        // lattice floor here is an *AO* discontinuity rather than a material
+        // change: the bug never needed two block types, which is why it showed
+        // up all over the terrain and not only at dirt/stone seams. The 478
+        // triangles are redundant geometry removed, not detail lost -- the
+        // crack-hiding skirts are all still emitted, and
+        // `no_crack_at_a_real_lod_boundary` still passes.
         let world = World::new();
         let registry = test_registry();
         let ctx = test_ctx(&registry);
@@ -331,7 +345,7 @@ mod tests {
                 tris += chunk.build_mesh(&ctx).triangle_count();
             }
         }
-        assert_eq!((chunks, tris), (50, 14068));
+        assert_eq!((chunks, tris), (50, 13590));
     }
 
     #[test]
