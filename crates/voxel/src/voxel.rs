@@ -723,7 +723,7 @@ mod tests {
         // The border wall itself (NegX: outward-facing where x=0 is solid and
         // x=-1 is treated as air) spans y in [8, 16). The skirt is the extra
         // one-cell-tall quad directly below it, y in [7, 8).
-        let has_skirt = mesh.vertices.chunks_exact(4).any(|quad| {
+        let has_skirt = mesh.vertices.as_chunks::<4>().0.iter().any(|quad| {
             quad.iter().all(|v| v.face() == Face::NegX)
                 && quad.iter().map(|v| v.y()).min() == Some(7)
                 && quad.iter().map(|v| v.y()).max() == Some(8)
