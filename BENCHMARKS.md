@@ -46,7 +46,7 @@ frames after 200 warmup.
 | 2026-08-24 | Skirt no longer overlaps a real face [#125], radius 12³² | 957 | **331,510** | ~4,771 | 0.089 ms | ~0.42 ms | `3af8d3b` |
 | 2026-08-24 | **Skirt no longer overlaps a real face** [#125], radius 64³² | 1,585 | **758,754** | ~3,665 | 0.112 ms | ~0.45 ms | `3af8d3b` |
 | 2026-08-24 | Reversed-Z depth [#129], radius 64³³ | 1,585 | 758,754 | ~3,952 | 0.100 ms | ~0.40 ms | `5277ddf` |
-| 2026-08-24 | Texture mip chain [#128], radius 64³⁴ | 1,585 | 758,754 | MEASURE_FPS | MEASURE_CPU | MEASURE_P99 | *(this PR)* |
+| 2026-08-24 | Texture mip chain [#128], radius 64³⁴ | 1,585 | 758,754 | ~3,990 | 0.100 ms | ~0.38 ms | *(this PR)* |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -920,12 +920,17 @@ settings were inert. At radius 64 the horizon is 1,024 blocks away, where a
 pixel and shimmered under movement — which a screenshot does not show and no
 test caught.
 
-Three back-to-back runs read **3,370–3,977 FPS / 0.101–0.114 ms CPU/frame**
-against **3,639–3,705 / 0.105–0.113 ms** for the row above. The ranges overlap;
-this is the same performance, not a win or a loss. Geometry is untouched
-(1,585 nodes, 758,754 tris, 1,341 drawn), and the added GPU cost of trilinear
-sampling is offset by mips being far kinder to the texture cache at distance.
-Recorded the median run.
+Three back-to-back runs read **3,653–4,080 FPS / 0.097–0.102 ms CPU/frame**
+against **3,851–4,095 / 0.098–0.103 ms** for the reversed-Z row above. The
+ranges overlap almost exactly; this is the same performance, not a win or a
+loss. Geometry is untouched (1,585 nodes, 758,754 tris, 1,342 drawn — the 1,342
+is reversed-Z's borderline node, ³³, not anything mips did), and the added GPU
+cost of trilinear sampling is offset by mips being far kinder to the texture
+cache at distance. Recorded the median run.
+
+Measured *after* rebasing onto reversed-Z rather than reusing the pre-rebase
+numbers, since the row now sits after it and a figure measured against a
+different base is not a delta against the row above it.
 
 The real result is in the golden images, and it is large: `terrain` moved 4.67%
 of its pixels and `lod_boundary` 6.12%, in both cases by replacing per-texel
