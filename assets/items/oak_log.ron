@@ -1,0 +1,11 @@
+// Chopped from an oak. The start of everything.
+//
+// max_stack and durability are tuning, not structure: change them here,
+// no recompile (REQUIREMENTS.md #3). An item declaring durability must
+// declare max_stack: 1 -- the registry rejects the combination, because
+// ItemStack's invariant makes a stack of two worn tools unbuildable.
+ItemDef(
+    name:       "cubara:oak_log",
+    max_stack:  64,
+    durability: None,
+)
