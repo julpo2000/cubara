@@ -16,6 +16,7 @@ mod arena;
 pub mod culling;
 pub mod headless;
 pub mod materials;
+pub mod panel;
 pub mod profiling;
 mod render;
 mod scene;
@@ -25,10 +26,11 @@ pub use arena::{ArenaUsage, ChunkArena, MeshedNode, NodeId};
 pub use culling::{Aabb, Frustum};
 pub use headless::{Frame, Shot};
 pub use materials::{swatch_color, MeshAssets};
+pub use panel::{InventoryPanel, PanelSlot, PanelSlotKind};
 pub use profiling::Profiler;
 pub use render::{
     build_pipeline, camera_bind_group_layout, create_depth_view, gpu_driven_features, grab_cursor,
     load_mesh_assets, load_registry, CameraPose, CameraUniform, Renderer,
 };
-pub use scene::{HotbarSlot, HotbarView, SceneFrame, SceneRenderer};
+pub use scene::{HotbarSlot, HotbarView, PanelView, SceneFrame, SceneRenderer};
 pub use text::TextRenderer;

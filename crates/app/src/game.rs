@@ -16,11 +16,11 @@
 use std::sync::Arc;
 
 use cubara_render::CameraPose;
-use cubara_render::{swatch_color, HotbarSlot};
-use cubara_sim::HOTBAR_WIDTH;
+use cubara_render::{swatch_color, HotbarSlot, InventoryPanel, PanelSlotKind};
 use cubara_sim::{InputFrame, Player, Sim, REACH, TICK_DT};
+use cubara_sim::{SlotRef, HOTBAR_WIDTH};
 use cubara_voxel::ChunkCoord;
-use cubara_voxel::{BlockId, BlockRegistry, ItemRegistry};
+use cubara_voxel::{BlockId, BlockRegistry, ItemRegistry, RecipeBook};
 use cubara_world::TerrainBlocks;
 use cubara_world::World;
 
@@ -49,6 +49,12 @@ pub fn load_item_registry() -> ItemRegistry {
     ItemRegistry::load(&repo_root.join("assets/items")).expect("assets/items must load")
 }
 
+/// Load `assets/recipes/*.ron`, resolving ingredient names through `items`.
+pub fn load_recipe_book(items: &ItemRegistry) -> RecipeBook {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    RecipeBook::load(&repo_root.join("assets/recipes"), items).expect("assets/recipes must load")
+}
+
 pub struct Game {
     /// The world being played. Behind an [`Arc`] so meshing jobs can carry the exact
     /// snapshot they were queued against; an edit publishes a new one.
@@ -68,6 +74,11 @@ pub struct Game {
     /// What items exist. Loaded by the app, not by `cubara-render`: items are
     /// not a render concern (Rule 3).
     items: Option<ItemRegistry>,
+    /// Every recipe, loaded alongside the items they name.
+    recipes: Option<RecipeBook>,
+    /// Whether the inventory screen is open. Screen state, not world state --
+    /// what the *grid* holds is world state and lives on the player.
+    inventory_open: bool,
     /// Wall-clock seconds not yet consumed by a fixed tick. `f64`, not `f32`
     /// like everything else here -- this is the one value that keeps being
     /// added to across a whole play session (thousands of frames), and
@@ -114,6 +125,8 @@ impl Game {
             blocks_registry: None,
             terrain: None,
             items: None,
+            recipes: None,
+            inventory_open: false,
             accumulator: 0.0,
             forward: false,
             back: false,
@@ -301,10 +314,16 @@ impl Game {
     /// ticks); issue #52 scoped out any change to raycasting itself anyway.
     /// Give the game the assets it needs to turn blocks into items and back.
     /// Called once, when the window and its registry exist.
-    pub fn set_assets(&mut self, registry: Arc<BlockRegistry>, items: ItemRegistry) {
+    pub fn set_assets(
+        &mut self,
+        registry: Arc<BlockRegistry>,
+        items: ItemRegistry,
+        recipes: RecipeBook,
+    ) {
         self.terrain = Some(TerrainBlocks::from_registry(&registry));
         self.blocks_registry = Some(registry);
         self.items = Some(items);
+        self.recipes = Some(recipes);
     }
 
     /// Break the targeted block and put its item in the inventory.
@@ -422,6 +441,97 @@ impl Game {
         Some(out)
     }
 
+    /// Whether the inventory screen is open.
+    pub fn inventory_open(&self) -> bool {
+        self.inventory_open
+    }
+
+    /// Open or close the screen. Closing is **refused** while the crafting grid
+    /// cannot empty into the inventory (2.2b's `close`), so items in the grid
+    /// are never eaten by walking away from them.
+    pub fn toggle_inventory(&mut self) {
+        if !self.inventory_open {
+            self.inventory_open = true;
+            return;
+        }
+        let Some(items) = self.items.as_ref() else {
+            self.inventory_open = false;
+            return;
+        };
+        let player = &mut self.sim.player;
+        if player.crafting.close(&mut player.inventory, items) {
+            self.inventory_open = false;
+        } else {
+            log::debug!("inventory full: the crafting grid still holds items, staying open");
+        }
+    }
+
+    /// Route a click on the open screen. `(x, y)` is in window pixels.
+    ///
+    /// The layout that decides *which* slot lives in `cubara-render` and is the
+    /// same one the screen is drawn from, so a click cannot land on a slot other
+    /// than the one under the cursor.
+    pub fn click_panel(&mut self, x: f32, y: f32, right: bool, width: u32, height: u32) {
+        let (Some(items), Some(book)) = (self.items.as_ref(), self.recipes.as_ref()) else {
+            return;
+        };
+        let panel = InventoryPanel::layout(width, height, self.sim.player.crafting.width());
+        let Some((kind, index)) = panel.hit(x, y) else {
+            return;
+        };
+        let slot = match kind {
+            PanelSlotKind::Inventory => SlotRef::Inventory(index),
+            PanelSlotKind::Grid => SlotRef::Grid(index),
+            PanelSlotKind::Result => SlotRef::Result,
+        };
+        let player = &mut self.sim.player;
+        player
+            .crafting
+            .click(slot, right, &mut player.inventory, items, book);
+    }
+
+    /// The screen's layout and contents, or `None` when it is closed.
+    ///
+    /// Walks the same layout the renderer draws from, filling one entry per
+    /// slot -- which is what keeps `contents` and `slots()` in step without
+    /// either side knowing the other's ordering.
+    pub fn panel_view(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> Option<(InventoryPanel, Vec<Option<HotbarSlot>>, Option<HotbarSlot>)> {
+        if !self.inventory_open {
+            return None;
+        }
+        let items = self.items.as_ref()?;
+        let crafting = &self.sim.player.crafting;
+        let book = self.recipes.as_ref();
+        let panel = InventoryPanel::layout(width, height, crafting.width());
+
+        let swatch = |stack: cubara_voxel::ItemStack| {
+            items.name_of(stack.item()).map(|name| HotbarSlot {
+                color: swatch_color(name),
+                count: stack.count(),
+            })
+        };
+
+        let contents = panel
+            .slots()
+            .iter()
+            .map(|s| match s.kind {
+                PanelSlotKind::Inventory => {
+                    self.sim.player.inventory.slot(s.index).and_then(swatch)
+                }
+                PanelSlotKind::Grid => crafting.cell(s.index).and_then(swatch),
+                PanelSlotKind::Result => book
+                    .and_then(|b| crafting.result(b, items))
+                    .and_then(swatch),
+            })
+            .collect();
+        let held = crafting.held().and_then(swatch);
+        Some((panel, contents, held))
+    }
+
     /// Which hotbar slot is held, for the renderer.
     pub fn selected_hotbar_slot(&self) -> u8 {
         self.sim.player.inventory.selected_slot()
@@ -494,9 +604,12 @@ mod tests {
     /// should catch, and a fixture would hide it.
     fn game_looking_at_ground() -> (Game, [i32; 3]) {
         let mut game = Game::new();
+        let items = load_item_registry();
+        let recipes = load_recipe_book(&items);
         game.set_assets(
             std::sync::Arc::new(cubara_render::load_registry()),
-            load_item_registry(),
+            items,
+            recipes,
         );
         let ground = game
             .world()

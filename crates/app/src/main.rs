@@ -14,9 +14,9 @@ mod streaming;
 
 use std::sync::Arc;
 
-use cubara_render::{grab_cursor, HotbarView, Profiler, Renderer};
+use cubara_render::{grab_cursor, HotbarView, PanelView, Profiler, Renderer};
 
-use crate::game::{load_item_registry, Game};
+use crate::game::{load_item_registry, load_recipe_book, Game};
 use crate::streaming::NodeStreaming;
 
 use winit::application::ApplicationHandler;
@@ -37,6 +37,9 @@ struct App {
     streaming: Option<NodeStreaming>,
     /// Whether the mouse is captured for first-person look (toggled with Escape).
     cursor_captured: bool,
+    /// Last known cursor position in window pixels. Only meaningful while the
+    /// inventory screen is open -- a captured cursor does not move.
+    cursor: (f32, f32),
     /// Kept alive for the program's lifetime when built with `--features profile`.
     _profiler: Option<Profiler>,
     /// When the last frame was drawn. The app loop owns the clock and hands `dt`
@@ -54,7 +57,9 @@ impl ApplicationHandler for App {
         let (renderer, mesh_assets) = Renderer::new(window.clone(), self.game.camera_pose());
         let layers = mesh_assets.layers;
         let registry = std::sync::Arc::new(mesh_assets.registry);
-        self.game.set_assets(registry.clone(), load_item_registry());
+        let items = load_item_registry();
+        let recipes = load_recipe_book(&items);
+        self.game.set_assets(registry.clone(), items, recipes);
         self.streaming = Some(NodeStreaming::new(registry, move |name: &str| {
             layers.layer_of(name)
         }));
@@ -85,12 +90,36 @@ impl ApplicationHandler for App {
                         grab_cursor(renderer.window(), self.cursor_captured);
                     } else if code == KeyCode::F3 && pressed {
                         renderer.toggle_debug();
+                    } else if code == KeyCode::KeyE && pressed {
+                        // The screen and the mouse are one thing: you cannot
+                        // click slots while the cursor is locked to look around.
+                        // Toggling may be *refused* -- see
+                        // `Game::toggle_inventory` -- so capture follows what
+                        // the game decided, not what was asked for.
+                        self.game.toggle_inventory();
+                        self.cursor_captured = !self.game.inventory_open();
+                        grab_cursor(renderer.window(), self.cursor_captured);
                     } else {
                         self.game.key_input(code, pressed);
                     }
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                // Only meaningful while the screen is open; a captured
+                // first-person cursor sits in the middle and never moves.
+                self.cursor = (position.x as f32, position.y as f32);
+            }
             WindowEvent::MouseInput { state, button, .. } => {
+                if self.game.inventory_open() && state == ElementState::Pressed {
+                    let (w, h) = renderer.size();
+                    self.game.click_panel(
+                        self.cursor.0,
+                        self.cursor.1,
+                        button == MouseButton::Right,
+                        w,
+                        h,
+                    );
+                }
                 // Left click breaks the targeted block, right click places one — but
                 // only while the cursor is captured (i.e. actually playing).
                 if self.cursor_captured && state == ElementState::Pressed {
@@ -123,7 +152,15 @@ impl ApplicationHandler for App {
                     slots: s,
                     selected: self.game.selected_hotbar_slot(),
                 });
-                renderer.render(camera, self.game.selected_block(), hotbar);
+                let (w, h) = renderer.size();
+                let panel_data = self.game.panel_view(w, h);
+                let panel = panel_data.as_ref().map(|(p, contents, held)| PanelView {
+                    panel: p,
+                    contents,
+                    held: *held,
+                    cursor: self.cursor,
+                });
+                renderer.render(camera, self.game.selected_block(), hotbar, panel);
                 // Immediately queue the next frame — we render continuously.
                 renderer.window().request_redraw();
             }

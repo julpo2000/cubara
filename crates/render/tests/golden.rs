@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use cubara_render::headless::{self, Frame, Shot};
 use cubara_render::materials::TextureLayers;
-use cubara_render::{HotbarSlot, MeshedNode, NodeId};
+use cubara_render::{HotbarSlot, InventoryPanel, MeshedNode, NodeId, PanelSlotKind};
 use cubara_voxel::{BlockId, BlockRegistry, Chunk, ChunkCoord};
 use cubara_world::mesh::mesh_region;
 use cubara_world::node::schedule_for_radius;
@@ -242,7 +242,7 @@ fn the_same_scene_renders_byte_identically() {
     // arena's internal layout is not reproducible. That matters the moment world
     // state is hashed or saved; see issue #83.
     let shot = Shot::default();
-    let Some(a) = render_world(&World::new(), shot) else {
+    let Some(a) = render_world(&World::new(), shot.clone()) else {
         eprintln!("SKIP the_same_scene_renders_byte_identically: no GPU adapter");
         return;
     };
@@ -295,6 +295,7 @@ fn a_cave_mouth_is_visible() {
         camera: Some((eye, target - eye)),
         highlighted_block: None,
         hotbar: None,
+        panel: None,
     };
     assert_golden("cave_mouth", &world, shot);
 }
@@ -356,6 +357,7 @@ fn the_selected_block_shows_an_outline() {
         camera: Some((eye, target - eye)),
         highlighted_block: Some(hit.block),
         hotbar: None,
+        panel: None,
     };
     assert_golden("outline", &world, shot);
 }
@@ -397,8 +399,63 @@ fn the_hotbar_shows_slots_counts_and_the_held_one() {
         camera: None,
         highlighted_block: None,
         hotbar: Some(hotbar),
+        panel: None,
     };
     assert_golden("hotbar", &world, shot);
+}
+
+#[test]
+fn the_inventory_screen_shows_slots_a_recipe_and_the_cursor() {
+    // Block 2.2c's own bar. Four things have to be legible at once, and a
+    // golden is the only automated way to say so: the dimmed world behind, the
+    // slot grid, a partial recipe with its result showing, and the cursor's
+    // stack drawn over everything.
+    //
+    // Built from the layout directly -- no sim, no inventory -- which is the
+    // point of `PanelView` carrying colours and counts (Rule 3).
+    let panel = InventoryPanel::layout(960, 540, 2);
+    let swatch = |r: f32, g: f32, b: f32, count: u8| {
+        Some(HotbarSlot {
+            color: [r, g, b],
+            count,
+        })
+    };
+
+    let contents: Vec<Option<HotbarSlot>> = panel
+        .slots()
+        .iter()
+        .map(|s| match (s.kind, s.index) {
+            // A 2x2 of planks in the grid: cells 0, 1, 3, 4 of the sim's fixed
+            // 3x3 storage.
+            (PanelSlotKind::Grid, 0 | 1 | 3 | 4) => swatch(0.66, 0.50, 0.31, 4),
+            // ... so the result slot shows what it makes.
+            (PanelSlotKind::Result, _) => swatch(0.55, 0.40, 0.26, 1),
+            (PanelSlotKind::Inventory, 0) => swatch(0.45, 0.62, 0.30, 12),
+            (PanelSlotKind::Inventory, 2) => swatch(0.52, 0.52, 0.55, 64),
+            (PanelSlotKind::Inventory, 11) => swatch(0.70, 0.35, 0.25, 3),
+            _ => None,
+        })
+        .collect();
+
+    let world = World::new();
+    let shot = Shot {
+        width: 960,
+        height: 540,
+        region_radius: 2,
+        orbit_t: 0.0,
+        camera: None,
+        highlighted_block: None,
+        hotbar: None,
+        panel: Some((
+            2,
+            contents,
+            swatch(0.66, 0.50, 0.31, 7),
+            // Over a slot rather than in open space, so the golden shows the
+            // cursor's stack drawn *on top of* a slot's contents.
+            (panel.slots()[0].x + 30.0, panel.slots()[0].y + 30.0),
+        )),
+    };
+    assert_golden("inventory_screen", &world, shot);
 }
 
 #[test]
@@ -439,6 +496,7 @@ fn distinct_materials_render_with_distinct_textures() {
         camera: None,
         highlighted_block: None,
         hotbar: None,
+        panel: None,
     };
 
     let Some(frame) = headless::render_chunks(&chunks, shot) else {
@@ -493,7 +551,7 @@ fn edits_change_what_is_drawn() {
     // cannot fail is worse than none, because it reads as coverage.
     let shot = Shot::default();
     let mut world = World::new();
-    let Some(base) = render_world(&World::new(), shot) else {
+    let Some(base) = render_world(&World::new(), shot.clone()) else {
         eprintln!("SKIP edits_change_what_is_drawn: no GPU adapter");
         return;
     };

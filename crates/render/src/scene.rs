@@ -15,6 +15,7 @@ use glam::Mat4;
 
 use crate::arena::ChunkArena;
 use crate::materials;
+use crate::panel::{InventoryPanel, PanelSlotKind};
 use crate::render::{
     build_outline_pipeline, build_pipeline, camera_bind_group_layout, create_depth_view,
     origins_bind_group_layout, outline_bind_group_layout, CameraUniform, OutlineUniform,
@@ -49,6 +50,23 @@ pub struct SceneFrame<'a> {
     pub overlay: Option<&'a str>,
     /// The hotbar to draw along the bottom, or `None` to draw none.
     pub hotbar: Option<HotbarView<'a>>,
+    /// The open inventory screen, or `None` when it is closed.
+    pub panel: Option<PanelView<'a>>,
+}
+
+/// What the renderer needs to draw the inventory screen.
+///
+/// Like [`HotbarView`], colours and counts rather than items -- `contents` is
+/// parallel to `panel.slots()`, so the app fills it by walking the same layout
+/// the renderer draws from. One layout, two consumers (see [`crate::panel`]).
+#[derive(Clone, Copy, Debug)]
+pub struct PanelView<'a> {
+    pub panel: &'a InventoryPanel,
+    /// One entry per slot in `panel.slots()`, same order.
+    pub contents: &'a [Option<HotbarSlot>],
+    /// What the cursor is carrying, and where the cursor is in pixels.
+    pub held: Option<HotbarSlot>,
+    pub cursor: (f32, f32),
 }
 
 /// One hotbar slot's contents, already reduced to what drawing needs.
@@ -217,6 +235,7 @@ impl SceneRenderer {
             selected_block,
             overlay,
             hotbar,
+            panel,
         } = frame;
         if let Some(block) = selected_block {
             let origin = [block[0] as f32, block[1] as f32, block[2] as f32];
@@ -269,7 +288,7 @@ impl SceneRenderer {
         // Overlay: a second pass over the same colour target (loaded, no depth).
         // Text and hotbar share it -- both are screen-space quads out of the
         // same vertex buffer, so drawing the HUD costs no extra pass.
-        if overlay.is_none() && hotbar.is_none() {
+        if overlay.is_none() && hotbar.is_none() && panel.is_none() {
             return;
         }
         if let Some(text) = overlay {
@@ -280,6 +299,11 @@ impl SceneRenderer {
         }
         if let Some(hotbar) = hotbar {
             self.queue_hotbar(hotbar);
+        }
+        // After the hotbar: the screen covers it, and the overlay pass has no
+        // depth to sort with, so order is the only thing deciding what is on top.
+        if let Some(panel) = panel {
+            self.queue_panel(panel);
         }
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -298,6 +322,69 @@ impl SceneRenderer {
         });
         self.text
             .flush(queue, &mut pass, self.width as f32, self.height as f32);
+    }
+
+    /// Draw the inventory screen from the same layout `hit` tests against.
+    fn queue_panel(&mut self, view: PanelView<'_>) {
+        const DIM: [f32; 3] = [0.02, 0.02, 0.03];
+        const BACK: [f32; 3] = [0.13, 0.13, 0.16];
+        const WELL: [f32; 3] = [0.24, 0.24, 0.27];
+        const RESULT: [f32; 3] = [0.32, 0.29, 0.20];
+        const PAD: f32 = 6.0;
+
+        // A dimmed sheet over the world, so the screen reads as modal even
+        // though the sim keeps running behind it. Alpha, not an opaque
+        // rectangle: hiding the world entirely reads as a scene change rather
+        // than a menu, and you lose the sense of where you were standing.
+        self.text
+            .queue_rect_alpha(0.0, 0.0, self.width as f32, self.height as f32, DIM, 0.72);
+        let p = view.panel;
+        self.text.queue_rect(p.x, p.y, p.width, p.height, BACK);
+
+        for (slot, content) in p.slots().iter().zip(view.contents) {
+            let well = if slot.kind == PanelSlotKind::Result {
+                RESULT
+            } else {
+                WELL
+            };
+            self.text
+                .queue_rect(slot.x, slot.y, slot.size, slot.size, well);
+            if let Some(item) = content {
+                self.queue_item(slot.x, slot.y, slot.size, PAD, *item);
+            }
+        }
+
+        // The cursor's stack last, so it is above everything -- it is the thing
+        // being moved, and it has to be visible over whatever it is moved onto.
+        if let Some(held) = view.held {
+            let (cx, cy) = view.cursor;
+            let s = crate::panel::SLOT;
+            self.queue_item(cx - s * 0.5, cy - s * 0.5, s, PAD, held);
+        }
+    }
+
+    /// One item swatch plus its count, inside a slot of `size` at (`x`, `y`).
+    /// Shared by the hotbar and the screen so the two cannot drift apart.
+    fn queue_item(&mut self, x: f32, y: f32, size: f32, pad: f32, item: HotbarSlot) {
+        self.text.queue_rect(
+            x + pad,
+            y + pad,
+            size - pad * 2.0,
+            size - pad * 2.0,
+            item.color,
+        );
+        // Counts of 1 are noise -- a slot with one thing in it is already
+        // visibly a slot with something in it.
+        if item.count > 1 {
+            const SCALE: f32 = 1.5;
+            let label = item.count.to_string();
+            let w = label.len() as f32 * font::GLYPH as f32 * SCALE;
+            let tx = x + size - w - 2.0;
+            let ty = y + size - font::GLYPH as f32 * SCALE - 2.0;
+            self.text
+                .queue(&label, tx + 1.0, ty + 1.0, SCALE, [0.0, 0.0, 0.0]);
+            self.text.queue(&label, tx, ty, SCALE, [1.0, 1.0, 1.0]);
+        }
     }
 
     /// Lay the hotbar out along the bottom centre and queue its quads.
@@ -339,26 +426,7 @@ impl SceneRenderer {
 
             let Some(item) = slot else { continue };
             const PAD: f32 = 8.0;
-            self.text.queue_rect(
-                x + PAD,
-                y + PAD,
-                SLOT - PAD * 2.0,
-                SLOT - PAD * 2.0,
-                item.color,
-            );
-
-            // Counts of 1 are noise -- a slot with one thing in it is already
-            // visibly a slot with something in it.
-            if item.count > 1 {
-                const SCALE: f32 = 1.5;
-                let label = item.count.to_string();
-                let w = label.len() as f32 * font::GLYPH as f32 * SCALE;
-                let tx = x + SLOT - w - 2.0;
-                let ty = y + SLOT - font::GLYPH as f32 * SCALE - 2.0;
-                self.text
-                    .queue(&label, tx + 1.0, ty + 1.0, SCALE, [0.0, 0.0, 0.0]);
-                self.text.queue(&label, tx, ty, SCALE, [1.0, 1.0, 1.0]);
-            }
+            self.queue_item(x, y, SLOT, PAD, *item);
         }
     }
 }

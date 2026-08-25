@@ -28,11 +28,15 @@ const ATLAS_H: u32 = font::GLYPH as u32;
 struct TextVertex {
     pos: [f32; 2],
     uv: [f32; 2],
-    color: [f32; 3],
+    /// Linear RGB **and alpha**. Everything except the inventory screen's
+    /// backdrop draws at alpha 1, where blending is a no-op -- the alpha exists
+    /// so a modal screen can dim the world rather than replace it, which
+    /// without blending is what an opaque rectangle does.
+    color: [f32; 4],
 }
 
 const TEXT_ATTRS: [wgpu::VertexAttribute; 3] =
-    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x3];
+    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4];
 
 /// Draws bitmap-font strings in screen space. Accumulate lines with
 /// [`queue`](Self::queue), then [`flush`](Self::flush) once per frame in a render
@@ -179,7 +183,10 @@ impl TextRenderer {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: None,
+                    // Straight alpha. Every existing caller draws at alpha 1,
+                    // for which this is the identity -- so the hotbar and the
+                    // debug text are byte-identical with it on.
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -235,16 +242,38 @@ impl TextRenderer {
     /// shares the glyph pipeline, its vertex buffer and its draw call -- the
     /// HUD costs no extra pass.
     pub fn queue_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: [f32; 3]) {
+        self.queue_rect_alpha(x, y, w, h, color, 1.0);
+    }
+
+    /// A filled rectangle with an explicit alpha -- what lets the inventory
+    /// screen dim the world instead of hiding it.
+    pub fn queue_rect_alpha(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        color: [f32; 3],
+        alpha: f32,
+    ) {
         let cell = SOLID_CELL as f32 * font::GLYPH as f32;
         // Inset half a texel on each side so bilinear-free sampling cannot
         // catch the neighbouring glyph's edge column.
         let u0 = (cell + 0.5) / ATLAS_W as f32;
         let u1 = (cell + font::GLYPH as f32 - 0.5) / ATLAS_W as f32;
-        self.push_rect(x, y, w, h, u0, u1, color);
+        self.push_rect(x, y, w, h, u0, u1, [color[0], color[1], color[2], alpha]);
     }
 
     fn push_quad(&mut self, x: f32, y: f32, size: f32, u0: f32, u1: f32, color: [f32; 3]) {
-        self.push_rect(x, y, size, size, u0, u1, color);
+        self.push_rect(
+            x,
+            y,
+            size,
+            size,
+            u0,
+            u1,
+            [color[0], color[1], color[2], 1.0],
+        );
     }
 
     /// The one place a quad is built. Eight arguments is over clippy's
@@ -252,7 +281,7 @@ impl TextRenderer {
     /// eight values one line up -- this is a private leaf that both public
     /// entry points funnel into, which is the shape Rule 5 wants.
     #[allow(clippy::too_many_arguments)]
-    fn push_rect(&mut self, x: f32, y: f32, w: f32, h: f32, u0: f32, u1: f32, color: [f32; 3]) {
+    fn push_rect(&mut self, x: f32, y: f32, w: f32, h: f32, u0: f32, u1: f32, color: [f32; 4]) {
         if self.verts.len() + 6 > MAX_CHARS * 6 {
             return;
         }

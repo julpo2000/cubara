@@ -457,6 +457,11 @@ impl Renderer {
         &self.window
     }
 
+    /// The surface's current size in pixels -- what screen-space layout needs.
+    pub fn size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
             self.config.width = width;
@@ -504,6 +509,7 @@ impl Renderer {
         camera: CameraPose,
         selected_block: Option<[i32; 3]>,
         hotbar: Option<crate::scene::HotbarView<'_>>,
+        panel: Option<crate::scene::PanelView<'_>>,
     ) {
         crate::profiling::Profiler::new_frame();
         puffin::profile_function!();
@@ -545,6 +551,7 @@ impl Renderer {
                     selected_block,
                     overlay: overlay.as_deref(),
                     hotbar,
+                    panel,
                 },
             );
         }
