@@ -6,13 +6,20 @@
 //! text stack, so it's decoupled from the wgpu version and fits the blocky aesthetic.
 //! See issue #49-follow-up (F3 debug screen).
 
-mod font;
+pub(crate) mod font;
 
 use wgpu::util::DeviceExt;
 
 /// Max characters drawn per frame (debug text is tiny; this is generous).
 const MAX_CHARS: usize = 4096;
-const ATLAS_W: u32 = font::FONT8X8.len() as u32 * font::GLYPH as u32;
+/// One cell per glyph, plus one **solid** cell at the end. That extra cell is
+/// what lets this same pipeline draw filled rectangles (see
+/// [`TextRenderer::queue_rect`]) instead of needing a second screen-space
+/// pipeline for the HUD -- one 2D path, per `ARCHITECTURE.md` Rule 5.
+const ATLAS_W: u32 = (font::FONT8X8.len() as u32 + 1) * font::GLYPH as u32;
+
+/// Index of the solid cell: one past the last glyph.
+const SOLID_CELL: usize = font::FONT8X8.len();
 const ATLAS_H: u32 = font::GLYPH as u32;
 
 /// One text-quad vertex: screen-pixel position, atlas UV, and RGB colour.
@@ -51,6 +58,14 @@ impl TextRenderer {
                         pixels[y * ATLAS_W as usize + px] = 255;
                     }
                 }
+            }
+        }
+        // The solid cell: every pixel set, so a quad sampling it is a filled
+        // rectangle of whatever colour the vertex carries.
+        for y in 0..font::GLYPH {
+            for x in 0..font::GLYPH {
+                let px = SOLID_CELL * font::GLYPH + x;
+                pixels[y * ATLAS_W as usize + px] = 255;
             }
         }
         let atlas = device.create_texture_with_data(
@@ -216,11 +231,32 @@ impl TextRenderer {
         }
     }
 
+    /// A filled rectangle in screen pixels. Uses the atlas's solid cell, so it
+    /// shares the glyph pipeline, its vertex buffer and its draw call -- the
+    /// HUD costs no extra pass.
+    pub fn queue_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: [f32; 3]) {
+        let cell = SOLID_CELL as f32 * font::GLYPH as f32;
+        // Inset half a texel on each side so bilinear-free sampling cannot
+        // catch the neighbouring glyph's edge column.
+        let u0 = (cell + 0.5) / ATLAS_W as f32;
+        let u1 = (cell + font::GLYPH as f32 - 0.5) / ATLAS_W as f32;
+        self.push_rect(x, y, w, h, u0, u1, color);
+    }
+
     fn push_quad(&mut self, x: f32, y: f32, size: f32, u0: f32, u1: f32, color: [f32; 3]) {
+        self.push_rect(x, y, size, size, u0, u1, color);
+    }
+
+    /// The one place a quad is built. Eight arguments is over clippy's
+    /// threshold and grouping them into a struct would only move the same
+    /// eight values one line up -- this is a private leaf that both public
+    /// entry points funnel into, which is the shape Rule 5 wants.
+    #[allow(clippy::too_many_arguments)]
+    fn push_rect(&mut self, x: f32, y: f32, w: f32, h: f32, u0: f32, u1: f32, color: [f32; 3]) {
         if self.verts.len() + 6 > MAX_CHARS * 6 {
             return;
         }
-        let (x1, y1) = (x + size, y + size);
+        let (x1, y1) = (x + w, y + h);
         let v = |px, py, u, vv| TextVertex {
             pos: [px, py],
             uv: [u, vv],

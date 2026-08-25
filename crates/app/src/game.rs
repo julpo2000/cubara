@@ -16,6 +16,8 @@
 use std::sync::Arc;
 
 use cubara_render::CameraPose;
+use cubara_render::{swatch_color, HotbarSlot};
+use cubara_sim::HOTBAR_WIDTH;
 use cubara_sim::{InputFrame, Player, Sim, REACH, TICK_DT};
 use cubara_voxel::ChunkCoord;
 use cubara_voxel::{BlockId, BlockRegistry, ItemRegistry};
@@ -389,6 +391,40 @@ impl Game {
         self.sim.player.inventory.take_one(slot, items)?;
 
         Some(Arc::make_mut(&mut self.world).set_block(target[0], target[1], target[2], block))
+    }
+
+    /// The hotbar reduced to what drawing needs: a swatch colour and a count
+    /// per slot, plus which is held.
+    ///
+    /// The reduction lives here, not in `cubara-render`: that crate does not
+    /// know what an item is, nor that slots 0..9 of a 36-slot array are the
+    /// hotbar (Rule 3). Returns `None` before assets are set, so the HUD simply
+    /// does not draw rather than drawing nine empty boxes.
+    ///
+    /// Colours come from `swatch_color`, the same deterministic name hash a
+    /// block with no texture file already uses -- so a stone block in the world
+    /// and a stone item in the hand read as the same material. Real item icons
+    /// are art that does not exist yet.
+    pub fn hotbar_slots(&self) -> Option<[Option<HotbarSlot>; HOTBAR_WIDTH]> {
+        let items = self.items.as_ref()?;
+        let inv = &self.sim.player.inventory;
+        let mut out = [None; HOTBAR_WIDTH];
+        for (i, out_slot) in out.iter_mut().enumerate() {
+            let Some(stack) = inv.slot(i) else { continue };
+            let Some(name) = items.name_of(stack.item()) else {
+                continue;
+            };
+            *out_slot = Some(HotbarSlot {
+                color: swatch_color(name),
+                count: stack.count(),
+            });
+        }
+        Some(out)
+    }
+
+    /// Which hotbar slot is held, for the renderer.
+    pub fn selected_hotbar_slot(&self) -> u8 {
+        self.sim.player.inventory.selected_slot()
     }
 
     /// Select a hotbar slot (number keys 1-9, passed as 0-8).

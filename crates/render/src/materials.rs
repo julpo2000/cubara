@@ -70,6 +70,18 @@ fn name_to_layer(registry: &BlockRegistry) -> HashMap<String, u32> {
 /// art (block 1.4c). Hashing the name, rather than a hand-picked table, keeps
 /// this generic: it works for any material a data file adds, not just
 /// today's three.
+/// The same deterministic colour as [`placeholder_color`], as linear floats --
+/// for a caller that needs a stand-in swatch rather than a texture, e.g. the
+/// hotbar drawing an item that has no art yet.
+///
+/// Shares `placeholder_color`'s hash on purpose: an item and a block of the
+/// same name get the same colour, so a stone block in the world and a stone
+/// item in the hotbar read as the same material even before either has art.
+pub fn swatch_color(name: &str) -> [f32; 3] {
+    let [r, g, b] = placeholder_color(name);
+    [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]
+}
+
 fn placeholder_color(name: &str) -> [u8; 3] {
     let mut hash: u32 = 2166136261; // FNV-1a offset basis
     for b in name.bytes() {

@@ -20,6 +20,7 @@ use crate::render::{
     origins_bind_group_layout, outline_bind_group_layout, CameraUniform, OutlineUniform,
     OUTLINE_CUBE_EDGES,
 };
+use crate::text::font;
 use crate::text::TextRenderer;
 
 /// The sky colour a frame clears to.
@@ -46,6 +47,34 @@ pub struct SceneFrame<'a> {
     pub selected_block: Option<[i32; 3]>,
     /// Screen-space debug text, or `None`.
     pub overlay: Option<&'a str>,
+    /// The hotbar to draw along the bottom, or `None` to draw none.
+    pub hotbar: Option<HotbarView<'a>>,
+}
+
+/// One hotbar slot's contents, already reduced to what drawing needs.
+#[derive(Clone, Copy, Debug)]
+pub struct HotbarSlot {
+    /// The swatch colour standing in for an item icon. Item art does not exist
+    /// yet; the caller derives a stable colour from the item's name, the same
+    /// way a block with no texture file gets a placeholder
+    /// (`materials::placeholder_color`).
+    pub color: [f32; 3],
+    pub count: u8,
+}
+
+/// What the renderer needs to draw a hotbar: colours and counts, and which slot
+/// is held.
+///
+/// Deliberately **not** an inventory. This crate does not know what an item is,
+/// what a stack is, or that slots 0..9 of a 36-slot array are special
+/// (`ARCHITECTURE.md` Rule 3 -- the renderer's inputs are meshes, origins, a
+/// camera, and now a strip of coloured boxes). The app reduces its `Inventory`
+/// to this, which is also what keeps the hotbar drawable in a headless golden
+/// test with no sim involved.
+#[derive(Clone, Copy, Debug)]
+pub struct HotbarView<'a> {
+    pub slots: &'a [Option<HotbarSlot>],
+    pub selected: u8,
 }
 
 /// Owns everything a frame needs that is not the geometry or the camera pose:
@@ -187,6 +216,7 @@ impl SceneRenderer {
             draw_count,
             selected_block,
             overlay,
+            hotbar,
         } = frame;
         if let Some(block) = selected_block {
             let origin = [block[0] as f32, block[1] as f32, block[2] as f32];
@@ -237,11 +267,20 @@ impl SceneRenderer {
         }
 
         // Overlay: a second pass over the same colour target (loaded, no depth).
-        let Some(text) = overlay else { return };
-        const SCALE: f32 = 2.0;
-        // Shadow first (dark, offset), then the white text on top.
-        self.text.queue(text, 10.0, 10.0, SCALE, [0.0, 0.0, 0.0]);
-        self.text.queue(text, 8.0, 8.0, SCALE, [1.0, 1.0, 1.0]);
+        // Text and hotbar share it -- both are screen-space quads out of the
+        // same vertex buffer, so drawing the HUD costs no extra pass.
+        if overlay.is_none() && hotbar.is_none() {
+            return;
+        }
+        if let Some(text) = overlay {
+            const SCALE: f32 = 2.0;
+            // Shadow first (dark, offset), then the white text on top.
+            self.text.queue(text, 10.0, 10.0, SCALE, [0.0, 0.0, 0.0]);
+            self.text.queue(text, 8.0, 8.0, SCALE, [1.0, 1.0, 1.0]);
+        }
+        if let Some(hotbar) = hotbar {
+            self.queue_hotbar(hotbar);
+        }
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("overlay-pass"),
@@ -259,5 +298,67 @@ impl SceneRenderer {
         });
         self.text
             .flush(queue, &mut pass, self.width as f32, self.height as f32);
+    }
+
+    /// Lay the hotbar out along the bottom centre and queue its quads.
+    ///
+    /// Pixel sizes rather than fractions of the window: the hotbar should be
+    /// the same physical size on a 1080p and a 4K screen, not four times
+    /// bigger, which is what scaling with the viewport would give.
+    fn queue_hotbar(&mut self, view: HotbarView<'_>) {
+        const SLOT: f32 = 48.0;
+        const GAP: f32 = 4.0;
+        const MARGIN: f32 = 16.0;
+        const BORDER: f32 = 3.0;
+        const FRAME: [f32; 3] = [0.10, 0.10, 0.12];
+        const EMPTY: [f32; 3] = [0.24, 0.24, 0.27];
+        const HELD: [f32; 3] = [1.0, 1.0, 1.0];
+
+        let n = view.slots.len() as f32;
+        if n == 0.0 {
+            return;
+        }
+        let total = n * SLOT + (n - 1.0) * GAP;
+        let x0 = (self.width as f32 - total) * 0.5;
+        let y = self.height as f32 - SLOT - MARGIN;
+
+        for (i, slot) in view.slots.iter().enumerate() {
+            let x = x0 + i as f32 * (SLOT + GAP);
+            let held = i as u8 == view.selected;
+
+            // Border, then the well, then the item -- painted back to front,
+            // since the overlay pass has no depth to sort with.
+            self.text.queue_rect(
+                x - BORDER,
+                y - BORDER,
+                SLOT + BORDER * 2.0,
+                SLOT + BORDER * 2.0,
+                if held { HELD } else { FRAME },
+            );
+            self.text.queue_rect(x, y, SLOT, SLOT, EMPTY);
+
+            let Some(item) = slot else { continue };
+            const PAD: f32 = 8.0;
+            self.text.queue_rect(
+                x + PAD,
+                y + PAD,
+                SLOT - PAD * 2.0,
+                SLOT - PAD * 2.0,
+                item.color,
+            );
+
+            // Counts of 1 are noise -- a slot with one thing in it is already
+            // visibly a slot with something in it.
+            if item.count > 1 {
+                const SCALE: f32 = 1.5;
+                let label = item.count.to_string();
+                let w = label.len() as f32 * font::GLYPH as f32 * SCALE;
+                let tx = x + SLOT - w - 2.0;
+                let ty = y + SLOT - font::GLYPH as f32 * SCALE - 2.0;
+                self.text
+                    .queue(&label, tx + 1.0, ty + 1.0, SCALE, [0.0, 0.0, 0.0]);
+                self.text.queue(&label, tx, ty, SCALE, [1.0, 1.0, 1.0]);
+            }
+        }
     }
 }

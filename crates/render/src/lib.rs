@@ -24,11 +24,11 @@ mod text;
 pub use arena::{ArenaUsage, ChunkArena, MeshedNode, NodeId};
 pub use culling::{Aabb, Frustum};
 pub use headless::{Frame, Shot};
-pub use materials::MeshAssets;
+pub use materials::{swatch_color, MeshAssets};
 pub use profiling::Profiler;
 pub use render::{
     build_pipeline, camera_bind_group_layout, create_depth_view, gpu_driven_features, grab_cursor,
     load_mesh_assets, load_registry, CameraPose, CameraUniform, Renderer,
 };
-pub use scene::{SceneFrame, SceneRenderer};
+pub use scene::{HotbarSlot, HotbarView, SceneFrame, SceneRenderer};
 pub use text::TextRenderer;
