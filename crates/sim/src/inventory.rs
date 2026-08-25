@@ -117,6 +117,28 @@ impl Inventory {
         self.slots.get_mut(index).and_then(|s| s.take())
     }
 
+    /// Remove exactly one item from `index`, returning a stack of that one.
+    ///
+    /// Lives here rather than at the call site because [`ItemStack`]'s fields
+    /// are private, and they are private on purpose: the count/state invariant
+    /// cannot be enforced by a constructor that anyone can bypass by editing a
+    /// field. Decrementing is the one legitimate mutation, so it is spelled out
+    /// once, here.
+    ///
+    /// The slot empties when the last one goes -- an `Some(stack)` with a count
+    /// of zero is not representable, which is the invariant doing its job.
+    pub fn take_one(&mut self, index: usize, registry: &ItemRegistry) -> Option<ItemStack> {
+        let slot = self.slots.get_mut(index)?;
+        let stack = (*slot)?;
+        let max = registry.max_stack(stack.item());
+        let one = ItemStack::new(stack.item(), 1, stack.state(), max).ok()?;
+        *slot = match stack.count() {
+            0 | 1 => None,
+            n => ItemStack::new(stack.item(), n - 1, stack.state(), max).ok(),
+        };
+        Some(one)
+    }
+
     /// Every slot in index order -- the order the world-state hash reads them
     /// in, and the only order anything should.
     pub fn slots(&self) -> impl Iterator<Item = Option<ItemStack>> + '_ {

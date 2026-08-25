@@ -1,0 +1,12 @@
+// The turf you walk on. Breaks into itself for now.
+//
+// One of the three blocks the world is currently made of. Every block
+// needs an item of the *same name* to drop anything at all -- that is the
+// placeholder drop policy (PHASE2_ARCHITECTURE.md 4.1), replaced by real
+// `drops:` tables in block 2.4. Without this file, breaking this block
+// silently yields nothing.
+ItemDef(
+    name:       "cubara:grass",
+    max_stack:  64,
+    durability: None,
+)

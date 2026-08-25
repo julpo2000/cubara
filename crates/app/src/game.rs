@@ -17,8 +17,9 @@ use std::sync::Arc;
 
 use cubara_render::CameraPose;
 use cubara_sim::{InputFrame, Player, Sim, REACH, TICK_DT};
-use cubara_voxel::BlockId;
 use cubara_voxel::ChunkCoord;
+use cubara_voxel::{BlockId, BlockRegistry, ItemRegistry};
+use cubara_world::TerrainBlocks;
 use cubara_world::World;
 
 use winit::keyboard::KeyCode;
@@ -34,6 +35,18 @@ const MAX_TICKS_PER_FRAME: u32 = 5;
 
 /// Everything the player *is* and *does*: the world they're in and the simulation
 /// running against it.
+/// Load `assets/items/*.ron`.
+///
+/// In the app rather than in `cubara-render` alongside `load_registry`: items
+/// are not a render concern (`ARCHITECTURE.md` Rule 3), and nothing about them
+/// needs a GPU. `CARGO_MANIFEST_DIR` is `crates/app`, so `../..` reaches the
+/// repo root regardless of the caller's working directory -- the same trick
+/// `load_registry` uses from `crates/render`.
+pub fn load_item_registry() -> ItemRegistry {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    ItemRegistry::load(&repo_root.join("assets/items")).expect("assets/items must load")
+}
+
 pub struct Game {
     /// The world being played. Behind an [`Arc`] so meshing jobs can carry the exact
     /// snapshot they were queued against; an edit publishes a new one.
@@ -43,6 +56,16 @@ pub struct Game {
     /// `sim.player` (the current tick), what [`Game::camera_pose`] interpolates
     /// between for smooth rendering of a 60 Hz sim at any frame rate (§9).
     prev_player: Player,
+    /// The block registry, shared with `NodeStreaming` rather than loaded
+    /// twice -- ids are per-registry (`PHASE2_ARCHITECTURE.md` §1.2), so two
+    /// loads would be two id spaces and the same number would mean different
+    /// materials on each side. `None` until `resumed` builds it.
+    blocks_registry: Option<Arc<BlockRegistry>>,
+    /// Which ids the terrain's grass/soil/stone are, in that registry.
+    terrain: Option<TerrainBlocks>,
+    /// What items exist. Loaded by the app, not by `cubara-render`: items are
+    /// not a render concern (Rule 3).
+    items: Option<ItemRegistry>,
     /// Wall-clock seconds not yet consumed by a fixed tick. `f64`, not `f32`
     /// like everything else here -- this is the one value that keeps being
     /// added to across a whole play session (thousands of frames), and
@@ -86,6 +109,9 @@ impl Game {
             world: Arc::new(World::new()),
             sim: Sim::new(0, player),
             prev_player: player,
+            blocks_registry: None,
+            terrain: None,
+            items: None,
             accumulator: 0.0,
             forward: false,
             back: false,
@@ -151,6 +177,32 @@ impl Game {
                     self.fly_toggle_pending = true;
                 }
                 self.fly_toggle_held = pressed;
+            }
+            // Hotbar selection. Applied on press only -- releasing a number
+            // key must not reselect, and holding it must not repeat.
+            KeyCode::Digit1
+            | KeyCode::Digit2
+            | KeyCode::Digit3
+            | KeyCode::Digit4
+            | KeyCode::Digit5
+            | KeyCode::Digit6
+            | KeyCode::Digit7
+            | KeyCode::Digit8
+            | KeyCode::Digit9 => {
+                if pressed {
+                    let slot = match key {
+                        KeyCode::Digit1 => 0,
+                        KeyCode::Digit2 => 1,
+                        KeyCode::Digit3 => 2,
+                        KeyCode::Digit4 => 3,
+                        KeyCode::Digit5 => 4,
+                        KeyCode::Digit6 => 5,
+                        KeyCode::Digit7 => 6,
+                        KeyCode::Digit8 => 7,
+                        _ => 8,
+                    };
+                    self.select_hotbar(slot);
+                }
             }
             _ => return false,
         }
@@ -245,24 +297,103 @@ impl Game {
     /// -- that field only updates on the next tick, so it can go stale
     /// against `self.world` after an edit lands (e.g. two edits between
     /// ticks); issue #52 scoped out any change to raycasting itself anyway.
-    pub fn edit_block(&mut self, block: BlockId) -> Option<ChunkCoord> {
+    /// Give the game the assets it needs to turn blocks into items and back.
+    /// Called once, when the window and its registry exist.
+    pub fn set_assets(&mut self, registry: Arc<BlockRegistry>, items: ItemRegistry) {
+        self.terrain = Some(TerrainBlocks::from_registry(&registry));
+        self.blocks_registry = Some(registry);
+        self.items = Some(items);
+    }
+
+    /// Break the targeted block and put its item in the inventory.
+    ///
+    /// The drop is one-for-one **by name**: the block `cubara:oak_log` yields
+    /// the item `cubara:oak_log`. A block with no matching item yields nothing.
+    /// That is the placeholder policy `PHASE2_ARCHITECTURE.md` §4.1 records --
+    /// §4's `drops:` and `requires_tier:` fields are block 2.4's work, and
+    /// doing it by name now avoids inventing a data format 2.4 will replace.
+    ///
+    /// **A drop that does not fit is lost.** There are no dropped-item entities
+    /// yet (they need ECS, 2.5), so the remainder `Inventory::add` hands back is
+    /// logged and discarded. Refusing to break the block instead would be a
+    /// gameplay decision, and those are the owner's.
+    pub fn break_block(&mut self) -> Option<ChunkCoord> {
         let origin = self.sim.player.pos.to_array();
         let dir = self.sim.player.look_dir().to_array();
         let hit = self.world.raycast(origin, dir, REACH)?;
-        // AIR breaks the block that was hit; anything else goes against the
-        // face, in the empty cell the ray came through.
-        let target = if block == BlockId::AIR {
-            hit.block
-        } else {
-            [
-                hit.block[0] + hit.normal[0],
-                hit.block[1] + hit.normal[1],
-                hit.block[2] + hit.normal[2],
-            ]
-        };
-        // Publishes a fresh snapshot: workers holding the old Arc keep meshing the
-        // pre-edit world, and their results are superseded by the re-mesh request.
+        let [x, y, z] = hit.block;
+
+        // The drop is the optional part; the break is not. Assets are always
+        // set in the real app, but making the whole action depend on them
+        // would mean a missing registry shows up as clicks that silently do
+        // nothing -- the least debuggable failure there is.
+        //
+        // Read the three as separate fields rather than through a helper: the
+        // borrow checker tracks disjoint field borrows, so `items` can stay
+        // borrowed while `self.sim.player.inventory` is mutated. A helper
+        // returning them all borrows the whole of `self`.
+        if let (Some(registry), Some(terrain), Some(items)) = (
+            self.blocks_registry.as_deref(),
+            self.terrain,
+            self.items.as_ref(),
+        ) {
+            let broken = self.world.block_at(x, y, z, terrain);
+            match registry
+                .name_of(broken)
+                .and_then(|name| items.id_of(name))
+                .and_then(|item| items.new_stack(item, 1).ok())
+            {
+                Some(stack) => {
+                    if let Some(lost) = self.sim.player.inventory.add(stack, items) {
+                        log::debug!(
+                            "inventory full: {} x{} lost (no dropped-item entities until ECS, 2.5)",
+                            items.name_of(lost.item()).unwrap_or("?"),
+                            lost.count()
+                        );
+                    }
+                }
+                None => log::debug!(
+                    "{} has no item of the same name; it drops nothing",
+                    registry.name_of(broken).unwrap_or("?")
+                ),
+            }
+        }
+
+        Some(Arc::make_mut(&mut self.world).set_block(x, y, z, BlockId::AIR))
+    }
+
+    /// Place the held hotbar item's block against the targeted face, consuming
+    /// one of it.
+    ///
+    /// The same name mapping as [`break_block`](Self::break_block), backwards.
+    /// An item with no matching block -- a stick, an ingot -- places nothing
+    /// **and consumes nothing**: a click that does nothing must not quietly
+    /// spend an item.
+    pub fn place_block(&mut self) -> Option<ChunkCoord> {
+        let registry = self.blocks_registry.as_deref()?;
+        let items = self.items.as_ref()?;
+        let held = self.sim.player.inventory.selected_stack()?;
+        let block = registry.id_of(items.name_of(held.item())?)?;
+
+        let origin = self.sim.player.pos.to_array();
+        let dir = self.sim.player.look_dir().to_array();
+        let hit = self.world.raycast(origin, dir, REACH)?;
+        let target = [
+            hit.block[0] + hit.normal[0],
+            hit.block[1] + hit.normal[1],
+            hit.block[2] + hit.normal[2],
+        ];
+
+        // Only now that the placement is certain to happen.
+        let slot = self.sim.player.inventory.selected_slot() as usize;
+        self.sim.player.inventory.take_one(slot, items)?;
+
         Some(Arc::make_mut(&mut self.world).set_block(target[0], target[1], target[2], block))
+    }
+
+    /// Select a hotbar slot (number keys 1-9, passed as 0-8).
+    pub fn select_hotbar(&mut self, index: u8) {
+        self.sim.player.inventory.select(index);
     }
 }
 
@@ -288,7 +419,7 @@ mod tests {
             .expect("ground below");
 
         // Out of reach from 60 blocks up: nothing changes.
-        assert_eq!(game.edit_block(BlockId::AIR), None);
+        assert_eq!(game.break_block(), None);
         assert!(game
             .world()
             .is_solid_at(hit.block[0], hit.block[1], hit.block[2]));
@@ -305,7 +436,7 @@ mod tests {
         let eye = glam::vec3(0.5, ground.block[1] as f32 + 3.5, 0.5);
         game.sim.player = Player::new(eye, 0.0, -1.5);
 
-        let dirty = game.edit_block(BlockId::AIR).expect("a block was in reach");
+        let dirty = game.break_block().expect("a block was in reach");
         assert!(
             !game
                 .world()
@@ -317,6 +448,182 @@ mod tests {
             dirty,
             ChunkCoord::from_world_pos([b[0] as f32, b[1] as f32, b[2] as f32]),
             "the dirty chunk is the one containing the broken block"
+        );
+    }
+
+    /// A game with the real registries wired in, standing just above the
+    /// ground and looking down -- the fixture every break/place test needs.
+    /// Uses the shipped `assets/`, not a synthetic registry: a block whose
+    /// name has no matching item file is exactly the failure these tests
+    /// should catch, and a fixture would hide it.
+    fn game_looking_at_ground() -> (Game, [i32; 3]) {
+        let mut game = Game::new();
+        game.set_assets(
+            std::sync::Arc::new(cubara_render::load_registry()),
+            load_item_registry(),
+        );
+        let ground = game
+            .world()
+            .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0)
+            .expect("ground below");
+        let eye = glam::vec3(0.5, ground.block[1] as f32 + 3.5, 0.5);
+        game.sim.player = Player::new(eye, 0.0, -1.5);
+        (game, ground.block)
+    }
+
+    #[test]
+    fn breaking_a_block_puts_its_item_in_the_inventory() {
+        let (mut game, block) = game_looking_at_ground();
+        let terrain = game.terrain.expect("assets are set");
+        let broken = game.world().block_at(block[0], block[1], block[2], terrain);
+        let name = game
+            .blocks_registry
+            .as_ref()
+            .unwrap()
+            .name_of(broken)
+            .expect("the block has a name")
+            .to_string();
+
+        game.break_block().expect("a block was in reach");
+
+        let items = game.items.as_ref().unwrap();
+        let stack = game
+            .sim
+            .player
+            .inventory
+            .slot(0)
+            .expect("slot 0 holds the drop");
+        assert_eq!(
+            items.name_of(stack.item()),
+            Some(name.as_str()),
+            "breaking {name} must yield the item of the same name"
+        );
+        assert_eq!(stack.count(), 1);
+    }
+
+    #[test]
+    fn placing_consumes_exactly_one_of_the_held_stack() {
+        let (mut game, _) = game_looking_at_ground();
+        // The terrain's own stone, resolved by name in both registries, so
+        // this test does not depend on which materials happen to ship -- only
+        // on the block and its item sharing a name, which is the drop policy.
+        let stone_name = game
+            .blocks_registry
+            .as_ref()
+            .unwrap()
+            .name_of(game.terrain.unwrap().stone)
+            .expect("terrain stone has a name")
+            .to_string();
+        let items = game.items.as_ref().unwrap();
+        let held = items
+            .id_of(&stone_name)
+            .expect("every shipped block needs an item of the same name to be placeable");
+        let stack = items.new_stack(held, 5).unwrap();
+        game.sim.player.inventory.add(stack, items);
+        game.select_hotbar(0);
+
+        game.place_block().expect("a face was in reach");
+
+        assert_eq!(
+            game.sim.player.inventory.slot(0).map(|s| s.count()),
+            Some(4),
+            "placing spends exactly one"
+        );
+    }
+
+    #[test]
+    fn placing_with_an_empty_hand_changes_nothing() {
+        let (mut game, _) = game_looking_at_ground();
+        let before = game.world().edit_count();
+        assert_eq!(game.place_block(), None, "nothing held, nothing placed");
+        assert_eq!(game.world().edit_count(), before);
+    }
+
+    #[test]
+    fn placing_an_item_with_no_block_consumes_nothing() {
+        // A stick is not a block. The click must do nothing *and* not quietly
+        // spend the stick -- an action that fails silently should not also
+        // cost you something.
+        let (mut game, _) = game_looking_at_ground();
+        let items = game.items.as_ref().unwrap();
+        let stick = items
+            .id_of("cubara:stick")
+            .expect("assets/items has a stick");
+        game.sim
+            .player
+            .inventory
+            .add(items.new_stack(stick, 3).unwrap(), items);
+        game.select_hotbar(0);
+
+        let before = game.world().edit_count();
+        assert_eq!(game.place_block(), None);
+        assert_eq!(game.world().edit_count(), before, "nothing was placed");
+        assert_eq!(
+            game.sim.player.inventory.slot(0).map(|s| s.count()),
+            Some(3),
+            "and nothing was consumed"
+        );
+    }
+
+    #[test]
+    fn breaking_with_a_full_inventory_still_breaks_the_block() {
+        // The drop is lost -- there are no dropped-item entities until ECS
+        // (2.5). Recorded behaviour, not a silent bug: what must not happen is
+        // the block refusing to break, which would read as the game being stuck.
+        let (mut game, block) = game_looking_at_ground();
+        let items = game.items.as_ref().unwrap();
+        let filler = items.id_of("cubara:stick").unwrap();
+        for _ in 0..cubara_sim::SLOT_COUNT {
+            game.sim
+                .player
+                .inventory
+                .add(items.new_stack(filler, 64).unwrap(), items);
+        }
+
+        game.break_block().expect("a block was in reach");
+        assert!(
+            !game.world().is_solid_at(block[0], block[1], block[2]),
+            "the block breaks even when the drop has nowhere to go"
+        );
+    }
+
+    #[test]
+    fn number_keys_select_hotbar_slots_on_press_only() {
+        let mut game = Game::new();
+        assert!(game.key_input(KeyCode::Digit4, true));
+        assert_eq!(game.sim.player.inventory.selected_slot(), 3);
+
+        // Releasing must not reselect -- otherwise every key-up would snap the
+        // selection back to whichever number was let go of last.
+        game.key_input(KeyCode::Digit1, true);
+        game.key_input(KeyCode::Digit4, false);
+        assert_eq!(game.sim.player.inventory.selected_slot(), 0);
+    }
+
+    #[test]
+    fn every_shipped_block_has_an_item_of_the_same_name() {
+        // The drop policy is "block name -> item of the same name"
+        // (PHASE2_ARCHITECTURE.md 4.1), so a block with no matching item file
+        // silently drops nothing. That is not a crash, not a warning, and not
+        // visible until someone mines it and wonders why their inventory is
+        // empty -- which is exactly how this was found: three of the three
+        // blocks the world is made of had no items.
+        //
+        // Until 2.4 replaces the policy with real `drops:` tables, this is what
+        // keeps the two asset directories in step.
+        let registry = cubara_render::load_registry();
+        let items = load_item_registry();
+
+        let missing: Vec<&str> = registry
+            .ids()
+            .filter(|&id| id != BlockId::AIR)
+            .filter_map(|id| registry.name_of(id))
+            .filter(|name| items.id_of(name).is_none())
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "these blocks would drop nothing when broken -- add assets/items/<name>.ron              for each, or give 2.4's drop table an entry: {missing:?}"
         );
     }
 

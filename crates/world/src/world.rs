@@ -236,7 +236,7 @@ impl World {
     /// which knows nothing about edits) so `chunk_at`'s edit overlay stays a
     /// single per-cell lookup, matching how [`is_solid_at`](Self::is_solid_at)
     /// already does it -- not a second pass over `self.edits` per chunk.
-    fn block_at(&self, x: i32, y: i32, z: i32, blocks: TerrainBlocks) -> BlockId {
+    pub fn block_at(&self, x: i32, y: i32, z: i32, blocks: TerrainBlocks) -> BlockId {
         match self.edits.get(&[x, y, z]) {
             Some(&block) => block,
             None => self
