@@ -8,8 +8,10 @@
 
 /// A runtime block-type index. 65,536 possible types; `AIR` (0) always means
 /// "no block".
+/// `Default` is `AIR`, matching id 0 -- the only sensible "nothing yet" value,
+/// and the one a `#[derive(Default)]` on a containing struct should get.
 #[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
 pub struct BlockId(pub u16);
 
 impl BlockId {

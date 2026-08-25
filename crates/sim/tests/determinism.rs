@@ -64,15 +64,15 @@ fn replay(seed: u64, script: &[InputFrame]) -> (Sim, World) {
 fn replay_with_edits(
     seed: u64,
     script: &[InputFrame],
-    edits: &[(usize, [i32; 3], bool)],
+    edits: &[(usize, [i32; 3], BlockId)],
 ) -> (Sim, World) {
     let mut world = World::with_seed(seed);
     let mut sim = Sim::new(seed, Player::new(glam::vec3(0.5, 40.0, 0.5), 0.0, 0.0));
     for (i, input) in script.iter().enumerate() {
         sim.tick(&mut world, input);
-        for &(tick, coord, solid) in edits {
+        for &(tick, coord, block) in edits {
             if tick == i {
-                world.set_block(coord[0], coord[1], coord[2], solid);
+                world.set_block(coord[0], coord[1], coord[2], block);
             }
         }
     }
@@ -122,8 +122,15 @@ fn fixture_script() -> Vec<InputFrame> {
 /// end -- fixed world coordinates, not tied to wherever the player actually
 /// ends up (this is a hash regression test, not a physics test; the edits
 /// only need to be deterministic and inside [`fixture_region`]).
-fn fixture_edits() -> Vec<(usize, [i32; 3], bool)> {
-    vec![(50, [2, 15, 2], false), (300, [5, 20, 5], true)]
+fn fixture_edits() -> Vec<(usize, [i32; 3], BlockId)> {
+    vec![
+        (50, [2, 15, 2], BlockId::AIR),
+        // `fixture_blocks().stone`, not `BlockId::STONE` -- this fixture's
+        // stone is id 3, and the constant is 1, which is its *grass*. Ids come
+        // from sorted names, so a hardcoded one silently means a different
+        // material (`World::chunk_at`'s doc comment).
+        (300, [5, 20, 5], fixture_blocks().stone),
+    ]
 }
 
 /// This implementation's own computed value for [`FIXTURE_SEED`] +

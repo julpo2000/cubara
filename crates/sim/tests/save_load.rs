@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use cubara_sim::{load_world, save_world, InputFrame, LoadError, Player, Sim, WorldHash};
-use cubara_voxel::{BlockRegistry, ChunkCoord, Faces, Material, Shape};
+use cubara_voxel::{BlockId, BlockRegistry, ChunkCoord, Faces, Material, Shape};
 use cubara_world::{TerrainBlocks, World, WORLDGEN_VERSION};
 
 /// No real registry loaded from disk here (that's `cubara-render`'s job) --
@@ -78,8 +78,8 @@ fn round_trip_edit_hash_save_load_hash_is_equal() {
 
     // A scripted edit sequence, then some ticks so tick/RNG/player state are
     // all non-trivial too, not just the world's edit overlay.
-    world.set_block(0, 0, 0, false);
-    world.set_block(2, 1, -1, true);
+    world.set_block(0, 0, 0, BlockId::AIR);
+    world.set_block(2, 1, -1, blocks.stone);
     let walking = InputFrame {
         move_axes: [0.0, 0.0, 1.0],
         look_delta: [0.3, 0.0],
@@ -119,7 +119,7 @@ fn an_unedited_chunk_is_bit_identical_after_a_save_load_round_trip() {
 
     let mut world = World::with_seed(seed);
     let sim = Sim::new(seed, Player::new(glam::Vec3::ZERO, 0.0, 0.0));
-    world.set_block(0, 0, 0, false); // an edit elsewhere, so save/load has real work
+    world.set_block(0, 0, 0, BlockId::AIR); // an edit elsewhere, so save/load has real work
 
     let original = world
         .edited_chunk_at(unedited, blocks)
@@ -142,13 +142,54 @@ fn an_unedited_chunk_is_bit_identical_after_a_save_load_round_trip() {
 }
 
 #[test]
+fn a_placed_block_keeps_its_own_material_across_a_round_trip() {
+    // The property block 2.1c (#141) added: the edit overlay records *which*
+    // block, not just "solid". A round trip has to preserve that, or breaking
+    // an oak log and reloading would hand you stone.
+    //
+    // Placing grass deep underground is what makes this a real test: the
+    // terrain there is stone, so a regression that flattened edits back to one
+    // material -- exactly what the pre-#141 bool did -- reads back stone and
+    // fails, rather than passing by coincidence because the two agreed.
+    let registry = test_registry();
+    let blocks = TerrainBlocks::from_registry(&registry);
+    let seed = 0x0011_2233_4455_6677;
+    assert_ne!(
+        blocks.grass, blocks.stone,
+        "this test needs two distinguishable materials to mean anything"
+    );
+
+    let (x, y, z) = (4, -60, 2);
+    let mut world = World::with_seed(seed);
+    world.set_block(x, y, z, blocks.grass);
+    let sim = Sim::new(seed, Player::new(glam::vec3(0.5, 40.0, 0.5), 0.0, 0.0));
+
+    let dir = scratch_dir("placed-material-round-trip");
+    save_world(&dir, &sim, &world, &registry, blocks).expect("save");
+    let (_, loaded) = load_world(&dir, &registry, blocks).expect("load");
+    std::fs::remove_dir_all(&dir).ok();
+
+    // Read it back through the chunk the renderer would get, rather than
+    // adding a test-only accessor.
+    let coord = ChunkCoord::from_block(x, y, z);
+    let chunk = loaded.edited_chunk_at(coord, blocks);
+    let size = 16i32;
+    let local = |v: i32| v.rem_euclid(size) as usize;
+    assert_eq!(
+        chunk.get(local(x), local(y), local(z)),
+        blocks.grass,
+        "a placed block must come back as itself, not as the terrain's material"
+    );
+}
+
+#[test]
 fn saving_the_same_world_twice_produces_byte_identical_files() {
     let registry = test_registry();
     let blocks = TerrainBlocks::from_registry(&registry);
     let seed = 0x0044_4455_5566_6677;
     let mut world = World::with_seed(seed);
-    world.set_block(1, 1, 1, true);
-    world.set_block(-9, 4, 20, false);
+    world.set_block(1, 1, 1, blocks.stone);
+    world.set_block(-9, 4, 20, BlockId::AIR);
     let sim = Sim::new(seed, Player::new(glam::vec3(1.0, 2.0, 3.0), 0.5, -0.1));
 
     let dir_a = scratch_dir("byte-stability-a");
@@ -220,9 +261,14 @@ fn fixture_state() -> (Sim, World) {
     let mut world = World::with_seed(SEED);
     let mut sim = Sim::new(SEED, Player::new(glam::vec3(0.5, 40.0, 0.5), 0.3, -0.1));
 
-    world.set_block(0, 0, 0, false);
-    world.set_block(3, 2, -1, true);
-    world.set_block(-5, 10, 5, false);
+    // Resolved from the fixture's own registry, not `BlockId::STONE`: ids are
+    // assigned by sorted name, so the constant is `cubara:grass` here, not
+    // stone. `World::chunk_at`'s doc comment tells that story; this is the same
+    // trap, one layer up.
+    let blocks = TerrainBlocks::from_registry(&test_registry());
+    world.set_block(0, 0, 0, BlockId::AIR);
+    world.set_block(3, 2, -1, blocks.stone);
+    world.set_block(-5, 10, 5, BlockId::AIR);
 
     let walking = InputFrame {
         move_axes: [0.0, 0.0, 1.0],

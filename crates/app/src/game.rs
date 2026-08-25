@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use cubara_render::CameraPose;
 use cubara_sim::{InputFrame, Player, Sim, REACH, TICK_DT};
+use cubara_voxel::BlockId;
 use cubara_voxel::ChunkCoord;
 use cubara_world::World;
 
@@ -244,22 +245,24 @@ impl Game {
     /// -- that field only updates on the next tick, so it can go stale
     /// against `self.world` after an edit lands (e.g. two edits between
     /// ticks); issue #52 scoped out any change to raycasting itself anyway.
-    pub fn edit_block(&mut self, place: bool) -> Option<ChunkCoord> {
+    pub fn edit_block(&mut self, block: BlockId) -> Option<ChunkCoord> {
         let origin = self.sim.player.pos.to_array();
         let dir = self.sim.player.look_dir().to_array();
         let hit = self.world.raycast(origin, dir, REACH)?;
-        let target = if place {
+        // AIR breaks the block that was hit; anything else goes against the
+        // face, in the empty cell the ray came through.
+        let target = if block == BlockId::AIR {
+            hit.block
+        } else {
             [
                 hit.block[0] + hit.normal[0],
                 hit.block[1] + hit.normal[1],
                 hit.block[2] + hit.normal[2],
             ]
-        } else {
-            hit.block
         };
         // Publishes a fresh snapshot: workers holding the old Arc keep meshing the
         // pre-edit world, and their results are superseded by the re-mesh request.
-        Some(Arc::make_mut(&mut self.world).set_block(target[0], target[1], target[2], place))
+        Some(Arc::make_mut(&mut self.world).set_block(target[0], target[1], target[2], block))
     }
 }
 
@@ -285,7 +288,7 @@ mod tests {
             .expect("ground below");
 
         // Out of reach from 60 blocks up: nothing changes.
-        assert_eq!(game.edit_block(false), None);
+        assert_eq!(game.edit_block(BlockId::AIR), None);
         assert!(game
             .world()
             .is_solid_at(hit.block[0], hit.block[1], hit.block[2]));
@@ -302,7 +305,7 @@ mod tests {
         let eye = glam::vec3(0.5, ground.block[1] as f32 + 3.5, 0.5);
         game.sim.player = Player::new(eye, 0.0, -1.5);
 
-        let dirty = game.edit_block(false).expect("a block was in reach");
+        let dirty = game.edit_block(BlockId::AIR).expect("a block was in reach");
         assert!(
             !game
                 .world()
