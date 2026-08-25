@@ -76,6 +76,14 @@ pub struct Game {
     items: Option<ItemRegistry>,
     /// Every recipe, loaded alongside the items they name.
     recipes: Option<RecipeBook>,
+    /// The crafting bench, resolved by name. Right-clicking one opens the 3x3
+    /// grid instead of placing whatever is held.
+    ///
+    /// Name-based, like the drop policy (`PHASE2_ARCHITECTURE.md` 4.1), and
+    /// for the same reason: block 2.4 needs the same treatment for the furnace,
+    /// and designing an `interact:` field in the block format now would mean
+    /// designing it without the second case in hand.
+    bench_block: Option<BlockId>,
     /// Whether the inventory screen is open. Screen state, not world state --
     /// what the *grid* holds is world state and lives on the player.
     inventory_open: bool,
@@ -126,6 +134,7 @@ impl Game {
             terrain: None,
             items: None,
             recipes: None,
+            bench_block: None,
             inventory_open: false,
             accumulator: 0.0,
             forward: false,
@@ -324,6 +333,10 @@ impl Game {
         self.blocks_registry = Some(registry);
         self.items = Some(items);
         self.recipes = Some(recipes);
+        self.bench_block = self
+            .blocks_registry
+            .as_ref()
+            .and_then(|r| r.id_of("cubara:crafting_bench"));
     }
 
     /// Break the targeted block and put its item in the inventory.
@@ -391,6 +404,13 @@ impl Game {
     /// **and consumes nothing**: a click that does nothing must not quietly
     /// spend an item.
     pub fn place_block(&mut self) -> Option<ChunkCoord> {
+        // An interactive block under the crosshair takes precedence over
+        // placing. Otherwise a bench would be unusable the moment you are
+        // holding anything -- which is most of the time.
+        if self.interact() {
+            return None;
+        }
+
         let registry = self.blocks_registry.as_deref()?;
         let items = self.items.as_ref()?;
         let held = self.sim.player.inventory.selected_stack()?;
@@ -441,6 +461,32 @@ impl Game {
         Some(out)
     }
 
+    /// If the targeted block is interactive, act on it and report `true`.
+    ///
+    /// Only the bench so far. Block 2.4 adds the furnace and is the point at
+    /// which this should become a property of the block rather than a name
+    /// comparison -- with two real cases to design against.
+    fn interact(&mut self) -> bool {
+        let (Some(bench), Some(terrain)) = (self.bench_block, self.terrain) else {
+            return false;
+        };
+        let origin = self.sim.player.pos.to_array();
+        let dir = self.sim.player.look_dir().to_array();
+        let Some(hit) = self.world.raycast(origin, dir, REACH) else {
+            return false;
+        };
+        let [x, y, z] = hit.block;
+        if self.world.block_at(x, y, z, terrain) != bench {
+            return false;
+        }
+        // Width lives on `Crafting` (world state), not on the screen: a 3x3
+        // grid holding items in its outer cells is a different world from a
+        // 2x2 one, and the hash already covers it.
+        self.sim.player.crafting.set_width(3);
+        self.inventory_open = true;
+        true
+    }
+
     /// Whether the inventory screen is open.
     pub fn inventory_open(&self) -> bool {
         self.inventory_open
@@ -461,6 +507,9 @@ impl Game {
         let player = &mut self.sim.player;
         if player.crafting.close(&mut player.inventory, items) {
             self.inventory_open = false;
+            // Back to the inventory's own grid. `close` emptied all nine cells
+            // regardless of width, so narrowing strands nothing.
+            player.crafting.set_width(2);
         } else {
             log::debug!("inventory full: the crafting grid still holds items, staying open");
         }
@@ -747,6 +796,150 @@ mod tests {
         game.key_input(KeyCode::Digit1, true);
         game.key_input(KeyCode::Digit4, false);
         assert_eq!(game.sim.player.inventory.selected_slot(), 0);
+    }
+
+    /// Place a bench right where the player is looking, and aim at it.
+    fn game_facing_a_bench() -> (Game, [i32; 3]) {
+        let (mut game, ground) = game_looking_at_ground();
+        let bench = game
+            .blocks_registry
+            .as_ref()
+            .unwrap()
+            .id_of("cubara:crafting_bench")
+            .expect("assets/blocks defines the bench");
+        std::sync::Arc::make_mut(&mut game.world).set_block(ground[0], ground[1], ground[2], bench);
+        (game, ground)
+    }
+
+    #[test]
+    fn right_clicking_a_bench_opens_the_three_by_three_grid() {
+        let (mut game, _) = game_facing_a_bench();
+        let items = game.items.as_ref().unwrap();
+        // Holding something placeable, to prove interaction wins over placing.
+        game.sim.player.inventory.add(
+            items
+                .new_stack(items.id_of("cubara:stone").unwrap(), 5)
+                .unwrap(),
+            items,
+        );
+        game.select_hotbar(0);
+        let before = game.world().edit_count();
+
+        assert_eq!(game.place_block(), None, "no block was placed");
+        assert_eq!(game.world().edit_count(), before, "the world is unchanged");
+        assert!(game.inventory_open(), "the screen opened");
+        assert_eq!(game.sim.player.crafting.width(), 3, "at bench size");
+    }
+
+    #[test]
+    fn right_clicking_anything_else_still_places() {
+        let (mut game, _) = game_looking_at_ground();
+        let items = game.items.as_ref().unwrap();
+        game.sim.player.inventory.add(
+            items
+                .new_stack(items.id_of("cubara:stone").unwrap(), 5)
+                .unwrap(),
+            items,
+        );
+        game.select_hotbar(0);
+
+        assert!(game.place_block().is_some(), "a normal block still places");
+        assert!(!game.inventory_open(), "and no screen opened");
+    }
+
+    /// Put one `item` into grid `cell`, the way a player would: pick it up
+    /// from a scratch inventory, then put it down. Going through `click`
+    /// rather than reaching into the cells keeps these tests honest about the
+    /// path the real game takes.
+    fn load_cell(game: &mut Game, cell: usize, item: cubara_voxel::ItemId, count: u8) {
+        let items = game.items.as_ref().unwrap();
+        let book = game.recipes.as_ref().unwrap();
+        let mut scratch = cubara_sim::Inventory::new();
+        scratch.add(items.new_stack(item, count).unwrap(), items);
+        let mut c = game.sim.player.crafting;
+        c.click(
+            cubara_sim::SlotRef::Inventory(0),
+            false,
+            &mut scratch,
+            items,
+            book,
+        );
+        c.click(
+            cubara_sim::SlotRef::Grid(cell),
+            false,
+            &mut scratch,
+            items,
+            book,
+        );
+        game.sim.player.crafting = c;
+    }
+
+    #[test]
+    fn closing_a_bench_returns_its_outer_cells_and_narrows() {
+        // Cell 8 is the bottom-right of a 3x3 -- unreachable at width 2.
+        // Narrowing must not strand it. `Crafting::close` empties all nine
+        // cells regardless of width deliberately, and this is the test that
+        // says why that mattered.
+        let (mut game, _) = game_facing_a_bench();
+        game.place_block();
+        assert_eq!(game.sim.player.crafting.width(), 3);
+
+        let stone = game.items.as_ref().unwrap().id_of("cubara:stone").unwrap();
+        load_cell(&mut game, 8, stone, 4);
+        assert!(
+            game.sim.player.crafting.cell(8).is_some(),
+            "cell 8 is loaded"
+        );
+
+        game.toggle_inventory();
+        assert!(!game.inventory_open(), "it closed");
+        assert_eq!(game.sim.player.crafting.width(), 2, "and narrowed");
+        assert!(
+            game.sim.player.crafting.cell(8).is_none(),
+            "the outer cell was emptied, not stranded"
+        );
+        assert!(
+            game.sim
+                .player
+                .inventory
+                .slots()
+                .flatten()
+                .any(|s| s.item() == stone),
+            "and its contents came back to the inventory"
+        );
+    }
+
+    #[test]
+    fn a_wooden_pick_can_be_crafted_at_a_bench() {
+        // The 3x3 recipe that is unreachable without this issue -- and the
+        // first rung of the ladder that needs a bench at all.
+        let (mut game, _) = game_facing_a_bench();
+        game.place_block();
+
+        let (plank, stick) = {
+            let items = game.items.as_ref().unwrap();
+            (
+                items.id_of("cubara:plank").unwrap(),
+                items.id_of("cubara:stick").unwrap(),
+            )
+        };
+        // PPP / .S. / .S.
+        for (cell, item) in [(0, plank), (1, plank), (2, plank), (4, stick), (7, stick)] {
+            load_cell(&mut game, cell, item, 1);
+        }
+
+        let items = game.items.as_ref().unwrap();
+        let made = game
+            .sim
+            .player
+            .crafting
+            .result(game.recipes.as_ref().unwrap(), items)
+            .expect("the grid makes something");
+        assert_eq!(
+            items.name_of(made.item()),
+            Some("cubara:wooden_pick"),
+            "a bench makes the wooden pick"
+        );
     }
 
     #[test]
