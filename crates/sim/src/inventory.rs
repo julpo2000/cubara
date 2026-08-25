@@ -139,6 +139,18 @@ impl Inventory {
         Some(one)
     }
 
+    /// Overwrite a slot outright.
+    ///
+    /// The click rules in [`crate::crafting`] compute a slot's new contents and
+    /// the cursor's together, so they need to *set* rather than add: `add`'s
+    /// lowest-indexed-first rule is right for a pickup and wrong for "put this
+    /// exact stack in this exact slot".
+    pub fn set_slot(&mut self, index: usize, stack: Option<ItemStack>) {
+        if let Some(slot) = self.slots.get_mut(index) {
+            *slot = stack;
+        }
+    }
+
     /// Every slot in index order -- the order the world-state hash reads them
     /// in, and the only order anything should.
     pub fn slots(&self) -> impl Iterator<Item = Option<ItemStack>> + '_ {

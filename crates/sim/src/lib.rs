@@ -8,6 +8,7 @@
 //! source (`scripts/check-architecture.sh` greps for both). GPU-free and
 //! window-free, so all of it is testable with no adapter and no window.
 
+mod crafting;
 mod hash;
 mod input;
 mod inventory;
@@ -16,6 +17,7 @@ mod player;
 mod rng;
 mod save;
 
+pub use crafting::{Crafting, SlotRef};
 pub use hash::{hash_region, WorldHash};
 pub use input::InputFrame;
 pub use inventory::{Inventory, HOTBAR_WIDTH, SLOT_COUNT};

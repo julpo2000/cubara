@@ -247,7 +247,14 @@ fn saving_the_same_world_twice_produces_byte_identical_files() {
 /// |---|---|
 /// | `0x2a6e_809c_6c6c_8930` | block 1.9 (#60), the original pin |
 /// | `0xf1cf_74d0_987d_efb4` | block 2.1b (#136), inventory added to the hash |
-const FIXTURE_HASH: u64 = 0xf1cf_74d0_987d_efb4;
+/// | `0x01ba_197a_381f_63c2` | block 2.2b (#148), crafting grid + cursor added |
+///
+/// Three moves in one session is worth noticing rather than shrugging at. All
+/// three are the same *kind* of change -- new player state joining the digest --
+/// and each is a one-line addition to `write_sim`. If a fourth arrives for a
+/// different reason, that is the signal these fixtures are pinned at the wrong
+/// level and want their own issue.
+const FIXTURE_HASH: u64 = 0x01ba_197a_381f_63c2;
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/save_fixture")

@@ -6,6 +6,7 @@
 //! (`ARCHITECTURE.md` Rule 1). The renderer no longer owns any of this --
 //! it receives a pose to render from, which is the boundary Rule 3 draws.
 
+use crate::crafting::Crafting;
 use crate::inventory::Inventory;
 use glam::Vec3;
 
@@ -55,6 +56,13 @@ pub struct Player {
     /// everything else (`crate::hash`) -- block 2.9's survival replay test
     /// asserts on the result.
     pub inventory: Inventory,
+    /// The crafting grid and what the cursor is holding.
+    ///
+    /// World state, not screen state: a scripted run that puts planks in a grid
+    /// reaches a different inventory than one that does not, so block 2.9's
+    /// survival replay has to see it. It is hashed and (from block 2.8) saved
+    /// like anything else the player carries.
+    pub crafting: Crafting,
 }
 
 impl Player {
@@ -67,6 +75,7 @@ impl Player {
             yaw,
             pitch: pitch.clamp(-PITCH_LIMIT, PITCH_LIMIT),
             inventory: Inventory::new(),
+            crafting: Crafting::default(),
         }
     }
 
@@ -139,6 +148,7 @@ impl Player {
             // Not interpolatable and not rendered from here: the current
             // tick's inventory passes through, like velocity above.
             inventory: other.inventory,
+            crafting: other.crafting,
         }
     }
 }
