@@ -12,13 +12,13 @@ struct Screen {
 struct VsIn {
     @location(0) pos: vec2<f32>,   // screen pixels, origin top-left
     @location(1) uv: vec2<f32>,
-    @location(2) color: vec3<f32>,
+    @location(2) color: vec4<f32>,
 };
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
-    @location(1) color: vec3<f32>,
+    @location(1) color: vec4<f32>,
 };
 
 @vertex
@@ -42,5 +42,5 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if textureSample(atlas, atlas_sampler, in.uv).r < 0.5 {
         discard;
     }
-    return vec4<f32>(in.color, 1.0);
+    return in.color;
 }

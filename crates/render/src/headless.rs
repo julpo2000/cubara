@@ -21,7 +21,19 @@ pub struct Frame {
 
 /// What to render. Deliberately small and explicit: a golden test's scene must be
 /// reproducible from these numbers alone.
-#[derive(Clone, Copy, Debug)]
+/// An open inventory screen in a [`Shot`]: the grid width, one entry per slot
+/// in `InventoryPanel::layout(..).slots()` order, what the cursor holds, and
+/// where the cursor is in pixels.
+pub type PanelShot = (
+    usize,
+    Vec<Option<crate::scene::HotbarSlot>>,
+    Option<crate::scene::HotbarSlot>,
+    (f32, f32),
+);
+
+/// Not `Copy`: `panel` holds the screen's slot contents, whose length depends
+/// on the grid width. `Clone` is enough -- a `Shot` is built once per test.
+#[derive(Clone, Debug)]
 pub struct Shot {
     pub width: u32,
     pub height: u32,
@@ -55,6 +67,12 @@ pub struct Shot {
     /// `cubara_sim::HOTBAR_WIDTH` (it cannot depend on that crate anyway --
     /// dependencies point one way, Rule 3).
     pub hotbar: Option<[Option<crate::scene::HotbarSlot>; 9]>,
+    /// An open inventory screen: `(grid_width, slot contents, held, cursor)`.
+    ///
+    /// `contents` is parallel to `InventoryPanel::layout(..).slots()`, which a
+    /// golden test builds directly -- no sim, no inventory, which is the point
+    /// of the view being colours and counts.
+    pub panel: Option<PanelShot>,
 }
 
 impl Default for Shot {
@@ -67,6 +85,7 @@ impl Default for Shot {
             camera: None,
             highlighted_block: None,
             hotbar: None,
+            panel: None,
         }
     }
 }
@@ -144,10 +163,21 @@ fn render_arena(
         camera,
         highlighted_block,
         hotbar,
+        panel,
     } = shot;
     // Slot 0 held: a fixed choice, so a golden reference has a stable
     // selection highlight to compare against.
     let hotbar_selected = 0u8;
+    // The open screen, if this shot wants one: the layout, its contents, the
+    // cursor's stack and where the cursor is.
+    let panel_view = panel.map(|(grid_width, contents, held, cursor)| {
+        (
+            crate::panel::InventoryPanel::layout(width, height, grid_width),
+            contents,
+            held,
+            cursor,
+        )
+    });
 
     let (mesh_assets, tex_view, tex_sampler) = load_mesh_assets(&device, &queue);
     let layer_of = |name: &str| mesh_assets.layers.layer_of(name);
@@ -236,6 +266,14 @@ fn render_arena(
                 slots: slots.as_slice(),
                 selected: hotbar_selected,
             }),
+            panel: panel_view
+                .as_ref()
+                .map(|(p, contents, held, cursor)| crate::scene::PanelView {
+                    panel: p,
+                    contents,
+                    held: *held,
+                    cursor: *cursor,
+                }),
         },
     );
     encoder.copy_texture_to_buffer(
