@@ -1,0 +1,7 @@
+// Placeable planks, and the base crafting material.
+Material(
+    name:   "cubara:plank",
+    solid:  true,
+    faces:  All("plank"),
+    shapes: [Full],
+)

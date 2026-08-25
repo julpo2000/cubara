@@ -1,0 +1,14 @@
+// Tier 3. The end of the ladder REQUIREMENTS #5 asks for.
+Recipe(
+    name:    "cubara:iron_pick",
+    pattern: [
+        "III",
+        " S ",
+        " S ",
+    ],
+    key: {
+        'I': "cubara:iron_ingot",
+        'S': "cubara:stick",
+    },
+    output: (item: "cubara:iron_pick", count: 1),
+)

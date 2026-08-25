@@ -1,0 +1,11 @@
+// One log splits into four planks. The first thing anyone makes.
+Recipe(
+    name:    "cubara:plank",
+    pattern: [
+        "L",
+    ],
+    key: {
+        'L': "cubara:oak_log",
+    },
+    output: (item: "cubara:plank", count: 4),
+)

@@ -1,0 +1,7 @@
+// Smelts ore into ingots. Block 2.4 gives it its timer and slots (PHASE2 7).
+Material(
+    name:   "cubara:furnace",
+    solid:  true,
+    faces:  Sided(top: "furnace_top", side: "furnace_side", bottom: "furnace_top"),
+    shapes: [Full],
+)
