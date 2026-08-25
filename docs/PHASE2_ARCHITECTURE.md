@@ -252,6 +252,22 @@ fixtures placed. Call sites now resolve from their own registry
 (`blocks.stone`), never from the constant. `World::chunk_at`'s doc comment
 already told this story for block 1.4b; it is the same trap one layer up.
 
+### §4.2 Every block needs an item of the same name
+
+A consequence of the placeholder drop policy that is easy to miss and was:
+because a drop is resolved by *name*, a block with no matching
+`assets/items/<name>.ron` **silently drops nothing**. Not a crash, not a
+warning — just an empty inventory and a confused player.
+
+It bit immediately. Block 2.1a shipped nine item files for the ladder to iron
+and none for `cubara:grass`, `cubara:soil` or `cubara:stone` — which is every
+block the world is currently made of. Breaking anything yielded nothing.
+
+`every_shipped_block_has_an_item_of_the_same_name` now keeps the two asset
+directories in step, and names the offenders when they drift. Block 2.4 replaces
+the policy with real `drops:` tables; when it does, that test's failure message
+should point at the table instead.
+
 ## §5 Trees
 
 Placement is already decided and is not re-opened here:

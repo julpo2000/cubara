@@ -62,12 +62,17 @@ pub struct NodeStreaming {
 }
 
 impl NodeStreaming {
+    /// Takes the registry already behind an [`Arc`] rather than wrapping one
+    /// itself: `Game` needs the *same* registry to resolve a broken block's
+    /// name to an item (block 2.1d, #143), and two loads would be two id
+    /// spaces -- ids are assigned per registry by sorted name (§1.2), so the
+    /// same number would mean different materials on each side.
     pub fn new(
-        registry: BlockRegistry,
+        registry: Arc<BlockRegistry>,
         layer_of: impl Fn(&str) -> u32 + Send + Sync + 'static,
     ) -> Self {
         Self {
-            registry: Arc::new(registry),
+            registry,
             layer_of: Arc::new(layer_of),
             mesh_pool: MeshPool::new(),
             resident: HashSet::new(),

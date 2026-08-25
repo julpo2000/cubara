@@ -15,9 +15,8 @@ mod streaming;
 use std::sync::Arc;
 
 use cubara_render::{grab_cursor, Profiler, Renderer};
-use cubara_voxel::BlockId;
 
-use crate::game::Game;
+use crate::game::{load_item_registry, Game};
 use crate::streaming::NodeStreaming;
 
 use winit::application::ApplicationHandler;
@@ -43,15 +42,6 @@ struct App {
     /// When the last frame was drawn. The app loop owns the clock and hands `dt`
     /// to the game; the renderer keeps its own timing only for the FPS readout.
     last_frame: Option<std::time::Instant>,
-    /// What a right-click places, resolved from the loaded registry **by name**
-    /// rather than assumed -- ids are assigned by sorted name, so a hardcoded
-    /// number silently means a different material the moment the material set
-    /// changes (`World::chunk_at`'s doc comment tells that story).
-    ///
-    /// A placeholder: block 2.1d replaces it with whatever the player is
-    /// holding in the hotbar. Until the inventory can feed it, right-click
-    /// places one fixed block, as it always has -- it just now says which.
-    place_block: BlockId,
 }
 
 impl ApplicationHandler for App {
@@ -62,16 +52,12 @@ impl ApplicationHandler for App {
         let attrs = Window::default_attributes().with_title("Cubara");
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let (renderer, mesh_assets) = Renderer::new(window.clone(), self.game.camera_pose());
-        // Resolve before the registry moves into streaming, below.
-        self.place_block = mesh_assets
-            .registry
-            .id_of("cubara:stone")
-            .expect("assets/blocks must define cubara:stone");
         let layers = mesh_assets.layers;
-        self.streaming = Some(NodeStreaming::new(
-            mesh_assets.registry,
-            move |name: &str| layers.layer_of(name),
-        ));
+        let registry = std::sync::Arc::new(mesh_assets.registry);
+        self.game.set_assets(registry.clone(), load_item_registry());
+        self.streaming = Some(NodeStreaming::new(registry, move |name: &str| {
+            layers.layer_of(name)
+        }));
         self.renderer = Some(renderer);
         // Capture the mouse for first-person look (Esc releases it). A window
         // concern, so the app owns it rather than the renderer.
@@ -109,8 +95,8 @@ impl ApplicationHandler for App {
                 // only while the cursor is captured (i.e. actually playing).
                 if self.cursor_captured && state == ElementState::Pressed {
                     let edit = match button {
-                        MouseButton::Left => self.game.edit_block(BlockId::AIR),
-                        MouseButton::Right => self.game.edit_block(self.place_block),
+                        MouseButton::Left => self.game.break_block(),
+                        MouseButton::Right => self.game.place_block(),
                         _ => None,
                     };
                     // The game decides what changed; streaming re-meshes it.
