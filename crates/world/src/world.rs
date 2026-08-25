@@ -40,7 +40,7 @@ pub struct World {
     /// `BTreeMap`, not `HashMap`: iteration order is part of the world's
     /// observable state once this is saved or hashed, and `ARCHITECTURE.md` Rule 1
     /// forbids results that depend on unordered iteration.
-    edits: BTreeMap<[i32; 3], bool>,
+    edits: BTreeMap<[i32; 3], BlockId>,
 }
 
 impl Default for World {
@@ -80,17 +80,29 @@ impl World {
     /// the world through this.
     pub fn is_solid_at(&self, x: i32, y: i32, z: i32) -> bool {
         match self.edits.get(&[x, y, z]) {
-            Some(&solid) => solid,
+            // Solidity is derived from the recorded block rather than stored
+            // beside it: one source of truth, so an edit cannot be solid here
+            // and air three lines down in `block_at`. Anything that is not AIR
+            // is solid -- this crate has no registry to ask, deliberately (the
+            // caller owns that, see `chunk_at`), and every block a player can
+            // place is solid in phase 2.
+            Some(&block) => block != BlockId::AIR,
             None => self.worldgen.is_solid(x, y, z),
         }
     }
 
-    /// Place (`solid = true`) or break (`false`) the block at world `(x, y, z)`,
-    /// recording it in the edit overlay so future [`chunk_at`](Self::chunk_at) /
-    /// [`is_solid_at`](Self::is_solid_at) reflect it. Returns the [`ChunkCoord`] that
+    /// Put `block` at world `(x, y, z)`, recording it in the edit overlay so
+    /// future [`chunk_at`](Self::chunk_at) / [`is_solid_at`](Self::is_solid_at)
+    /// reflect it. [`BlockId::AIR`] is a break. Returns the [`ChunkCoord`] that
     /// contains the block, so the caller can re-mesh it.
-    pub fn set_block(&mut self, x: i32, y: i32, z: i32, solid: bool) -> ChunkCoord {
-        self.edits.insert([x, y, z], solid);
+    ///
+    /// This took a `bool` until block 2.1c (#141). "Solid or not" was enough
+    /// while breaking and placing were a debug affordance, but it cannot say
+    /// *which* block -- so it could express neither "you broke an oak log, take
+    /// an oak log" nor "place the stone you are holding", which is the loop
+    /// block 2.1 exists to build.
+    pub fn set_block(&mut self, x: i32, y: i32, z: i32, block: BlockId) -> ChunkCoord {
+        self.edits.insert([x, y, z], block);
         ChunkCoord::from_block(x, y, z)
     }
 
@@ -190,10 +202,11 @@ impl World {
     /// grass/soil next to an edit with whatever the loaded chunk happens to
     /// show there -- itself just the regenerated value, but there's no
     /// reason to store it as an edit). Lossless for anything
-    /// [`set_block`](Self::set_block) can actually produce, since an edit
-    /// only ever resolves to `blocks.stone` or air (`block_at`'s doc
-    /// comment) -- exactly what a "differs from generation and is solid"
-    /// voxel in `chunk` already is, by construction of how it got saved.
+    /// [`set_block`](Self::set_block) can produce -- and since #141 that is
+    /// *any* block, not just stone-or-air, because the overlay now records
+    /// which one. The loaded voxel is written straight through rather than
+    /// being flattened to a solid/air bool on the way in, which is what made
+    /// the old version lossy for anything but stone.
     pub fn load_chunk_edits(&mut self, coord: ChunkCoord, chunk: &Chunk, blocks: TerrainBlocks) {
         let size = Chunk::SIZE as i32;
         let origin = [coord.x * size, coord.y * size, coord.z * size];
@@ -207,16 +220,17 @@ impl World {
                         let wx = origin[0] + lx as i32;
                         let wy = origin[1] + ly as i32;
                         let wz = origin[2] + lz as i32;
-                        self.set_block(wx, wy, wz, loaded != BlockId::AIR);
+                        self.set_block(wx, wy, wz, loaded);
                     }
                 }
             }
         }
     }
 
-    /// The block at world `(x, y, z)`: a player edit if one exists there
-    /// (always `blocks.stone` when placed -- edits don't carry a material
-    /// choice yet), otherwise this world's [`WorldGen`] at that position.
+    /// The block at world `(x, y, z)`: a player edit if one exists there,
+    /// otherwise this world's [`WorldGen`] at that position. Since #141 an
+    /// edit carries the block it placed, so this is a plain lookup rather
+    /// than a bool resolved to one fixed material.
     ///
     /// Kept as a per-cell method (not built from [`WorldGen::generate`],
     /// which knows nothing about edits) so `chunk_at`'s edit overlay stays a
@@ -224,8 +238,7 @@ impl World {
     /// already does it -- not a second pass over `self.edits` per chunk.
     fn block_at(&self, x: i32, y: i32, z: i32, blocks: TerrainBlocks) -> BlockId {
         match self.edits.get(&[x, y, z]) {
-            Some(&true) => blocks.stone,
-            Some(&false) => BlockId::AIR,
+            Some(&block) => block,
             None => self
                 .worldgen
                 .block_at(x, y, z, blocks)
@@ -350,28 +363,35 @@ mod tests {
 
     #[test]
     fn edits_override_worldgen_regardless_of_underlying_terrain() {
-        // World::block_at's edit branch matches the overlay first, before
-        // ever consulting WorldGen -- so a placed/broken block's material is
-        // exactly `blocks.stone`/air regardless of what the underlying
-        // terrain there actually is. The depth rule itself (grass/soil/stone
-        // by depth) is WorldGen's own contract, pinned in
-        // `worldgen::tests::terrain_layers_by_depth`.
-        let stone = BlockId(3);
-        let other = BlockId(4);
+        // World::block_at's edit branch matches the overlay first, before ever
+        // consulting WorldGen -- so an edit's material is exactly what was
+        // placed, regardless of what the terrain there would have been.
+        //
+        // Until block 2.1c (#141) this asserted the *old* contract: "a placed
+        // block is always stone -- edits carry no material choice yet". That
+        // was true when the overlay was a bool, and it is the thing that made
+        // "you broke an oak log, take an oak log" impossible to express. The
+        // test now pins what replaced it.
+        //
+        // The depth rule itself (grass/soil/stone by depth) is WorldGen's own
+        // contract, pinned in `worldgen::tests::terrain_layers_by_depth`.
         let blocks = TerrainBlocks {
-            grass: other,
-            soil: other,
-            stone,
+            grass: BlockId(4),
+            soil: BlockId(4),
+            stone: BlockId(3),
         };
+        // Deliberately none of the three above: an edit is not drawn from the
+        // terrain palette, so a value outside it must survive untouched.
+        let placed = BlockId(9);
 
         let mut world = World::new();
-        world.set_block(0, 500, 0, true); // "place" -- far above any plausible surface
+        world.set_block(0, 500, 0, placed); // far above any plausible surface
         assert_eq!(
             world.block_at(0, 500, 0, blocks),
-            stone,
-            "a placed block is always stone -- edits carry no material choice yet"
+            placed,
+            "an edit must yield the block that was placed, not a terrain material"
         );
-        world.set_block(0, -500, 0, false); // "break" -- far below any plausible surface
+        world.set_block(0, -500, 0, BlockId::AIR); // far below any plausible surface
         assert_eq!(
             world.block_at(0, -500, 0, blocks),
             BlockId::AIR,
@@ -411,11 +431,11 @@ mod tests {
         // coordinates had to be pushed 500_000 blocks out to stay clear of it.
         let mut world = World::new();
         assert!(!world.is_solid_at(0, 120, 0));
-        world.set_block(0, 120, 0, true);
+        world.set_block(0, 120, 0, BlockId::STONE);
         assert!(world.is_solid_at(0, 120, 0));
 
         assert!(world.is_solid_at(16, 0, 16));
-        world.set_block(16, 0, 16, false);
+        world.set_block(16, 0, 16, BlockId::AIR);
         assert!(!world.is_solid_at(16, 0, 16));
     }
 
@@ -423,7 +443,10 @@ mod tests {
     fn set_block_returns_containing_chunk() {
         // Block (16, 33, -1) lives in chunk (1, 2, -1) (16-block chunks).
         let mut world = World::new();
-        assert_eq!(world.set_block(16, 33, -1, true), ChunkCoord::new(1, 2, -1));
+        assert_eq!(
+            world.set_block(16, 33, -1, BlockId::STONE),
+            ChunkCoord::new(1, 2, -1)
+        );
     }
 
     #[test]
@@ -435,7 +458,7 @@ mod tests {
             world.chunk_at(cc, stone_blocks()).is_none(),
             "air chunk starts empty"
         );
-        world.set_block(0, 130, 0, true);
+        world.set_block(0, 130, 0, BlockId::STONE);
         assert!(
             world.chunk_at(cc, stone_blocks()).is_some(),
             "placing a block makes the chunk non-empty"
@@ -448,7 +471,7 @@ mod tests {
         // process, neither seeing the other's edits.
         let mut a = World::new();
         let b = World::new();
-        a.set_block(0, 120, 0, true);
+        a.set_block(0, 120, 0, BlockId::STONE);
         assert!(a.is_solid_at(0, 120, 0));
         assert!(!b.is_solid_at(0, 120, 0), "b must not see a's edit");
     }
@@ -460,10 +483,10 @@ mod tests {
         let mut a = World::new();
         let mut b = World::new();
         for c in [[5, 1, 2], [0, 0, 0], [-3, 9, 4]] {
-            a.set_block(c[0], c[1], c[2], true);
+            a.set_block(c[0], c[1], c[2], BlockId::STONE);
         }
         for c in [[-3, 9, 4], [5, 1, 2], [0, 0, 0]] {
-            b.set_block(c[0], c[1], c[2], true);
+            b.set_block(c[0], c[1], c[2], BlockId::STONE);
         }
         let keys = |w: &World| w.edits.keys().copied().collect::<Vec<_>>();
         assert_eq!(keys(&a), keys(&b));
@@ -480,10 +503,10 @@ mod tests {
     fn dirty_chunks_reports_every_touched_chunk_once_in_order() {
         let mut world = World::new();
         // Two edits in chunk (0,0,0), one each in (1,0,0) and (-1,0,0).
-        world.set_block(0, 0, 0, true);
-        world.set_block(1, 1, 1, false);
-        world.set_block(16, 0, 0, true);
-        world.set_block(-1, 0, 0, false);
+        world.set_block(0, 0, 0, BlockId::STONE);
+        world.set_block(1, 1, 1, BlockId::AIR);
+        world.set_block(16, 0, 0, BlockId::STONE);
+        world.set_block(-1, 0, 0, BlockId::AIR);
         assert_eq!(
             world.dirty_chunks(),
             vec![
@@ -503,9 +526,9 @@ mod tests {
         // on the next load.
         let mut world = World::new();
         let cc = ChunkCoord::new(0, 8, 0); // high in the air, starts empty
-        world.set_block(0, 130, 0, true);
+        world.set_block(0, 130, 0, BlockId::STONE);
         assert!(world.chunk_at(cc, stone_blocks()).is_some());
-        world.set_block(0, 130, 0, false); // undo it -- back to fully air
+        world.set_block(0, 130, 0, BlockId::AIR); // undo it -- back to fully air
         assert!(
             world.chunk_at(cc, stone_blocks()).is_none(),
             "chunk_at reports empty as None"
@@ -525,8 +548,8 @@ mod tests {
         // chunk -- not just at the edited voxel.
         let mut original = World::new();
         let cc = ChunkCoord::new(0, 8, 0);
-        original.set_block(0, 130, 5, true);
-        original.set_block(3, 129, 2, true);
+        original.set_block(0, 130, 5, BlockId::STONE);
+        original.set_block(3, 129, 2, BlockId::STONE);
 
         let blocks = stone_blocks();
         let edited_chunk = original.edited_chunk_at(cc, blocks);
@@ -561,7 +584,7 @@ mod tests {
             original.is_solid_at(0, 0, 0),
             "test assumes this cell starts solid"
         );
-        original.set_block(0, 0, 0, false); // one genuine edit: break confirmed-solid ground
+        original.set_block(0, 0, 0, BlockId::AIR); // one genuine edit: break confirmed-solid ground
 
         let blocks = stone_blocks();
         let edited_chunk = original.edited_chunk_at(cc, blocks);
@@ -577,7 +600,7 @@ mod tests {
     #[test]
     fn level_0_node_at_matches_chunk_at() {
         let mut world = World::new();
-        world.set_block(3, 1, 2, true); // an edit, so this also proves it's edit-aware
+        world.set_block(3, 1, 2, BlockId::STONE); // an edit, so this also proves it's edit-aware
         let node = NodeKey::new(0, [0, 0, 0]);
         let blocks = stone_blocks();
 
@@ -639,7 +662,7 @@ mod tests {
         let before = world.node_at(node, blocks);
         // An edit deep inside this node's volume, far from any chunk
         // boundary the sampling lattice would skip regardless.
-        world.set_block(0, 0, 0, false);
+        world.set_block(0, 0, 0, BlockId::AIR);
         let after = world.node_at(node, blocks);
 
         assert_eq!(

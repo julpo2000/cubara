@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use cubara_render::headless::{self, Frame, Shot};
 use cubara_render::materials::TextureLayers;
 use cubara_render::{MeshedNode, NodeId};
-use cubara_voxel::{BlockRegistry, Chunk, ChunkCoord};
+use cubara_voxel::{BlockId, BlockRegistry, Chunk, ChunkCoord};
 use cubara_world::mesh::mesh_region;
 use cubara_world::node::schedule_for_radius;
 use cubara_world::World;
@@ -459,7 +459,7 @@ fn edits_change_what_is_drawn() {
     for x in -100..100 {
         for z in -16..16 {
             for y in 0..40 {
-                world.set_block(x, y, z, false);
+                world.set_block(x, y, z, BlockId::AIR);
             }
         }
     }

@@ -291,7 +291,7 @@ mod tests {
             "test assumes this cell starts solid"
         );
         let before = WorldHash::compute(&sim, &world, &region(), blocks(), 1);
-        world.set_block(0, 0, 0, false);
+        world.set_block(0, 0, 0, BlockId::AIR);
         let after = WorldHash::compute(&sim, &world, &region(), blocks(), 1);
         assert_ne!(before, after);
     }

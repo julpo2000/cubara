@@ -215,6 +215,43 @@ not punished twice for the same mistake.
 
 ---
 
+## §4.1 The edit overlay had to learn what a block is
+
+**A gap in this document, found while implementing 2.1c (#141) and recorded
+here rather than worked around.** §2 designs the inventory and §4 designs drops,
+and neither noticed that the thing they both stand on was a boolean:
+
+```rust
+edits: BTreeMap<[i32; 3], bool>,          // before
+pub fn set_block(&mut self, x: i32, y: i32, z: i32, solid: bool) -> ChunkCoord
+```
+
+`true` meant "something solid", resolved to grass/soil/stone by depth. That was
+right for phase 1, where breaking and placing were a debug affordance and no
+system asked *which* block. It can express neither "you broke an oak log, take an
+oak log" nor "place the stone you are holding" — the whole of block 2.1.
+
+**The overlay carries a `BlockId`.** `BlockId::AIR` is a break; anything else is
+a placement of that specific block. There is no `bool` overload beside it — one
+way to edit a block, per Rule 5.
+
+Two consequences worth stating, because both were invisible before:
+
+- **Solidity is derived, not stored.** `is_solid_at` asks whether the recorded
+  block is `AIR`, rather than keeping its own flag. One source of truth, so an
+  edit cannot read solid in one method and air in another.
+- **`load_chunk_edits` became lossless.** It used to flatten a loaded voxel to
+  `loaded != AIR` on the way in, which was fine only because an edit could not be
+  anything but stone-or-air. It now writes the block straight through.
+
+**The trap this walked into, recorded so the next person does not.** Translating
+the old `set_block(.., true)` calls looked mechanical, and it was not: ids are
+assigned by sorted name, so `BlockId::STONE` (the constant, id 1) is *grass* in a
+three-material registry. A blind translation silently changed which material two
+fixtures placed. Call sites now resolve from their own registry
+(`blocks.stone`), never from the constant. `World::chunk_at`'s doc comment
+already told this story for block 1.4b; it is the same trap one layer up.
+
 ## §5 Trees
 
 Placement is already decided and is not re-opened here:

@@ -437,8 +437,8 @@ mod tests {
     #[test]
     fn saving_the_same_state_twice_produces_byte_identical_files() {
         let mut world = World::new();
-        world.set_block(0, 0, 0, false);
-        world.set_block(100, 0, 100, true);
+        world.set_block(0, 0, 0, BlockId::AIR);
+        world.set_block(100, 0, 100, BlockId::STONE);
         let blocks = stone_blocks();
 
         let dir_a = scratch_dir("byte-stability-a");
