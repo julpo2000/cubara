@@ -14,7 +14,7 @@ mod streaming;
 
 use std::sync::Arc;
 
-use cubara_render::{grab_cursor, Profiler, Renderer};
+use cubara_render::{grab_cursor, HotbarView, Profiler, Renderer};
 
 use crate::game::{load_item_registry, Game};
 use crate::streaming::NodeStreaming;
@@ -118,7 +118,12 @@ impl ApplicationHandler for App {
                 self.game.advance(dt);
                 let camera = self.game.camera_pose();
                 streaming.update(renderer, self.game.world(), camera.eye.to_array());
-                renderer.render(camera, self.game.selected_block());
+                let slots = self.game.hotbar_slots();
+                let hotbar = slots.as_ref().map(|s| HotbarView {
+                    slots: s,
+                    selected: self.game.selected_hotbar_slot(),
+                });
+                renderer.render(camera, self.game.selected_block(), hotbar);
                 // Immediately queue the next frame — we render continuously.
                 renderer.window().request_redraw();
             }

@@ -162,6 +162,8 @@ pub fn run(radius: i32) {
                     draw_count,
                     selected_block: None,
                     overlay: None,
+                    // The bench measures the world, not a HUD.
+                    hotbar: None,
                 },
             );
             queue.submit(std::iter::once(encoder.finish()));

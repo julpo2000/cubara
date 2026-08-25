@@ -497,7 +497,14 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self, camera: CameraPose, selected_block: Option<[i32; 3]>) {
+    /// `hotbar` is plain data the caller reduces its inventory to -- this
+    /// crate never learns what an item is (Rule 3).
+    pub fn render(
+        &mut self,
+        camera: CameraPose,
+        selected_block: Option<[i32; 3]>,
+        hotbar: Option<crate::scene::HotbarView<'_>>,
+    ) {
         crate::profiling::Profiler::new_frame();
         puffin::profile_function!();
         self.update(camera);
@@ -537,6 +544,7 @@ impl Renderer {
                     draw_count,
                     selected_block,
                     overlay: overlay.as_deref(),
+                    hotbar,
                 },
             );
         }

@@ -44,6 +44,17 @@ pub struct Shot {
     /// (the sim's own raycast); a golden test sets it explicitly to whatever
     /// block its `camera` is known to be looking at.
     pub highlighted_block: Option<[i32; 3]>,
+    /// Hotbar slots to draw along the bottom, or `None` for no HUD. Plain data
+    /// -- a golden test builds it directly, with no sim and no inventory,
+    /// which is the point of `HotbarView` carrying colours and counts rather
+    /// than items.
+    ///
+    /// A fixed nine so `Shot` stays `Copy`. Nine is this struct's choice, not a
+    /// contract: [`crate::scene::HotbarView`] takes a slice and draws whatever
+    /// length it is given, which is what lets the renderer stay ignorant of
+    /// `cubara_sim::HOTBAR_WIDTH` (it cannot depend on that crate anyway --
+    /// dependencies point one way, Rule 3).
+    pub hotbar: Option<[Option<crate::scene::HotbarSlot>; 9]>,
 }
 
 impl Default for Shot {
@@ -55,6 +66,7 @@ impl Default for Shot {
             orbit_t: 6.0,
             camera: None,
             highlighted_block: None,
+            hotbar: None,
         }
     }
 }
@@ -131,7 +143,11 @@ fn render_arena(
         orbit_t,
         camera,
         highlighted_block,
+        hotbar,
     } = shot;
+    // Slot 0 held: a fixed choice, so a golden reference has a stable
+    // selection highlight to compare against.
+    let hotbar_selected = 0u8;
 
     let (mesh_assets, tex_view, tex_sampler) = load_mesh_assets(&device, &queue);
     let layer_of = |name: &str| mesh_assets.layers.layer_of(name);
@@ -216,6 +232,10 @@ fn render_arena(
             draw_count,
             selected_block: highlighted_block,
             overlay: None,
+            hotbar: hotbar.as_ref().map(|slots| crate::scene::HotbarView {
+                slots: slots.as_slice(),
+                selected: hotbar_selected,
+            }),
         },
     );
     encoder.copy_texture_to_buffer(

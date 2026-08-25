@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use cubara_render::headless::{self, Frame, Shot};
 use cubara_render::materials::TextureLayers;
-use cubara_render::{MeshedNode, NodeId};
+use cubara_render::{HotbarSlot, MeshedNode, NodeId};
 use cubara_voxel::{BlockId, BlockRegistry, Chunk, ChunkCoord};
 use cubara_world::mesh::mesh_region;
 use cubara_world::node::schedule_for_radius;
@@ -294,6 +294,7 @@ fn a_cave_mouth_is_visible() {
         orbit_t: 0.0,
         camera: Some((eye, target - eye)),
         highlighted_block: None,
+        hotbar: None,
     };
     assert_golden("cave_mouth", &world, shot);
 }
@@ -354,8 +355,50 @@ fn the_selected_block_shows_an_outline() {
         orbit_t: 0.0,
         camera: Some((eye, target - eye)),
         highlighted_block: Some(hit.block),
+        hotbar: None,
     };
     assert_golden("outline", &world, shot);
+}
+
+#[test]
+fn the_hotbar_shows_slots_counts_and_the_held_one() {
+    // Block 2.1e's own bar. Three things have to be visible, and a golden is
+    // the only automated way to say so: nine slots along the bottom, the held
+    // one distinguishable from the rest, and a count on a stack of more than
+    // one.
+    //
+    // Built from plain colours and counts rather than from an inventory --
+    // that is the point of `HotbarView` (Rule 3: this crate does not know what
+    // an item is), and it is what lets this run with no sim at all.
+    let slot = |r: f32, g: f32, b: f32, count: u8| {
+        Some(HotbarSlot {
+            color: [r, g, b],
+            count,
+        })
+    };
+    let hotbar = [
+        slot(0.45, 0.62, 0.30, 12), // a two-digit count
+        slot(0.55, 0.40, 0.26, 1),  // a count of 1 draws no number -- deliberate
+        None,
+        slot(0.52, 0.52, 0.55, 64), // a full stack
+        None,
+        None,
+        slot(0.70, 0.35, 0.25, 3),
+        None,
+        None,
+    ];
+
+    let world = World::new();
+    let shot = Shot {
+        width: 960,
+        height: 540,
+        region_radius: 2,
+        orbit_t: 0.0,
+        camera: None,
+        highlighted_block: None,
+        hotbar: Some(hotbar),
+    };
+    assert_golden("hotbar", &world, shot);
 }
 
 #[test]
@@ -395,6 +438,7 @@ fn distinct_materials_render_with_distinct_textures() {
         orbit_t: 5.0,
         camera: None,
         highlighted_block: None,
+        hotbar: None,
     };
 
     let Some(frame) = headless::render_chunks(&chunks, shot) else {
