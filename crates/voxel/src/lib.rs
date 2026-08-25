@@ -22,7 +22,7 @@ pub use item::{
     ItemDef, ItemId, ItemRegistry, ItemRegistryError, ItemStack, ItemState, StackError,
 };
 pub use mesh::{Face, Mesh, Vertex};
-pub use recipe::{Recipe, RecipeBook, RecipeDef, RecipeError, MAX_GRID};
+pub use recipe::{Recipe, RecipeBook, RecipeDef, RecipeError, RecipeOutputDef, MAX_GRID};
 pub use registry::{BlockRegistry, Faces, Material, RegistryError, Shape};
 pub use storage::{ChunkPayloadError, ChunkStorage};
 pub use voxel::{Chunk, MeshContext};

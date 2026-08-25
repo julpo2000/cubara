@@ -14,6 +14,7 @@
 //! reasoning [`crate::WorldHash`] (block 1.8) already established for why
 //! this crate, not that one.
 
+use crate::crafting::Crafting;
 use crate::inventory::Inventory;
 use std::collections::HashMap;
 use std::path::Path;
@@ -266,6 +267,11 @@ pub fn load_world(
         // world starts empty-handed until then, deliberately and visibly,
         // rather than silently half-restoring an inventory.
         inventory: Inventory::new(),
+        // Same as the inventory: not in the format until block 2.8. A loaded
+        // world opens with an empty grid, which is also the only sane state to
+        // resume in -- a half-filled grid restored without its screen open
+        // would be items the player cannot see.
+        crafting: Crafting::default(),
     };
 
     let sim = Sim {

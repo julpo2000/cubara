@@ -18,9 +18,10 @@
 //! block-array hash test: `z`-outer/`y`-mid/`x`-inner voxel order, each
 //! value's little-endian bytes fed in one at a time.
 
-use cubara_voxel::{BlockId, Chunk, ChunkCoord, ItemState};
+use cubara_voxel::{BlockId, Chunk, ChunkCoord, ItemStack, ItemState};
 use cubara_world::{TerrainBlocks, World};
 
+use crate::crafting::Crafting;
 use crate::inventory::Inventory;
 use crate::Sim;
 
@@ -100,6 +101,7 @@ impl WorldHash {
         self.write_f32(p.yaw);
         self.write_f32(p.pitch);
         self.write_inventory(&p.inventory);
+        self.write_crafting(&p.crafting);
     }
 
     /// Every slot in index order, present-or-not first so an empty slot is
@@ -111,20 +113,36 @@ impl WorldHash {
     /// than only the payload: without the byte, a stateless item and a tool at
     /// zero remaining would hash identically, and those are very different
     /// worlds.
+    /// The grid's nine cells and the cursor, in index order. `width` is
+    /// included because the same cells mean different things in a 2x2 and a
+    /// 3x3 -- a bench-open state and an inventory-open state with identical
+    /// contents are different worlds.
+    fn write_crafting(&mut self, c: &Crafting) {
+        self.write_u8(c.width() as u8);
+        for i in 0..cubara_voxel::MAX_GRID * cubara_voxel::MAX_GRID {
+            self.write_stack(c.cell(i));
+        }
+        self.write_stack(c.held());
+    }
+
+    fn write_stack(&mut self, slot: Option<ItemStack>) {
+        self.write_bool(slot.is_some());
+        let Some(stack) = slot else { return };
+        self.write_u16(stack.item().0);
+        self.write_u8(stack.count());
+        match stack.state() {
+            ItemState::None => self.write_u8(0),
+            ItemState::Durability { remaining } => {
+                self.write_u8(1);
+                self.write_u16(remaining);
+            }
+        }
+    }
+
     fn write_inventory(&mut self, inv: &Inventory) {
         self.write_u8(inv.selected_slot());
         for slot in inv.slots() {
-            self.write_bool(slot.is_some());
-            let Some(stack) = slot else { continue };
-            self.write_u16(stack.item().0);
-            self.write_u8(stack.count());
-            match stack.state() {
-                ItemState::None => self.write_u8(0),
-                ItemState::Durability { remaining } => {
-                    self.write_u8(1);
-                    self.write_u16(remaining);
-                }
-            }
+            self.write_stack(slot);
         }
     }
 

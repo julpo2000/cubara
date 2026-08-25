@@ -175,6 +175,34 @@ no size — a recipe simply fails to match if its trimmed pattern does not fit t
 grid it is offered to. The bench therefore gates 3×3 recipes without any recipe
 needing to say so, and nothing has to be duplicated per grid size.
 
+### §3.1 How the player actually crafts
+
+Two decisions the owner made when block 2.2's UI came into view, recorded here
+so the issues that implement them are executable.
+
+**The grid is the basis, and every recipe has a grid form.** Ingredients go into
+a grid; the result appears in a slot beside it; clicking that slot takes the
+result and consumes the ingredients. A recipe book — click what you want, it
+gathers the ingredients — is allowed as a *later convenience*, but it may never
+be the only way to make something.
+
+That invariant is already enforced by the types rather than by discipline:
+`RecipeBook` holds nothing but shaped patterns, so a recipe with no grid form
+cannot be expressed. If a book is added later and someone wants a book-only
+recipe, they will have to change the data model to get it, which is exactly the
+friction that should exist.
+
+**Moving items is click-to-pick-up, click-to-place.** Click a slot to lift its
+stack onto the cursor, click another to put it down; right-click places one.
+Not drag-and-drop, and not both.
+
+The reason is testability, not taste. Click-to-place is a *state machine* — a
+held stack plus a sequence of slot indices — so every rule about merging,
+splitting and swapping is a unit test with no mouse involved. Dragging is a
+gesture over mouse-motion events, which can only really be verified by hand.
+Supporting both would be two input paths into the same state change, which is
+the duplication Rule 5 exists to prevent.
+
 **Rejected: shapeless recipes as a second kind.** One matcher is Rule 5. A
 recipe that genuinely does not care about layout is expressible as a shaped one
 today; if that becomes painful, adding a `shapeless: true` variant is a data
