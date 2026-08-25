@@ -1,0 +1,18 @@
+// Tier 2, and what iron ore requires.
+//
+// Uses cubara:stone because that is what breaking stone yields today
+// (4.2's name-based drops). Block 2.4 may switch this to cubara:cobble
+// when it adds real drop tables -- a data change here, no code.
+Recipe(
+    name:    "cubara:stone_pick",
+    pattern: [
+        "SSS",
+        " T ",
+        " T ",
+    ],
+    key: {
+        'S': "cubara:stone",
+        'T': "cubara:stick",
+    },
+    output: (item: "cubara:stone_pick", count: 1),
+)

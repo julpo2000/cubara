@@ -1,0 +1,13 @@
+// Two planks stacked. Vertical on purpose -- a shaped recipe, and the
+// simplest demonstration that layout matters.
+Recipe(
+    name:    "cubara:stick",
+    pattern: [
+        "P",
+        "P",
+    ],
+    key: {
+        'P': "cubara:plank",
+    },
+    output: (item: "cubara:stick", count: 4),
+)

@@ -1,0 +1,7 @@
+// The 3x3 grid. Decision A's whole point: the bench is a real milestone.
+Material(
+    name:   "cubara:crafting_bench",
+    solid:  true,
+    faces:  Sided(top: "bench_top", side: "bench_side", bottom: "plank"),
+    shapes: [Full],
+)

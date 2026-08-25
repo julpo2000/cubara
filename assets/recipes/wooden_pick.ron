@@ -1,0 +1,14 @@
+// Tier 1. Needs the bench: 3 wide does not fit the inventory's 2x2.
+Recipe(
+    name:    "cubara:wooden_pick",
+    pattern: [
+        "PPP",
+        " S ",
+        " S ",
+    ],
+    key: {
+        'P': "cubara:plank",
+        'S': "cubara:stick",
+    },
+    output: (item: "cubara:wooden_pick", count: 1),
+)

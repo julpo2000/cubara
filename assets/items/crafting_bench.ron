@@ -1,0 +1,9 @@
+// Crafted from four planks. Opens the 3x3 grid.
+//
+// Every block needs an item of the same name or it drops nothing when
+// broken -- see PHASE2_ARCHITECTURE.md 4.2.
+ItemDef(
+    name:       "cubara:crafting_bench",
+    max_stack:  64,
+    durability: None,
+)

@@ -1,0 +1,13 @@
+// Four planks. Fits a 2x2 grid, so it is craftable from the inventory --
+// which is what makes the bench reachable at all.
+Recipe(
+    name:    "cubara:crafting_bench",
+    pattern: [
+        "PP",
+        "PP",
+    ],
+    key: {
+        'P': "cubara:plank",
+    },
+    output: (item: "cubara:crafting_bench", count: 1),
+)
