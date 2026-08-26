@@ -8,7 +8,7 @@
 //! unedited chunk be regenerated instead of saved (§7.4) and a far LOD node
 //! sample its own volume with no neighbours to ask (§6).
 
-use cubara_voxel::{BlockId, BlockRegistry, Chunk};
+use cubara_voxel::{BlockId, BlockRegistry, Chunk, StructureRegistry};
 
 use crate::noise::{fbm2, fbm3};
 
@@ -30,9 +30,70 @@ pub struct TerrainBlocks {
     /// carry a material choice yet, since there's no inventory/build system
     /// to choose one from.
     pub stone: BlockId,
+    /// The oak's trunk and canopy, and the shape it grows in. `None` when no
+    /// structure data was supplied -- a world with no trees, which every test
+    /// that predates block 2.3 still expects.
+    pub oak: Option<Oak>,
+}
+
+/// The oak, resolved: ids instead of names, and the shape numbers from
+/// `assets/structures/oak.ron`.
+///
+/// Shape lives in data (`REQUIREMENTS.md` #3); *placement* does not, and is
+/// the structure pass below (`PHASE1_ARCHITECTURE.md` §8.4) -- an algorithm
+/// with a declared radius, not a number to tune.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Oak {
+    pub log: BlockId,
+    pub leaves: BlockId,
+    /// Only grows on this block, which keeps trees off stone and out of caves.
+    pub grows_on: BlockId,
+    /// Inclusive trunk height range.
+    pub height: (i32, i32),
+    /// How far the canopy reaches from the trunk, in blocks.
+    pub canopy_radius: i32,
+    /// One in `density` chunk columns carries a tree. An integer so the
+    /// decision is bit-identical across platforms (§8.5).
+    pub density: u32,
 }
 
 impl TerrainBlocks {
+    /// Add the oak, resolved from `structures` and `registry` by name.
+    ///
+    /// A builder rather than a parameter on [`from_registry`](Self::from_registry)
+    /// so that the many callers who do not care about trees -- tests pinning
+    /// terrain shape, save round-trips, the determinism fixture -- keep a
+    /// one-argument constructor and a treeless world. The callers that render
+    /// or play the real world opt in.
+    ///
+    /// Returns `self` unchanged if the structure or any of its blocks are
+    /// missing: a world with no oaks is a worse world, not a broken one, and
+    /// panicking here would make a missing data file fatal at startup for
+    /// something the game can do without.
+    pub fn with_oak(mut self, structures: &StructureRegistry, registry: &BlockRegistry) -> Self {
+        let Some(def) = structures.get("cubara:oak") else {
+            return self;
+        };
+        let (Some(log), Some(leaves), Some(grows_on)) = (
+            registry.id_of(&def.trunk.block),
+            registry.id_of(&def.canopy.block),
+            registry.id_of(&def.grows_on),
+        ) else {
+            // No logging: this crate has no logger dependency, and a
+            // missing block is caught by the registry tests long before here.
+            return self;
+        };
+        self.oak = Some(Oak {
+            log,
+            leaves,
+            grows_on,
+            height: def.trunk.height,
+            canopy_radius: def.canopy.radius,
+            density: def.density,
+        });
+        self
+    }
+
     /// Resolve `cubara:grass`/`cubara:soil`/`cubara:stone` from `registry` by
     /// name -- the one place every real caller (the live renderer, the
     /// headless bench/screenshot paths) gets its `TerrainBlocks` from, so the
@@ -45,6 +106,7 @@ impl TerrainBlocks {
                 .unwrap_or_else(|| panic!("assets/blocks must define {name}"))
         };
         Self {
+            oak: None,
             grass: id("cubara:grass"),
             soil: id("cubara:soil"),
             stone: id("cubara:stone"),
@@ -98,6 +160,59 @@ pub const WORLDGEN_VERSION: u32 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorldGen {
     seed: u64,
+}
+
+/// One placed tree: where its trunk stands, and how tall it is.
+///
+/// Resolved from a hash of `(seed, chunk column)` alone, so it is a pure
+/// function of the seed and never depends on what has been generated (§8.1).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PlacedTree {
+    x: i32,
+    z: i32,
+    base: i32,
+    height: i32,
+}
+
+/// The at-most-nine trees that can reach one chunk column.
+///
+/// A fixed array rather than a `Vec`: this is built per chunk (and per voxel
+/// on the single-block paths), and allocating there would put a heap call in
+/// the middle of worldgen. Nine is a proven bound, not a guess -- see
+/// [`WorldGen::trees_near`].
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TreeSet {
+    trees: [Option<PlacedTree>; 9],
+    len: usize,
+}
+
+impl TreeSet {
+    fn new() -> Self {
+        Self {
+            trees: [None; 9],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, t: PlacedTree) {
+        if self.len < self.trees.len() {
+            self.trees[self.len] = Some(t);
+            self.len += 1;
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[cfg(test)]
+    fn count_for_test(&self) -> usize {
+        self.len
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &PlacedTree> {
+        self.trees[..self.len].iter().flatten()
+    }
 }
 
 impl WorldGen {
@@ -209,6 +324,126 @@ impl WorldGen {
         }
     }
 
+    /// The trees whose volume can reach anything in this chunk column: at most
+    /// one per neighbouring chunk column, so at most nine.
+    ///
+    /// **Why this takes a chunk column rather than a voxel.** Which trees can
+    /// reach a voxel depends only on its chunk, not on the voxel, so this is
+    /// computed *once per chunk* by `World::build_chunk` and once per query by
+    /// the single-voxel paths. One rule, hoisted differently -- a naive
+    /// per-voxel version would cost nine hashes 8,192 times per chunk and blow
+    /// `radius_64_smoke`'s budget.
+    ///
+    /// Nine is the bound because a tree reaches at most `canopy_radius` blocks
+    /// sideways, and one chunk is 16 -- so only immediately adjacent chunk
+    /// columns can ever overlap this one, and each carries at most one tree.
+    pub(crate) fn trees_near(&self, chunk_x: i32, chunk_z: i32, blocks: TerrainBlocks) -> TreeSet {
+        let mut out = TreeSet::new();
+        if blocks.oak.is_none() {
+            return out;
+        }
+        for cz in chunk_z - 1..=chunk_z + 1 {
+            for cx in chunk_x - 1..=chunk_x + 1 {
+                if let Some(t) = self.tree_in_column(cx, cz, blocks) {
+                    out.push(t);
+                }
+            }
+        }
+        out
+    }
+
+    /// The tree in one chunk column, if it has one.
+    ///
+    /// Integer arithmetic only: the placement decision has to produce the same
+    /// bits on every platform (§8.5), and float comparisons are exactly what
+    /// that rule exists to avoid.
+    fn tree_in_column(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+        blocks: TerrainBlocks,
+    ) -> Option<PlacedTree> {
+        let oak = blocks.oak?;
+        // A separate hash stream from the terrain's, so retuning one cannot
+        // silently move the other.
+        let h = crate::noise::hash(self.seed ^ 0x7EE5, chunk_x, 0, chunk_z);
+        if !h.is_multiple_of(oak.density as u64) {
+            return None;
+        }
+        // Where in the column, kept clear of the chunk edge by the canopy
+        // radius so a tree never reaches further than the one chunk of slack
+        // `trees_near` allows for.
+        let size = Chunk::SIZE as i32;
+        let margin = oak.canopy_radius;
+        let span = (size - margin * 2).max(1) as u64;
+        let x = chunk_x * size + margin + ((h >> 8) % span) as i32;
+        let z = chunk_z * size + margin + ((h >> 24) % span) as i32;
+
+        let surface = self.surface_height(x, z);
+        // Only on the block it grows on, which keeps trees off stone and out
+        // of caves -- and only where that surface block is actually there,
+        // since a cave can carve the ground out from under it.
+        // The real surface material, from the real palette.
+        //
+        // An earlier version compared against a *synthetic* palette whose
+        // `grass` was already `grows_on` -- which made the check vacuous: it
+        // could only ever pass. `trees_do_not_grow_on_stone_or_in_caves`
+        // caught it, which is exactly what that test is for.
+        //
+        // The density check is the second half: a cave can carve the ground
+        // out from under a surface height, and a tree must not grow on air.
+        if self.material_at(surface, surface, blocks) != oak.grows_on
+            || self.density_at(x, surface, z, surface) <= 0.0
+        {
+            return None;
+        }
+
+        let (lo, hi) = oak.height;
+        let height = lo + ((h >> 40) % (hi - lo + 1).max(1) as u64) as i32;
+        Some(PlacedTree {
+            x,
+            z,
+            base: surface + 1,
+            height,
+        })
+    }
+
+    /// Whether one of `trees` occupies `(x, y, z)`, and with what.
+    ///
+    /// Trunk wins over canopy where they overlap, so the trunk reads as a
+    /// continuous column rather than being swallowed by its own leaves.
+    pub(crate) fn tree_block_at(
+        &self,
+        trees: &TreeSet,
+        x: i32,
+        y: i32,
+        z: i32,
+        oak: Oak,
+    ) -> Option<BlockId> {
+        let mut leaves = false;
+        for t in trees.iter() {
+            let top = t.base + t.height - 1;
+            if t.x == x && t.z == z && y >= t.base && y <= top {
+                return Some(oak.log);
+            }
+            // A blob around the top of the trunk: within the canopy radius
+            // horizontally, and from just below the top to just above it.
+            let dx = (x - t.x).abs();
+            let dz = (z - t.z).abs();
+            let r = oak.canopy_radius;
+            if dx <= r && dz <= r && y >= top - r && y <= top + 1 {
+                // Trim the corners so the canopy reads as round rather than a
+                // cube, and drop the ring at the very top so it comes to a
+                // point.
+                let shrink = if y >= top { 1 } else { 0 };
+                if dx + dz <= r + 1 - shrink {
+                    leaves = true;
+                }
+            }
+        }
+        leaves.then_some(oak.leaves)
+    }
+
     /// The block at a world position given an already-known
     /// `surface_height(x, z)`, or `None` for air. What
     /// [`generate`](Self::generate) calls per lattice cell.
@@ -227,8 +462,53 @@ impl WorldGen {
     /// callers that only need one block (a `World` cell with no edit
     /// overriding it) rather than a whole chunk; [`generate`](Self::generate)
     /// does not call this; see its doc comment for why.
-    pub fn block_at(&self, x: i32, y: i32, z: i32, blocks: TerrainBlocks) -> Option<BlockId> {
+    /// The terrain at a position, **without** consulting structures.
+    ///
+    /// What a caller uses when it has already resolved the trees for a whole
+    /// chunk once (`World::build_chunk`) -- so the nine-hash structure lookup
+    /// happens per chunk rather than per voxel. Getting that wrong is not a
+    /// correctness bug, it is a 5x frame-time regression, which is how it was
+    /// found.
+    pub fn terrain_block_at(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        blocks: TerrainBlocks,
+    ) -> Option<BlockId> {
         self.block_at_on_surface(x, y, z, self.surface_height(x, z), blocks)
+    }
+
+    pub fn block_at(&self, x: i32, y: i32, z: i32, blocks: TerrainBlocks) -> Option<BlockId> {
+        if let Some(oak) = blocks.oak {
+            let size = Chunk::SIZE as i32;
+            let trees = self.trees_near(x.div_euclid(size), z.div_euclid(size), blocks);
+            // Trees sit *on* the terrain, so they win where they overlap air
+            // and lose to nothing -- a trunk is never inside solid ground,
+            // because it starts one block above the surface.
+            if let Some(block) = self.tree_block_at(&trees, x, y, z, oak) {
+                return Some(block);
+            }
+        }
+        self.block_at_on_surface(x, y, z, self.surface_height(x, z), blocks)
+    }
+
+    /// Whether `(x, y, z)` is solid **including trees**, given the ids that
+    /// say what a tree is made of.
+    ///
+    /// Separate from [`is_solid`](Self::is_solid) because that one answers a
+    /// yes/no question without needing a [`TerrainBlocks`], and most callers
+    /// (the density field itself) genuinely do not want trees. Walking and
+    /// raycasting do: you must not walk through a trunk you can see.
+    pub fn is_solid_with_trees(&self, x: i32, y: i32, z: i32, blocks: TerrainBlocks) -> bool {
+        if let Some(oak) = blocks.oak {
+            let size = Chunk::SIZE as i32;
+            let trees = self.trees_near(x.div_euclid(size), z.div_euclid(size), blocks);
+            if !trees.is_empty() && self.tree_block_at(&trees, x, y, z, oak).is_some() {
+                return true;
+            }
+        }
+        self.is_solid(x, y, z)
     }
 
     /// Fill a `16³` lattice of samples, `step` world-blocks apart starting
@@ -263,6 +543,12 @@ impl WorldGen {
     /// a real regression the radius-64 smoke test caught (a debug-build
     /// generation pass that used to finish in ~1.3s no longer finished in
     /// the test's 120s budget) -- see `BENCHMARKS.md`.
+    /// **No trees here, deliberately.** `PHASE1_ARCHITECTURE.md` §8.4:
+    /// structures run at level 0 only, because "a tree sampled every 8 blocks
+    /// is one stray voxel". This is the LOD path (`step > 1`), so growing trees
+    /// in it would put single floating leaf blocks on the horizon. The two
+    /// per-voxel routes -- `block_at` and `is_solid_with_trees` -- are the ones
+    /// that do. They differ by design, and this comment is the design.
     pub fn generate(&self, origin: [i32; 3], step: i32, blocks: TerrainBlocks) -> Chunk {
         let mut surfaces = [[0i32; Chunk::SIZE]; Chunk::SIZE];
         for (lz, row) in surfaces.iter_mut().enumerate() {
@@ -288,6 +574,7 @@ mod tests {
 
     fn test_blocks() -> TerrainBlocks {
         TerrainBlocks {
+            oak: None,
             grass: BlockId(1),
             soil: BlockId(2),
             stone: BlockId(3),
@@ -358,6 +645,130 @@ mod tests {
             a, b,
             "two different seeds landed on the same height by coincidence"
         );
+    }
+
+    /// A terrain palette with trees, for the structure-pass tests.
+    fn tree_blocks() -> TerrainBlocks {
+        TerrainBlocks {
+            oak: Some(Oak {
+                log: BlockId(10),
+                leaves: BlockId(11),
+                grows_on: BlockId(1),
+                height: (4, 6),
+                canopy_radius: 2,
+                density: 4,
+            }),
+            grass: BlockId(1),
+            soil: BlockId(2),
+            stone: BlockId(3),
+        }
+    }
+
+    /// Where this seed actually puts a trunk, found by looking rather than
+    /// assumed: a hardcoded coordinate would silently stop testing anything
+    /// the moment the terrain noise is retuned.
+    fn find_a_trunk(gen: &WorldGen, blocks: TerrainBlocks) -> (i32, i32, i32) {
+        let oak = blocks.oak.expect("this fixture has trees");
+        for cz in -4..4 {
+            for cx in -4..4 {
+                let trees = gen.trees_near(cx, cz, blocks);
+                for x in cx * 16..(cx + 1) * 16 {
+                    for z in cz * 16..(cz + 1) * 16 {
+                        let surface = gen.surface_height(x, z);
+                        for y in surface..surface + 10 {
+                            if gen.tree_block_at(&trees, x, y, z, oak) == Some(oak.log) {
+                                return (x, y, z);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        panic!("this seed grows no trees at all -- density is wrong");
+    }
+
+    #[test]
+    fn trees_grow_and_are_solid() {
+        // The walk-through-a-trunk bug. `is_solid` answers from the density
+        // field, which knows nothing about trees, so the tree-aware query is
+        // the one physics and raycasting have to use.
+        let gen = WorldGen::new(0x77EE_5EED);
+        let blocks = tree_blocks();
+        let (x, y, z) = find_a_trunk(&gen, blocks);
+
+        assert_eq!(
+            gen.block_at(x, y, z, blocks),
+            Some(blocks.oak.unwrap().log),
+            "the trunk is there"
+        );
+        assert!(
+            gen.is_solid_with_trees(x, y, z, blocks),
+            "and you cannot walk through it"
+        );
+        assert!(
+            !gen.is_solid(x, y, z),
+            "while the raw density field still says air -- which is exactly why              the tree-aware query has to exist"
+        );
+    }
+
+    #[test]
+    fn the_same_seed_grows_the_same_trees() {
+        let blocks = tree_blocks();
+        let survey = |g: &WorldGen| {
+            (-3..3)
+                .flat_map(|cx| (-3..3).map(move |cz| (cx, cz)))
+                .map(|(cx, cz)| g.trees_near(cx, cz, blocks).count_for_test())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            survey(&WorldGen::new(0x77EE_5EED)),
+            survey(&WorldGen::new(0x77EE_5EED)),
+            "the same seed grows the same trees"
+        );
+        assert_ne!(
+            survey(&WorldGen::new(0x77EE_5EED)),
+            survey(&WorldGen::new(0x77EE_5EEE)),
+            "a different seed grows different ones -- otherwise the seed is not              reaching placement at all"
+        );
+    }
+
+    #[test]
+    fn trees_do_not_grow_on_stone_or_in_caves() {
+        // `grows_on` is the whole rule. Point it at a block no surface ever
+        // is, and nothing may grow anywhere.
+        let gen = WorldGen::new(0x77EE_5EED);
+        let mut blocks = tree_blocks();
+        blocks.oak = Some(Oak {
+            grows_on: BlockId(99),
+            ..blocks.oak.unwrap()
+        });
+        for cz in -3..3 {
+            for cx in -3..3 {
+                assert!(
+                    gen.trees_near(cx, cz, blocks).is_empty(),
+                    "a tree grew on a surface it does not grow on, at chunk ({cx}, {cz})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lod_nodes_contain_no_tree_blocks() {
+        // §8.4: structures run at level 0 only, because a tree sampled every
+        // eight blocks is one stray voxel. `generate` is the LOD path.
+        let gen = WorldGen::new(0x77EE_5EED);
+        let blocks = tree_blocks();
+        let oak = blocks.oak.unwrap();
+        let node = gen.generate([0, 0, 0], 8, blocks);
+        for z in 0..Chunk::SIZE {
+            for y in 0..Chunk::SIZE {
+                for x in 0..Chunk::SIZE {
+                    let b = node.get(x, y, z);
+                    assert_ne!(b, oak.log, "a log appeared in an LOD node");
+                    assert_ne!(b, oak.leaves, "leaves appeared in an LOD node");
+                }
+            }
+        }
     }
 
     #[test]

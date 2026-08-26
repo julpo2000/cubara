@@ -7,7 +7,7 @@
 /// integer arithmetic throughout (no floats), so it produces the same bits
 /// on every platform -- the foundation the §8.5 cross-platform determinism
 /// guarantee is built on.
-fn hash(seed: u64, x: i32, y: i32, z: i32) -> u64 {
+pub(crate) fn hash(seed: u64, x: i32, y: i32, z: i32) -> u64 {
     let mut h = seed;
     h ^= (x as u32 as u64).wrapping_mul(0x9E3779B97F4A7C15);
     h ^= (y as u32 as u64).wrapping_mul(0xC2B2AE3D27D4EB4F);

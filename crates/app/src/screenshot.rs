@@ -31,6 +31,8 @@ pub fn run(path: &str) {
         ChunkCoord::new(0, 0, 0),
         0..=2,
         &schedule,
+        cubara_world::TerrainBlocks::from_registry(&registry)
+            .with_oak(&crate::game::load_structure_registry(), &registry),
     )
     .into_iter()
     .filter_map(to_meshed_node);

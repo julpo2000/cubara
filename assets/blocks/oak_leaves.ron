@@ -1,0 +1,9 @@
+// An oak canopy. Solid, and drops itself -- leaf decay and saplings are
+// gameplay decisions the owner has not made (PHASE2_ARCHITECTURE.md 9),
+// so neither is assumed here.
+Material(
+    name:   "cubara:oak_leaves",
+    solid:  true,
+    faces:  All("oak_leaves"),
+    shapes: [Full],
+)

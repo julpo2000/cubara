@@ -116,6 +116,7 @@ fn radius_64_world_load_settles_within_budget() {
                 // material rendering).
                 let stone = registry.id_of("cubara:stone").unwrap();
                 let blocks = TerrainBlocks {
+                    oak: None,
                     grass: stone,
                     soil: stone,
                     stone,

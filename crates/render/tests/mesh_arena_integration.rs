@@ -10,7 +10,7 @@ use cubara_render::ChunkArena;
 use cubara_voxel::{BlockRegistry, ChunkCoord, Faces, Material, Shape};
 use cubara_world::mesh::{mesh_node, sort_batch, BuiltNode};
 use cubara_world::node::desired_nodes;
-use cubara_world::World;
+use cubara_world::{TerrainBlocks, World};
 
 /// A registry with the three real material *names* -- `mesh_node` resolves
 /// `TerrainBlocks::from_registry` by name (block 1.4c), so a fixture missing
@@ -103,7 +103,13 @@ fn sorted_batch_gives_the_same_arena_layout_regardless_of_arrival_order() {
             .iter()
             .map(|&node| BuiltNode {
                 node,
-                geometry: mesh_node(&world, &registry, &layer_of, node),
+                geometry: mesh_node(
+                    &world,
+                    &registry,
+                    &layer_of,
+                    node,
+                    TerrainBlocks::from_registry(&registry),
+                ),
             })
             .collect();
 

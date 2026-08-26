@@ -49,6 +49,13 @@ pub fn load_item_registry() -> ItemRegistry {
     ItemRegistry::load(&repo_root.join("assets/items")).expect("assets/items must load")
 }
 
+/// Load `assets/structures/*.ron` -- the shapes worldgen grows.
+pub fn load_structure_registry() -> cubara_voxel::StructureRegistry {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    cubara_voxel::StructureRegistry::load(&repo_root.join("assets/structures"))
+        .expect("assets/structures must load")
+}
+
 /// Load `assets/recipes/*.ron`, resolving ingredient names through `items`.
 pub fn load_recipe_book(items: &ItemRegistry) -> RecipeBook {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -294,7 +301,10 @@ impl Game {
         let mut ticks = 0;
         while self.accumulator >= TICK_DT as f64 {
             self.prev_player = self.sim.player;
-            self.sim.tick(Arc::make_mut(&mut self.world), &input);
+            // Read before the mutable borrow of `world`.
+            let terrain = self.terrain();
+            self.sim
+                .tick(Arc::make_mut(&mut self.world), &input, terrain);
             input.jump = false;
             input.toggle_fly = false;
             input.look_delta = [0.0, 0.0];
@@ -329,7 +339,9 @@ impl Game {
         items: ItemRegistry,
         recipes: RecipeBook,
     ) {
-        self.terrain = Some(TerrainBlocks::from_registry(&registry));
+        self.terrain = Some(
+            TerrainBlocks::from_registry(&registry).with_oak(&load_structure_registry(), &registry),
+        );
         self.blocks_registry = Some(registry);
         self.items = Some(items);
         self.recipes = Some(recipes);
@@ -354,7 +366,7 @@ impl Game {
     pub fn break_block(&mut self) -> Option<ChunkCoord> {
         let origin = self.sim.player.pos.to_array();
         let dir = self.sim.player.look_dir().to_array();
-        let hit = self.world.raycast(origin, dir, REACH)?;
+        let hit = self.world.raycast(origin, dir, REACH, self.terrain())?;
         let [x, y, z] = hit.block;
 
         // The drop is the optional part; the break is not. Assets are always
@@ -418,7 +430,7 @@ impl Game {
 
         let origin = self.sim.player.pos.to_array();
         let dir = self.sim.player.look_dir().to_array();
-        let hit = self.world.raycast(origin, dir, REACH)?;
+        let hit = self.world.raycast(origin, dir, REACH, self.terrain())?;
         let target = [
             hit.block[0] + hit.normal[0],
             hit.block[1] + hit.normal[1],
@@ -472,7 +484,7 @@ impl Game {
         };
         let origin = self.sim.player.pos.to_array();
         let dir = self.sim.player.look_dir().to_array();
-        let Some(hit) = self.world.raycast(origin, dir, REACH) else {
+        let Some(hit) = self.world.raycast(origin, dir, REACH, self.terrain()) else {
             return false;
         };
         let [x, y, z] = hit.block;
@@ -485,6 +497,23 @@ impl Game {
         self.sim.player.crafting.set_width(3);
         self.inventory_open = true;
         true
+    }
+
+    /// Which ids the terrain is made of, or a treeless default before assets
+    /// are set.
+    ///
+    /// Trees are solid, so physics and raycasting need this -- `is_solid_at`
+    /// cannot answer from the density field alone any more. The fallback is a
+    /// world with no trees rather than a panic: `Game::new()` runs before a
+    /// window exists, and a headless test that never sets assets should still
+    /// be able to walk around.
+    fn terrain(&self) -> TerrainBlocks {
+        self.terrain.unwrap_or(TerrainBlocks {
+            oak: None,
+            grass: BlockId::AIR,
+            soil: BlockId::AIR,
+            stone: BlockId::AIR,
+        })
     }
 
     /// Whether the inventory screen is open.
@@ -610,14 +639,14 @@ mod tests {
         game.sim.player = Player::new(glam::vec3(0.5, 60.0, 0.5), 0.0, -1.5);
         let hit = game
             .world()
-            .raycast([0.5, 60.0, 0.5], [0.0, -1.0, 0.0], 100.0)
+            .raycast([0.5, 60.0, 0.5], [0.0, -1.0, 0.0], 100.0, game.terrain())
             .expect("ground below");
 
         // Out of reach from 60 blocks up: nothing changes.
         assert_eq!(game.break_block(), None);
         assert!(game
             .world()
-            .is_solid_at(hit.block[0], hit.block[1], hit.block[2]));
+            .is_solid_at(hit.block[0], hit.block[1], hit.block[2], game.terrain()));
     }
 
     #[test]
@@ -625,7 +654,7 @@ mod tests {
         let mut game = Game::new();
         let ground = game
             .world()
-            .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0)
+            .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
         // Stand just above the surface, looking down — now it is within reach.
         let eye = glam::vec3(0.5, ground.block[1] as f32 + 3.5, 0.5);
@@ -633,9 +662,12 @@ mod tests {
 
         let dirty = game.break_block().expect("a block was in reach");
         assert!(
-            !game
-                .world()
-                .is_solid_at(ground.block[0], ground.block[1], ground.block[2]),
+            !game.world().is_solid_at(
+                ground.block[0],
+                ground.block[1],
+                ground.block[2],
+                game.terrain()
+            ),
             "the targeted block is now air"
         );
         let b = ground.block;
@@ -662,7 +694,7 @@ mod tests {
         );
         let ground = game
             .world()
-            .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0)
+            .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
         let eye = glam::vec3(0.5, ground.block[1] as f32 + 3.5, 0.5);
         game.sim.player = Player::new(eye, 0.0, -1.5);
@@ -780,7 +812,9 @@ mod tests {
 
         game.break_block().expect("a block was in reach");
         assert!(
-            !game.world().is_solid_at(block[0], block[1], block[2]),
+            !game
+                .world()
+                .is_solid_at(block[0], block[1], block[2], game.terrain()),
             "the block breaks even when the drop has nowhere to go"
         );
     }
