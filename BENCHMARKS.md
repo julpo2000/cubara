@@ -96,6 +96,8 @@ frames after 200 warmup.
 | 2026-08-11 | `cubara-render` drops its `cubara-world` dependency [#110], radius 64²⁸ | 1,585 | 829,608 | ~1,291 | 0.531 ms | ~1.11 ms | `0fe7e7d` |
 | 2026-08-11 | Arena capacity re-sized for the node tree [#111], radius 12²⁹ | 957 | 367,026 | ~2,474 | 0.270 ms | ~0.92 ms | `da55704` |
 | 2026-08-11 | Arena capacity re-sized for the node tree [#111], radius 64²⁹ | 1,585 | 829,608 | ~1,275 | 0.535 ms | ~1.50 ms | `da55704` |
+| 2026-08-30 | macOS baseline caught up to `main` — skirt fix, reversed-Z, mips, blocks 2.1–2.2, radius 64³⁵ | 1,585 | 758,754 | ~1,462 | **0.483 ms** | ~0.89 ms | `f9080f7` |
+| 2026-08-30 | **Oak trees via the structure pass** [#154], radius 64³⁵ | **1,600** | **766,476** | ~1,442 | **0.484 ms** | ~0.89 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -936,6 +938,44 @@ The real result is in the golden images, and it is large: `terrain` moved 4.67%
 of its pixels and `lod_boundary` 6.12%, in both cases by replacing per-texel
 speckle across the whole surface with a coherent one. See the PR for the
 before/after and for why the reference set moved from Metal to Vulkan.
+
+³⁵ **Oak trees via the structure pass (#154) — measured A/B on an idle
+machine, because the first attempt was not.** The draft PR deliberately carried
+no row: every reading had been taken with a game running on the same GPU, and
+they ranged from 450 to 3,292 FPS on identical code. That is not a measurement,
+so the PR stayed draft until it could be redone.
+
+Re-run as a **paired A/B**: three runs of each side, alternating
+trees / `main` / trees / `main` / trees / `main` in one sequence on an otherwise
+idle machine, so the clock-boost ramp that the caveat at the top of this file
+warns about lands on both sides equally rather than on whichever ran second.
+
+```
+trees   1446 / 1435 / 1445 FPS    CPU/frame 0.480 / 0.494 / 0.478 ms
+main    1460 / 1466 / 1461 FPS    CPU/frame 0.486 / 0.483 / 0.481 ms
+```
+
+**CPU/frame is flat: 0.484 vs 0.483 ms**, a difference smaller than either
+side's own run-to-run spread. Trees cost the CPU nothing measurable — which is
+what `trees_near`-hoisted-per-chunk was designed to buy, and it is the metric
+this file trusts at this scene size.
+
+The −1.4% throughput (~1,442 vs ~1,462) tracks the **+1.0% geometry**
+(766,476 vs 758,754 triangles, 1,600 vs 1,585 nodes) almost exactly: the trees
+are extra triangles, drawn at the same cost per triangle as everything else. A
+proportional GPU cost for proportionally more world is the honest reading, not
+a regression in the engine.
+
+The first of the two rows is the **baseline row**, not a feature: this machine
+had no radius-64 number since `da55704` on 2026-08-11, because the skirt fix
+(#125), reversed-Z (#129), the mip chain (#128) and phase 2's blocks 2.1–2.2
+were all recorded on the Windows machine. It collapses that whole gap into one
+macOS measurement, and it is the figure the trees row is a delta against.
+Against `da55704`'s ~1,275 FPS / 0.535 ms, `main` is now **~1,462 / 0.483 ms** —
+the skirt fix's −8.5% geometry (829,608 → 758,754) doing most of that work.
+
+Gate: **MET on both sides**, at ~1.44× the 1,000-FPS bar with trees in the
+world.
 
 ## Detailed run logs
 
