@@ -25,7 +25,7 @@ pub use player::Player;
 pub use rng::WorldRng;
 pub use save::{load_world, save_world, LoadError, SaveError, FORMAT_VERSION};
 
-use cubara_world::World;
+use cubara_world::{TerrainBlocks, World};
 
 /// One fixed simulation step, in seconds. 60 Hz.
 pub const TICK_DT: f32 = 1.0 / 60.0;
@@ -81,7 +81,10 @@ impl Sim {
     /// `world`, depending on which mode the player is currently in
     /// (`docs/PHASE1_ARCHITECTURE.md` §10, issue #53), then re-targets from
     /// the resulting pose (issue #52).
-    pub fn tick(&mut self, world: &mut World, input: &InputFrame) {
+    /// `blocks` is which ids the terrain is made of. The tick needs it because
+    /// trees are solid (block 2.3a) and a tree is specific ids -- the density
+    /// field alone can no longer answer "can I walk here".
+    pub fn tick(&mut self, world: &mut World, input: &InputFrame, blocks: TerrainBlocks) {
         if input.toggle_fly {
             self.player.free_fly = !self.player.free_fly;
         }
@@ -91,7 +94,7 @@ impl Sim {
             self.player.apply_free_fly(input, TICK_DT);
         } else {
             physics::step(&mut self.player, input, TICK_DT, |x, y, z| {
-                world.is_solid_at(x, y, z)
+                world.is_solid_at(x, y, z, blocks)
             });
         }
         self.target = world
@@ -99,6 +102,7 @@ impl Sim {
                 self.player.pos.to_array(),
                 self.player.look_dir().to_array(),
                 REACH,
+                blocks,
             )
             .map(|hit| hit.block);
         self.tick += 1;
@@ -109,6 +113,17 @@ impl Sim {
 mod tests {
     use super::*;
 
+    /// A treeless terrain palette: these tests are about the tick, not about
+    /// what the world is made of.
+    fn blocks() -> TerrainBlocks {
+        TerrainBlocks {
+            oak: None,
+            grass: cubara_voxel::BlockId::STONE,
+            soil: cubara_voxel::BlockId::STONE,
+            stone: cubara_voxel::BlockId::STONE,
+        }
+    }
+
     fn no_input() -> InputFrame {
         InputFrame::default()
     }
@@ -118,7 +133,7 @@ mod tests {
         let mut world = World::new();
         let mut sim = Sim::new(0, Player::new(glam::Vec3::ZERO, 0.0, 0.0));
         for expected in 1..=100u64 {
-            sim.tick(&mut world, &no_input());
+            sim.tick(&mut world, &no_input(), blocks());
             assert_eq!(sim.tick, expected);
         }
     }
@@ -127,13 +142,13 @@ mod tests {
     fn tick_targets_the_block_the_player_is_looking_at() {
         let mut world = World::new();
         let ground = world
-            .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0)
+            .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, blocks())
             .expect("ground below");
         // Hover just above the surface, looking straight down at it.
         let eye = glam::vec3(0.5, ground.block[1] as f32 + 3.5, 0.5);
         let mut sim = Sim::new(0, Player::new(eye, 0.0, -std::f32::consts::FRAC_PI_2));
         sim.player.free_fly = true; // hold position -- only the raycast matters here
-        sim.tick(&mut world, &no_input());
+        sim.tick(&mut world, &no_input(), blocks());
         assert_eq!(sim.target, Some(ground.block));
     }
 
@@ -144,7 +159,7 @@ mod tests {
         // solid within REACH in either direction.
         let mut sim = Sim::new(0, Player::new(glam::vec3(0.5, 500.0, 0.5), 0.0, 0.0));
         sim.player.free_fly = true;
-        sim.tick(&mut world, &no_input());
+        sim.tick(&mut world, &no_input(), blocks());
         assert_eq!(sim.target, None);
     }
 
@@ -153,8 +168,8 @@ mod tests {
         let mut world = World::new();
         let mut a = Sim::new(1, Player::new(glam::Vec3::ZERO, 0.0, 0.0));
         let mut b = Sim::new(1, Player::new(glam::Vec3::ZERO, 0.0, 0.0));
-        a.tick(&mut world, &no_input());
-        b.tick(&mut world, &no_input());
+        a.tick(&mut world, &no_input(), blocks());
+        b.tick(&mut world, &no_input(), blocks());
         assert_eq!(a.roll(), b.roll(), "same seed, same tick, same roll");
     }
 
@@ -168,7 +183,7 @@ mod tests {
     fn walking_uneven_terrain_for_10_000_ticks_never_intersects_solid_or_falls_through() {
         let mut world = World::new();
         let ground = world
-            .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0)
+            .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, blocks())
             .expect("ground below");
         let spawn = glam::vec3(0.5, ground.block[1] as f32 + 10.0, 0.5);
         let mut sim = Sim::new(7, Player::new(spawn, 0.0, 0.0));
@@ -179,10 +194,14 @@ mod tests {
         };
 
         for i in 0..10_000u64 {
-            sim.tick(&mut world, &wander);
+            sim.tick(&mut world, &wander, blocks());
             assert!(
-                !physics::player_intersects_solid(&sim.player, &|x, y, z| world
-                    .is_solid_at(x, y, z)),
+                !physics::player_intersects_solid(&sim.player, &|x, y, z| world.is_solid_at(
+                    x,
+                    y,
+                    z,
+                    blocks()
+                )),
                 "tick {i}: player collision box intersects a solid voxel"
             );
             assert!(

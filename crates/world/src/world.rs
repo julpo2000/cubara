@@ -78,7 +78,9 @@ impl World {
     /// one exists there, otherwise the terrain. Samples a single block without
     /// generating a whole chunk; the primitive [`raycast`](crate::raycast) queries
     /// the world through this.
-    pub fn is_solid_at(&self, x: i32, y: i32, z: i32) -> bool {
+    /// Takes `blocks` because trees are solid and a tree is made of specific
+    /// ids (block 2.3a): the density field alone cannot answer this any more.
+    pub fn is_solid_at(&self, x: i32, y: i32, z: i32, blocks: TerrainBlocks) -> bool {
         match self.edits.get(&[x, y, z]) {
             // Solidity is derived from the recorded block rather than stored
             // beside it: one source of truth, so an edit cannot be solid here
@@ -87,7 +89,7 @@ impl World {
             // caller owns that, see `chunk_at`), and every block a player can
             // place is solid in phase 2.
             Some(&block) => block != BlockId::AIR,
-            None => self.worldgen.is_solid(x, y, z),
+            None => self.worldgen.is_solid_with_trees(x, y, z, blocks),
         }
     }
 
@@ -109,9 +111,15 @@ impl World {
     /// Cast a ray through the world (terrain + edits) and return the first solid
     /// block hit (see [`raycast`](crate::raycast)) — the basis for targeting a block
     /// to break/place.
-    pub fn raycast(&self, origin: [f32; 3], dir: [f32; 3], max_dist: f32) -> Option<crate::RayHit> {
+    pub fn raycast(
+        &self,
+        origin: [f32; 3],
+        dir: [f32; 3],
+        max_dist: f32,
+        blocks: TerrainBlocks,
+    ) -> Option<crate::RayHit> {
         crate::raycast(origin, dir, max_dist, |b| {
-            self.is_solid_at(b[0], b[1], b[2])
+            self.is_solid_at(b[0], b[1], b[2], blocks)
         })
     }
 
@@ -169,11 +177,29 @@ impl World {
 
     fn build_chunk(&self, coord: ChunkCoord, blocks: TerrainBlocks) -> Chunk {
         let size = Chunk::SIZE as i32;
+        // Resolved once for the whole chunk. Which trees can reach a voxel
+        // depends only on its chunk column, so this is the hoist the structure
+        // pass was designed around -- doing it per voxel instead costs nine
+        // hashes 8,192 times over and takes radius-64 from ~3,500 FPS to ~500.
+        let trees = blocks
+            .oak
+            .map(|_| self.worldgen.trees_near(coord.x, coord.z, blocks));
+
         Chunk::from_fn(|lx, ly, lz| {
             let wx = coord.x * size + lx as i32;
             let wy = coord.y * size + ly as i32;
             let wz = coord.z * size + lz as i32;
-            self.block_at(wx, wy, wz, blocks)
+            if let Some(&block) = self.edits.get(&[wx, wy, wz]) {
+                return block;
+            }
+            if let (Some(trees), Some(oak)) = (trees.as_ref(), blocks.oak) {
+                if let Some(block) = self.worldgen.tree_block_at(trees, wx, wy, wz, oak) {
+                    return block;
+                }
+            }
+            self.worldgen
+                .terrain_block_at(wx, wy, wz, blocks)
+                .unwrap_or(BlockId::AIR)
         })
     }
 
@@ -280,6 +306,7 @@ mod tests {
     /// not, not which material it renders as.
     fn stone_blocks() -> TerrainBlocks {
         TerrainBlocks {
+            oak: None,
             grass: BlockId::STONE,
             soil: BlockId::STONE,
             stone: BlockId::STONE,
@@ -345,6 +372,7 @@ mod tests {
         // quads that would move the triangle count for the wrong reason.
         let stone = registry.id_of("cubara:stone").unwrap();
         let blocks = TerrainBlocks {
+            oak: None,
             grass: stone,
             soil: stone,
             stone,
@@ -376,6 +404,7 @@ mod tests {
         // The depth rule itself (grass/soil/stone by depth) is WorldGen's own
         // contract, pinned in `worldgen::tests::terrain_layers_by_depth`.
         let blocks = TerrainBlocks {
+            oak: None,
             grass: BlockId(4),
             soil: BlockId(4),
             stone: BlockId(3),
@@ -405,12 +434,18 @@ mod tests {
         // entered through its top face.
         let world = World::new();
         let hit = world
-            .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0)
+            .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, stone_blocks())
             .expect("a downward ray must hit the ground");
         assert_eq!(hit.normal, [0, 1, 0], "entered through the top face");
         let [x, y, z] = hit.block;
-        assert!(world.is_solid_at(x, y, z), "hit block is solid");
-        assert!(!world.is_solid_at(x, y + 1, z), "the block above it is air");
+        assert!(
+            world.is_solid_at(x, y, z, stone_blocks()),
+            "hit block is solid"
+        );
+        assert!(
+            !world.is_solid_at(x, y + 1, z, stone_blocks()),
+            "the block above it is air"
+        );
     }
 
     #[test]
@@ -418,7 +453,7 @@ mod tests {
         // Starting inside the terrain reports that block immediately (distance 0).
         let world = World::new();
         let hit = world
-            .raycast([0.5, 0.0, 0.5], [0.0, 1.0, 0.0], 100.0)
+            .raycast([0.5, 0.0, 0.5], [0.0, 1.0, 0.0], 100.0, stone_blocks())
             .expect("underground origin is inside a solid block");
         assert_eq!(hit.distance, 0.0);
         assert_eq!(hit.block, [0, 0, 0]);
@@ -430,13 +465,13 @@ mod tests {
         // region regression test above. Under the old global overlay these
         // coordinates had to be pushed 500_000 blocks out to stay clear of it.
         let mut world = World::new();
-        assert!(!world.is_solid_at(0, 120, 0));
+        assert!(!world.is_solid_at(0, 120, 0, stone_blocks()));
         world.set_block(0, 120, 0, BlockId::STONE);
-        assert!(world.is_solid_at(0, 120, 0));
+        assert!(world.is_solid_at(0, 120, 0, stone_blocks()));
 
-        assert!(world.is_solid_at(16, 0, 16));
+        assert!(world.is_solid_at(16, 0, 16, stone_blocks()));
         world.set_block(16, 0, 16, BlockId::AIR);
-        assert!(!world.is_solid_at(16, 0, 16));
+        assert!(!world.is_solid_at(16, 0, 16, stone_blocks()));
     }
 
     #[test]
@@ -472,8 +507,11 @@ mod tests {
         let mut a = World::new();
         let b = World::new();
         a.set_block(0, 120, 0, BlockId::STONE);
-        assert!(a.is_solid_at(0, 120, 0));
-        assert!(!b.is_solid_at(0, 120, 0), "b must not see a's edit");
+        assert!(a.is_solid_at(0, 120, 0, stone_blocks()));
+        assert!(
+            !b.is_solid_at(0, 120, 0, stone_blocks()),
+            "b must not see a's edit"
+        );
     }
 
     #[test]
@@ -564,8 +602,8 @@ mod tests {
                     let wy = cc.y * 16 + y;
                     let wz = cc.z * 16 + z;
                     assert_eq!(
-                        original.is_solid_at(wx, wy, wz),
-                        loaded.is_solid_at(wx, wy, wz),
+                        original.is_solid_at(wx, wy, wz, stone_blocks()),
+                        loaded.is_solid_at(wx, wy, wz, stone_blocks()),
                         "({wx},{wy},{wz})"
                     );
                 }
@@ -581,7 +619,7 @@ mod tests {
         let mut original = World::new();
         let cc = ChunkCoord::new(0, 0, 0); // deep underground -- confirmed solid, no ambiguity
         assert!(
-            original.is_solid_at(0, 0, 0),
+            original.is_solid_at(0, 0, 0, stone_blocks()),
             "test assumes this cell starts solid"
         );
         original.set_block(0, 0, 0, BlockId::AIR); // one genuine edit: break confirmed-solid ground

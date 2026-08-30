@@ -1,0 +1,7 @@
+// An oak trunk. Chopping one is the first step of the ladder to iron.
+Material(
+    name:   "cubara:oak_log",
+    solid:  true,
+    faces:  Sided(top: "oak_log_top", side: "oak_log_side", bottom: "oak_log_top"),
+    shapes: [Full],
+)

@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use cubara_render::{grab_cursor, HotbarView, PanelView, Profiler, Renderer};
 
-use crate::game::{load_item_registry, load_recipe_book, Game};
+use crate::game::{load_item_registry, load_recipe_book, load_structure_registry, Game};
 use crate::streaming::NodeStreaming;
 
 use winit::application::ApplicationHandler;
@@ -60,9 +60,12 @@ impl ApplicationHandler for App {
         let items = load_item_registry();
         let recipes = load_recipe_book(&items);
         self.game.set_assets(registry.clone(), items, recipes);
-        self.streaming = Some(NodeStreaming::new(registry, move |name: &str| {
-            layers.layer_of(name)
-        }));
+        let structures = load_structure_registry();
+        self.streaming = Some(NodeStreaming::new(
+            registry,
+            &structures,
+            move |name: &str| layers.layer_of(name),
+        ));
         self.renderer = Some(renderer);
         // Capture the mouse for first-person look (Esc releases it). A window
         // concern, so the app owns it rather than the renderer.

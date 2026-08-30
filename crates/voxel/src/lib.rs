@@ -13,6 +13,7 @@ pub mod mesh;
 pub mod recipe;
 pub mod registry;
 pub mod storage;
+pub mod structure;
 pub mod voxel;
 
 pub use block::BlockId;
@@ -25,4 +26,5 @@ pub use mesh::{Face, Mesh, Vertex};
 pub use recipe::{Recipe, RecipeBook, RecipeDef, RecipeError, RecipeOutputDef, MAX_GRID};
 pub use registry::{BlockRegistry, Faces, Material, RegistryError, Shape};
 pub use storage::{ChunkPayloadError, ChunkStorage};
+pub use structure::{StructureDef, StructureError, StructureRegistry};
 pub use voxel::{Chunk, MeshContext};

@@ -86,7 +86,7 @@ fn round_trip_edit_hash_save_load_hash_is_equal() {
         ..InputFrame::default()
     };
     for _ in 0..30 {
-        sim.tick(&mut world, &walking);
+        sim.tick(&mut world, &walking, blocks);
     }
     let _ = sim.roll(); // advance the RNG stream too, so it's not still at its seeded start
 
@@ -283,7 +283,7 @@ fn fixture_state() -> (Sim, World) {
         ..InputFrame::default()
     };
     for _ in 0..120 {
-        sim.tick(&mut world, &walking);
+        sim.tick(&mut world, &walking, blocks);
     }
     (sim, world)
 }

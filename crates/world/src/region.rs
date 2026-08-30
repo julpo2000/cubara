@@ -265,6 +265,7 @@ mod tests {
 
     fn stone_blocks() -> TerrainBlocks {
         TerrainBlocks {
+            oak: None,
             grass: BlockId::STONE,
             soil: BlockId::STONE,
             stone: BlockId::STONE,

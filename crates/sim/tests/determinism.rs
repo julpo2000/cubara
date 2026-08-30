@@ -27,6 +27,7 @@ const FIXTURE_SEED: u64 = 0x00C0_FFEE_D0D0;
 /// something to resolve edits/terrain layers to.
 fn fixture_blocks() -> TerrainBlocks {
     TerrainBlocks {
+        oak: None,
         grass: BlockId(1),
         soil: BlockId(2),
         stone: BlockId(3),
@@ -52,7 +53,7 @@ fn replay(seed: u64, script: &[InputFrame]) -> (Sim, World) {
     let mut world = World::with_seed(seed);
     let mut sim = Sim::new(seed, Player::new(glam::vec3(0.5, 40.0, 0.5), 0.0, 0.0));
     for input in script {
-        sim.tick(&mut world, input);
+        sim.tick(&mut world, input, fixture_blocks());
     }
     (sim, world)
 }
@@ -69,7 +70,7 @@ fn replay_with_edits(
     let mut world = World::with_seed(seed);
     let mut sim = Sim::new(seed, Player::new(glam::vec3(0.5, 40.0, 0.5), 0.0, 0.0));
     for (i, input) in script.iter().enumerate() {
-        sim.tick(&mut world, input);
+        sim.tick(&mut world, input, fixture_blocks());
         for &(tick, coord, block) in edits {
             if tick == i {
                 world.set_block(coord[0], coord[1], coord[2], block);

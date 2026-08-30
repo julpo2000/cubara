@@ -262,6 +262,7 @@ mod tests {
 
     fn blocks() -> TerrainBlocks {
         TerrainBlocks {
+            oak: None,
             grass: BlockId(1),
             soil: BlockId(2),
             stone: BlockId(3),
@@ -305,7 +306,7 @@ mod tests {
         // *placing* there (`true`) would be a no-op on content; break it
         // instead, which unconditionally turns solid stone into air.
         assert!(
-            world.is_solid_at(0, 0, 0),
+            world.is_solid_at(0, 0, 0, blocks()),
             "test assumes this cell starts solid"
         );
         let before = WorldHash::compute(&sim, &world, &region(), blocks(), 1);

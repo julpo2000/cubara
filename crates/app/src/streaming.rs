@@ -15,6 +15,7 @@ use cubara_render::{MeshedNode, NodeId, Renderer};
 use cubara_voxel::{BlockRegistry, ChunkCoord};
 use cubara_world::mesh::{sort_batch, BuiltNode, MeshPool};
 use cubara_world::node::{self, NodeKey};
+use cubara_world::TerrainBlocks;
 use cubara_world::World;
 
 /// Vertical chunk band to stream -- the terrain sits comfortably inside it.
@@ -48,6 +49,8 @@ pub(crate) fn to_meshed_node(built: BuiltNode) -> Option<MeshedNode> {
 /// [`Renderer::apply_node_updates`] each frame. One per live `Renderer` (they
 /// share a lifecycle -- see `main.rs`).
 pub struct NodeStreaming {
+    /// Which ids the terrain is made of, including the oak.
+    blocks: TerrainBlocks,
     registry: Arc<BlockRegistry>,
     layer_of: Arc<dyn Fn(&str) -> u32 + Send + Sync>,
     mesh_pool: MeshPool,
@@ -69,9 +72,14 @@ impl NodeStreaming {
     /// same number would mean different materials on each side.
     pub fn new(
         registry: Arc<BlockRegistry>,
+        structures: &cubara_voxel::StructureRegistry,
         layer_of: impl Fn(&str) -> u32 + Send + Sync + 'static,
     ) -> Self {
         Self {
+            // Resolved once, here, and carried with every meshing job.
+            // Meshing used to re-derive this per node from the registry, which
+            // was both wasted work and blind to structures (block 2.3a).
+            blocks: TerrainBlocks::from_registry(&registry).with_oak(structures, &registry),
             registry,
             layer_of: Arc::new(layer_of),
             mesh_pool: MeshPool::new(),
@@ -106,7 +114,7 @@ impl NodeStreaming {
         let node = NodeKey::containing(cc, 0);
         self.mesh_pool.cancel(node);
         self.mesh_pool
-            .request(world, &self.registry, &self.layer_of, node);
+            .request(world, &self.registry, &self.layer_of, node, self.blocks);
     }
 
     /// Drop nodes that fell outside the ring schedule, and *request* each
@@ -155,7 +163,7 @@ impl NodeStreaming {
                 continue;
             }
             self.mesh_pool
-                .request(world, &self.registry, &self.layer_of, node);
+                .request(world, &self.registry, &self.layer_of, node, self.blocks);
         }
         self.center = Some(center);
     }

@@ -69,11 +69,9 @@ pub fn mesh_node(
     registry: &BlockRegistry,
     layer_of: &dyn Fn(&str) -> u32,
     node: NodeKey,
+    blocks: TerrainBlocks,
 ) -> Option<NodeGeometry> {
     let ctx = MeshContext { registry, layer_of };
-    // TODO(#48): a simple fixed depth rule (block 1.4c) until real layered
-    // terrain (block 1.5) -- see `TerrainBlocks`.
-    let blocks = TerrainBlocks::from_registry(registry);
     let chunk = world.node_at(node, blocks)?;
     let world_origin = node.world_origin();
     let origin = [
@@ -103,6 +101,7 @@ pub fn mesh_region(
     center: ChunkCoord,
     y_range: RangeInclusive<i32>,
     schedule: &RingSchedule,
+    blocks: TerrainBlocks,
 ) -> Vec<BuiltNode> {
     let mut nodes = desired_nodes(center, y_range, schedule);
     nodes.sort();
@@ -110,7 +109,7 @@ pub fn mesh_region(
         .into_iter()
         .map(|node| BuiltNode {
             node,
-            geometry: mesh_node(world, registry, layer_of, node),
+            geometry: mesh_node(world, registry, layer_of, node, blocks),
         })
         .collect()
 }
@@ -131,6 +130,10 @@ type Job = (
     Arc<BlockRegistry>,
     Arc<dyn Fn(&str) -> u32 + Send + Sync>,
     NodeKey,
+    // Resolved once by the caller and carried with the job, rather than each
+    // worker re-deriving it from the registry per node -- which is what this
+    // used to do, and which also had no way to know about structures.
+    TerrainBlocks,
 );
 
 /// A pool of worker threads that mesh nodes off the main thread.
@@ -172,7 +175,7 @@ impl MeshPool {
                 std::thread::Builder::new()
                     .name("cubara-mesher".into())
                     .spawn(move || loop {
-                        let (world, registry, layer_of, node) = {
+                        let (world, registry, layer_of, node, blocks) = {
                             let rx = jobs.lock().expect("mesher job lock");
                             match rx.recv() {
                                 Ok(job) => job,
@@ -182,7 +185,7 @@ impl MeshPool {
                         };
                         let built = BuiltNode {
                             node,
-                            geometry: mesh_node(&world, &registry, &*layer_of, node),
+                            geometry: mesh_node(&world, &registry, &*layer_of, node, blocks),
                         };
                         if results.send(built).is_err() {
                             break; // caller gone
@@ -211,6 +214,7 @@ impl MeshPool {
         registry: &Arc<BlockRegistry>,
         layer_of: &Arc<dyn Fn(&str) -> u32 + Send + Sync>,
         node: NodeKey,
+        blocks: TerrainBlocks,
     ) {
         if self.in_flight.insert(node) {
             // Send can only fail if all workers died; nothing useful to do if so.
@@ -219,6 +223,7 @@ impl MeshPool {
                 Arc::clone(registry),
                 Arc::clone(layer_of),
                 node,
+                blocks,
             ));
         }
     }
@@ -317,7 +322,13 @@ mod tests {
         ];
         let mut pool = MeshPool::with_workers(3);
         for &n in &nodes {
-            pool.request(&world, &registry, &layer_of, n);
+            pool.request(
+                &world,
+                &registry,
+                &layer_of,
+                n,
+                TerrainBlocks::from_registry(&registry),
+            );
         }
 
         let mut got: HashMap<NodeKey, Option<usize>> = HashMap::new();
@@ -330,8 +341,14 @@ mod tests {
 
         assert_eq!(got.len(), nodes.len(), "every requested node returns once");
         for &n in &nodes {
-            let expect =
-                mesh_node(&world, &registry, &*layer_of, n).map(|g| g.mesh.triangle_count());
+            let expect = mesh_node(
+                &world,
+                &registry,
+                &*layer_of,
+                n,
+                TerrainBlocks::from_registry(&registry),
+            )
+            .map(|g| g.mesh.triangle_count());
             assert_eq!(got.get(&n).copied().flatten(), expect, "mismatch at {n:?}");
         }
     }
@@ -343,7 +360,13 @@ mod tests {
         let layer_of = zero_layer();
         let mut pool = MeshPool::with_workers(1);
         let n = NodeKey::new(0, [0, 0, 0]);
-        pool.request(&world, &registry, &layer_of, n);
+        pool.request(
+            &world,
+            &registry,
+            &layer_of,
+            n,
+            TerrainBlocks::from_registry(&registry),
+        );
         pool.cancel(n);
         // Give the worker time to finish and enqueue its (now unwanted) result.
         while !pool.in_flight().is_empty() {
@@ -364,8 +387,20 @@ mod tests {
         let layer_of = zero_layer();
         let mut pool = MeshPool::with_workers(1);
         let n = NodeKey::new(0, [0, 0, 0]);
-        pool.request(&world, &registry, &layer_of, n);
-        pool.request(&world, &registry, &layer_of, n);
+        pool.request(
+            &world,
+            &registry,
+            &layer_of,
+            n,
+            TerrainBlocks::from_registry(&registry),
+        );
+        pool.request(
+            &world,
+            &registry,
+            &layer_of,
+            n,
+            TerrainBlocks::from_registry(&registry),
+        );
         let mut results = Vec::new();
         while !pool.in_flight().is_empty() {
             results.extend(pool.poll());
@@ -387,6 +422,7 @@ mod tests {
             ChunkCoord::new(0, 0, 0),
             0..=1,
             &schedule,
+            TerrainBlocks::from_registry(&registry),
         );
         assert_eq!(built.len(), 5 * 5 * 2, "(2*2+1)^2 columns * 2 y layers");
         let mut sorted = built.iter().map(|b| b.node).collect::<Vec<_>>();

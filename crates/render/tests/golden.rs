@@ -26,11 +26,20 @@ use cubara_render::{HotbarSlot, InventoryPanel, MeshedNode, NodeId, PanelSlotKin
 use cubara_voxel::{BlockId, BlockRegistry, Chunk, ChunkCoord};
 use cubara_world::mesh::mesh_region;
 use cubara_world::node::schedule_for_radius;
-use cubara_world::World;
+use cubara_world::{TerrainBlocks, World};
 
 /// The real `assets/blocks` registry -- the same one every entry point
 /// (window, `--bench`, `--screenshot`, these tests) meshes and renders
 /// against.
+/// The real terrain palette, trees included -- the same one the game plays
+/// with, so a golden shows what a player sees.
+fn real_blocks() -> TerrainBlocks {
+    let r = real_registry();
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/structures");
+    let structures = cubara_voxel::StructureRegistry::load(&dir).expect("assets/structures");
+    TerrainBlocks::from_registry(&r).with_oak(&structures, &r)
+}
+
 fn real_registry() -> BlockRegistry {
     let assets_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/blocks");
     BlockRegistry::load(&assets_dir).expect("assets/blocks must be valid")
@@ -57,6 +66,7 @@ fn render_world(world: &World, shot: Shot) -> Option<Frame> {
         ChunkCoord::new(0, 0, 0),
         0..=2,
         &schedule,
+        real_blocks(),
     )
     .into_iter()
     .filter_map(|built| {
@@ -341,12 +351,17 @@ fn the_selected_block_shows_an_outline() {
     // which is why only the top face's outline shows here.
     let world = World::new();
     let ground = world
-        .raycast([5.5, 200.0, 5.5], [0.0, -1.0, 0.0], 400.0)
+        .raycast([5.5, 200.0, 5.5], [0.0, -1.0, 0.0], 400.0, real_blocks())
         .expect("ground below");
     let eye = glam::vec3(2.5, ground.block[1] as f32 + 3.0, 2.5);
     let target = glam::vec3(5.5, ground.block[1] as f32 + 0.5, 5.5);
     let hit = world
-        .raycast(eye.to_array(), (target - eye).to_array(), 30.0)
+        .raycast(
+            eye.to_array(),
+            (target - eye).to_array(),
+            30.0,
+            real_blocks(),
+        )
         .expect("the block this shot is framed around");
 
     let shot = Shot {

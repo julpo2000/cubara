@@ -1,0 +1,15 @@
+// The oak's shape. Placement is not here -- that is PHASE1_ARCHITECTURE.md
+// 8.4's structure pass, which is code. This is only what a tree looks like,
+// so it can be retuned without a recompile (REQUIREMENTS.md #3).
+//
+// `density` is "one in N chunk columns has a tree", an integer rather than a
+// float on purpose: the placement decision has to be bit-identical across
+// platforms (8.5), and an integer comparison is the cheapest way to be sure.
+// Lower is denser.
+Structure(
+    name:     "cubara:oak",
+    trunk:    (block: "cubara:oak_log", height: (4, 6)),
+    canopy:   (block: "cubara:oak_leaves", radius: 2),
+    grows_on: "cubara:grass",
+    density:  12,
+)
