@@ -52,6 +52,21 @@ pub struct SceneFrame<'a> {
     pub hotbar: Option<HotbarView<'a>>,
     /// The open inventory screen, or `None` when it is closed.
     pub panel: Option<PanelView<'a>>,
+    /// Health in **points**, or `None` to draw no hearts.
+    ///
+    /// Points, not hearts, and not a fraction: this crate is told the number
+    /// and works out how many full and half hearts that is. It does not know
+    /// what full health is, what hurt the player, or that 20 is the maximum --
+    /// the app passes both numbers (`ARCHITECTURE.md` Rule 3, the same
+    /// boundary [`HotbarView`] draws).
+    pub health: Option<HealthView>,
+}
+
+/// What the renderer needs to draw hearts: two numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HealthView {
+    pub points: u8,
+    pub max_points: u8,
 }
 
 /// What the renderer needs to draw the inventory screen.
@@ -236,6 +251,7 @@ impl SceneRenderer {
             overlay,
             hotbar,
             panel,
+            health,
         } = frame;
         if let Some(block) = selected_block {
             let origin = [block[0] as f32, block[1] as f32, block[2] as f32];
@@ -288,7 +304,7 @@ impl SceneRenderer {
         // Overlay: a second pass over the same colour target (loaded, no depth).
         // Text and hotbar share it -- both are screen-space quads out of the
         // same vertex buffer, so drawing the HUD costs no extra pass.
-        if overlay.is_none() && hotbar.is_none() && panel.is_none() {
+        if overlay.is_none() && hotbar.is_none() && panel.is_none() && health.is_none() {
             return;
         }
         if let Some(text) = overlay {
@@ -296,6 +312,9 @@ impl SceneRenderer {
             // Shadow first (dark, offset), then the white text on top.
             self.text.queue(text, 10.0, 10.0, SCALE, [0.0, 0.0, 0.0]);
             self.text.queue(text, 8.0, 8.0, SCALE, [1.0, 1.0, 1.0]);
+        }
+        if let Some(health) = health {
+            self.queue_hearts(health);
         }
         if let Some(hotbar) = hotbar {
             self.queue_hotbar(hotbar);
@@ -384,6 +403,56 @@ impl SceneRenderer {
             self.text
                 .queue(&label, tx + 1.0, ty + 1.0, SCALE, [0.0, 0.0, 0.0]);
             self.text.queue(&label, tx, ty, SCALE, [1.0, 1.0, 1.0]);
+        }
+    }
+
+    /// Hearts, in a row just above the hotbar.
+    ///
+    /// **Two points per heart**, so odd health draws a half. The half is drawn
+    /// as a narrower filled quad over the empty one rather than as its own
+    /// shape: the font/quad overlay has no sprites, and half a heart is exactly
+    /// half a heart's width of fill.
+    ///
+    /// Left-aligned with the hotbar rather than centred, because a row that
+    /// grows and shrinks from its centre makes it hard to read at a glance how
+    /// many are missing.
+    fn queue_hearts(&mut self, view: HealthView) {
+        const HEART: f32 = 18.0;
+        const GAP: f32 = 3.0;
+        const MARGIN: f32 = 16.0;
+        const HOTBAR: f32 = 48.0;
+        const LIFT: f32 = 10.0;
+        const EMPTY: [f32; 3] = [0.18, 0.06, 0.08];
+        const FULL: [f32; 3] = [0.86, 0.16, 0.22];
+        const BORDER: [f32; 3] = [0.06, 0.02, 0.03];
+        const PER_HEART: u8 = 2;
+
+        if view.max_points == 0 {
+            return;
+        }
+        let hearts = view.max_points.div_ceil(PER_HEART) as usize;
+        let total = hearts as f32 * HEART + (hearts as f32 - 1.0) * GAP;
+        // Aligned with the hotbar's left edge, and sitting above it.
+        let hotbar_total = 9.0 * 48.0 + 8.0 * 4.0;
+        let x0 = (self.width as f32 - hotbar_total) * 0.5;
+        let y = self.height as f32 - HOTBAR - MARGIN - HEART - LIFT;
+        let _ = total;
+
+        for i in 0..hearts {
+            let x = x0 + i as f32 * (HEART + GAP);
+            self.text
+                .queue_rect(x - 1.0, y - 1.0, HEART + 2.0, HEART + 2.0, BORDER);
+            self.text.queue_rect(x, y, HEART, HEART, EMPTY);
+
+            // How much of *this* heart is filled: 2 points full, 1 half, 0 none.
+            let filled = view
+                .points
+                .saturating_sub(i as u8 * PER_HEART)
+                .min(PER_HEART);
+            if filled > 0 {
+                let w = HEART * (filled as f32 / PER_HEART as f32);
+                self.text.queue_rect(x, y, w, HEART, FULL);
+            }
         }
     }
 

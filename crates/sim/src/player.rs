@@ -63,7 +63,45 @@ pub struct Player {
     /// survival replay has to see it. It is hashed and (from block 2.8) saved
     /// like anything else the player carries.
     pub crafting: Crafting,
+    /// Health in **points**, `0..=MAX_HEALTH` (`PHASE2_ARCHITECTURE.md` §13.1).
+    ///
+    /// Points, not hearts: a heart is two points, so half-hearts are
+    /// representable. Nothing in the simulation counts in hearts -- that is the
+    /// HUD's job, and it is given a points value.
+    pub health: u8,
+    /// Ticks since the last damage, against [`REGEN_INTERVAL`] (§13.2).
+    /// Reset to zero by any damage, so sustained damage means no healing at all
+    /// rather than slow healing.
+    pub ticks_since_damage: u32,
+    /// How far the player has fallen since last touching ground, in blocks
+    /// (§13.3). Spent on landing.
+    ///
+    /// **Not saved.** It is transient and derived: a loaded world starts the
+    /// player on the ground, and carrying a half-completed fall across a reload
+    /// would be a fall the player never made.
+    pub fall_distance: f32,
+    /// Where death returns the player to (§13.4). Set when the player is
+    /// created, at the position they start from.
+    pub spawn: Vec3,
 }
+
+/// Full health, in points. Ten hearts of two points each (§13.1).
+pub const MAX_HEALTH: u8 = 20;
+
+/// One heart, in points.
+pub const HEART: u8 = 2;
+
+/// Ticks of no damage before a heart comes back: 5 seconds at 60 Hz (§13.2).
+///
+/// Ticks rather than seconds, and compared against a counter rather than a
+/// wall-clock instant -- Rule 1, the same reason mining is tick-counted.
+pub const REGEN_INTERVAL: u32 = 300;
+
+/// Blocks you may fall without being hurt (§13.3). Tuning.
+pub const SAFE_FALL: f32 = 3.0;
+
+/// Damage per block fallen beyond [`SAFE_FALL`]. Tuning.
+pub const FALL_DAMAGE_PER_BLOCK: u8 = 1;
 
 impl Player {
     pub fn new(pos: Vec3, yaw: f32, pitch: f32) -> Self {
@@ -76,7 +114,74 @@ impl Player {
             pitch: pitch.clamp(-PITCH_LIMIT, PITCH_LIMIT),
             inventory: Inventory::new(),
             crafting: Crafting::default(),
+            health: MAX_HEALTH,
+            ticks_since_damage: 0,
+            fall_distance: 0.0,
+            spawn: pos,
         }
+    }
+
+    /// Take `points` of damage, dying if it reaches zero (§13.4).
+    ///
+    /// Returns whether this killed the player, so the caller can react without
+    /// re-deriving it. Damage of zero is *not* damage: it does not reset the
+    /// regeneration counter, so a fall inside the safe distance does not
+    /// interrupt healing.
+    pub fn take_damage(&mut self, points: u8) -> bool {
+        if points == 0 {
+            return false;
+        }
+        self.ticks_since_damage = 0;
+        self.health = self.health.saturating_sub(points);
+        if self.health == 0 {
+            self.respawn();
+            return true;
+        }
+        false
+    }
+
+    /// Return to spawn at full health, **keeping the inventory** (§13.4, the
+    /// owner's decision).
+    ///
+    /// Velocity is cleared and the fall distance with it, or the player would
+    /// arrive at spawn still carrying the fall that killed them and die again
+    /// on landing.
+    pub fn respawn(&mut self) {
+        self.pos = self.spawn;
+        self.velocity = Vec3::ZERO;
+        self.fall_distance = 0.0;
+        self.on_ground = false;
+        self.health = MAX_HEALTH;
+        self.ticks_since_damage = 0;
+    }
+
+    /// One tick of regeneration (§13.2): a heart per [`REGEN_INTERVAL`] ticks
+    /// without damage, capped at [`MAX_HEALTH`].
+    ///
+    /// Not gated on food, because there is no food -- gating it now would mean
+    /// inventing hunger, which the owner deferred. When hunger arrives it
+    /// becomes the gate, which is one condition rather than a redesign.
+    pub fn tick_regeneration(&mut self) {
+        if self.health >= MAX_HEALTH {
+            // Already full: hold the counter at zero so healing always takes a
+            // full interval from the moment it is actually needed.
+            self.ticks_since_damage = 0;
+            return;
+        }
+        self.ticks_since_damage += 1;
+        if self.ticks_since_damage >= REGEN_INTERVAL {
+            self.ticks_since_damage = 0;
+            self.health = (self.health + HEART).min(MAX_HEALTH);
+        }
+    }
+
+    /// How many points a fall of `blocks` deals (§13.3).
+    pub fn fall_damage_for(blocks: f32) -> u8 {
+        let beyond = (blocks - SAFE_FALL).floor();
+        if beyond <= 0.0 {
+            return 0;
+        }
+        (beyond as u32).min(u8::MAX as u32) as u8 * FALL_DAMAGE_PER_BLOCK
     }
 
     /// Whether the player is currently in free-fly (noclip) debug mode
@@ -148,6 +253,12 @@ impl Player {
             // Not interpolatable and not rendered from here: the current
             // tick's inventory passes through, like velocity above.
             inventory: other.inventory,
+            // Same: health is a discrete point count, so interpolating it
+            // would invent half-points the sim never had.
+            health: other.health,
+            ticks_since_damage: other.ticks_since_damage,
+            fall_distance: other.fall_distance,
+            spawn: other.spawn,
             crafting: other.crafting,
         }
     }
@@ -223,8 +334,25 @@ mod tests {
     fn lerp_at_zero_and_one_returns_the_endpoints() {
         let a = Player::new(Vec3::ZERO, 0.0, 0.0);
         let b = Player::new(Vec3::new(10.0, 0.0, 0.0), 1.0, 0.2);
-        assert_eq!(a.lerp(&b, 0.0), a);
-        assert_eq!(a.lerp(&b, 1.0), b);
+
+        // The *interpolated* fields hit the endpoints. Whole-struct equality is
+        // deliberately not asserted: `lerp` documents that fields which are not
+        // meaningfully interpolatable pass through from `other` (the current
+        // tick), so `lerp(.., 0.0)` is only equal to `a` when the two agree on
+        // all of them. That happened to be true until block 2.9a gave
+        // `Player::new` a `spawn` derived from its position -- at which point
+        // the assertion was testing a coincidence, not the contract.
+        for (t, want) in [(0.0, &a), (1.0, &b)] {
+            let got = a.lerp(&b, t);
+            assert_eq!(got.pos, want.pos, "pos at t={t}");
+            assert_eq!(got.yaw, want.yaw, "yaw at t={t}");
+            assert_eq!(got.pitch, want.pitch, "pitch at t={t}");
+        }
+
+        // And the pass-through half of the contract, asserted rather than
+        // assumed: the current tick's values, at either end.
+        assert_eq!(a.lerp(&b, 0.0).spawn, b.spawn);
+        assert_eq!(a.lerp(&b, 0.0).health, b.health);
     }
 
     #[test]
@@ -235,5 +363,110 @@ mod tests {
         assert!((mid.pos - Vec3::new(5.0, 0.0, 0.0)).length() < 1e-5);
         assert!((mid.yaw - 0.5).abs() < 1e-5);
         assert!((mid.pitch - 0.1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_fall_inside_the_safe_distance_costs_nothing() {
+        // The boundary, from both sides. SAFE_FALL is 3, so 3 blocks is free
+        // and 4 costs one point.
+        assert_eq!(Player::fall_damage_for(0.0), 0);
+        assert_eq!(Player::fall_damage_for(3.0), 0);
+        assert_eq!(Player::fall_damage_for(3.99), 0);
+        assert_eq!(Player::fall_damage_for(4.0), 1);
+        assert_eq!(Player::fall_damage_for(10.0), 7);
+    }
+
+    #[test]
+    fn a_long_enough_fall_kills_and_respawns() {
+        let mut p = Player::new(Vec3::new(5.0, 70.0, 5.0), 0.0, 0.0);
+        p.pos = Vec3::new(5.0, 2.0, 5.0);
+
+        // 23 blocks: 20 points beyond the safe distance, which is exactly full
+        // health.
+        let died = p.take_damage(Player::fall_damage_for(23.0));
+
+        assert!(died);
+        assert_eq!(p.health, MAX_HEALTH, "respawned at full health");
+        assert_eq!(p.pos, Vec3::new(5.0, 70.0, 5.0), "back at spawn");
+    }
+
+    #[test]
+    fn death_keeps_the_inventory() {
+        // The owner's decision (§13.4). Worth its own test because the obvious
+        // alternative -- dropping everything -- is what the genre usually does,
+        // and a future change here should have to say so out loud.
+        let mut p = Player::new(Vec3::ZERO, 0.0, 0.0);
+        let before = p.inventory;
+        p.take_damage(MAX_HEALTH);
+        assert_eq!(p.health, MAX_HEALTH);
+        assert_eq!(p.inventory, before, "items survive death");
+    }
+
+    #[test]
+    fn a_heart_comes_back_every_interval_without_damage() {
+        let mut p = Player::new(Vec3::ZERO, 0.0, 0.0);
+        p.take_damage(6);
+        assert_eq!(p.health, 14);
+
+        // One tick short of the interval: still hurt.
+        for _ in 0..REGEN_INTERVAL - 1 {
+            p.tick_regeneration();
+        }
+        assert_eq!(p.health, 14, "healed early");
+
+        p.tick_regeneration();
+        assert_eq!(p.health, 14 + HEART, "one heart, on the interval tick");
+
+        // And again, for the next one.
+        for _ in 0..REGEN_INTERVAL {
+            p.tick_regeneration();
+        }
+        assert_eq!(p.health, 14 + HEART * 2);
+    }
+
+    #[test]
+    fn damage_restarts_the_regeneration_clock() {
+        // Sustained damage means no healing at all, rather than slow healing.
+        let mut p = Player::new(Vec3::ZERO, 0.0, 0.0);
+        p.take_damage(10);
+        for _ in 0..REGEN_INTERVAL - 1 {
+            p.tick_regeneration();
+        }
+        p.take_damage(1);
+        for _ in 0..REGEN_INTERVAL - 1 {
+            p.tick_regeneration();
+        }
+        assert_eq!(p.health, MAX_HEALTH - 11, "the clock restarted");
+    }
+
+    #[test]
+    fn a_harmless_fall_does_not_interrupt_healing() {
+        // Zero damage is not damage: landing inside the safe distance must not
+        // reset the counter, or a player hopping around would never heal.
+        let mut p = Player::new(Vec3::ZERO, 0.0, 0.0);
+        p.take_damage(4);
+        for _ in 0..REGEN_INTERVAL - 1 {
+            p.tick_regeneration();
+        }
+        p.take_damage(Player::fall_damage_for(2.0)); // a 2-block hop: 0 points
+        p.tick_regeneration();
+        assert_eq!(p.health, MAX_HEALTH - 4 + HEART, "healed on schedule");
+    }
+
+    #[test]
+    fn regeneration_stops_at_full_health() {
+        let mut p = Player::new(Vec3::ZERO, 0.0, 0.0);
+        for _ in 0..REGEN_INTERVAL * 3 {
+            p.tick_regeneration();
+        }
+        assert_eq!(p.health, MAX_HEALTH);
+    }
+
+    #[test]
+    fn health_never_wraps_past_zero() {
+        let mut p = Player::new(Vec3::ZERO, 0.0, 0.0);
+        // Far more than full health in one hit: saturating, then a respawn.
+        p.take_damage(u8::MAX);
+        assert_eq!(p.health, MAX_HEALTH);
     }
 }

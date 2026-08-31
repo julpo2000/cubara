@@ -502,14 +502,16 @@ impl Renderer {
         }
     }
 
-    /// `hotbar` is plain data the caller reduces its inventory to -- this
-    /// crate never learns what an item is (Rule 3).
+    /// `hotbar` and `health` are plain data the caller reduces its state to --
+    /// this crate never learns what an item is, or what hurt the player
+    /// (Rule 3).
     pub fn render(
         &mut self,
         camera: CameraPose,
         selected_block: Option<[i32; 3]>,
         hotbar: Option<crate::scene::HotbarView<'_>>,
         panel: Option<crate::scene::PanelView<'_>>,
+        health: Option<crate::scene::HealthView>,
     ) {
         crate::profiling::Profiler::new_frame();
         puffin::profile_function!();
@@ -552,6 +554,7 @@ impl Renderer {
                     overlay: overlay.as_deref(),
                     hotbar,
                     panel,
+                    health,
                 },
             );
         }

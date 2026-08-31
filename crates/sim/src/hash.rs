@@ -104,6 +104,12 @@ impl WorldHash {
         self.write_bool(p.free_fly);
         self.write_f32(p.yaw);
         self.write_f32(p.pitch);
+        // World state (§13.5): two worlds differing only in how hurt the player
+        // is are different worlds, and the gate's survival replay has to see
+        // damage happen. `fall_distance` is deliberately absent -- it is
+        // transient and derived, and is not saved either.
+        self.write_u8(p.health);
+        self.write_u32(p.ticks_since_damage);
         self.write_inventory(&p.inventory);
         self.write_crafting(&p.crafting);
     }

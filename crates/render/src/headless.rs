@@ -96,6 +96,8 @@ pub struct Shot {
     /// golden test builds directly -- no sim, no inventory, which is the point
     /// of the view being colours and counts.
     pub panel: Option<PanelShot>,
+    /// Hearts to draw, as `(points, max_points)`. `None` draws none.
+    pub health: Option<(u8, u8)>,
 }
 
 impl Default for Shot {
@@ -109,6 +111,7 @@ impl Default for Shot {
             highlighted_block: None,
             hotbar: None,
             panel: None,
+            health: None,
         }
     }
 }
@@ -187,6 +190,7 @@ fn render_arena(
         highlighted_block,
         hotbar,
         panel,
+        health,
     } = shot;
     // Slot 0 held: a fixed choice, so a golden reference has a stable
     // selection highlight to compare against.
@@ -284,6 +288,8 @@ fn render_arena(
                 slots: slots.as_slice(),
                 selected: hotbar_selected,
             }),
+            health: health
+                .map(|(points, max_points)| crate::scene::HealthView { points, max_points }),
             panel: panel_view
                 .as_ref()
                 .map(|(p, contents, held, cursor)| crate::scene::PanelView {

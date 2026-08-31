@@ -105,7 +105,8 @@ frames after 200 warmup.
 | 2026-08-31 | ECS + dropped items [#56], radius 64³⁷ | 1,600 | 822,420 | ~1,381 | 0.505 ms | ~0.86 ms | `9ec31bb` |
 | 2026-08-31 | Chunk state machine + dormancy [#47], radius 64³⁷ | 1,600 | 822,420 | ~1,375 | 0.498 ms | ~0.87 ms | `511f58e` |
 | 2026-08-31 | Bounded dormant catch-up [#58], radius 64³⁷ | 1,600 | 822,420 | ~1,367 | 0.496 ms | ~0.95 ms | `55ce3e5` |
-| 2026-08-31 | Save format covers phase 2 state [#170], radius 64³⁷ | 1,600 | 822,420 | ~1,387 | 0.513 ms | ~0.85 ms | *(this PR)* |
+| 2026-08-31 | Save format covers phase 2 state [#170], radius 64³⁷ | 1,600 | 822,420 | ~1,387 | 0.513 ms | ~0.85 ms | `4b4b131` |
+| 2026-08-31 | Health, fall damage, regeneration [#172], radius 64³⁷ | 1,600 | 822,420 | ~1,379 | 0.496 ms | ~0.93 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -1075,6 +1076,13 @@ happens on demand, and `--bench` never calls it -- so this row is once more a
 statement that the scene is untouched rather than a measurement of the feature.
 Seven consecutive rows at 822,420 triangles is itself the useful signal: every
 block since iron ore changed simulation, not geometry.
+
+**Health and fall damage (#172)** makes it eight: 822,420 again, 1,379 FPS,
+0.496 ms. It adds two integer operations per tick (a fall-distance accumulate
+and a regeneration counter) and a row of quads to the HUD, and neither shows.
+The run of identical triangle counts is now long enough to be worth stating as a
+property rather than a coincidence: **since block 2.3b, every change has been to
+what the world *does*, not to what it draws.**
 
 ## Detailed run logs
 

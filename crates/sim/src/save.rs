@@ -96,6 +96,20 @@ struct SavedPlayer {
     grid_width: usize,
     #[serde(default)]
     held: Option<SavedStack>,
+    /// Health in points, and the regeneration counter (§13.5). Block 2.9a.
+    #[serde(default = "full_health")]
+    health: u8,
+    #[serde(default)]
+    ticks_since_damage: u32,
+    /// Where death returns the player to.
+    #[serde(default)]
+    spawn: (f32, f32, f32),
+}
+
+/// A save written before block 2.9a has no health field; a loaded player is
+/// alive and well rather than dead on arrival.
+fn full_health() -> u8 {
+    crate::player::MAX_HEALTH
 }
 
 /// A save written before block 2.8 has no grid width; 2 is the inventory's own.
@@ -299,6 +313,9 @@ pub fn save_world(
                 .collect(),
             grid_width: sim.player.crafting.width(),
             held: to_saved(sim.player.crafting.held(), items),
+            health: sim.player.health,
+            ticks_since_damage: sim.player.ticks_since_damage,
+            spawn: sim.player.spawn.into(),
         },
         blocks: blocks_table,
         items: items
@@ -422,6 +439,17 @@ pub fn load_world(
             inv.select(header.player.selected_slot);
             inv
         },
+        health: header.player.health,
+        ticks_since_damage: header.player.ticks_since_damage,
+        // Transient and derived (§13.3): a loaded world starts the player on
+        // the ground, and carrying a half-completed fall across a reload would
+        // be a fall the player never made.
+        fall_distance: 0.0,
+        spawn: glam::Vec3::new(
+            header.player.spawn.0,
+            header.player.spawn.1,
+            header.player.spawn.2,
+        ),
         crafting: {
             let mut c = Crafting::new(header.player.grid_width);
             for (i, saved) in header.player.grid.iter().enumerate() {

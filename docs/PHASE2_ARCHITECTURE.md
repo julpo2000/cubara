@@ -705,6 +705,70 @@ process's inputs can be constructed in a test without a registry.
 
 ---
 
+## §13 Staying alive (block 2.9a)
+
+**Decided by the project owner, 2026-08-31.** Block 2.9 is the largest in the
+phase and is almost entirely gameplay, so it is taken in slices. This is the
+first: being hurt, and healing. Hunger and food are explicitly deferred; mobs are
+2.9b.
+
+### §13.1 Health is 20 points, drawn as 10 hearts
+
+Twenty points, not ten, because half-hearts have to be representable — a heart is
+two points. The *number* is simulation state and the *hearts* are a drawing;
+nothing in the sim counts in hearts.
+
+Mechanic only. `REQUIREMENTS.md` #6: mechanics may be inspired, assets and
+branding are ours. No other game is named anywhere in this repo, and the hearts
+are our own texture.
+
+### §13.2 Regeneration: one heart per 5 seconds without damage
+
+**300 ticks**, counted in ticks and never in wall-clock — Rule 1, exactly as
+mining (§4.3) and smelting (§7) are. Taking damage resets the counter to zero, so
+sustained damage means no healing at all rather than healing slowly.
+
+Regeneration is unconditional otherwise. It is *not* gated on food, because there
+is no food: gating it now would mean inventing hunger, and the owner deferred
+that. When hunger arrives it becomes the gate, and that is a change to one
+condition rather than a redesign.
+
+### §13.3 Fall damage is the first thing that hurts
+
+Chosen because it needs **no new content** — the physics already tracks velocity
+and landing — and because it makes health and regeneration real in play
+immediately. It also gives the caves block 1.5 built an actual cost.
+
+**Measured in distance fallen, not in impact speed.** Distance is what the player
+can see and judge before jumping; speed is a number they cannot. Fall distance
+accumulates while airborne and descending, and is spent on landing:
+
+```
+damage = max(0, floor(fall_distance) - SAFE_FALL)
+```
+
+Landing, entering free-fly, or otherwise touching ground resets it. `SAFE_FALL`
+and the damage per block live in data, and are expected to move.
+
+### §13.4 Death returns you to spawn with your things
+
+**The owner's call.** At 0 points the player respawns at the world spawn with
+health restored and **the inventory untouched**.
+
+The consequence is worth recording rather than discovering later: this leaves
+**§10.5's `Treasured` tier with no user.** It was built for the pile you leave on
+death, and with items kept there is no pile. The tier stays — it costs nothing,
+it is already tested, and the moment anything makes death cost items it is
+already there. What it must not do is quietly acquire a different meaning.
+
+### §13.5 Health is world state
+
+Hashed and saved like the inventory: two worlds differing only in how hurt the
+player is are different worlds, and the survival replay test the phase gate wants
+has to be able to see damage happen.
+
+---
+
 ## §9 Not in this scope — and which are the owner's call
 
 Engineering-deferred, mine to sequence: ECS (2.5), the chunk state machine (2.6),
@@ -724,6 +788,12 @@ so the trail from question to decision is readable):
 - *What does the furnace burn?* → **wood; no coal**, §7.
 - *What happens to a drop with nowhere to go?* → **it falls on the floor**, and
   despawns on a timer set by its rarity, §10.4–§10.5.
+- *How much health, and does it regenerate?* → **20 points as 10 hearts; one
+  heart per 5 damage-free seconds**, §13.1–§13.2.
+- *What hurts you first, and what does death cost?* → **fall damage**; death
+  returns you to spawn **with your items**, §13.3–§13.4.
+
+Still open, and still the owner's: hunger and food, and what mobs exist (2.9b).
 
 None of these block the ladder to iron. Each is listed so that it gets asked
 rather than invented — a plausible-sounding invention is worse than a question,

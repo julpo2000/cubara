@@ -429,6 +429,18 @@ impl Game {
         dirty
     }
 
+    /// The player's health, reduced to what the renderer draws
+    /// (`PHASE2_ARCHITECTURE.md` §13.1).
+    ///
+    /// Both numbers, so `cubara-render` never learns what full health is --
+    /// it is told the points and the maximum and works out the hearts (Rule 3).
+    pub fn health_view(&self) -> cubara_render::HealthView {
+        cubara_render::HealthView {
+            points: self.sim.player.health,
+            max_points: cubara_sim::MAX_HEALTH,
+        }
+    }
+
     /// Whether the break button is held. Held state rather than an edge, since
     /// mining advances for as long as it is down (§4.3).
     ///
@@ -2376,6 +2388,118 @@ mod tests {
         assert_eq!(
             now.progress, after_one.progress,
             "a dormant furnace did not advance"
+        );
+    }
+
+    #[test]
+    fn falling_onto_the_ground_actually_hurts() {
+        // Through the real physics and the real tick loop, not the damage
+        // formula in isolation: the formula is unit-tested in `cubara-sim`, and
+        // what this asserts is that a fall *reaches* it.
+        let (mut game, _) = game_looking_at_ground();
+        let ground = game
+            .world()
+            .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
+            .expect("ground below");
+        // Ten blocks: past the 3-block safe distance, but **survivable**.
+        // A longer drop would deal more than full health, and death restores
+        // it -- so a lethal fall reads as "no damage" here. That is what the
+        // first version of this test measured, and it is why the lethal case
+        // has its own test below, asserting the respawn instead.
+        game.sim.player = Player::new(
+            glam::vec3(0.5, ground.block[1] as f32 + 11.0, 0.5),
+            0.0,
+            0.0,
+        );
+        let full = game.sim.player.health;
+
+        for _ in 0..600 {
+            game.advance(TICK_DT);
+            if game.sim.player.on_ground {
+                break;
+            }
+        }
+
+        assert!(game.sim.player.on_ground, "it landed");
+        assert!(
+            game.sim.player.health < full,
+            "landing from ten blocks left {} of {full} health",
+            game.sim.player.health
+        );
+    }
+
+    #[test]
+    fn a_lethal_fall_returns_you_to_spawn_with_your_things() {
+        // The owner's decision (§13.4): death costs position, not progress.
+        let (mut game, _) = game_looking_at_ground();
+        let ground = game
+            .world()
+            .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
+            .expect("ground below");
+        let spawn = glam::vec3(0.5, ground.block[1] as f32 + 3.0, 0.5);
+        game.sim.player = Player::new(spawn, 0.0, 0.0);
+        // Give them something to lose, then drop them from lethal height.
+        hold(&mut game, "cubara:iron_pick");
+        let carried = game.sim.player.inventory;
+        game.sim.player.pos = glam::vec3(0.5, ground.block[1] as f32 + 60.0, 0.5);
+
+        for _ in 0..600 {
+            game.advance(TICK_DT);
+            if game.sim.player.pos.y <= spawn.y + 0.001 && game.sim.player.on_ground {
+                break;
+            }
+        }
+
+        assert_eq!(
+            game.sim.player.health,
+            cubara_sim::MAX_HEALTH,
+            "respawned at full health"
+        );
+        assert_eq!(game.sim.player.inventory, carried, "and kept the pick");
+    }
+
+    #[test]
+    fn walking_off_a_low_step_does_not_hurt() {
+        let (mut game, _) = game_looking_at_ground();
+        let ground = game
+            .world()
+            .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
+            .expect("ground below");
+        game.sim.player = Player::new(glam::vec3(0.5, ground.block[1] as f32 + 2.5, 0.5), 0.0, 0.0);
+        let full = game.sim.player.health;
+
+        for _ in 0..300 {
+            game.advance(TICK_DT);
+        }
+
+        assert_eq!(game.sim.player.health, full, "a short drop is free");
+    }
+
+    #[test]
+    fn free_fly_never_hurts_however_far_you_descend() {
+        // It is a debug mode; dropping out of the sky in it must not kill you
+        // (§13.3). The fall distance is cleared every tick it is active.
+        let (mut game, _) = game_looking_at_ground();
+        let ground = game
+            .world()
+            .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
+            .expect("ground below");
+        game.sim.player = Player::new(
+            glam::vec3(0.5, ground.block[1] as f32 + 80.0, 0.5),
+            0.0,
+            -1.5,
+        );
+        // Toggle free-fly on, then descend through the whole drop.
+        game.fly_toggle_pending = true;
+        game.down = true;
+        for _ in 0..600 {
+            game.advance(TICK_DT);
+        }
+        let health_in_flight = game.sim.player.health;
+        assert_eq!(
+            health_in_flight,
+            cubara_sim::MAX_HEALTH,
+            "free-fly descent cost health"
         );
     }
 }
