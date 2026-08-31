@@ -40,10 +40,79 @@ not_implemented() {
     fail=$((fail + 1))
 }
 
-if [ "$phase" != "1" ]; then
-    echo "phase $phase's gate is not wired up yet -- only phase 1 is." >&2
+if [ "$phase" != "1" ] && [ "$phase" != "2" ]; then
+    echo "phase $phase's gate is not wired up yet -- only phases 1 and 2 are." >&2
     echo "(ROADMAP.md's phase $phase exit gate exists on paper; this script doesn't answer it yet.)" >&2
     exit 2
+fi
+
+if [ "$phase" = "2" ]; then
+    echo "Phase 2 exit gate (ROADMAP.md) ------------------------------------------"
+    echo
+    echo "  Wired up while block 2.7a was landing, deliberately RED: the point of a"
+    echo "  gate is to say what is missing before the work is done, which is what"
+    echo "  block 1.0 established when it shipped phase 1's gate failing."
+    echo
+
+    # "Everything phase 1's gate checks, still passing -- a perf regression
+    # blocks the phase (Rule 7), it is not noted and forgotten."
+    run "cargo test --all" cargo test --all
+    run "cargo clippy --all-targets --all-features" cargo clippy --all-targets --all-features
+    run "cargo fmt --all --check" cargo fmt --all --check
+    run "architecture rules (check-architecture.sh)" ./scripts/check-architecture.sh
+    run "single render path (check-single-render-path.sh)" ./scripts/check-single-render-path.sh
+
+    bench_out=$(cargo run --release -- --bench 64 2>&1)
+    summary=$(printf '%s\n' "$bench_out" | grep 'SUMMARY:' | tail -1)
+    fps=$(printf '%s\n' "$summary" | sed -nE 's/.*SUMMARY: ([0-9]+) FPS.*/\1/p')
+    if [ -n "$fps" ] && [ "$fps" -ge 1000 ]; then
+        echo "PASS  phase 1 perf holds: --bench 64 >= 1000 FPS ($fps FPS)"
+        pass=$((pass + 1))
+    else
+        echo "FAIL  phase 1 perf holds: --bench 64 >= 1000 FPS (measured ${fps:-none})"
+        fail=$((fail + 1))
+    fi
+
+    run "determinism replay still passes single- vs multi-threaded" \
+        cargo test -p cubara-sim --test determinism the_fixture_reaches_a_known_hash_regardless_of_worker_count
+
+    # "The dormant test: a chunk left dormant for N ticks and then activated
+    # ends in the same state as one simulated continuously for N ticks."
+    # Landed in block 2.6 (#47); the bounded path from 2.7a (#58) is checked
+    # against its own one-tick reference.
+    run "dormant test: a chunk dormant for N ticks == one ticked continuously" \
+        cargo test -p cubara --bin cubara a_dormant_chunk_ends_where_a_continuously_ticked_one_would
+    run "catch-up matches a tick-by-tick reference (bounded path, 2.7a)" \
+        cargo test -p cubara-world --lib bounded_catch_up_agrees_with_the_one_tick_reference
+
+    # "The survival replay test: a fixed, scripted input sequence runs headlessly
+    # and completes the loop -- chop a tree, craft a tool, mine iron ore, smelt
+    # it, eat, take damage -- then asserts a world-state hash. It runs
+    # single-threaded and multi-threaded and must agree."
+    #
+    # Needs eating and damage, which are block 2.9. There is no harness that
+    # drives a scripted InputFrame sequence headlessly either. This is the gate's
+    # own "real gate" criterion and it is the furthest from done.
+    not_implemented "survival replay test (scripted headless loop, asserts a world-state hash)"
+
+    # "The round-trip test, extended from phase 1 to cover phase 2's state: save
+    # the world mid-script, reload it, run the rest of the script, and land on
+    # the same hash as the uninterrupted run."
+    #
+    # Block 2.8. Block entities (2.4c) and entities (2.5) are in the world hash
+    # but not yet in the save format, so a reload loses them by construction.
+    not_implemented "round-trip covering phase 2 state (block entities, entities, inventory)"
+
+    echo
+    echo "$pass passed, $fail failed."
+    if [ "$fail" -gt 0 ]; then
+        echo
+        echo "Phase 2 is NOT finished. Remaining: blocks 2.8 (save format) and"
+        echo "2.9 (health, hunger, damage, mobs), plus the survival replay harness."
+        exit 1
+    fi
+    echo "OK: phase 2 exit gate met."
+    exit 0
 fi
 
 echo "Phase 1 exit gate (ROADMAP.md) ------------------------------------------"
