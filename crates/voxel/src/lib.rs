@@ -8,6 +8,7 @@
 pub mod block;
 pub mod bounds;
 pub mod coord;
+pub mod fixed;
 pub mod item;
 pub mod mesh;
 pub mod ore;
@@ -21,6 +22,7 @@ pub mod voxel;
 pub use block::BlockId;
 pub use bounds::{build_mesh_bounded, Aabb};
 pub use coord::ChunkCoord;
+pub use fixed::{Fixed, FixedVec3, FRAC_BITS};
 pub use item::{
     ItemDef, ItemId, ItemRegistry, ItemRegistryError, ItemStack, ItemState, Rarity, StackError,
 };
