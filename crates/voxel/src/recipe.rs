@@ -404,6 +404,7 @@ mod tests {
                     max_stack: 64,
                     durability: None,
                     tier: 0,
+                    speed: None,
                 },
             )
         };

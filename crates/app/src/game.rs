@@ -70,6 +70,23 @@ pub fn load_recipe_book(items: &ItemRegistry) -> RecipeBook {
     RecipeBook::load(&repo_root.join("assets/recipes"), items).expect("assets/recipes must load")
 }
 
+/// A break part-way through (`PHASE2_ARCHITECTURE.md` §4.3).
+///
+/// Keyed by the block position *and* the tool being used: change either and the
+/// progress is dropped rather than carried over, which is what "abandoned, not
+/// banked" means in practice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Mining {
+    block: [i32; 3],
+    /// The item id held when this break started, so switching tools restarts.
+    /// `None` for a bare hand.
+    tool: Option<cubara_voxel::ItemId>,
+    /// Work done so far, in the same units as the block's `hardness`. One tick
+    /// adds the tool's `speed`, so this reaching `hardness` is exactly
+    /// `ceil(hardness / speed)` ticks -- the §4.3 formula, without a division.
+    progress: u32,
+}
+
 pub struct Game {
     /// The world being played. Behind an [`Arc`] so meshing jobs can carry the exact
     /// snapshot they were queued against; an edit publishes a new one.
@@ -102,6 +119,17 @@ pub struct Game {
     /// Whether the inventory screen is open. Screen state, not world state --
     /// what the *grid* holds is world state and lives on the player.
     inventory_open: bool,
+    /// Whether the break button is currently held. Read once per `advance`
+    /// into [`InputFrame::breaking`].
+    breaking: bool,
+    /// The break in progress, if any (`PHASE2_ARCHITECTURE.md` §4.3).
+    ///
+    /// **Not on the chunk, and not in the save format.** It is transient, it
+    /// belongs to one player, and §4.3 decided progress is abandoned rather
+    /// than banked -- so there is nothing here worth persisting, and putting it
+    /// on the chunk would make it block-entity-shaped (§7) for something the
+    /// player cannot even see.
+    mining: Option<Mining>,
     /// Wall-clock seconds not yet consumed by a fixed tick. `f64`, not `f32`
     /// like everything else here -- this is the one value that keeps being
     /// added to across a whole play session (thousands of frames), and
@@ -151,6 +179,8 @@ impl Game {
             recipes: None,
             bench_block: None,
             inventory_open: false,
+            breaking: false,
+            mining: None,
             accumulator: 0.0,
             forward: false,
             back: false,
@@ -279,7 +309,7 @@ impl Game {
     ///   unmodified total each time (correct for held `move_axes`) would turn
     ///   one frame's mouse motion, or one key press, into N. So: clear them
     ///   after the first tick.
-    pub fn advance(&mut self, dt: f32) {
+    pub fn advance(&mut self, dt: f32) -> Vec<ChunkCoord> {
         self.accumulator += dt as f64;
 
         // Not a tick's worth of time yet: leave the accumulated one-shot inputs
@@ -288,7 +318,7 @@ impl Game {
         // re-read from live held state on the frame that does tick, so nothing
         // is lost by returning early.
         if self.accumulator < TICK_DT as f64 {
-            return;
+            return Vec::new();
         }
 
         let mut input = InputFrame {
@@ -300,6 +330,7 @@ impl Game {
             look_delta: [self.look_delta.0, self.look_delta.1],
             jump: self.jump_pending,
             toggle_fly: self.fly_toggle_pending,
+            breaking: self.breaking,
         };
         // A tick below will consume these, so it's safe to clear them now.
         self.look_delta = (0.0, 0.0);
@@ -307,12 +338,19 @@ impl Game {
         self.fly_toggle_pending = false;
 
         let mut ticks = 0;
+        let mut dirty = Vec::new();
         while self.accumulator >= TICK_DT as f64 {
             self.prev_player = self.sim.player;
             // Read before the mutable borrow of `world`.
             let terrain = self.terrain();
             self.sim
                 .tick(Arc::make_mut(&mut self.world), &input, terrain);
+            // Mining advances *per tick*, not per frame -- §4.3, and the same
+            // reason the tick loop exists. A catch-up burst of N ticks is N
+            // ticks of progress, which is correct: that time really did pass.
+            if let Some(cc) = self.tick_mining(input.breaking) {
+                dirty.push(cc);
+            }
             input.jump = false;
             input.toggle_fly = false;
             input.look_delta = [0.0, 0.0];
@@ -326,6 +364,17 @@ impl Game {
                 break;
             }
         }
+        dirty
+    }
+
+    /// Whether the break button is held. Held state rather than an edge, since
+    /// mining advances for as long as it is down (§4.3).
+    ///
+    /// Releasing abandons any break in progress on the next tick -- that is
+    /// [`tick_mining`](Self::tick_mining)'s doing, not this setter's, so the
+    /// abandon rule lives in one place.
+    pub fn set_breaking(&mut self, held: bool) {
+        self.breaking = held;
     }
 
     /// Break (`place = false`) or place (`true`) the block the player is looking
@@ -384,11 +433,105 @@ impl Game {
     /// yet (they need ECS, 2.5), so the remainder `Inventory::add` hands back is
     /// logged and discarded. Refusing to break the block instead would be a
     /// gameplay decision, and those are the owner's.
+    ///
+    /// **No longer on the game's own path**, since 2.4b: playing mines over
+    /// several ticks via [`tick_mining`](Self::tick_mining), and both go
+    /// through the same [`break_at`](Self::break_at). Kept as the instant-break
+    /// entry point, which is what the drop and tier tests drive directly rather
+    /// than holding a button for eight ticks to assert one drop.
+    #[allow(dead_code)]
     pub fn break_block(&mut self) -> Option<ChunkCoord> {
         let origin = self.sim.player.pos.to_array();
         let dir = self.sim.player.look_dir().to_array();
         let hit = self.world.raycast(origin, dir, REACH, self.terrain())?;
-        let [x, y, z] = hit.block;
+        Some(self.break_at(hit.block))
+    }
+
+    /// One tick of mining (`PHASE2_ARCHITECTURE.md` §4.3). Returns the chunk to
+    /// re-mesh on the tick the block finally gives way.
+    ///
+    /// **Progress is abandoned, not banked.** It is dropped when the button is
+    /// released, when the player looks at a different block, or when the held
+    /// tool changes -- each of those makes the stored `Mining` stop matching,
+    /// and a non-match restarts from zero rather than resuming.
+    fn tick_mining(&mut self, breaking: bool) -> Option<ChunkCoord> {
+        if !breaking {
+            self.mining = None;
+            return None;
+        }
+        let origin = self.sim.player.pos.to_array();
+        let dir = self.sim.player.look_dir().to_array();
+        let Some(hit) = self.world.raycast(origin, dir, REACH, self.terrain()) else {
+            // Looking at nothing in reach: whatever was in progress is gone.
+            self.mining = None;
+            return None;
+        };
+        let (registry, terrain) = (self.blocks_registry.as_deref()?, self.terrain?);
+        let target = self
+            .world
+            .block_at(hit.block[0], hit.block[1], hit.block[2], terrain);
+
+        // Absent hardness means unbreakable -- no progress accrues and no
+        // amount of holding the button changes that.
+        let hardness = registry.hardness(target)?;
+
+        let held = self.sim.player.inventory.selected_stack().map(|s| s.item());
+        let speed = match (held, self.items.as_ref()) {
+            (Some(item), Some(items)) => items.speed(item),
+            // An empty hand, or assets not yet wired: speed 1, §4.3's floor.
+            _ => 1,
+        };
+
+        let fresh = Mining {
+            block: hit.block,
+            tool: held,
+            progress: 0,
+        };
+        let m = match self.mining {
+            Some(m) if m.block == fresh.block && m.tool == fresh.tool => m,
+            _ => fresh,
+        };
+        let progress = m.progress + speed;
+        if progress < hardness {
+            self.mining = Some(Mining { progress, ..m });
+            return None;
+        }
+        self.mining = None;
+        Some(self.break_at(hit.block))
+    }
+
+    /// How far along the current break is, `0.0..1.0`, for the renderer to draw
+    /// a crack overlay with. `None` when nothing is being mined.
+    ///
+    /// Exposed as a fraction rather than as the raw counters so that drawing it
+    /// needs no access to the registries -- the renderer does not own gameplay
+    /// (Rule 3).
+    ///
+    /// Nothing draws this yet -- the crack overlay is 2.4d, deliberately out of
+    /// 2.4b's scope (#159). This is the fraction it will consume, and it is
+    /// pinned by a test so the hook cannot rot before then.
+    #[allow(dead_code)]
+    pub fn mining_progress(&self) -> Option<f32> {
+        let m = self.mining?;
+        let registry = self.blocks_registry.as_deref()?;
+        let terrain = self.terrain?;
+        let target = self
+            .world
+            .block_at(m.block[0], m.block[1], m.block[2], terrain);
+        let hardness = registry.hardness(target)?;
+        if hardness == 0 {
+            return Some(1.0);
+        }
+        Some((m.progress as f32 / hardness as f32).clamp(0.0, 1.0))
+    }
+
+    /// Break the block at `block`, applying §4's drop and durability rules.
+    /// The shared tail of [`break_block`](Self::break_block) (instant, for
+    /// tests and for anything that bypasses mining) and
+    /// [`tick_mining`](Self::tick_mining) (timed, what the game actually does),
+    /// so the two cannot drift apart on what a break *yields*.
+    fn break_at(&mut self, block: [i32; 3]) -> ChunkCoord {
+        let [x, y, z] = block;
 
         // The drop is the optional part; the break is not. Assets are always
         // set in the real app, but making the whole action depend on them
@@ -445,7 +588,7 @@ impl Game {
             }
         }
 
-        Some(Arc::make_mut(&mut self.world).set_block(x, y, z, BlockId::AIR))
+        Arc::make_mut(&mut self.world).set_block(x, y, z, BlockId::AIR)
     }
 
     /// Spend one point of the held tool's durability, removing the stack when
@@ -1436,5 +1579,181 @@ mod tests {
         game.break_block().expect("a block was in reach");
 
         assert_eq!(count_of(&game, "cubara:soil"), 1);
+    }
+
+    /// Aim at `block_name` placed underfoot and hold the break button, then run
+    /// `ticks` sim ticks. Returns how many ticks it took to break, or `None` if
+    /// it had not broken by then.
+    fn mine_for(game: &mut Game, ticks: u32) -> Option<u32> {
+        game.set_breaking(true);
+        for t in 1..=ticks {
+            let dirty = game.advance(TICK_DT);
+            if !dirty.is_empty() {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn mining_takes_ceil_hardness_over_speed_ticks() {
+        // §4.3's formula, on the real assets: stone is hardness 30, a stone
+        // pick is speed 4, so ceil(30/4) = 8 ticks.
+        let (mut game, _) = game_looking_at_ground();
+        stand_over(&mut game, "cubara:stone");
+        hold(&mut game, "cubara:stone_pick");
+
+        assert_eq!(mine_for(&mut game, 20), Some(8));
+    }
+
+    #[test]
+    fn a_faster_tool_breaks_the_same_block_in_fewer_ticks() {
+        // The whole point of the block: the tool changes the time, not just
+        // whether you get a drop. Stone at hardness 30: hand 30, wooden 15,
+        // stone 8, iron 5.
+        let cases = [
+            (None, 30),
+            (Some("cubara:wooden_pick"), 15),
+            (Some("cubara:stone_pick"), 8),
+            (Some("cubara:iron_pick"), 5),
+        ];
+        for (tool, want) in cases {
+            let (mut game, _) = game_looking_at_ground();
+            stand_over(&mut game, "cubara:stone");
+            if let Some(t) = tool {
+                hold(&mut game, t);
+            }
+            assert_eq!(
+                mine_for(&mut game, 60),
+                Some(want),
+                "wrong tick count for {tool:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn releasing_the_button_abandons_progress() {
+        // §4.3: abandoned, not banked. Six ticks of an eight-tick break, then
+        // let go -- starting again must cost the full eight, not two.
+        let (mut game, _) = game_looking_at_ground();
+        stand_over(&mut game, "cubara:stone");
+        hold(&mut game, "cubara:stone_pick");
+
+        game.set_breaking(true);
+        for _ in 0..6 {
+            assert!(game.advance(TICK_DT).is_empty());
+        }
+        game.set_breaking(false);
+        game.advance(TICK_DT);
+
+        assert_eq!(mine_for(&mut game, 20), Some(8), "restarted from zero");
+    }
+
+    #[test]
+    fn switching_tools_abandons_progress() {
+        // The stored break is keyed by tool as well as position.
+        let (mut game, _) = game_looking_at_ground();
+        stand_over(&mut game, "cubara:stone");
+        hold(&mut game, "cubara:wooden_pick");
+
+        game.set_breaking(true);
+        for _ in 0..10 {
+            assert!(game.advance(TICK_DT).is_empty(), "wooden pick needs 15");
+        }
+        hold(&mut game, "cubara:stone_pick");
+
+        // Fresh start at speed 4: eight more ticks, not the two that would be
+        // left if the wooden pick's progress had carried over.
+        assert_eq!(mine_for(&mut game, 20), Some(8));
+    }
+
+    #[test]
+    fn a_timed_break_applies_the_same_drop_rules_as_an_instant_one() {
+        // `break_at` is shared, so 2.4a's tier gate still holds: iron ore
+        // needs tier 2, and a wooden pick mines it (slowly) for nothing.
+        let (mut game, _) = game_looking_at_ground();
+        stand_over(&mut game, "cubara:iron_ore");
+        hold(&mut game, "cubara:wooden_pick");
+
+        // hardness 45 at speed 2 -> 23 ticks.
+        assert_eq!(mine_for(&mut game, 40), Some(23));
+        assert_eq!(count_of(&game, "cubara:raw_iron"), 0, "tier too low");
+
+        let (mut game, _) = game_looking_at_ground();
+        stand_over(&mut game, "cubara:iron_ore");
+        hold(&mut game, "cubara:stone_pick");
+        // hardness 45 at speed 4 -> 12 ticks.
+        assert_eq!(mine_for(&mut game, 40), Some(12));
+        assert_eq!(count_of(&game, "cubara:raw_iron"), 1);
+    }
+
+    #[test]
+    fn mining_progress_reports_a_fraction_that_climbs_to_the_break() {
+        let (mut game, _) = game_looking_at_ground();
+        stand_over(&mut game, "cubara:stone");
+        hold(&mut game, "cubara:stone_pick");
+        assert_eq!(game.mining_progress(), None, "nothing started yet");
+
+        game.set_breaking(true);
+        let mut last = 0.0;
+        for _ in 0..7 {
+            game.advance(TICK_DT);
+            let p = game.mining_progress().expect("a break is in progress");
+            assert!(p > last, "progress must climb: {p} after {last}");
+            assert!(p < 1.0, "not finished yet: {p}");
+            last = p;
+        }
+        game.advance(TICK_DT);
+        assert_eq!(game.mining_progress(), None, "finished, so nothing pending");
+    }
+
+    #[test]
+    fn mining_is_tick_identical_across_two_runs() {
+        // Rule 1: same inputs, same tick, same result. Two independent games
+        // driven identically must break on the same tick.
+        let run = || {
+            let (mut game, _) = game_looking_at_ground();
+            stand_over(&mut game, "cubara:iron_ore");
+            hold(&mut game, "cubara:stone_pick");
+            mine_for(&mut game, 40)
+        };
+        assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn one_frame_of_several_ticks_advances_mining_by_all_of_them() {
+        // A catch-up burst is N ticks of progress, unlike `jump`, which is a
+        // one-shot. That difference is deliberate (see `InputFrame::breaking`).
+        //
+        // Five ticks, not more: `MAX_TICKS_PER_FRAME` caps a frame's catch-up
+        // at five, so an iron pick (speed 6) on stone (hardness 30) is the
+        // longest break that can finish inside one frame.
+        let (mut game, _) = game_looking_at_ground();
+        stand_over(&mut game, "cubara:stone");
+        hold(&mut game, "cubara:iron_pick");
+        game.set_breaking(true);
+
+        // 5.5 rather than exactly 5.0: `TICK_DT * 5.0` in `f32` can land a
+        // hair under five ticks' worth once widened to the `f64` accumulator,
+        // and this test is about the burst, not about a rounding boundary.
+        // The surplus stays in the accumulator; the cap still limits it to five.
+        let dirty = game.advance(TICK_DT * 5.5);
+        assert!(!dirty.is_empty(), "five ticks in one frame breaks it");
+    }
+
+    #[test]
+    fn a_frame_longer_than_the_catch_up_cap_still_only_mines_the_cap() {
+        // The spiral-of-death guard applies to mining too: a frame worth 20
+        // ticks runs five, so a break needing eight is not finished by it.
+        // Mining must not be a way to smuggle progress past the cap.
+        let (mut game, _) = game_looking_at_ground();
+        stand_over(&mut game, "cubara:stone");
+        hold(&mut game, "cubara:stone_pick");
+        game.set_breaking(true);
+
+        assert!(
+            game.advance(TICK_DT * 20.0).is_empty(),
+            "capped at five ticks, and stone at speed 4 needs eight"
+        );
     }
 }

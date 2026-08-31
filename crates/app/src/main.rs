@@ -127,16 +127,22 @@ impl ApplicationHandler for App {
                         h,
                     );
                 }
-                // Left click breaks the targeted block, right click places one — but
-                // only while the cursor is captured (i.e. actually playing).
-                if self.cursor_captured && state == ElementState::Pressed {
-                    let edit = match button {
-                        MouseButton::Left => self.game.break_block(),
-                        MouseButton::Right => self.game.place_block(),
-                        _ => None,
-                    };
+                // Holding left mines the targeted block over several ticks
+                // (block 2.4b); right click places one. Both only while the
+                // cursor is captured (i.e. actually playing).
+                if self.cursor_captured && button == MouseButton::Left {
+                    // Held state, not an edge: mining advances for as long as
+                    // the button is down, and `Game::advance` reads it each
+                    // tick. The break itself happens on the tick the block
+                    // gives way, not here.
+                    self.game.set_breaking(state == ElementState::Pressed);
+                }
+                if self.cursor_captured
+                    && state == ElementState::Pressed
+                    && button == MouseButton::Right
+                {
                     // The game decides what changed; streaming re-meshes it.
-                    if let Some(cc) = edit {
+                    if let Some(cc) = self.game.place_block() {
                         streaming.invalidate(self.game.world(), cc);
                     }
                 }
@@ -151,7 +157,9 @@ impl ApplicationHandler for App {
                 // The only place `Instant::now()` appears -- `Game::advance` turns
                 // this wall-clock `dt` into fixed sim ticks without ever reading
                 // the clock itself (`ARCHITECTURE.md` Rule 1, §9).
-                self.game.advance(dt);
+                for cc in self.game.advance(dt) {
+                    streaming.invalidate(self.game.world(), cc);
+                }
                 let camera = self.game.camera_pose();
                 streaming.update(renderer, self.game.world(), camera.eye.to_array());
                 let slots = self.game.hotbar_slots();

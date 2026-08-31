@@ -289,6 +289,7 @@ mod tests {
                     shapes: vec![Shape::Full],
                     drops: DropRule::SameName,
                     requires_tier: 0,
+                    hardness: Some(1),
                 },
             )
         };

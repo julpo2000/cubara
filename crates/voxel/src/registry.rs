@@ -105,6 +105,15 @@ pub struct Material {
     /// it just yields nothing.
     #[serde(default)]
     pub requires_tier: u8,
+    /// How much work breaking this takes (`PHASE2_ARCHITECTURE.md` §4.3), against
+    /// the held tool's speed: `ticks = ceil(hardness / speed)`.
+    ///
+    /// **Absent means unbreakable**, not instant -- `Some(0)` is instant. A
+    /// block that forgot to declare hardness therefore becomes conspicuously
+    /// unminable rather than silently free, which is the failure that gets
+    /// noticed and fixed.
+    #[serde(default)]
+    pub hardness: Option<u32>,
 }
 
 /// What a block yields when broken.
@@ -221,6 +230,7 @@ struct Entry {
     file: PathBuf,
     drops: DropRule,
     requires_tier: u8,
+    hardness: Option<u32>,
 }
 
 /// Runtime block identity: which blocks exist, and the [`BlockId`]s assigned
@@ -280,6 +290,7 @@ impl BlockRegistry {
             file: PathBuf,
             drops: DropRule,
             requires_tier: u8,
+            hardness: Option<u32>,
         }
 
         let mut expanded: Vec<Expanded> = Vec::new();
@@ -309,6 +320,7 @@ impl BlockRegistry {
                     file: file.clone(),
                     drops: material.drops.clone(),
                     requires_tier: material.requires_tier,
+                    hardness: material.hardness,
                 });
             }
         }
@@ -328,6 +340,7 @@ impl BlockRegistry {
             // if it ever is reached.
             drops: DropRule::Nothing,
             requires_tier: 0,
+            hardness: None,
         }];
         let mut by_name = HashMap::new();
         by_name.insert("cubara:air".to_string(), BlockId::AIR);
@@ -342,6 +355,7 @@ impl BlockRegistry {
                 file: e.file,
                 drops: e.drops,
                 requires_tier: e.requires_tier,
+                hardness: e.hardness,
             });
         }
 
@@ -368,6 +382,12 @@ impl BlockRegistry {
             .get(id.0 as usize)
             .map(|e| e.requires_tier)
             .unwrap_or(u8::MAX)
+    }
+
+    /// How much work breaking `id` takes, or `None` if it cannot be broken
+    /// (§4.3). Air and unknown ids are unbreakable.
+    pub fn hardness(&self, id: BlockId) -> Option<u32> {
+        self.entries.get(id.0 as usize).and_then(|e| e.hardness)
     }
 
     /// Whether `id` is solid. Unknown ids (shouldn't happen -- a `Chunk` only
@@ -480,6 +500,7 @@ mod tests {
                 shapes: vec![Shape::Full],
                 drops: DropRule::SameName,
                 requires_tier: 0,
+                hardness: Some(1),
             },
         )
     }
@@ -498,6 +519,7 @@ mod tests {
                 shapes: vec![Shape::Full],
                 drops: DropRule::SameName,
                 requires_tier: 0,
+                hardness: Some(1),
             },
         )
     }
@@ -512,6 +534,7 @@ mod tests {
                 shapes: vec![Shape::Full],
                 drops: DropRule::SameName,
                 requires_tier: 0,
+                hardness: Some(1),
             },
         )
     }
@@ -634,6 +657,7 @@ mod tests {
                 shapes: vec![Shape::Full],
                 drops: DropRule::SameName,
                 requires_tier: 0,
+                hardness: Some(1),
             },
         );
         let b = (
@@ -645,6 +669,7 @@ mod tests {
                 shapes: vec![Shape::Full],
                 drops: DropRule::SameName,
                 requires_tier: 0,
+                hardness: Some(1),
             },
         );
         let err = BlockRegistry::from_materials(vec![a, b]).unwrap_err();
@@ -652,6 +677,30 @@ mod tests {
         assert!(msg.contains("cubara:stone"), "{msg}");
         assert!(msg.contains("a.ron"), "{msg}");
         assert!(msg.contains("b.ron"), "{msg}");
+    }
+
+    #[test]
+    fn a_material_without_hardness_is_unbreakable() {
+        // §4.3 chose "absent means unbreakable" over "absent means instant" so
+        // that a block file which forgets to declare hardness is conspicuously
+        // unminable rather than silently free. No shipped block relies on it --
+        // which is exactly why it is pinned here rather than in a game test.
+        let r = BlockRegistry::from_materials(vec![(
+            PathBuf::from("bedrock.ron"),
+            Material {
+                name: "cubara:bedrock".into(),
+                solid: true,
+                faces: Faces::All("stone".into()),
+                shapes: vec![Shape::Full],
+                drops: DropRule::Nothing,
+                requires_tier: 0,
+                hardness: None,
+            },
+        )])
+        .expect("valid");
+        let id = r.id_of("cubara:bedrock").expect("registered");
+        assert_eq!(r.hardness(id), None);
+        assert_eq!(r.hardness(BlockId::AIR), None, "air too");
     }
 
     #[test]
@@ -665,6 +714,7 @@ mod tests {
                 shapes: vec![],
                 drops: DropRule::SameName,
                 requires_tier: 0,
+                hardness: Some(1),
             },
         );
         let err = BlockRegistry::from_materials(vec![material]).unwrap_err();

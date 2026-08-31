@@ -4,4 +4,7 @@ Material(
     solid:  true,
     faces:  Sided(top: "bench_top", side: "bench_side", bottom: "plank"),
     shapes: [Full],
+    // Ticks of work at speed 1 (PHASE2_ARCHITECTURE.md 4.3). Absent would
+    // mean unbreakable, so every shipped block declares one.
+    hardness: Some(15),
 )

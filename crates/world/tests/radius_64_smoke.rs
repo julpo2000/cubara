@@ -39,6 +39,7 @@ fn test_registry() -> BlockRegistry {
             shapes: vec![Shape::Full],
             drops: DropRule::SameName,
             requires_tier: 0,
+            hardness: Some(1),
         },
     )])
     .expect("fixture registry is valid")

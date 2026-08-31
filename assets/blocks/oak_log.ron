@@ -4,4 +4,7 @@ Material(
     solid:  true,
     faces:  Sided(top: "oak_log_top", side: "oak_log_side", bottom: "oak_log_top"),
     shapes: [Full],
+    // Ticks of work at speed 1 (PHASE2_ARCHITECTURE.md 4.3). Absent would
+    // mean unbreakable, so every shipped block declares one.
+    hardness: Some(15),
 )

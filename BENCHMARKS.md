@@ -99,7 +99,8 @@ frames after 200 warmup.
 | 2026-08-30 | macOS baseline caught up to `main` — skirt fix, reversed-Z, mips, blocks 2.1–2.2, radius 64³⁵ | 1,585 | 758,754 | ~1,462 | **0.483 ms** | ~0.89 ms | `f9080f7` |
 | 2026-08-30 | **Oak trees via the structure pass** [#154], radius 64³⁵ | **1,600** | **766,476** | ~1,442 | **0.484 ms** | ~0.89 ms | `89ca231` |
 | 2026-08-31 | **Iron ore as a density-pass threshold** [#156], radius 64³⁶ | 1,600 | **822,420** | ~1,381 | 0.509 ms | ~0.86 ms | `a0b8108` |
-| 2026-08-31 | Drops and tool tiers from data [#158], radius 64³⁷ | 1,600 | 822,420 | ~1,385 | 0.509 ms | ~0.86 ms | *(this PR)* |
+| 2026-08-31 | Drops and tool tiers from data [#158], radius 64³⁷ | 1,600 | 822,420 | ~1,385 | 0.509 ms | ~0.86 ms | `b78ab56` |
+| 2026-08-31 | Mining takes time [#159], radius 64³⁷ | 1,600 | 822,420 | ~1,380 | 0.502 ms | ~0.92 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -1021,6 +1022,14 @@ against that row's ~1,381, and 0.509 ms CPU/frame against 0.509.
 Recorded rather than skipped because "it obviously cannot affect performance" is
 exactly the assumption worth spending one run to check; the row's value is the
 identical triangle count, not the FPS.
+
+The same applies to **mining time (#159)** on the row below it: 822,420
+triangles again, 1,380 FPS, 0.502 ms. Mining adds one `raycast` and a handful of
+integer operations per tick *while the break button is held*, and `--bench` holds
+nothing -- so the honest reading is that this row measures the unchanged scene,
+not the feature. What the feature costs when actually mining is one raycast per
+tick, which is the same raycast the block highlight (#52) already does every
+frame.
 
 ## Detailed run logs
 
