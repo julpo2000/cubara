@@ -394,3 +394,92 @@ unreliable — and netcode is where a missed lint costs most.
 Steps 1 and 2 are worth starting regardless of when the rest is scheduled,
 because both get harder as the codebase grows and neither commits to a
 player-count answer.
+
+---
+
+## §8 The client/server seam, concretely
+
+§7 step 2 is *"split `Game` into client and server halves, with singleplayer
+running the server in-process"*. This section is what that means against the code
+that exists, written before the work rather than during it.
+
+### §8.1 What `Game` owns today, and which side each field belongs to
+
+`Game` is currently one struct holding twenty-four fields. Sorting them is most
+of the design:
+
+| Field | Side | Why |
+|---|---|---|
+| `world`, `sim` | **both, separately** | See §8.2 — this is the interesting one. |
+| `blocks_registry`, `items`, `recipes`, `smelting`, `terrain` | **both** | Content definitions. Both sides need them; the server is authoritative about what they *mean*. |
+| `sim_centre` | server | Which chunks simulate is authority. |
+| `mining`, `breaking` | **client predicts, server decides** | Progress is display; the break is an edit. |
+| `inventory_open`, `open_furnace` | client | Screen state. A server does not care what you have open — §11 already calls `inventory_open` screen state rather than world state. |
+| `prev_player`, `accumulator` | client | Interpolation and frame pacing are presentation. |
+| `forward`…`look_delta`, `jump_pending` | client | Raw input, collapsed into an `InputFrame` and sent. |
+
+Two of those are already correct and worth noticing: `InputFrame` exists as a
+*value* precisely so it can be sent, and `Crafting`/`Inventory` already live on
+the player rather than on the screen.
+
+### §8.2 Both sides have a `World`, and that is the point
+
+The instinct is to share one `World` in singleplayer. **That defeats the
+exercise**: the seam only tells you something if the client cannot reach into
+the server's state, and an in-process shortcut is exactly the shortcut that will
+not exist over a socket.
+
+So both hold a `World`. This is affordable only because of §3.4: terrain is a
+pure function of the seed, so the client's copy is *generated*, not received.
+What the server sends is the edit overlay — which is already how `World` is
+built (`worldgen` + `edits`), and already what the save format persists.
+
+**The client's `World` is a replica, not a cache.** It may be wrong, briefly,
+between an optimistic prediction and the server's correction. Nothing may treat
+it as authority.
+
+### §8.3 The messages
+
+Small, and deliberately not a generic RPC:
+
+```
+client -> server   InputFrame (per tick)
+                   Action::{Break, Place, ClickSlot, Interact}
+
+server -> client   Edits(Vec<(pos, BlockId)>)
+                   PlayerState(position, velocity, health, inventory, …)
+                   Entities(spawned, moved, despawned)
+                   BlockEntities(changed)
+                   Tick(u64)
+```
+
+`Action` is separate from `InputFrame` on purpose. An input is *what the player
+did with the controls*; an action is *what they are asking the world to do*.
+Sending "mouse button down" and letting the server raycast means the server
+decides what was hit, which is what stops a client claiming it mined something
+across the map — the §3.4 rule, "may never be believed", made structural.
+
+### §8.4 What lands first, and what must not
+
+**First:** the seam, in-process, with no networking and no prediction. The
+client sends actions, the server applies them, the client applies the returned
+edits. Singleplayer will feel identical because the round trip is a function
+call.
+
+**Not first, and not in this block:** prediction and reconciliation. They are
+what makes a *remote* client feel good and they are pure latency compensation —
+building them before there is latency means building them against a round trip
+that is always zero, which cannot show whether they work.
+
+**The test that says it worked:** every existing gameplay test still passes,
+unchanged. If splitting the seam requires changing what a test asserts about
+breaking a block or opening a furnace, the split has changed behaviour and is
+wrong.
+
+### §8.5 The risk worth naming
+
+This is the largest refactor the project has attempted — larger than the render
+extraction in phase 1, because it cuts through the middle of the type every
+gameplay test drives. Its whole value is that it is **cheaper now than later**:
+at one player, ten thousand lines, and no netcode, the seam can be moved by
+changing which struct owns a field. After netcode exists it cannot.
