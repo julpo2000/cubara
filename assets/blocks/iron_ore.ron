@@ -1,12 +1,14 @@
 // Iron ore. Generated as a threshold in the density pass, not as a structure
 // (PHASE2_ARCHITECTURE.md §6) -- it replaces stone and never surfaces.
 //
-// No `drops` or `requires_tier` yet: §4 designs both, but Material carries
-// neither today, and a field the engine ignores is worse than no field.
-// Mining, tiers and drops are block 2.4.
+// Yields raw iron, not the ore block -- and only to a stone pick or better
+// (§4's tiers: 0 hand, 1 wood, 2 stone, 3 iron). A wooden pick still breaks
+// it, it just gets nothing, which is how the rule teaches itself.
 Material(
     name:   "cubara:iron_ore",
     solid:  true,
     faces:  All("iron_ore"),
     shapes: [Full],
+    drops:  Item((item: "cubara:raw_iron", count: 1)),
+    requires_tier: 2,
 )

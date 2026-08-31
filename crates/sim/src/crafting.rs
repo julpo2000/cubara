@@ -304,6 +304,7 @@ mod tests {
                     name: name.to_string(),
                     max_stack: max,
                     durability: dur,
+                    tier: 0,
                 },
             )
         };

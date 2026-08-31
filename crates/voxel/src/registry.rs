@@ -95,6 +95,50 @@ pub struct Material {
     pub solid: bool,
     pub faces: Faces,
     pub shapes: Vec<Shape>,
+    /// What breaking this yields (`PHASE2_ARCHITECTURE.md` §4). Absent means
+    /// [`DropRule::SameName`] -- see that type for why the three states are
+    /// named rather than `Option`.
+    #[serde(default)]
+    pub drops: DropRule,
+    /// The tool tier needed to get anything out of this block: **0 hand,
+    /// 1 wood, 2 stone, 3 iron** (§4). A lower tier still *breaks* the block;
+    /// it just yields nothing.
+    #[serde(default)]
+    pub requires_tier: u8,
+}
+
+/// What a block yields when broken.
+///
+/// **Three named states rather than `Option<ItemDrop>`**, which is a
+/// deliberate deviation from §4's sketch (`drops: Some(..)` / `drops: None`).
+/// `Option` has only two, and this needs three: *drop my own name* (the
+/// pre-2.4 policy, and what every block file that says nothing still means),
+/// *drop this specific item*, and *drop nothing at all*.
+///
+/// Writing that with `Option` would make an **omitted** field and an explicit
+/// `None` the same value -- so a new block file that simply forgot to mention
+/// `drops` would silently yield nothing. That exact failure already happened
+/// once in this project (§4.2: nine item files shipped, three blocks left
+/// without, and breaking them silently did nothing), and it is worth a small
+/// syntax deviation to make it unrepresentable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub enum DropRule {
+    /// Yield the item with the same name as this block. The default, so the
+    /// block files written before 2.4 keep their existing behaviour without
+    /// being edited.
+    #[default]
+    SameName,
+    /// Yield nothing, whatever tool is held. Leaves, per §5.
+    Nothing,
+    /// Yield exactly this.
+    Item(ItemDrop),
+}
+
+/// A specific drop: which item, and how many.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ItemDrop {
+    pub item: String,
+    pub count: u8,
 }
 
 /// A validation failure while building a [`BlockRegistry`]. Every variant
@@ -175,6 +219,8 @@ struct Entry {
     /// The file this entry was defined in, for [`RegistryError`] messages.
     /// Meaningless (empty) for air.
     file: PathBuf,
+    drops: DropRule,
+    requires_tier: u8,
 }
 
 /// Runtime block identity: which blocks exist, and the [`BlockId`]s assigned
@@ -232,6 +278,8 @@ impl BlockRegistry {
             solid: bool,
             faces: Faces,
             file: PathBuf,
+            drops: DropRule,
+            requires_tier: u8,
         }
 
         let mut expanded: Vec<Expanded> = Vec::new();
@@ -259,6 +307,8 @@ impl BlockRegistry {
                     solid: material.solid,
                     faces: material.faces.clone(),
                     file: file.clone(),
+                    drops: material.drops.clone(),
+                    requires_tier: material.requires_tier,
                 });
             }
         }
@@ -273,6 +323,11 @@ impl BlockRegistry {
             solid: false,
             faces: None,
             file: PathBuf::new(),
+            // Air is never broken, so this is unreachable rather than
+            // meaningful -- `Nothing` is the answer that cannot leak an item
+            // if it ever is reached.
+            drops: DropRule::Nothing,
+            requires_tier: 0,
         }];
         let mut by_name = HashMap::new();
         by_name.insert("cubara:air".to_string(), BlockId::AIR);
@@ -285,10 +340,34 @@ impl BlockRegistry {
                 solid: e.solid,
                 faces: Some(e.faces),
                 file: e.file,
+                drops: e.drops,
+                requires_tier: e.requires_tier,
             });
         }
 
         Ok(Self { entries, by_name })
+    }
+
+    /// What breaking `id` yields, before the tier check.
+    ///
+    /// Unknown ids report [`DropRule::Nothing`]: the safe answer, since it can
+    /// only ever cost a drop rather than invent one.
+    pub fn drops(&self, id: BlockId) -> DropRule {
+        self.entries
+            .get(id.0 as usize)
+            .map(|e| e.drops.clone())
+            .unwrap_or(DropRule::Nothing)
+    }
+
+    /// The tool tier `id` needs before it yields anything (§4).
+    ///
+    /// Unknown ids report `u8::MAX` -- nothing satisfies it. Same stance as
+    /// [`drops`](Self::drops): fail towards yielding nothing.
+    pub fn requires_tier(&self, id: BlockId) -> u8 {
+        self.entries
+            .get(id.0 as usize)
+            .map(|e| e.requires_tier)
+            .unwrap_or(u8::MAX)
     }
 
     /// Whether `id` is solid. Unknown ids (shouldn't happen -- a `Chunk` only
@@ -399,6 +478,8 @@ mod tests {
                 solid: true,
                 faces: Faces::All("stone".to_string()),
                 shapes: vec![Shape::Full],
+                drops: DropRule::SameName,
+                requires_tier: 0,
             },
         )
     }
@@ -415,6 +496,8 @@ mod tests {
                     bottom: "soil".to_string(),
                 },
                 shapes: vec![Shape::Full],
+                drops: DropRule::SameName,
+                requires_tier: 0,
             },
         )
     }
@@ -427,6 +510,8 @@ mod tests {
                 solid: true,
                 faces: Faces::All("soil".to_string()),
                 shapes: vec![Shape::Full],
+                drops: DropRule::SameName,
+                requires_tier: 0,
             },
         )
     }
@@ -547,6 +632,8 @@ mod tests {
                 solid: true,
                 faces: Faces::All("stone".to_string()),
                 shapes: vec![Shape::Full],
+                drops: DropRule::SameName,
+                requires_tier: 0,
             },
         );
         let b = (
@@ -556,6 +643,8 @@ mod tests {
                 solid: true,
                 faces: Faces::All("stone".to_string()),
                 shapes: vec![Shape::Full],
+                drops: DropRule::SameName,
+                requires_tier: 0,
             },
         );
         let err = BlockRegistry::from_materials(vec![a, b]).unwrap_err();
@@ -574,6 +663,8 @@ mod tests {
                 solid: true,
                 faces: Faces::All("stone".to_string()),
                 shapes: vec![],
+                drops: DropRule::SameName,
+                requires_tier: 0,
             },
         );
         let err = BlockRegistry::from_materials(vec![material]).unwrap_err();

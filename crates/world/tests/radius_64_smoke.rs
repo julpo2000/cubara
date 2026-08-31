@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cubara_voxel::{BlockRegistry, ChunkCoord, Faces, Material, MeshContext, Shape};
+use cubara_voxel::{BlockRegistry, ChunkCoord, DropRule, Faces, Material, MeshContext, Shape};
 use cubara_world::{streaming, OreSet, TerrainBlocks, World};
 
 const RADIUS: i32 = 64;
@@ -37,6 +37,8 @@ fn test_registry() -> BlockRegistry {
             solid: true,
             faces: Faces::All("stone".to_string()),
             shapes: vec![Shape::Full],
+            drops: DropRule::SameName,
+            requires_tier: 0,
         },
     )])
     .expect("fixture registry is valid")

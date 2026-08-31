@@ -20,7 +20,9 @@ use cubara_render::{swatch_color, HotbarSlot, InventoryPanel, PanelSlotKind};
 use cubara_sim::{InputFrame, Player, Sim, REACH, TICK_DT};
 use cubara_sim::{SlotRef, HOTBAR_WIDTH};
 use cubara_voxel::ChunkCoord;
-use cubara_voxel::{BlockId, BlockRegistry, ItemRegistry, RecipeBook};
+use cubara_voxel::{
+    BlockId, BlockRegistry, DropRule, ItemRegistry, ItemStack, ItemState, RecipeBook,
+};
 use cubara_world::TerrainBlocks;
 use cubara_world::World;
 
@@ -359,13 +361,24 @@ impl Game {
             .and_then(|r| r.id_of("cubara:crafting_bench"));
     }
 
-    /// Break the targeted block and put its item in the inventory.
+    /// Break the targeted block and put its drop in the inventory.
     ///
-    /// The drop is one-for-one **by name**: the block `cubara:oak_log` yields
-    /// the item `cubara:oak_log`. A block with no matching item yields nothing.
-    /// That is the placeholder policy `PHASE2_ARCHITECTURE.md` §4.1 records --
-    /// §4's `drops:` and `requires_tier:` fields are block 2.4's work, and
-    /// doing it by name now avoids inventing a data format 2.4 will replace.
+    /// **The break always happens; the drop is conditional.** Three things
+    /// decide what you get (`PHASE2_ARCHITECTURE.md` §4, block 2.4a):
+    ///
+    /// 1. The block's [`DropRule`] -- its own name, a specific item, or
+    ///    nothing.
+    /// 2. Its `requires_tier` against the held tool's tier. **Too low a tier
+    ///    still breaks the block, but yields nothing.** §4 chose that over
+    ///    refusing to break: a block that will not break with no explanation
+    ///    reads as a bug, where one that breaks and drops nothing teaches the
+    ///    rule in one go.
+    /// 3. Whether an item of that name exists at all.
+    ///
+    /// **Durability is spent only on a break that yielded something.** A
+    /// failed-tier break costs nothing -- §4: you are not punished twice for
+    /// the same mistake. Breaking bare-handed costs nothing either, since only
+    /// a tool carries durability.
     ///
     /// **A drop that does not fit is lost.** There are no dropped-item entities
     /// yet (they need ECS, 2.5), so the remainder `Inventory::add` hands back is
@@ -392,11 +405,28 @@ impl Game {
             self.items.as_ref(),
         ) {
             let broken = self.world.block_at(x, y, z, terrain);
-            match registry
-                .name_of(broken)
-                .and_then(|name| items.id_of(name))
-                .and_then(|item| items.new_stack(item, 1).ok())
-            {
+            let held = self.sim.player.inventory.selected_stack();
+            let held_tier = held.map(|s| items.tier(s.item())).unwrap_or(0);
+
+            let drop = if held_tier < registry.requires_tier(broken) {
+                log::debug!(
+                    "{} needs tier {}, holding tier {held_tier}: breaks, yields nothing",
+                    registry.name_of(broken).unwrap_or("?"),
+                    registry.requires_tier(broken),
+                );
+                None
+            } else {
+                match registry.drops(broken) {
+                    DropRule::Nothing => None,
+                    DropRule::SameName => registry
+                        .name_of(broken)
+                        .and_then(|name| items.id_of(name))
+                        .map(|item| (item, 1u8)),
+                    DropRule::Item(d) => items.id_of(&d.item).map(|item| (item, d.count)),
+                }
+            };
+
+            match drop.and_then(|(item, count)| items.new_stack(item, count).ok()) {
                 Some(stack) => {
                     if let Some(lost) = self.sim.player.inventory.add(stack, items) {
                         log::debug!(
@@ -405,15 +435,55 @@ impl Game {
                             lost.count()
                         );
                     }
+                    // Only a break that yielded something wears the tool.
+                    self.wear_held_tool();
                 }
                 None => log::debug!(
-                    "{} has no item of the same name; it drops nothing",
+                    "{} yielded nothing",
                     registry.name_of(broken).unwrap_or("?")
                 ),
             }
         }
 
         Some(Arc::make_mut(&mut self.world).set_block(x, y, z, BlockId::AIR))
+    }
+
+    /// Spend one point of the held tool's durability, removing the stack when
+    /// it reaches zero (`PHASE2_ARCHITECTURE.md` §4, decision C).
+    ///
+    /// A no-op for anything that is not a tool: only an item declaring
+    /// `durability` carries [`ItemState::Durability`], so an empty hand or a
+    /// stack of planks falls through untouched.
+    ///
+    /// The worn stack is rebuilt rather than mutated because `ItemStack`
+    /// enforces its own invariant (a stack with state is a stack of one), and
+    /// going through `ItemStack::new` is what keeps that enforcement in one
+    /// place.
+    fn wear_held_tool(&mut self) {
+        let Some(items) = self.items.as_ref() else {
+            return;
+        };
+        let inv = &mut self.sim.player.inventory;
+        let slot = inv.selected_slot() as usize;
+        let Some(stack) = inv.slot(slot) else {
+            return;
+        };
+        let ItemState::Durability { remaining } = stack.state() else {
+            return;
+        };
+        let left = remaining.saturating_sub(1);
+        if left == 0 {
+            inv.set_slot(slot, None);
+            return;
+        }
+        let worn = ItemStack::new(
+            stack.item(),
+            stack.count(),
+            ItemState::Durability { remaining: left },
+            items.max_stack(stack.item()),
+        )
+        .ok();
+        inv.set_slot(slot, worn);
     }
 
     /// Place the held hotbar item's block against the targeted face, consuming
@@ -1175,5 +1245,196 @@ mod tests {
 
         assert_eq!(steady.sim.tick, jittery.sim.tick);
         assert_eq!(steady.sim.player, jittery.sim.player);
+    }
+
+    /// Put `block` directly in front of the player and aim at it, so a test can
+    /// choose which material it breaks rather than taking whatever terrain is
+    /// underfoot. Returns the position it was placed at.
+    fn stand_over(game: &mut Game, block_name: &str) -> [i32; 3] {
+        let id = game
+            .blocks_registry
+            .as_ref()
+            .unwrap()
+            .id_of(block_name)
+            .unwrap_or_else(|| panic!("no block {block_name}"));
+        let ground = game
+            .world()
+            .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
+            .expect("ground below");
+        let b = ground.block;
+        Arc::make_mut(&mut game.world).set_block(b[0], b[1], b[2], id);
+        b
+    }
+
+    /// Give the player `item` in the selected hotbar slot.
+    fn hold(game: &mut Game, item: &str) {
+        let items = game.items.as_ref().unwrap();
+        let id = items
+            .id_of(item)
+            .unwrap_or_else(|| panic!("no item {item}"));
+        let stack = items.new_stack(id, 1).expect("a stack of one");
+        let slot = game.sim.player.inventory.selected_slot() as usize;
+        game.sim.player.inventory.set_slot(slot, Some(stack));
+    }
+
+    fn count_of(game: &Game, item: &str) -> u8 {
+        let items = game.items.as_ref().unwrap();
+        let Some(id) = items.id_of(item) else {
+            return 0;
+        };
+        (0..cubara_sim::SLOT_COUNT)
+            .filter_map(|i| game.sim.player.inventory.slot(i))
+            .filter(|s| s.item() == id)
+            .map(|s| s.count())
+            .sum()
+    }
+
+    #[test]
+    fn a_tool_below_the_required_tier_breaks_the_block_but_yields_nothing() {
+        // §4's rule, and the reason it was chosen over refusing to break: the
+        // block goes, the drop does not. Iron ore needs tier 2; a wooden pick
+        // is tier 1.
+        let (mut game, _) = game_looking_at_ground();
+        let b = stand_over(&mut game, "cubara:iron_ore");
+        hold(&mut game, "cubara:wooden_pick");
+
+        game.break_block().expect("a block was in reach");
+
+        assert!(
+            !game.world().is_solid_at(b[0], b[1], b[2], game.terrain()),
+            "the block still breaks"
+        );
+        assert_eq!(count_of(&game, "cubara:raw_iron"), 0, "but yields nothing");
+    }
+
+    #[test]
+    fn the_required_tier_yields_the_declared_drop_not_the_block() {
+        // The other half: a stone pick is tier 2, so iron ore yields
+        // `cubara:raw_iron` -- the declared drop, and *not* an item named after
+        // the block, which is what the pre-2.4a policy would have given.
+        let (mut game, _) = game_looking_at_ground();
+        stand_over(&mut game, "cubara:iron_ore");
+        hold(&mut game, "cubara:stone_pick");
+
+        game.break_block().expect("a block was in reach");
+
+        assert_eq!(count_of(&game, "cubara:raw_iron"), 1);
+        assert_eq!(count_of(&game, "cubara:iron_ore"), 0);
+    }
+
+    #[test]
+    fn stone_yields_cobble() {
+        let (mut game, _) = game_looking_at_ground();
+        stand_over(&mut game, "cubara:stone");
+        hold(&mut game, "cubara:wooden_pick");
+
+        game.break_block().expect("a block was in reach");
+
+        assert_eq!(count_of(&game, "cubara:cobble"), 1);
+        assert_eq!(count_of(&game, "cubara:stone"), 0);
+    }
+
+    #[test]
+    fn stone_by_hand_yields_nothing() {
+        // requires_tier 1, and the empty hand is tier 0.
+        let (mut game, _) = game_looking_at_ground();
+        stand_over(&mut game, "cubara:stone");
+
+        game.break_block().expect("a block was in reach");
+
+        assert_eq!(count_of(&game, "cubara:cobble"), 0);
+    }
+
+    #[test]
+    fn leaves_yield_nothing_whatever_is_held() {
+        // `drops: Nothing` ignores the tool entirely -- an iron pick is tier 3
+        // and still gets no leaves.
+        let (mut game, _) = game_looking_at_ground();
+        stand_over(&mut game, "cubara:oak_leaves");
+        hold(&mut game, "cubara:iron_pick");
+
+        game.break_block().expect("a block was in reach");
+
+        assert_eq!(count_of(&game, "cubara:oak_leaves"), 0);
+    }
+
+    #[test]
+    fn a_successful_break_costs_one_durability() {
+        let (mut game, _) = game_looking_at_ground();
+        stand_over(&mut game, "cubara:stone");
+        hold(&mut game, "cubara:stone_pick");
+        let before = match game.sim.player.inventory.selected_stack().unwrap().state() {
+            ItemState::Durability { remaining } => remaining,
+            other => panic!("a pick should carry durability, got {other:?}"),
+        };
+
+        game.break_block().expect("a block was in reach");
+
+        let after = match game.sim.player.inventory.selected_stack().unwrap().state() {
+            ItemState::Durability { remaining } => remaining,
+            other => panic!("still a pick, got {other:?}"),
+        };
+        assert_eq!(after, before - 1);
+    }
+
+    #[test]
+    fn a_failed_tier_break_costs_no_durability() {
+        // §4: you are not punished twice for the same mistake.
+        let (mut game, _) = game_looking_at_ground();
+        stand_over(&mut game, "cubara:iron_ore");
+        hold(&mut game, "cubara:wooden_pick");
+        let before = match game.sim.player.inventory.selected_stack().unwrap().state() {
+            ItemState::Durability { remaining } => remaining,
+            other => panic!("a pick should carry durability, got {other:?}"),
+        };
+
+        game.break_block().expect("a block was in reach");
+
+        let after = match game.sim.player.inventory.selected_stack().unwrap().state() {
+            ItemState::Durability { remaining } => remaining,
+            other => panic!("still a pick, got {other:?}"),
+        };
+        assert_eq!(after, before, "the wasted swing cost nothing");
+    }
+
+    #[test]
+    fn a_tool_at_zero_durability_leaves_the_slot() {
+        let (mut game, _) = game_looking_at_ground();
+        let items = game.items.as_ref().unwrap();
+        let pick = items.id_of("cubara:stone_pick").unwrap();
+        let nearly_dead = ItemStack::new(
+            pick,
+            1,
+            ItemState::Durability { remaining: 1 },
+            items.max_stack(pick),
+        )
+        .expect("a worn pick");
+        let slot = game.sim.player.inventory.selected_slot() as usize;
+        game.sim.player.inventory.set_slot(slot, Some(nearly_dead));
+        stand_over(&mut game, "cubara:stone");
+
+        game.break_block().expect("a block was in reach");
+
+        assert!(
+            game.sim.player.inventory.slot(slot).is_none(),
+            "the spent tool is gone"
+        );
+        assert_eq!(
+            count_of(&game, "cubara:cobble"),
+            1,
+            "the last break counted"
+        );
+    }
+
+    #[test]
+    fn breaking_bare_handed_is_not_an_error() {
+        // Nothing to wear, and the hand is tier 0 -- soil requires nothing, so
+        // this still yields.
+        let (mut game, _) = game_looking_at_ground();
+        stand_over(&mut game, "cubara:soil");
+
+        game.break_block().expect("a block was in reach");
+
+        assert_eq!(count_of(&game, "cubara:soil"), 1);
     }
 }

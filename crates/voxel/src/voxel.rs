@@ -644,7 +644,7 @@ fn push_skirt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{Faces, Material, Shape};
+    use crate::registry::{DropRule, Faces, Material, Shape};
 
     fn empty() -> Chunk {
         Chunk {
@@ -675,6 +675,8 @@ mod tests {
                 solid: true,
                 faces: Faces::All("stone".to_string()),
                 shapes: vec![Shape::Full],
+                drops: DropRule::SameName,
+                requires_tier: 0,
             },
         )])
         .expect("fixture registry is valid")
@@ -780,6 +782,8 @@ mod tests {
                     solid: true,
                     faces: Faces::All(tex.to_string()),
                     shapes: vec![Shape::Full],
+                    drops: DropRule::SameName,
+                    requires_tier: 0,
                 },
             )
         };
@@ -1050,6 +1054,8 @@ mod tests {
                     solid: true,
                     faces: Faces::All("stone".to_string()),
                     shapes: vec![Shape::Full],
+                    drops: DropRule::SameName,
+                    requires_tier: 0,
                 },
             ),
             (
@@ -1059,6 +1065,8 @@ mod tests {
                     solid: true,
                     faces: Faces::All("soil".to_string()),
                     shapes: vec![Shape::Full],
+                    drops: DropRule::SameName,
+                    requires_tier: 0,
                 },
             ),
         ])
@@ -1103,6 +1111,8 @@ mod tests {
                     bottom: "soil".to_string(),
                 },
                 shapes: vec![Shape::Full],
+                drops: DropRule::SameName,
+                requires_tier: 0,
             },
         )])
         .unwrap();

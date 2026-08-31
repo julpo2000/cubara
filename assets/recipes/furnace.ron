@@ -1,4 +1,4 @@
-// Eight stone in a ring. The only 3x3 recipe with a hole in it, which is
+// Eight cobble in a ring. The only 3x3 recipe with a hole in it, which is
 // also the clearest proof that a space means 'must be empty'.
 Recipe(
     name:    "cubara:furnace",
@@ -8,7 +8,7 @@ Recipe(
         "SSS",
     ],
     key: {
-        'S': "cubara:stone",
+        'S': "cubara:cobble",
     },
     output: (item: "cubara:furnace", count: 1),
 )

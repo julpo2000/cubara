@@ -278,7 +278,7 @@ mod tests {
     use super::*;
     use crate::streaming;
     use crate::worldgen::OreSet;
-    use cubara_voxel::{BlockRegistry, Faces, Material, MeshContext, Shape};
+    use cubara_voxel::{BlockRegistry, DropRule, Faces, Material, MeshContext, Shape};
 
     /// A registry with a single solid material -- air (0) plus one other
     /// material sorts to id 1, matching `BlockId::STONE`, which is what
@@ -294,6 +294,8 @@ mod tests {
                 solid: true,
                 faces: Faces::All("stone".to_string()),
                 shapes: vec![Shape::Full],
+                drops: DropRule::SameName,
+                requires_tier: 0,
             },
         )])
         .expect("fixture registry is valid")

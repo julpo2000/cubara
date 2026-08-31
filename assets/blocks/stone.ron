@@ -3,4 +3,11 @@ Material(
     solid:  true,
     faces:  All("stone"),
     shapes: [Full],
+    // Mined stone comes up as cobble, which is what the `cubara:cobble` item
+    // has been waiting for -- `stone_pick.ron` carried the note that block 2.4
+    // might switch to it, and this is that switch. Placing stone back down is
+    // a later crafting step, not a drop.
+    drops:  Item((item: "cubara:cobble", count: 1)),
+    // Bare hands get nothing out of stone; any pick does.
+    requires_tier: 1,
 )
