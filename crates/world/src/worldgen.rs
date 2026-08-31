@@ -8,7 +8,7 @@
 //! unedited chunk be regenerated instead of saved (§7.4) and a far LOD node
 //! sample its own volume with no neighbours to ask (§6).
 
-use cubara_voxel::{BlockId, BlockRegistry, Chunk, StructureRegistry};
+use cubara_voxel::{BlockId, BlockRegistry, Chunk, OreRegistry, StructureRegistry};
 
 use crate::noise::{fbm2, fbm3};
 
@@ -34,6 +34,90 @@ pub struct TerrainBlocks {
     /// structure data was supplied -- a world with no trees, which every test
     /// that predates block 2.3 still expects.
     pub oak: Option<Oak>,
+    /// The ores that replace deep material, checked in slot order with the
+    /// first match winning. Empty when no ore data was supplied -- a world of
+    /// plain stone, which every test that predates block 2.3b still expects.
+    pub ores: OreSet,
+}
+
+/// The ores a world generates, as a fixed-size set.
+///
+/// **Fixed-size rather than a `Vec` because [`TerrainBlocks`] is `Copy`** and
+/// is passed by value through every per-voxel path in this file; a heap
+/// allocation there would be a per-voxel cost for a list that never has more
+/// than a handful of entries.
+///
+/// Four slots rather than one deliberately: a single `Option<Iron>` would be
+/// smaller, but it would make a second ore a code change instead of a data
+/// file, and `REQUIREMENTS.md` #3 asks for the opposite.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct OreSet {
+    ores: [Option<OreGen>; MAX_ORES],
+}
+
+/// How many distinct ores one world can generate. Raising it costs a few
+/// bytes in a `Copy` struct and nothing else.
+pub const MAX_ORES: usize = 4;
+
+impl OreSet {
+    /// The ore-free set: plain stone everywhere.
+    pub const EMPTY: Self = Self {
+        ores: [None; MAX_ORES],
+    };
+
+    /// Append an ore, ignoring it once the set is full.
+    ///
+    /// Silently ignoring rather than panicking, for the same reason
+    /// [`TerrainBlocks::with_oak`] tolerates missing data: a world missing its
+    /// fifth ore is a worse world, not a broken one, and a data file should
+    /// not be able to crash the game at startup.
+    fn push(&mut self, ore: OreGen) {
+        if let Some(slot) = self.ores.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(ore);
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &OreGen> {
+        self.ores.iter().flatten()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ores.iter().all(|s| s.is_none())
+    }
+}
+
+/// One ore, resolved: ids instead of names, and the tuning numbers from
+/// `assets/ores/*.ron` converted from the integers the file stores.
+///
+/// Ore is a *material* choice, never a density one -- it replaces a solid
+/// block with a different solid block. That is what keeps it out of the
+/// three-path problem trees have (`PHASE2_ARCHITECTURE.md` §6): solidity is
+/// identical with and without ore, so `is_solid` need not know it exists, and
+/// `generate` (LOD) can include it safely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OreGen {
+    pub block: BlockId,
+    /// Only this material becomes ore. Deep material only, so ore can never
+    /// surface and never hollows out a trunk.
+    pub replaces: BlockId,
+    /// The highest `y` this ore appears at.
+    pub max_y: i32,
+    /// Noise above this becomes ore, in **thousandths**, exactly as the data
+    /// file stores it.
+    ///
+    /// Kept as the integer rather than converted at load, for two reasons that
+    /// point the same way: it keeps this struct (and so [`TerrainBlocks`])
+    /// `Eq`, which an `f32` field would forbid; and it puts the single
+    /// IEEE-defined conversion at the one place the comparison happens, so
+    /// there is no rounding step between the file and the decision. §8.5 wants
+    /// that decision bit-identical across platforms.
+    threshold_milli: i32,
+    /// Noise frequency per 1000 blocks. See
+    /// [`threshold_milli`](Self::threshold_milli).
+    freq_milli: i32,
+    /// Keeps two ores from generating in exactly the same places. Derived
+    /// from the ore's name, so it is stable across runs and platforms.
+    seed_mix: u64,
 }
 
 /// The oak, resolved: ids instead of names, and the shape numbers from
@@ -94,6 +178,40 @@ impl TerrainBlocks {
         self
     }
 
+    /// Add every ore in `ores`, resolved from `registry` by name.
+    ///
+    /// A builder rather than a parameter on [`from_registry`](Self::from_registry)
+    /// for exactly the reason [`with_oak`](Self::with_oak) is one: the many
+    /// callers that pin terrain shape, round-trip a save, or seed the
+    /// determinism fixture keep a one-argument constructor and an ore-free
+    /// world, so this change cannot move a single existing expectation. Only
+    /// the callers that render or play the real world opt in.
+    ///
+    /// Ores are taken in **name order** ([`OreRegistry::sorted`]) and checked
+    /// in that order, first match winning, so which ore wins an overlap is a
+    /// property of the data and not of hash iteration order (Rule 1).
+    ///
+    /// An ore whose blocks are missing from `registry` is skipped, not fatal:
+    /// same reasoning as `with_oak`.
+    pub fn with_ores(mut self, ores: &OreRegistry, registry: &BlockRegistry) -> Self {
+        for def in ores.sorted() {
+            let (Some(block), Some(replaces)) =
+                (registry.id_of(&def.name), registry.id_of(&def.replaces))
+            else {
+                continue;
+            };
+            self.ores.push(OreGen {
+                block,
+                replaces,
+                max_y: def.max_y,
+                threshold_milli: def.threshold,
+                freq_milli: def.freq,
+                seed_mix: ore_seed_mix(&def.name),
+            });
+        }
+        self
+    }
+
     /// Resolve `cubara:grass`/`cubara:soil`/`cubara:stone` from `registry` by
     /// name -- the one place every real caller (the live renderer, the
     /// headless bench/screenshot paths) gets its `TerrainBlocks` from, so the
@@ -107,6 +225,7 @@ impl TerrainBlocks {
         };
         Self {
             oak: None,
+            ores: OreSet::EMPTY,
             grass: id("cubara:grass"),
             soil: id("cubara:soil"),
             stone: id("cubara:stone"),
@@ -146,6 +265,33 @@ const CAVE_THRESHOLD: f32 = 0.6;
 const CAVE_CARVE_AMOUNT: f32 = 1_000_000.0;
 const CAVE_SEED_MIX: u64 = 0xD6E8_FEB8_6659_FD93;
 
+// Ore shape. Each ore carries its own frequency and threshold from its data
+// file (`assets/ores/*.ron`); what is fixed here is the *kind* of noise, which
+// is an algorithm rather than a number to tune. One octave, like caves: ore
+// wants compact blobs, and extra octaves only add detail far below the size of
+// a single block.
+const ORE_OCTAVES: u32 = 1;
+const ORE_LACUNARITY: f32 = 2.0;
+const ORE_GAIN: f32 = 0.5;
+/// Keeps ore noise from being cave noise reused -- without it, ore would line
+/// every cave wall, since both would cross their thresholds in the same cells.
+const ORE_SEED_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// A per-ore seed offset derived from its name.
+///
+/// FNV-1a rather than [`std::collections::hash_map::DefaultHasher`]: the
+/// standard hasher is explicitly not stable across Rust releases, and a world
+/// whose ore positions move when the toolchain updates would violate Rule 1 in
+/// a way no test on one machine would ever catch.
+fn ore_seed_mix(name: &str) -> u64 {
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+    for b in name.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    h
+}
+
 /// Bumped whenever a change in this file could change already-generated
 /// terrain's shape -- any of the constants above, `density_at`,
 /// `surface_height`, or the noise functions themselves. Save/load (block
@@ -153,7 +299,7 @@ const CAVE_SEED_MIX: u64 = 0xD6E8_FEB8_6659_FD93;
 /// old save's *unedited* chunks are regenerated on load (§7.4), so a
 /// changed generator would silently reshape the world around the player's
 /// edits if this weren't checked -- the failure mode §7.4 names directly.
-pub const WORLDGEN_VERSION: u32 = 1;
+pub const WORLDGEN_VERSION: u32 = 2;
 
 /// Seeded terrain + cave generator. See the module docs and
 /// `docs/PHASE1_ARCHITECTURE.md` §8 for the contract this must hold to.
@@ -313,15 +459,52 @@ impl WorldGen {
     /// not near the surface except at the rare mouth where a tunnel
     /// breaches it, and a breach is exactly where grass at a cave wall
     /// would be correct anyway).
-    fn material_at(&self, y: i32, surface: i32, blocks: TerrainBlocks) -> BlockId {
+    fn material_at(&self, x: i32, y: i32, z: i32, surface: i32, blocks: TerrainBlocks) -> BlockId {
         let depth = surface - y;
         if depth <= 0 {
             blocks.grass
         } else if depth <= SOIL_DEPTH {
             blocks.soil
         } else {
-            blocks.stone
+            self.ore_or(x, y, z, blocks.stone, blocks.ores)
         }
+    }
+
+    /// `stone`, or an ore that replaces it at this position
+    /// (`PHASE2_ARCHITECTURE.md` §6).
+    ///
+    /// **This is a material substitution and nothing else.** It is reached
+    /// only where the caller has already decided the voxel is solid and deep,
+    /// and it returns a solid block in every case -- so adding an ore cannot
+    /// change any world's shape, which is what lets `generate` (LOD) call it
+    /// safely where the structure pass deliberately is not called at all.
+    ///
+    /// Returns early on an empty set, which is every test that predates block
+    /// 2.3b and every world built without `with_ores`: no noise is sampled, so
+    /// an ore-free world costs exactly what it did before.
+    fn ore_or(&self, x: i32, y: i32, z: i32, stone: BlockId, ores: OreSet) -> BlockId {
+        if ores.is_empty() {
+            return stone;
+        }
+        for ore in ores.iter() {
+            if ore.replaces != stone || y > ore.max_y {
+                continue;
+            }
+            let freq = ore.freq_milli as f32 * 0.001;
+            let n = fbm3(
+                self.seed ^ ORE_SEED_MIX ^ ore.seed_mix,
+                x as f32 * freq,
+                y as f32 * freq,
+                z as f32 * freq,
+                ORE_OCTAVES,
+                ORE_LACUNARITY,
+                ORE_GAIN,
+            );
+            if n > ore.threshold_milli as f32 * 0.001 {
+                return ore.block;
+            }
+        }
+        stone
     }
 
     /// The trees whose volume can reach anything in this chunk column: at most
@@ -392,7 +575,7 @@ impl WorldGen {
         //
         // The density check is the second half: a cave can carve the ground
         // out from under a surface height, and a tree must not grow on air.
-        if self.material_at(surface, surface, blocks) != oak.grows_on
+        if self.material_at(x, surface, z, surface, blocks) != oak.grows_on
             || self.density_at(x, surface, z, surface) <= 0.0
         {
             return None;
@@ -455,7 +638,8 @@ impl WorldGen {
         surface: i32,
         blocks: TerrainBlocks,
     ) -> Option<BlockId> {
-        (self.density_at(x, y, z, surface) > 0.0).then(|| self.material_at(y, surface, blocks))
+        (self.density_at(x, y, z, surface) > 0.0)
+            .then(|| self.material_at(x, y, z, surface, blocks))
     }
 
     /// The block at a world position, or `None` for air. Exposed for
@@ -575,6 +759,7 @@ mod tests {
     fn test_blocks() -> TerrainBlocks {
         TerrainBlocks {
             oak: None,
+            ores: OreSet::EMPTY,
             grass: BlockId(1),
             soil: BlockId(2),
             stone: BlockId(3),
@@ -606,19 +791,19 @@ mod tests {
         let surface = gen.surface_height(0, 0);
 
         assert_eq!(
-            gen.material_at(surface, surface, blocks),
+            gen.material_at(0, surface, 0, surface, blocks),
             blocks.grass,
             "surface"
         );
         for depth in 1..=SOIL_DEPTH {
             assert_eq!(
-                gen.material_at(surface - depth, surface, blocks),
+                gen.material_at(0, surface - depth, 0, surface, blocks),
                 blocks.soil,
                 "depth {depth}"
             );
         }
         assert_eq!(
-            gen.material_at(surface - SOIL_DEPTH - 1, surface, blocks),
+            gen.material_at(0, surface - SOIL_DEPTH - 1, 0, surface, blocks),
             blocks.stone,
             "below the soil layer"
         );
@@ -658,6 +843,7 @@ mod tests {
                 canopy_radius: 2,
                 density: 4,
             }),
+            ores: OreSet::EMPTY,
             grass: BlockId(1),
             soil: BlockId(2),
             stone: BlockId(3),
@@ -860,5 +1046,163 @@ mod tests {
             }
         }
         assert_eq!(hash, 0x680f_9807_8f35_e325);
+    }
+
+    /// A world with one ore, tuned like `assets/ores/iron.ron` but with the
+    /// synthetic palette the rest of these tests use.
+    fn ore_blocks() -> TerrainBlocks {
+        let mut ores = OreSet::EMPTY;
+        ores.push(OreGen {
+            block: BlockId(20),
+            replaces: BlockId(3), // stone
+            max_y: 40,
+            threshold_milli: 800,
+            freq_milli: 350,
+            seed_mix: ore_seed_mix("cubara:iron_ore"),
+        });
+        TerrainBlocks {
+            ores,
+            ..test_blocks()
+        }
+    }
+
+    const ORE: BlockId = BlockId(20);
+
+    #[test]
+    fn ore_generates_at_all() {
+        // The tuning is data, but "some ore exists" is the floor below which
+        // the whole block is pointless, and a typo in the threshold would sail
+        // past every other test here.
+        let gen = WorldGen::new(0x5EED);
+        let blocks = ore_blocks();
+        let found = (-40..40)
+            .flat_map(|x| (0..40).map(move |y| (x, y)))
+            .any(|(x, y)| gen.block_at(x, y, 7, blocks) == Some(ORE));
+        assert!(found, "no ore anywhere in the probed volume");
+    }
+
+    #[test]
+    fn ore_only_ever_replaces_stone() {
+        // Never grass, never soil, never a tree block, never air. This is the
+        // property that keeps ore from surfacing or hollowing out a trunk.
+        let gen = WorldGen::new(0x5EED);
+        let plain = ore_blocks();
+        let bare = test_blocks();
+        for x in -30..30 {
+            for z in -30..30 {
+                for y in 0..40 {
+                    let with = gen.block_at(x, y, z, plain);
+                    let without = gen.block_at(x, y, z, bare);
+                    if with != without {
+                        assert_eq!(with, Some(ORE), "at ({x},{y},{z})");
+                        assert_eq!(
+                            without,
+                            Some(bare.stone),
+                            "ore replaced something that was not stone at ({x},{y},{z})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_ore_above_its_max_y() {
+        let gen = WorldGen::new(0x5EED);
+        let blocks = ore_blocks();
+        let max_y = blocks.ores.iter().next().unwrap().max_y;
+        for x in -30..30 {
+            for z in -30..30 {
+                for y in (max_y + 1)..(max_y + 60) {
+                    assert_ne!(
+                        gen.block_at(x, y, z, blocks),
+                        Some(ORE),
+                        "ore above max_y at ({x},{y},{z})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ore_never_changes_whether_a_voxel_is_solid() {
+        // The load-bearing property of §6, and the reason ore -- unlike a tree
+        // -- is safe in `generate`/LOD: it is a material substitution, so
+        // `is_solid` (raycast, player collision) need not know it exists. If
+        // this ever fails, ore has become a structure and the three-path
+        // problem is back.
+        let gen = WorldGen::new(0x5EED);
+        let plain = ore_blocks();
+        let bare = test_blocks();
+        for x in -30..30 {
+            for z in -30..30 {
+                for y in 0..50 {
+                    assert_eq!(
+                        gen.block_at(x, y, z, plain).is_some(),
+                        gen.block_at(x, y, z, bare).is_some(),
+                        "solidity changed at ({x},{y},{z})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_ore_free_world_is_bit_identical_to_one_generated_before_ores_existed() {
+        // `with_ores` is opt-in precisely so that every caller that does not
+        // ask for ore -- the save fixture, the determinism harness, every
+        // terrain-shape test -- generates exactly what it generated before.
+        let gen = WorldGen::new(0x5EED);
+        let a = gen.generate([0, 0, 0], 1, test_blocks());
+        let b = gen.generate(
+            [0, 0, 0],
+            1,
+            TerrainBlocks {
+                ores: OreSet::EMPTY,
+                ..test_blocks()
+            },
+        );
+        assert!(chunks_equal(&a, &b));
+    }
+
+    #[test]
+    fn the_same_seed_and_position_always_give_the_same_ore() {
+        // Rule 1. The ore's seed mix comes from an FNV hash of its name rather
+        // than `DefaultHasher`, which is not stable across Rust releases.
+        let gen = WorldGen::new(0x5EED);
+        let blocks = ore_blocks();
+        let once = gen.generate([0, 0, 0], 1, blocks);
+        let twice = gen.generate([0, 0, 0], 1, blocks);
+        assert!(chunks_equal(&once, &twice));
+        assert_eq!(
+            ore_seed_mix("cubara:iron_ore"),
+            ore_seed_mix("cubara:iron_ore")
+        );
+        assert_ne!(
+            ore_seed_mix("cubara:iron_ore"),
+            ore_seed_mix("cubara:coal_ore")
+        );
+    }
+
+    #[test]
+    fn lod_nodes_do_contain_ore() {
+        // The deliberate opposite of `lod_nodes_contain_no_tree_blocks`. A
+        // structure must not appear at level > 0 (one stray voxel); a material
+        // must, or distant terrain would be a different colour than near
+        // terrain and the LOD boundary would be visible as a seam.
+        let gen = WorldGen::new(0x5EED);
+        let blocks = ore_blocks();
+        let node = gen.generate([-64, 0, -64], 8, blocks);
+        let mut any = false;
+        for z in 0..Chunk::SIZE {
+            for y in 0..Chunk::SIZE {
+                for x in 0..Chunk::SIZE {
+                    if node.get(x, y, z) == ORE {
+                        any = true;
+                    }
+                }
+            }
+        }
+        assert!(any, "no ore in an LOD node -- §6 wants ore at every level");
     }
 }

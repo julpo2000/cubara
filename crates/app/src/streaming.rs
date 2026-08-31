@@ -73,13 +73,16 @@ impl NodeStreaming {
     pub fn new(
         registry: Arc<BlockRegistry>,
         structures: &cubara_voxel::StructureRegistry,
+        ores: &cubara_voxel::OreRegistry,
         layer_of: impl Fn(&str) -> u32 + Send + Sync + 'static,
     ) -> Self {
         Self {
             // Resolved once, here, and carried with every meshing job.
             // Meshing used to re-derive this per node from the registry, which
             // was both wasted work and blind to structures (block 2.3a).
-            blocks: TerrainBlocks::from_registry(&registry).with_oak(structures, &registry),
+            blocks: TerrainBlocks::from_registry(&registry)
+                .with_oak(structures, &registry)
+                .with_ores(ores, &registry),
             registry,
             layer_of: Arc::new(layer_of),
             mesh_pool: MeshPool::new(),

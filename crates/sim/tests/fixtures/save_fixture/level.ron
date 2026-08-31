@@ -1,6 +1,6 @@
 (
     format_version: 1,
-    worldgen_version: 1,
+    worldgen_version: 2,
     seed: 71755617007496449,
     tick: 120,
     rng: (

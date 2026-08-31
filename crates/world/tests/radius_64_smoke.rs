@@ -21,7 +21,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cubara_voxel::{BlockRegistry, ChunkCoord, Faces, Material, MeshContext, Shape};
-use cubara_world::{streaming, TerrainBlocks, World};
+use cubara_world::{streaming, OreSet, TerrainBlocks, World};
 
 const RADIUS: i32 = 64;
 
@@ -117,6 +117,7 @@ fn radius_64_world_load_settles_within_budget() {
                 let stone = registry.id_of("cubara:stone").unwrap();
                 let blocks = TerrainBlocks {
                     oak: None,
+                    ores: OreSet::EMPTY,
                     grass: stone,
                     soil: stone,
                     stone,

@@ -1,0 +1,12 @@
+// Iron ore. Generated as a threshold in the density pass, not as a structure
+// (PHASE2_ARCHITECTURE.md §6) -- it replaces stone and never surfaces.
+//
+// No `drops` or `requires_tier` yet: §4 designs both, but Material carries
+// neither today, and a field the engine ignores is worse than no field.
+// Mining, tiers and drops are block 2.4.
+Material(
+    name:   "cubara:iron_ore",
+    solid:  true,
+    faces:  All("iron_ore"),
+    shapes: [Full],
+)

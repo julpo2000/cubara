@@ -16,7 +16,9 @@ use std::sync::Arc;
 
 use cubara_render::{grab_cursor, HotbarView, PanelView, Profiler, Renderer};
 
-use crate::game::{load_item_registry, load_recipe_book, load_structure_registry, Game};
+use crate::game::{
+    load_item_registry, load_ore_registry, load_recipe_book, load_structure_registry, Game,
+};
 use crate::streaming::NodeStreaming;
 
 use winit::application::ApplicationHandler;
@@ -61,9 +63,11 @@ impl ApplicationHandler for App {
         let recipes = load_recipe_book(&items);
         self.game.set_assets(registry.clone(), items, recipes);
         let structures = load_structure_registry();
+        let ores = load_ore_registry();
         self.streaming = Some(NodeStreaming::new(
             registry,
             &structures,
+            &ores,
             move |name: &str| layers.layer_of(name),
         ));
         self.renderer = Some(renderer);

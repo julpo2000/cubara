@@ -1,0 +1,20 @@
+// Iron: the ore REQUIREMENTS #5 names. Deep enough that finding it is a trip
+// underground, common enough that the trip succeeds.
+//
+// threshold and freq are integers, not floats, on purpose: the placement
+// decision must be bit-identical across platforms (PHASE1_ARCHITECTURE.md
+// §8.5). See crates/voxel/src/ore.rs.
+//
+// Tuned by measuring, not by eye. At this pair, iron is ~1% of all stone below
+// max_y, in veins averaging ~3.6 blocks (median 2, largest ~29). The first
+// guess was freq 45, which read as ~0.5% -- but that was a small-sample
+// artifact of a low-frequency field sampled over a small box, and the real
+// figure was ~5%: a handful of 400-block iron boulders rather than ore. Higher
+// freq is what makes a vein vein-sized; threshold is what makes it rare.
+Ore(
+    name:      "cubara:iron_ore",
+    replaces:  "cubara:stone",
+    max_y:     40,
+    threshold: 800,
+    freq:      350,
+)
