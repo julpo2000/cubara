@@ -101,7 +101,8 @@ frames after 200 warmup.
 | 2026-08-31 | **Iron ore as a density-pass threshold** [#156], radius 64³⁶ | 1,600 | **822,420** | ~1,381 | 0.509 ms | ~0.86 ms | `a0b8108` |
 | 2026-08-31 | Drops and tool tiers from data [#158], radius 64³⁷ | 1,600 | 822,420 | ~1,385 | 0.509 ms | ~0.86 ms | `b78ab56` |
 | 2026-08-31 | Mining takes time [#159], radius 64³⁷ | 1,600 | 822,420 | ~1,380 | 0.502 ms | ~0.92 ms | `d4ee268` |
-| 2026-08-31 | The furnace: block entities, wood fuel, smelting [#160], radius 64³⁷ | 1,600 | 822,420 | ~1,381 | 0.499 ms | ~0.90 ms | *(this PR)* |
+| 2026-08-31 | The furnace: block entities, wood fuel, smelting [#160], radius 64³⁷ | 1,600 | 822,420 | ~1,381 | 0.499 ms | ~0.90 ms | `19f0fa9` |
+| 2026-08-31 | ECS + dropped items [#56], radius 64³⁷ | 1,600 | 822,420 | ~1,381 | 0.505 ms | ~0.86 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -1039,6 +1040,14 @@ measurable. What it costs *with* furnaces is one `BTreeMap` walk plus a handful
 of integer operations per furnace per tick -- worth measuring properly when
 block 2.6/2.7 make dormant chunks a thing and a world can hold thousands of
 them, which is exactly the scenario those blocks exist to make cheap.
+
+**The ECS and dropped items (#56)** is the fourth: 822,420 triangles, 1,381 FPS,
+0.505 ms. `--bench` drops nothing, so `Sim::tick_entities` returns on its
+`is_empty` guard and `hecs` never allocates an archetype. The row's value is the
+**identical triangle count** confirming a new dependency in `cubara-sim` changed
+nothing about the scene -- and confirming the guard: adding an ECS to the tick
+loop is exactly the kind of change that could have cost something per frame
+whether or not there were entities, and it did not.
 
 ## Detailed run logs
 

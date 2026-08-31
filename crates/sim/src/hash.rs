@@ -197,7 +197,30 @@ impl WorldHash {
         total.write_sim(sim);
         total.write_hash(hash_region(world, region, blocks, thread_count));
         total.write_block_entities(world);
+        total.write_entities(sim);
         total
+    }
+
+    /// Fold in every entity, **in `EntityKey` order** (`PHASE2_ARCHITECTURE.md`
+    /// §10.2 rule 3).
+    ///
+    /// `Entities::sorted` is what guarantees the order; hashing the raw query
+    /// would make this depend on `hecs` archetype layout, which is exactly the
+    /// Rule 1 violation §10.2 exists to prevent.
+    ///
+    /// The `EntityKey` itself is hashed, not just the contents: two worlds where
+    /// the same items were dropped in a different sequence *are* different
+    /// worlds, and the next key each would hand out differs.
+    fn write_entities(&mut self, sim: &Sim) {
+        for (key, d) in sim.entities.sorted() {
+            self.write_u64(key.0);
+            self.write_u16(d.stack.item().0);
+            self.write_u8(d.stack.count());
+            self.write_f32(d.pos.x);
+            self.write_f32(d.pos.y);
+            self.write_f32(d.pos.z);
+            self.write_u32(d.age);
+        }
     }
 
     /// Fold in every block entity, in position order (`PHASE2_ARCHITECTURE.md`

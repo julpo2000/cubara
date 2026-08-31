@@ -8,4 +8,7 @@ ItemDef(
     name:       "cubara:iron_ingot",
     max_stack:  64,
     durability: None,
+    // A real trip's worth of work: 30 minutes on the floor, not 5
+    // (PHASE2_ARCHITECTURE.md 10.5).
+    rarity:     Uncommon,
 )

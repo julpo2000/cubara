@@ -9,6 +9,7 @@
 //! window-free, so all of it is testable with no adapter and no window.
 
 mod crafting;
+pub mod entity;
 mod hash;
 mod input;
 mod inventory;
@@ -18,6 +19,7 @@ mod rng;
 mod save;
 
 pub use crafting::{Crafting, SlotRef};
+pub use entity::{despawn_ticks, DroppedItem, Entities, EntityKey, PICKUP_RADIUS};
 pub use hash::{hash_region, WorldHash};
 pub use input::InputFrame;
 pub use inventory::{Inventory, HOTBAR_WIDTH, SLOT_COUNT};
@@ -54,6 +56,10 @@ pub struct Sim {
     /// not decide what's selected (issue #52's Rule 3 boundary) -- this
     /// field is the seam.
     pub target: Option<[i32; 3]>,
+    /// Everything on the floor (`PHASE2_ARCHITECTURE.md` §10). Ticked here,
+    /// so dropped items fall and despawn on the same fixed clock the player
+    /// walks on -- Rule 1.
+    pub entities: Entities,
 }
 
 impl Sim {
@@ -63,6 +69,7 @@ impl Sim {
             rng: WorldRng::new(seed, 0),
             player,
             target: None,
+            entities: Entities::default(),
         }
     }
 
@@ -84,6 +91,27 @@ impl Sim {
     /// `blocks` is which ids the terrain is made of. The tick needs it because
     /// trees are solid (block 2.3a) and a tree is specific ids -- the density
     /// field alone can no longer answer "can I walk here".
+    /// One tick of the entities, and the player picking up whatever is in
+    /// reach (§10.4).
+    ///
+    /// Separate from [`tick`](Self::tick) only because it needs the item
+    /// registry, which the sim does not otherwise carry -- the caller has it.
+    /// It is still called once per fixed step, from the same loop.
+    pub fn tick_entities(
+        &mut self,
+        world: &World,
+        blocks: TerrainBlocks,
+        items: &cubara_voxel::ItemRegistry,
+    ) {
+        if self.entities.is_empty() {
+            return;
+        }
+        self.entities
+            .tick(TICK_DT, items, |x, y, z| world.is_solid_at(x, y, z, blocks));
+        self.entities
+            .collect_nearby(self.player.pos, &mut self.player.inventory, items);
+    }
+
     pub fn tick(&mut self, world: &mut World, input: &InputFrame, blocks: TerrainBlocks) {
         if input.toggle_fly {
             self.player.free_fly = !self.player.free_fly;

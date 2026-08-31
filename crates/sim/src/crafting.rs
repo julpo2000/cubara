@@ -290,8 +290,14 @@ impl Crafting {
     ///
     /// Returns `true` when everything fit. Anything that did not is **left
     /// where it was**, and the caller should keep the screen open: refusing to
-    /// close is more honest than eating the items, and dropping them on the
-    /// floor needs entities that do not exist until ECS (2.5).
+    /// close is more honest than eating the items.
+    ///
+    /// Since block 2.5 there *is* a floor to drop them on (§10.4), so this
+    /// could instead always close and spill the remainder. It deliberately does
+    /// not: nothing is lost either way, and "the screen stays open because your
+    /// inventory is full" is a clearer thing to have happen than items you did
+    /// not ask to drop appearing at your feet. Worth revisiting if it annoys
+    /// in play -- which is the owner's call, not this function's.
     pub fn close(&mut self, inventory: &mut Inventory, items: &ItemRegistry) -> bool {
         let mut all_fit = true;
         for i in 0..MAX_GRID * MAX_GRID {
@@ -320,7 +326,7 @@ impl Crafting {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cubara_voxel::{ItemDef, ItemId, RecipeDef, RecipeOutputDef};
+    use cubara_voxel::{ItemDef, ItemId, Rarity, RecipeDef, RecipeOutputDef};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -335,6 +341,7 @@ mod tests {
                     tier: 0,
                     speed: None,
                     burn_ticks: None,
+                    rarity: Rarity::Common,
                 },
             )
         };

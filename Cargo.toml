@@ -22,6 +22,10 @@ puffin_http = "0.16"
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { version = "1", features = ["derive"] }
 ron = "0.8"
+# A data store, not a framework: a `World` is a plain value the sim owns and
+# passes in (Rule 2), with no scheduler competing with the fixed-timestep loop.
+# See docs/PHASE2_ARCHITECTURE.md §10.1.
+hecs = "0.11"
 
 # Optimize dependencies even in debug builds so the engine is playable while we
 # still get fast incremental compiles on our own crates.

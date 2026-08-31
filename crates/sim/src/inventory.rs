@@ -177,7 +177,7 @@ impl Inventory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cubara_voxel::{ItemDef, ItemId, ItemRegistry};
+    use cubara_voxel::{ItemDef, ItemId, ItemRegistry, Rarity};
     use std::path::PathBuf;
 
     fn registry() -> ItemRegistry {
@@ -191,6 +191,7 @@ mod tests {
                     tier: 0,
                     speed: None,
                     burn_ticks: None,
+                    rarity: Rarity::Common,
                 },
             )
         };

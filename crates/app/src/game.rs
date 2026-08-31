@@ -95,6 +95,11 @@ struct Mining {
     progress: u32,
 }
 
+/// The middle of block `b`, where an item dropped by breaking it appears.
+fn drop_centre(b: [i32; 3]) -> glam::Vec3 {
+    glam::Vec3::new(b[0] as f32 + 0.5, b[1] as f32 + 0.5, b[2] as f32 + 0.5)
+}
+
 pub struct Game {
     /// The world being played. Behind an [`Arc`] so meshing jobs can carry the exact
     /// snapshot they were queued against; an edit publishes a new one.
@@ -358,6 +363,11 @@ impl Game {
                 dirty.push(cc);
             }
             self.tick_furnaces();
+            // Dropped items fall, age out, and get picked up -- on the same
+            // fixed clock as everything else (§10.4, Rule 1).
+            if let Some(items) = self.items.as_ref() {
+                self.sim.tick_entities(&self.world, terrain, items);
+            }
             input.jump = false;
             input.toggle_fly = false;
             input.look_delta = [0.0, 0.0];
@@ -536,10 +546,23 @@ impl Game {
     /// so the two cannot drift apart on what a break *yields*.
     fn break_at(&mut self, block: [i32; 3]) -> ChunkCoord {
         let [x, y, z] = block;
-        // Whatever state the block owned goes with it (§7). Its contents are
-        // lost rather than spilled: dropped-item entities need ECS (block 2.5),
-        // and quietly moving them to the player would be a rule nobody decided.
-        Arc::make_mut(&mut self.world).remove_block_entity(block);
+        // Whatever state the block owned goes with it (§7) -- but its contents
+        // now spill onto the floor rather than being destroyed (block 2.5,
+        // §10.4). This is one of the five sites that used to lose items.
+        if let Some(f) = Arc::make_mut(&mut self.world).remove_block_entity(block) {
+            let contents: Vec<_> = [f.input, f.fuel, f.output].into_iter().flatten().collect();
+            if let Some(items) = self.items.as_ref() {
+                let spawned: Vec<_> = contents
+                    .into_iter()
+                    .filter_map(|(id, count)| items.new_stack(id, count).ok())
+                    .collect();
+                for stack in spawned {
+                    self.sim
+                        .entities
+                        .spawn_item(stack, drop_centre(block), glam::Vec3::ZERO);
+                }
+            }
+        }
         if self.open_furnace == Some(block) {
             self.open_furnace = None;
             self.inventory_open = false;
@@ -583,12 +606,12 @@ impl Game {
 
             match drop.and_then(|(item, count)| items.new_stack(item, count).ok()) {
                 Some(stack) => {
-                    if let Some(lost) = self.sim.player.inventory.add(stack, items) {
-                        log::debug!(
-                            "inventory full: {} x{} lost (no dropped-item entities until ECS, 2.5)",
-                            items.name_of(lost.item()).unwrap_or("?"),
-                            lost.count()
-                        );
+                    // Block 2.5: what does not fit falls on the floor rather
+                    // than being destroyed (§10.4).
+                    if let Some(rest) = self.sim.player.inventory.add(stack, items) {
+                        self.sim
+                            .entities
+                            .spawn_item(rest, drop_centre(block), glam::Vec3::ZERO);
                     }
                     // Only a break that yielded something wears the tool.
                     self.wear_held_tool();
@@ -2128,5 +2151,69 @@ mod tests {
             Some((raw, 2)),
             "contents stayed in the furnace"
         );
+    }
+
+    #[test]
+    fn a_drop_that_does_not_fit_falls_on_the_floor_instead_of_vanishing() {
+        // Block 2.5's whole reason for existing. Before this, the item was
+        // logged and destroyed.
+        let (mut game, _) = game_looking_at_ground();
+        let b = stand_over(&mut game, "cubara:soil");
+        // Fill every slot with something that will not stack with soil.
+        let raw = item(&game, "cubara:raw_iron");
+        for i in 0..cubara_sim::SLOT_COUNT {
+            let full = game.items.as_ref().unwrap().new_stack(raw, 64).unwrap();
+            game.sim.player.inventory.set_slot(i, Some(full));
+        }
+
+        game.break_at(b);
+
+        assert_eq!(game.sim.entities.len(), 1, "the drop is on the floor");
+        let (_, d) = game.sim.entities.sorted()[0];
+        assert_eq!(
+            game.items.as_ref().unwrap().name_of(d.stack.item()),
+            Some("cubara:soil")
+        );
+    }
+
+    #[test]
+    fn a_broken_furnace_spills_its_contents() {
+        let (mut game, _) = game_looking_at_ground();
+        let pos = open_a_furnace(&mut game);
+        let raw = item(&game, "cubara:raw_iron");
+        let log = item(&game, "cubara:oak_log");
+        {
+            let f = Arc::make_mut(&mut game.world).furnace_at_mut(pos).unwrap();
+            f.input = Some((raw, 4));
+            f.fuel = Some((log, 2));
+        }
+
+        game.break_at(pos);
+
+        // Three would-be-lost stacks: input, fuel, and the furnace's own drop
+        // goes to the inventory, so two entities plus whatever did not fit.
+        assert!(
+            game.sim.entities.len() >= 2,
+            "input and fuel are on the floor, got {}",
+            game.sim.entities.len()
+        );
+    }
+
+    #[test]
+    fn walking_over_a_dropped_item_picks_it_up() {
+        let (mut game, _) = game_looking_at_ground();
+        let stack = {
+            let items = game.items.as_ref().unwrap();
+            let id = items.id_of("cubara:cobble").unwrap();
+            items.new_stack(id, 7).unwrap()
+        };
+        // Right where the player is standing.
+        let at = game.sim.player.pos;
+        game.sim.entities.spawn_item(stack, at, glam::Vec3::ZERO);
+
+        game.advance(TICK_DT);
+
+        assert_eq!(game.sim.entities.len(), 0, "collected");
+        assert_eq!(count_of(&game, "cubara:cobble"), 7);
     }
 }

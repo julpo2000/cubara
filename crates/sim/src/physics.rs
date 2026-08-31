@@ -46,6 +46,19 @@ struct Aabb {
 }
 
 impl Aabb {
+    /// A box `half` wide and `half` tall in every direction, centred on
+    /// `centre` -- what a dropped item is (§10.4).
+    fn cube(centre: Vec3, half: f32) -> Self {
+        Self {
+            min: centre - Vec3::splat(half),
+            max: centre + Vec3::splat(half),
+        }
+    }
+
+    fn centre(&self) -> Vec3 {
+        (self.min + self.max) * 0.5
+    }
+
     fn from_feet(feet: Vec3) -> Self {
         Self {
             min: Vec3::new(feet.x - HALF_WIDTH, feet.y, feet.z - HALF_WIDTH),
@@ -111,6 +124,47 @@ pub(crate) fn step(
 
     let feet = aabb.feet();
     player.pos = Vec3::new(feet.x, feet.y + EYE_HEIGHT, feet.z);
+}
+
+/// Half-extent of a dropped item's collision box. Small enough to rest in a
+/// one-block hole, big enough not to tunnel through a floor at terminal
+/// velocity within one tick.
+pub(crate) const ITEM_HALF: f32 = 0.125;
+
+/// Advance one fixed tick of a dropped item (`PHASE2_ARCHITECTURE.md` §10.4).
+///
+/// **Reuses [`move_axis`]**, the same swept resolution the player walks with,
+/// rather than integrating separately -- Rule 5. An item is simply a smaller
+/// box with no input and no step-up.
+///
+/// Returns whether it came to rest on the ground, which is what stops a
+/// resting item from accumulating downward velocity forever.
+pub(crate) fn step_item(
+    pos: &mut Vec3,
+    velocity: &mut Vec3,
+    dt: f32,
+    is_solid: impl Fn(i32, i32, i32) -> bool,
+) -> bool {
+    velocity.y -= GRAVITY * dt;
+    let aabb = Aabb::cube(*pos, ITEM_HALF);
+
+    let (aabb, y_blocked, y_negative) = move_axis(aabb, 1, velocity.y * dt, &is_solid);
+    let on_ground = y_blocked && y_negative;
+    if y_blocked {
+        velocity.y = 0.0;
+    }
+    // Horizontal drift, so an item pushed out of a broken block does not stack
+    // exactly on its neighbour. No step-up: items do not climb stairs.
+    let aabb = move_axis(aabb, 0, velocity.x * dt, &is_solid).0;
+    let aabb = move_axis(aabb, 2, velocity.z * dt, &is_solid).0;
+
+    if on_ground {
+        // Friction, so a dropped stack settles instead of sliding forever.
+        velocity.x = 0.0;
+        velocity.z = 0.0;
+    }
+    *pos = aabb.centre();
+    on_ground
 }
 
 /// The two axis indices other than `axis` (0 = x, 1 = y, 2 = z).
