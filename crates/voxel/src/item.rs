@@ -168,6 +168,13 @@ pub struct ItemDef {
     /// different numbers, rather than one being a special case.
     #[serde(default)]
     pub speed: Option<u32>,
+    /// How long one of these burns in a furnace, in ticks
+    /// (`PHASE2_ARCHITECTURE.md` §7). **Absent means this is not fuel.**
+    ///
+    /// A property of the item rather than a separate fuel table, so "can this
+    /// go in the fuel slot" is one lookup that cannot disagree with itself.
+    #[serde(default)]
+    pub burn_ticks: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -241,6 +248,7 @@ struct Entry {
     durability: Option<u16>,
     tier: u8,
     speed: Option<u32>,
+    burn_ticks: Option<u32>,
 }
 
 /// Which items exist, and the runtime ids assigned to them.
@@ -325,6 +333,7 @@ impl ItemRegistry {
             durability: None,
             tier: 0,
             speed: None,
+            burn_ticks: None,
         }];
         let mut by_name = HashMap::new();
         by_name.insert("cubara:none".to_string(), ItemId::NONE);
@@ -338,6 +347,7 @@ impl ItemRegistry {
                 durability: def.durability,
                 tier: def.tier,
                 speed: def.speed,
+                burn_ticks: def.burn_ticks,
             });
         }
 
@@ -375,6 +385,11 @@ impl ItemRegistry {
     /// it can only ever cost a drop, never grant one.
     pub fn tier(&self, id: ItemId) -> u8 {
         self.entries.get(id.0 as usize).map(|e| e.tier).unwrap_or(0)
+    }
+
+    /// How long one `id` burns for, or `None` if it is not fuel (§7).
+    pub fn burn_ticks(&self, id: ItemId) -> Option<u32> {
+        self.entries.get(id.0 as usize).and_then(|e| e.burn_ticks)
     }
 
     /// How fast `id` breaks blocks (§4.3). **1** for anything that does not
@@ -415,6 +430,7 @@ mod tests {
                 durability,
                 tier: 0,
                 speed: None,
+                burn_ticks: None,
             },
         )
     }

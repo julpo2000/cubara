@@ -19,6 +19,10 @@ pub enum PanelSlotKind {
     Inventory,
     Grid,
     Result,
+    /// A furnace's fuel slot. Distinct from [`Grid`](Self::Grid) because a
+    /// furnace's two inputs are not interchangeable -- putting a log where the
+    /// ore goes should not smelt it.
+    Fuel,
 }
 
 /// One slot's place on screen, in pixels from the top-left.
@@ -150,6 +154,53 @@ impl InventoryPanel {
         }
     }
 
+    /// A furnace screen: input above fuel on the left, output on the right,
+    /// with the same inventory and hotbar below.
+    ///
+    /// Built from [`layout`](Self::layout)'s 1-wide form rather than as a
+    /// second layout routine, so the inventory half -- which is most of the
+    /// panel, and all of the fiddly index mapping -- has exactly one
+    /// implementation (Rule 5). Only the three furnace slots are positioned
+    /// here; `Grid(0)` is reused as the input slot, since a furnace input *is*
+    /// a one-cell grid as far as the click router is concerned.
+    pub fn layout_furnace(width: u32, height: u32) -> Self {
+        // Built on the **2-wide** form, not the 1-wide one: the furnace stacks
+        // input above fuel, so it needs two rows of vertical space in the
+        // crafting area. A 1-wide base reserves one, and the fuel slot would
+        // then overlap the first row of the inventory below it.
+        let mut panel = Self::layout(width, height, 2);
+        const PAD: f32 = 16.0;
+        let step = SLOT + GAP;
+        let ox = panel.x + PAD;
+        let oy = panel.y + PAD;
+
+        // Keep only grid cell 0 as the input; the other three cells of the 2x2
+        // base have no meaning here.
+        panel
+            .slots
+            .retain(|s| s.kind != PanelSlotKind::Grid || s.index == 0);
+
+        // Output to the right, vertically centred against the input/fuel pair.
+        for slot in &mut panel.slots {
+            if slot.kind == PanelSlotKind::Result {
+                slot.x = ox + 2.0 * step;
+                slot.y = oy + step * 0.5;
+            }
+        }
+
+        // Fuel directly below the input -- the arrangement the genre uses, and
+        // so the one a player will guess at. Its bottom edge lands exactly on
+        // the base layout's crafting-area height, so nothing below moves.
+        panel.slots.push(PanelSlot {
+            kind: PanelSlotKind::Fuel,
+            index: 0,
+            x: ox,
+            y: oy + step,
+            size: SLOT,
+        });
+        panel
+    }
+
     pub fn slots(&self) -> &[PanelSlot] {
         &self.slots
     }
@@ -171,6 +222,55 @@ impl InventoryPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_furnace_panel_has_three_slots_that_do_not_overlap_the_inventory() {
+        let p = InventoryPanel::layout_furnace(1920, 1080);
+        let furnace: Vec<&PanelSlot> = p
+            .slots()
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.kind,
+                    PanelSlotKind::Grid | PanelSlotKind::Fuel | PanelSlotKind::Result
+                )
+            })
+            .collect();
+        assert_eq!(furnace.len(), 3, "input, fuel, output -- and nothing else");
+
+        // The bug this pins: a 1-wide base reserves one row of crafting height,
+        // so the fuel slot underneath the input would sit on top of the first
+        // inventory row.
+        let inv_top = p
+            .slots()
+            .iter()
+            .filter(|s| s.kind == PanelSlotKind::Inventory)
+            .map(|s| s.y)
+            .fold(f32::INFINITY, f32::min);
+        for s in &furnace {
+            assert!(
+                s.y + s.size <= inv_top + 0.001,
+                "{:?} at y={} overlaps the inventory at y={inv_top}",
+                s.kind,
+                s.y
+            );
+        }
+    }
+
+    #[test]
+    fn a_click_finds_the_furnace_fuel_slot() {
+        let p = InventoryPanel::layout_furnace(1920, 1080);
+        let fuel = p
+            .slots()
+            .iter()
+            .find(|s| s.kind == PanelSlotKind::Fuel)
+            .copied()
+            .expect("a fuel slot");
+        assert_eq!(
+            p.hit(fuel.x + 1.0, fuel.y + 1.0),
+            Some((PanelSlotKind::Fuel, 0))
+        );
+    }
 
     fn panel() -> InventoryPanel {
         InventoryPanel::layout(1280, 720, 2)

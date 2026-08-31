@@ -114,6 +114,32 @@ pub struct Material {
     /// noticed and fixed.
     #[serde(default)]
     pub hardness: Option<u32>,
+    /// What right-clicking this block does, if anything.
+    #[serde(default)]
+    pub interact: Interact,
+}
+
+/// What right-clicking a block does.
+///
+/// **A property of the block, replacing the name comparison** that `Game`
+/// used while the bench was the only case. That comparison carried a note
+/// saying block 2.4 was the point to generalise it, "with two real cases to
+/// design against" -- the furnace is the second, and this is that
+/// generalisation.
+///
+/// Deliberately a small closed vocabulary rather than a script hook: every
+/// variant here is a screen the renderer already knows how to draw, and an
+/// open-ended `on_use` would be inventing a modding API two phases before
+/// anything asks for one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum Interact {
+    /// Nothing; placing or breaking is all it does.
+    #[default]
+    None,
+    /// Opens the 3x3 crafting grid.
+    Bench,
+    /// Opens the furnace's input/fuel/output screen.
+    Furnace,
 }
 
 /// What a block yields when broken.
@@ -231,6 +257,7 @@ struct Entry {
     drops: DropRule,
     requires_tier: u8,
     hardness: Option<u32>,
+    interact: Interact,
 }
 
 /// Runtime block identity: which blocks exist, and the [`BlockId`]s assigned
@@ -291,6 +318,7 @@ impl BlockRegistry {
             drops: DropRule,
             requires_tier: u8,
             hardness: Option<u32>,
+            interact: Interact,
         }
 
         let mut expanded: Vec<Expanded> = Vec::new();
@@ -321,6 +349,7 @@ impl BlockRegistry {
                     drops: material.drops.clone(),
                     requires_tier: material.requires_tier,
                     hardness: material.hardness,
+                    interact: material.interact,
                 });
             }
         }
@@ -341,6 +370,7 @@ impl BlockRegistry {
             drops: DropRule::Nothing,
             requires_tier: 0,
             hardness: None,
+            interact: Interact::None,
         }];
         let mut by_name = HashMap::new();
         by_name.insert("cubara:air".to_string(), BlockId::AIR);
@@ -356,6 +386,7 @@ impl BlockRegistry {
                 drops: e.drops,
                 requires_tier: e.requires_tier,
                 hardness: e.hardness,
+                interact: e.interact,
             });
         }
 
@@ -382,6 +413,14 @@ impl BlockRegistry {
             .get(id.0 as usize)
             .map(|e| e.requires_tier)
             .unwrap_or(u8::MAX)
+    }
+
+    /// What right-clicking `id` does.
+    pub fn interact(&self, id: BlockId) -> Interact {
+        self.entries
+            .get(id.0 as usize)
+            .map(|e| e.interact)
+            .unwrap_or(Interact::None)
     }
 
     /// How much work breaking `id` takes, or `None` if it cannot be broken
@@ -501,6 +540,7 @@ mod tests {
                 drops: DropRule::SameName,
                 requires_tier: 0,
                 hardness: Some(1),
+                interact: Interact::None,
             },
         )
     }
@@ -520,6 +560,7 @@ mod tests {
                 drops: DropRule::SameName,
                 requires_tier: 0,
                 hardness: Some(1),
+                interact: Interact::None,
             },
         )
     }
@@ -535,6 +576,7 @@ mod tests {
                 drops: DropRule::SameName,
                 requires_tier: 0,
                 hardness: Some(1),
+                interact: Interact::None,
             },
         )
     }
@@ -658,6 +700,7 @@ mod tests {
                 drops: DropRule::SameName,
                 requires_tier: 0,
                 hardness: Some(1),
+                interact: Interact::None,
             },
         );
         let b = (
@@ -670,6 +713,7 @@ mod tests {
                 drops: DropRule::SameName,
                 requires_tier: 0,
                 hardness: Some(1),
+                interact: Interact::None,
             },
         );
         let err = BlockRegistry::from_materials(vec![a, b]).unwrap_err();
@@ -695,6 +739,7 @@ mod tests {
                 drops: DropRule::Nothing,
                 requires_tier: 0,
                 hardness: None,
+                interact: Interact::None,
             },
         )])
         .expect("valid");
@@ -715,6 +760,7 @@ mod tests {
                 drops: DropRule::SameName,
                 requires_tier: 0,
                 hardness: Some(1),
+                interact: Interact::None,
             },
         );
         let err = BlockRegistry::from_materials(vec![material]).unwrap_err();

@@ -8,4 +8,6 @@ ItemDef(
     name:       "cubara:oak_log",
     max_stack:  64,
     durability: None,
+    // Wood is the fuel (PHASE2_ARCHITECTURE.md 7). No coal exists.
+    burn_ticks: Some(80),
 )

@@ -7,4 +7,7 @@ Material(
     // Ticks of work at speed 1 (PHASE2_ARCHITECTURE.md 4.3). Absent would
     // mean unbreakable, so every shipped block declares one.
     hardness: Some(30),
+    // Right-clicking opens its screen. A property of the block since block
+    // 2.4c, replacing Game's name comparison.
+    interact: Furnace,
 )

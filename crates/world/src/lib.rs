@@ -14,6 +14,7 @@
 //! kept only as the radius-64 baseline comparison (`BENCHMARKS.md`) -- no
 //! production code streams through it anymore.
 
+pub mod block_entity;
 pub mod mesh;
 pub mod node;
 mod noise;
@@ -23,6 +24,7 @@ pub mod streaming;
 mod world;
 mod worldgen;
 
+pub use block_entity::{BlockEntities, Furnace, FurnaceOutcome};
 pub use raycast::{raycast, RayHit};
 pub use world::World;
 pub use worldgen::{OreGen, OreSet, TerrainBlocks, WorldGen, MAX_ORES, WORLDGEN_VERSION};

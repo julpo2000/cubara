@@ -62,6 +62,10 @@ impl WorldHash {
         self.write_bytes(&v.to_le_bytes());
     }
 
+    fn write_u32(&mut self, v: u32) {
+        self.write_bytes(&v.to_le_bytes());
+    }
+
     fn write_u64(&mut self, v: u64) {
         self.write_bytes(&v.to_le_bytes());
     }
@@ -192,7 +196,44 @@ impl WorldHash {
         let mut total = WorldHash::new();
         total.write_sim(sim);
         total.write_hash(hash_region(world, region, blocks, thread_count));
+        total.write_block_entities(world);
         total
+    }
+
+    /// Fold in every block entity, in position order (`PHASE2_ARCHITECTURE.md`
+    /// §7).
+    ///
+    /// A running furnace is world state: two worlds that differ only in how far
+    /// along a smelt is are genuinely different worlds, and the replay test has
+    /// to be able to see that. `World::block_entities` iterates a `BTreeMap`,
+    /// so the order is the positions' own, not a hash seed's.
+    ///
+    /// Folded once at the end rather than per chunk, because the chunk hashes
+    /// are computed on a worker pool and this must not depend on how that work
+    /// was sliced -- the same reasoning behind `hash_region`'s per-chunk
+    /// digests.
+    fn write_block_entities(&mut self, world: &World) {
+        for (pos, f) in world.block_entities() {
+            self.write_i32(pos[0]);
+            self.write_i32(pos[1]);
+            self.write_i32(pos[2]);
+            for slot in [f.input, f.fuel, f.output] {
+                match slot {
+                    Some((id, count)) => {
+                        self.write_u16(id.0);
+                        self.write_u8(count);
+                    }
+                    // A distinct marker rather than skipping: an empty slot and
+                    // a missing one must not hash alike.
+                    None => {
+                        self.write_u16(u16::MAX);
+                        self.write_u8(0);
+                    }
+                }
+            }
+            self.write_u32(f.burning);
+            self.write_u32(f.progress);
+        }
     }
 }
 
