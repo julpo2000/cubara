@@ -27,6 +27,8 @@ use cubara_voxel::{
 };
 use cubara_world::TerrainBlocks;
 use cubara_world::World;
+
+use crate::server::Server;
 use cubara_world::{ChunkState, Furnace, SmeltCtx, TimedProcess};
 
 use winit::keyboard::KeyCode;
@@ -152,10 +154,13 @@ fn drop_centre(b: [i32; 3]) -> FixedVec3 {
 }
 
 pub struct Game {
-    /// The world being played. Behind an [`Arc`] so meshing jobs can carry the exact
-    /// snapshot they were queued against; an edit publishes a new one.
-    world: Arc<World>,
-    sim: Sim,
+    /// The authoritative half (`docs/RESEARCH_MULTIPLAYER.md` §8): the world,
+    /// the simulation and the registries.
+    ///
+    /// `Game` is now the **client**, plus the wiring that runs a server
+    /// in-process for singleplayer (§3.3). Everything left on `Game` itself is
+    /// input, screen state or presentation — the §8.1 table is the sorting.
+    pub server: Server,
     /// The player's pose as of the *previous* completed tick -- together with
     /// `sim.player` (the current tick), what [`Game::camera_pose`] interpolates
     /// between for smooth rendering of a 60 Hz sim at any frame rate (§9).
@@ -164,25 +169,19 @@ pub struct Game {
     /// twice -- ids are per-registry (`PHASE2_ARCHITECTURE.md` §1.2), so two
     /// loads would be two id spaces and the same number would mean different
     /// materials on each side. `None` until `resumed` builds it.
-    blocks_registry: Option<Arc<BlockRegistry>>,
     /// Which ids the terrain's grass/soil/stone are, in that registry.
-    terrain: Option<TerrainBlocks>,
     /// What items exist. Loaded by the app, not by `cubara-render`: items are
     /// not a render concern (Rule 3).
-    items: Option<ItemRegistry>,
     /// Every recipe, loaded alongside the items they name.
-    recipes: Option<RecipeBook>,
     /// Whether the inventory screen is open. Screen state, not world state --
     /// what the *grid* holds is world state and lives on the player.
     inventory_open: bool,
     /// The chunk the simulation radius was last updated around. `None` until
     /// the first tick, so it always runs once.
-    sim_centre: Option<ChunkCoord>,
     /// The furnace whose screen is open, by world position. `None` when the
     /// open screen is the plain inventory or a bench.
     open_furnace: Option<[i32; 3]>,
     /// Every smelting recipe, loaded alongside the items they name.
-    smelting: Option<SmeltBook>,
     /// Whether the break button is currently held. Read once per `advance`
     /// into [`InputFrame::breaking`].
     breaking: bool,
@@ -234,17 +233,19 @@ impl Game {
     pub fn new() -> Self {
         let player = Player::new(FixedVec3::from_blocks(0, 48, 0), 0.6, -0.3);
         Self {
-            world: Arc::new(World::new()),
-            sim: Sim::new(0, player),
+            server: Server {
+                world: Arc::new(World::new()),
+                sim: Sim::new(0, player),
+                blocks_registry: None,
+                terrain: None,
+                items: None,
+                recipes: None,
+                smelting: None,
+                sim_centre: None,
+            },
             prev_player: player,
-            blocks_registry: None,
-            terrain: None,
-            items: None,
-            recipes: None,
             inventory_open: false,
-            sim_centre: None,
             open_furnace: None,
-            smelting: None,
             breaking: false,
             mining: None,
             accumulator: 0.0,
@@ -262,7 +263,7 @@ impl Game {
     }
 
     pub fn world(&self) -> &Arc<World> {
-        &self.world
+        &self.server.world
     }
 
     /// The camera pose to render from: the sim's player pose, interpolated
@@ -270,7 +271,7 @@ impl Game {
     /// fraction. Render-side only (§9) -- never read back into the sim.
     pub fn camera_pose(&self) -> CameraPose {
         let alpha = (self.accumulator / TICK_DT as f64).clamp(0.0, 1.0) as f32;
-        let player = self.prev_player.lerp(&self.sim.player, alpha);
+        let player = self.prev_player.lerp(&self.server.sim.player, alpha);
         CameraPose {
             // The renderer works in floats, and that is the correct side of the
             // seam for it: a wrong last bit in a camera matrix is a sub-pixel
@@ -285,7 +286,7 @@ impl Game {
     /// tick (`cubara_sim::Sim::tick`), not here. The renderer draws it; it
     /// does not decide it (`ARCHITECTURE.md` Rule 3, issue #52).
     pub fn selected_block(&self) -> Option<[i32; 3]> {
-        self.sim.target
+        self.server.sim.target
     }
 
     /// Record a movement key going down/up. Unmapped keys are ignored (returns
@@ -409,11 +410,12 @@ impl Game {
         let mut ticks = 0;
         let mut dirty = Vec::new();
         while self.accumulator >= TICK_DT as f64 {
-            self.prev_player = self.sim.player;
+            self.prev_player = self.server.sim.player;
             // Read before the mutable borrow of `world`.
             let terrain = self.terrain();
-            self.sim
-                .tick(Arc::make_mut(&mut self.world), &input, terrain);
+            self.server
+                .sim
+                .tick(Arc::make_mut(&mut self.server.world), &input, terrain);
             // Mining advances *per tick*, not per frame -- §4.3, and the same
             // reason the tick loop exists. A catch-up burst of N ticks is N
             // ticks of progress, which is correct: that time really did pass.
@@ -423,8 +425,10 @@ impl Game {
             self.tick_furnaces();
             // Dropped items fall, age out, and get picked up -- on the same
             // fixed clock as everything else (§10.4, Rule 1).
-            if let Some(items) = self.items.as_ref() {
-                self.sim.tick_entities(&self.world, terrain, items);
+            if let Some(items) = self.server.items.as_ref() {
+                self.server
+                    .sim
+                    .tick_entities(&self.server.world, terrain, items);
             }
             input.jump = false;
             input.toggle_fly = false;
@@ -461,24 +465,25 @@ impl Game {
     /// the 3-block safe fall, and it avoids having to reach for the private
     /// eye-height constant from another crate.
     fn place_player_on_ground(&mut self) {
-        let Some(terrain) = self.terrain else {
+        let Some(terrain) = self.server.terrain else {
             return;
         };
-        let p = self.sim.player.pos;
+        let p = self.server.sim.player.pos;
         let [px, _, pz] = p.to_f32();
-        let Some(hit) = self
-            .world
-            .raycast([px, 200.0, pz], [0.0, -1.0, 0.0], 400.0, terrain)
+        let Some(hit) =
+            self.server
+                .world
+                .raycast([px, 200.0, pz], [0.0, -1.0, 0.0], 400.0, terrain)
         else {
             return;
         };
         let standing = FixedVec3::new(p.x, cubara_voxel::Fixed::from_blocks(hit.block[1] + 2), p.z);
-        self.sim.player.pos = standing;
-        self.sim.player.velocity = FixedVec3::ZERO;
-        self.sim.player.fall_distance = cubara_voxel::Fixed::ZERO;
+        self.server.sim.player.pos = standing;
+        self.server.sim.player.velocity = FixedVec3::ZERO;
+        self.server.sim.player.fall_distance = cubara_voxel::Fixed::ZERO;
         // Death returns here, not to wherever `Game::new` happened to start.
-        self.sim.player.spawn = standing;
-        self.prev_player = self.sim.player;
+        self.server.sim.player.spawn = standing;
+        self.prev_player = self.server.sim.player;
     }
 
     /// Write the world to disk (#179).
@@ -495,13 +500,20 @@ impl Game {
     /// so they never touch the real world folder.
     pub fn save_to(&self, dir: &std::path::Path) {
         let (Some(registry), Some(items), Some(blocks)) = (
-            self.blocks_registry.as_deref(),
-            self.items.as_ref(),
-            self.terrain,
+            self.server.blocks_registry.as_deref(),
+            self.server.items.as_ref(),
+            self.server.terrain,
         ) else {
             return;
         };
-        match cubara_sim::save_world(dir, &self.sim, &self.world, registry, items, blocks) {
+        match cubara_sim::save_world(
+            dir,
+            &self.server.sim,
+            &self.server.world,
+            registry,
+            items,
+            blocks,
+        ) {
             Ok(()) => log::info!("world saved to {}", dir.display()),
             Err(e) => log::error!("could not save the world: {e}"),
         }
@@ -526,9 +538,9 @@ impl Game {
     /// [`load`](Self::load) from a specific directory.
     pub fn load_from(&mut self, dir: &std::path::Path) -> bool {
         let (Some(registry), Some(items), Some(blocks)) = (
-            self.blocks_registry.as_deref(),
-            self.items.as_ref(),
-            self.terrain,
+            self.server.blocks_registry.as_deref(),
+            self.server.items.as_ref(),
+            self.server.terrain,
         ) else {
             return false;
         };
@@ -537,12 +549,12 @@ impl Game {
         }
         match cubara_sim::load_world(dir, registry, items, blocks) {
             Ok((sim, world)) => {
-                self.sim = sim;
-                self.world = Arc::new(world);
-                self.prev_player = self.sim.player;
+                self.server.sim = sim;
+                self.server.world = Arc::new(world);
+                self.prev_player = self.server.sim.player;
                 // The simulation radius is recomputed from scratch: the saved
                 // world has no chunk lifecycle (§11), by design.
-                self.sim_centre = None;
+                self.server.sim_centre = None;
                 log::info!("world loaded from {}", dir.display());
                 true
             }
@@ -563,7 +575,7 @@ impl Game {
     /// it is told the points and the maximum and works out the hearts (Rule 3).
     pub fn health_view(&self) -> cubara_render::HealthView {
         cubara_render::HealthView {
-            points: self.sim.player.health,
+            points: self.server.sim.player.health,
             max_points: cubara_sim::MAX_HEALTH,
         }
     }
@@ -587,7 +599,7 @@ impl Game {
     /// interpolation is a render-only concern (§9) that must never feed back
     /// into it. Raycasts fresh rather than reusing [`Sim::target`](cubara_sim::Sim)
     /// -- that field only updates on the next tick, so it can go stale
-    /// against `self.world` after an edit lands (e.g. two edits between
+    /// against `self.server.world` after an edit lands (e.g. two edits between
     /// ticks); issue #52 scoped out any change to raycasting itself anyway.
     /// Give the game the assets it needs to turn blocks into items and back.
     /// Called once, when the window and its registry exist.
@@ -597,18 +609,18 @@ impl Game {
         items: ItemRegistry,
         recipes: RecipeBook,
     ) {
-        self.terrain = Some(
+        self.server.terrain = Some(
             TerrainBlocks::from_registry(&registry)
                 .with_oak(&load_structure_registry(), &registry)
                 .with_ores(&load_ore_registry(), &registry),
         );
-        self.blocks_registry = Some(registry);
-        self.smelting = Some(load_smelt_book(&items));
+        self.server.blocks_registry = Some(registry);
+        self.server.smelting = Some(load_smelt_book(&items));
         // Terrain is known for the first time here, so this is where the player
         // can be put somewhere that exists.
         self.place_player_on_ground();
-        self.items = Some(items);
-        self.recipes = Some(recipes);
+        self.server.items = Some(items);
+        self.server.recipes = Some(recipes);
     }
 
     /// Break the targeted block and put its drop in the inventory.
@@ -642,9 +654,12 @@ impl Game {
     /// than holding a button for eight ticks to assert one drop.
     #[allow(dead_code)]
     pub fn break_block(&mut self) -> Option<ChunkCoord> {
-        let origin = self.sim.player.pos.to_f32();
-        let dir = self.sim.player.look_dir().to_array();
-        let hit = self.world.raycast(origin, dir, REACH, self.terrain())?;
+        let origin = self.server.sim.player.pos.to_f32();
+        let dir = self.server.sim.player.look_dir().to_array();
+        let hit = self
+            .server
+            .world
+            .raycast(origin, dir, REACH, self.terrain())?;
         Some(self.break_at(hit.block))
     }
 
@@ -660,15 +675,23 @@ impl Game {
             self.mining = None;
             return None;
         }
-        let origin = self.sim.player.pos.to_f32();
-        let dir = self.sim.player.look_dir().to_array();
-        let Some(hit) = self.world.raycast(origin, dir, REACH, self.terrain()) else {
+        let origin = self.server.sim.player.pos.to_f32();
+        let dir = self.server.sim.player.look_dir().to_array();
+        let Some(hit) = self
+            .server
+            .world
+            .raycast(origin, dir, REACH, self.terrain())
+        else {
             // Looking at nothing in reach: whatever was in progress is gone.
             self.mining = None;
             return None;
         };
-        let (registry, terrain) = (self.blocks_registry.as_deref()?, self.terrain?);
+        let (registry, terrain) = (
+            self.server.blocks_registry.as_deref()?,
+            self.server.terrain?,
+        );
         let target = self
+            .server
             .world
             .block_at(hit.block[0], hit.block[1], hit.block[2], terrain);
 
@@ -676,8 +699,14 @@ impl Game {
         // amount of holding the button changes that.
         let hardness = registry.hardness(target)?;
 
-        let held = self.sim.player.inventory.selected_stack().map(|s| s.item());
-        let speed = match (held, self.items.as_ref()) {
+        let held = self
+            .server
+            .sim
+            .player
+            .inventory
+            .selected_stack()
+            .map(|s| s.item());
+        let speed = match (held, self.server.items.as_ref()) {
             (Some(item), Some(items)) => items.speed(item),
             // An empty hand, or assets not yet wired: speed 1, §4.3's floor.
             _ => 1,
@@ -714,9 +743,10 @@ impl Game {
     #[allow(dead_code)]
     pub fn mining_progress(&self) -> Option<f32> {
         let m = self.mining?;
-        let registry = self.blocks_registry.as_deref()?;
-        let terrain = self.terrain?;
+        let registry = self.server.blocks_registry.as_deref()?;
+        let terrain = self.server.terrain?;
         let target = self
+            .server
             .world
             .block_at(m.block[0], m.block[1], m.block[2], terrain);
         let hardness = registry.hardness(target)?;
@@ -736,15 +766,16 @@ impl Game {
         // Whatever state the block owned goes with it (§7) -- but its contents
         // now spill onto the floor rather than being destroyed (block 2.5,
         // §10.4). This is one of the five sites that used to lose items.
-        if let Some(f) = Arc::make_mut(&mut self.world).remove_block_entity(block) {
+        if let Some(f) = Arc::make_mut(&mut self.server.world).remove_block_entity(block) {
             let contents: Vec<_> = [f.input, f.fuel, f.output].into_iter().flatten().collect();
-            if let Some(items) = self.items.as_ref() {
+            if let Some(items) = self.server.items.as_ref() {
                 let spawned: Vec<_> = contents
                     .into_iter()
                     .filter_map(|(id, count)| items.new_stack(id, count).ok())
                     .collect();
                 for stack in spawned {
-                    self.sim
+                    self.server
+                        .sim
                         .entities
                         .spawn_item(stack, drop_centre(block), FixedVec3::ZERO);
                 }
@@ -762,15 +793,15 @@ impl Game {
         //
         // Read the three as separate fields rather than through a helper: the
         // borrow checker tracks disjoint field borrows, so `items` can stay
-        // borrowed while `self.sim.player.inventory` is mutated. A helper
+        // borrowed while `self.server.sim.player.inventory` is mutated. A helper
         // returning them all borrows the whole of `self`.
         if let (Some(registry), Some(terrain), Some(items)) = (
-            self.blocks_registry.as_deref(),
-            self.terrain,
-            self.items.as_ref(),
+            self.server.blocks_registry.as_deref(),
+            self.server.terrain,
+            self.server.items.as_ref(),
         ) {
-            let broken = self.world.block_at(x, y, z, terrain);
-            let held = self.sim.player.inventory.selected_stack();
+            let broken = self.server.world.block_at(x, y, z, terrain);
+            let held = self.server.sim.player.inventory.selected_stack();
             let held_tier = held.map(|s| items.tier(s.item())).unwrap_or(0);
 
             let drop = if held_tier < registry.requires_tier(broken) {
@@ -795,10 +826,12 @@ impl Game {
                 Some(stack) => {
                     // Block 2.5: what does not fit falls on the floor rather
                     // than being destroyed (§10.4).
-                    if let Some(rest) = self.sim.player.inventory.add(stack, items) {
-                        self.sim
-                            .entities
-                            .spawn_item(rest, drop_centre(block), FixedVec3::ZERO);
+                    if let Some(rest) = self.server.sim.player.inventory.add(stack, items) {
+                        self.server.sim.entities.spawn_item(
+                            rest,
+                            drop_centre(block),
+                            FixedVec3::ZERO,
+                        );
                     }
                     // Only a break that yielded something wears the tool.
                     self.wear_held_tool();
@@ -810,7 +843,7 @@ impl Game {
             }
         }
 
-        Arc::make_mut(&mut self.world).set_block(x, y, z, BlockId::AIR)
+        Arc::make_mut(&mut self.server.world).set_block(x, y, z, BlockId::AIR)
     }
 
     /// Spend one point of the held tool's durability, removing the stack when
@@ -825,10 +858,10 @@ impl Game {
     /// going through `ItemStack::new` is what keeps that enforcement in one
     /// place.
     fn wear_held_tool(&mut self) {
-        let Some(items) = self.items.as_ref() else {
+        let Some(items) = self.server.items.as_ref() else {
             return;
         };
-        let inv = &mut self.sim.player.inventory;
+        let inv = &mut self.server.sim.player.inventory;
         let slot = inv.selected_slot() as usize;
         let Some(stack) = inv.slot(slot) else {
             return;
@@ -866,14 +899,17 @@ impl Game {
             return None;
         }
 
-        let registry = self.blocks_registry.as_deref()?;
-        let items = self.items.as_ref()?;
-        let held = self.sim.player.inventory.selected_stack()?;
+        let registry = self.server.blocks_registry.as_deref()?;
+        let items = self.server.items.as_ref()?;
+        let held = self.server.sim.player.inventory.selected_stack()?;
         let block = registry.id_of(items.name_of(held.item())?)?;
 
-        let origin = self.sim.player.pos.to_f32();
-        let dir = self.sim.player.look_dir().to_array();
-        let hit = self.world.raycast(origin, dir, REACH, self.terrain())?;
+        let origin = self.server.sim.player.pos.to_f32();
+        let dir = self.server.sim.player.look_dir().to_array();
+        let hit = self
+            .server
+            .world
+            .raycast(origin, dir, REACH, self.terrain())?;
         let target = [
             hit.block[0] + hit.normal[0],
             hit.block[1] + hit.normal[1],
@@ -881,18 +917,19 @@ impl Game {
         ];
 
         // Only now that the placement is certain to happen.
-        let slot = self.sim.player.inventory.selected_slot() as usize;
-        self.sim.player.inventory.take_one(slot, items)?;
+        let slot = self.server.sim.player.inventory.selected_slot() as usize;
+        self.server.sim.player.inventory.take_one(slot, items)?;
 
         // A block that owns state gets it the moment it is placed, rather than
         // on first use -- so a furnace someone never opens still ticks, and the
         // world hash covers it either way.
         let interactive = self
+            .server
             .blocks_registry
             .as_deref()
             .map(|r| r.interact(block) == Interact::Furnace)
             .unwrap_or(false);
-        let world = Arc::make_mut(&mut self.world);
+        let world = Arc::make_mut(&mut self.server.world);
         let cc = world.set_block(target[0], target[1], target[2], block);
         if interactive {
             world.add_furnace(target);
@@ -913,8 +950,8 @@ impl Game {
     /// and a stone item in the hand read as the same material. Real item icons
     /// are art that does not exist yet.
     pub fn hotbar_slots(&self) -> Option<[Option<HotbarSlot>; HOTBAR_WIDTH]> {
-        let items = self.items.as_ref()?;
-        let inv = &self.sim.player.inventory;
+        let items = self.server.items.as_ref()?;
+        let inv = &self.server.sim.player.inventory;
         let mut out = [None; HOTBAR_WIDTH];
         for (i, out_slot) in out.iter_mut().enumerate() {
             let Some(stack) = inv.slot(i) else { continue };
@@ -936,23 +973,28 @@ impl Game {
     /// the point to generalise it, "with two real cases to design against" --
     /// the furnace is that second case.
     fn interact(&mut self) -> bool {
-        let (Some(registry), Some(terrain)) = (self.blocks_registry.as_deref(), self.terrain)
+        let (Some(registry), Some(terrain)) =
+            (self.server.blocks_registry.as_deref(), self.server.terrain)
         else {
             return false;
         };
-        let origin = self.sim.player.pos.to_f32();
-        let dir = self.sim.player.look_dir().to_array();
-        let Some(hit) = self.world.raycast(origin, dir, REACH, self.terrain()) else {
+        let origin = self.server.sim.player.pos.to_f32();
+        let dir = self.server.sim.player.look_dir().to_array();
+        let Some(hit) = self
+            .server
+            .world
+            .raycast(origin, dir, REACH, self.terrain())
+        else {
             return false;
         };
         let [x, y, z] = hit.block;
-        match registry.interact(self.world.block_at(x, y, z, terrain)) {
+        match registry.interact(self.server.world.block_at(x, y, z, terrain)) {
             Interact::None => false,
             Interact::Bench => {
                 // Width lives on `Crafting` (world state), not on the screen: a
                 // 3x3 grid holding items in its outer cells is a different world
                 // from a 2x2 one, and the hash already covers it.
-                self.sim.player.crafting.set_width(3);
+                self.server.sim.player.crafting.set_width(3);
                 self.open_furnace = None;
                 self.inventory_open = true;
                 true
@@ -961,7 +1003,7 @@ impl Game {
                 // A furnace placed before this block existed (or loaded from an
                 // older save) has no entity yet; give it one on first use rather
                 // than refusing to open.
-                Arc::make_mut(&mut self.world).add_furnace([x, y, z]);
+                Arc::make_mut(&mut self.server.world).add_furnace([x, y, z]);
                 self.open_furnace = Some([x, y, z]);
                 self.inventory_open = true;
                 true
@@ -979,7 +1021,9 @@ impl Game {
     /// is active. Block 2.6's dormant chunks and 2.7's catch-up are what change
     /// that, and [`Furnace::advance`] already takes an elapsed count so they can.
     fn tick_furnaces(&mut self) {
-        let (Some(items), Some(smelting)) = (self.items.as_ref(), self.smelting.as_ref()) else {
+        let (Some(items), Some(smelting)) =
+            (self.server.items.as_ref(), self.server.smelting.as_ref())
+        else {
             return;
         };
 
@@ -990,18 +1034,22 @@ impl Game {
         // change no chunk's state, and this walks a (2r+1)²x3 box -- 243
         // lookups at radius 4 -- which is pure waste every tick the player is
         // not moving, which is most of them.
-        let centre = ChunkCoord::from_world_pos(self.sim.player.pos.to_f32());
-        let now = self.sim.tick;
-        let woken = if self.sim_centre == Some(centre) {
+        let centre = ChunkCoord::from_world_pos(self.server.sim.player.pos.to_f32());
+        let now = self.server.sim.tick;
+        let woken = if self.server.sim_centre == Some(centre) {
             Vec::new()
         } else {
-            self.sim_centre = Some(centre);
-            Arc::make_mut(&mut self.world).update_simulation_radius(centre, SIM_RADIUS_CHUNKS, now)
+            self.server.sim_centre = Some(centre);
+            Arc::make_mut(&mut self.server.world).update_simulation_radius(
+                centre,
+                SIM_RADIUS_CHUNKS,
+                now,
+            )
         };
         let caught_up: std::collections::BTreeMap<ChunkCoord, u64> =
             woken.into_iter().map(|w| (w.coord, w.elapsed)).collect();
 
-        let world = Arc::make_mut(&mut self.world);
+        let world = Arc::make_mut(&mut self.server.world);
         let positions = world.block_entity_positions();
         if positions.is_empty() {
             return;
@@ -1027,25 +1075,13 @@ impl Game {
     /// The furnace screen currently open, if any.
     pub fn open_furnace(&self) -> Option<Furnace> {
         let pos = self.open_furnace?;
-        self.world.furnace_at(pos).copied()
+        self.server.world.furnace_at(pos).copied()
     }
 
-    /// Which ids the terrain is made of, or a treeless default before assets
-    /// are set.
-    ///
-    /// Trees are solid, so physics and raycasting need this -- `is_solid_at`
-    /// cannot answer from the density field alone any more. The fallback is a
-    /// world with no trees rather than a panic: `Game::new()` runs before a
-    /// window exists, and a headless test that never sets assets should still
-    /// be able to walk around.
+    /// Which ids the terrain is made of — delegated to the server, which owns
+    /// the registries (§8.1).
     fn terrain(&self) -> TerrainBlocks {
-        self.terrain.unwrap_or(TerrainBlocks {
-            oak: None,
-            ores: cubara_world::OreSet::EMPTY,
-            grass: BlockId::AIR,
-            soil: BlockId::AIR,
-            stone: BlockId::AIR,
-        })
+        self.server.terrain()
     }
 
     /// Whether the inventory screen is open.
@@ -1065,8 +1101,8 @@ impl Game {
         // the block and stay in it. Only the cursor needs somewhere to go.
         if self.open_furnace.take().is_some() {
             self.inventory_open = false;
-            if let Some(items) = self.items.as_ref() {
-                let player = &mut self.sim.player;
+            if let Some(items) = self.server.items.as_ref() {
+                let player = &mut self.server.sim.player;
                 if let Some(held) = player.crafting.held() {
                     if let Some(lost) = player.inventory.add(held, items) {
                         log::debug!(
@@ -1080,11 +1116,11 @@ impl Game {
             }
             return;
         }
-        let Some(items) = self.items.as_ref() else {
+        let Some(items) = self.server.items.as_ref() else {
             self.inventory_open = false;
             return;
         };
-        let player = &mut self.sim.player;
+        let player = &mut self.server.sim.player;
         if player.crafting.close(&mut player.inventory, items) {
             self.inventory_open = false;
             // Back to the inventory's own grid. `close` emptied all nine cells
@@ -1101,12 +1137,13 @@ impl Game {
     /// same one the screen is drawn from, so a click cannot land on a slot other
     /// than the one under the cursor.
     pub fn click_panel(&mut self, x: f32, y: f32, right: bool, width: u32, height: u32) {
-        let (Some(items), Some(book)) = (self.items.as_ref(), self.recipes.as_ref()) else {
+        let (Some(items), Some(book)) = (self.server.items.as_ref(), self.server.recipes.as_ref())
+        else {
             return;
         };
         let panel = match self.open_furnace {
             Some(_) => InventoryPanel::layout_furnace(width, height),
-            None => InventoryPanel::layout(width, height, self.sim.player.crafting.width()),
+            None => InventoryPanel::layout(width, height, self.server.sim.player.crafting.width()),
         };
         let Some((kind, index)) = panel.hit(x, y) else {
             return;
@@ -1123,7 +1160,7 @@ impl Game {
             // is the safe branch rather than mapping it to a grid cell.
             PanelSlotKind::Fuel => return,
         };
-        let player = &mut self.sim.player;
+        let player = &mut self.server.sim.player;
         player
             .crafting
             .click(slot, right, &mut player.inventory, items, book);
@@ -1141,18 +1178,18 @@ impl Game {
     /// one, so a player never has two things in hand at once and closing either
     /// screen has one rule for what happens to it.
     fn click_furnace(&mut self, pos: [i32; 3], kind: PanelSlotKind, index: usize) {
-        let Some(items) = self.items.as_ref() else {
+        let Some(items) = self.server.items.as_ref() else {
             return;
         };
         if kind == PanelSlotKind::Inventory {
-            let player = &mut self.sim.player;
+            let player = &mut self.server.sim.player;
             player
                 .crafting
                 .click_inventory_only(index, &mut player.inventory, items);
             return;
         }
-        let held = self.sim.player.crafting.held();
-        let world = Arc::make_mut(&mut self.world);
+        let held = self.server.sim.player.crafting.held();
+        let world = Arc::make_mut(&mut self.server.world);
         let Some(f) = world.furnace_at_mut(pos) else {
             return;
         };
@@ -1164,7 +1201,7 @@ impl Game {
                 if held.is_none() {
                     if let Some((id, count)) = f.output.take() {
                         if let Ok(stack) = items.new_stack(id, count) {
-                            self.sim.player.crafting.set_held(Some(stack));
+                            self.server.sim.player.crafting.set_held(Some(stack));
                         }
                     }
                 }
@@ -1176,11 +1213,11 @@ impl Game {
             Some(stack) => {
                 let previous = slot.replace((stack.item(), stack.count()));
                 let give_back = previous.and_then(|(id, c)| items.new_stack(id, c).ok());
-                self.sim.player.crafting.set_held(give_back);
+                self.server.sim.player.crafting.set_held(give_back);
             }
             None => {
                 let taken = slot.take().and_then(|(id, c)| items.new_stack(id, c).ok());
-                self.sim.player.crafting.set_held(taken);
+                self.server.sim.player.crafting.set_held(taken);
             }
         }
     }
@@ -1198,9 +1235,9 @@ impl Game {
         if !self.inventory_open {
             return None;
         }
-        let items = self.items.as_ref()?;
-        let crafting = &self.sim.player.crafting;
-        let book = self.recipes.as_ref();
+        let items = self.server.items.as_ref()?;
+        let crafting = &self.server.sim.player.crafting;
+        let book = self.server.recipes.as_ref();
         let furnace = self.open_furnace();
         let panel = match self.open_furnace {
             Some(_) => InventoryPanel::layout_furnace(width, height),
@@ -1228,9 +1265,13 @@ impl Game {
             .slots()
             .iter()
             .map(|s| match (s.kind, furnace) {
-                (PanelSlotKind::Inventory, _) => {
-                    self.sim.player.inventory.slot(s.index).and_then(swatch)
-                }
+                (PanelSlotKind::Inventory, _) => self
+                    .server
+                    .sim
+                    .player
+                    .inventory
+                    .slot(s.index)
+                    .and_then(swatch),
                 (PanelSlotKind::Grid, Some(f)) => furnace_swatch(f.input),
                 (PanelSlotKind::Fuel, Some(f)) => furnace_swatch(f.fuel),
                 (PanelSlotKind::Result, Some(f)) => furnace_swatch(f.output),
@@ -1248,12 +1289,12 @@ impl Game {
 
     /// Which hotbar slot is held, for the renderer.
     pub fn selected_hotbar_slot(&self) -> u8 {
-        self.sim.player.inventory.selected_slot()
+        self.server.sim.player.inventory.selected_slot()
     }
 
     /// Select a hotbar slot (number keys 1-9, passed as 0-8).
     pub fn select_hotbar(&mut self, index: u8) {
-        self.sim.player.inventory.select(index);
+        self.server.sim.player.inventory.select(index);
     }
 }
 
@@ -1272,7 +1313,7 @@ mod tests {
         // No GPU involved — this is why gameplay does not belong on the renderer.
         let mut game = Game::new();
         // Look straight down from above the terrain.
-        game.sim.player = Player::new(
+        game.server.sim.player = Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, 60.0, 0.5]),
             0.0,
             -1.5,
@@ -1298,7 +1339,7 @@ mod tests {
             .expect("ground below");
         // Stand just above the surface, looking down — now it is within reach.
         let eye = cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 3.5, 0.5]);
-        game.sim.player = Player::new(eye, 0.0, -1.5);
+        game.server.sim.player = Player::new(eye, 0.0, -1.5);
 
         let dirty = game.break_block().expect("a block was in reach");
         assert!(
@@ -1337,16 +1378,17 @@ mod tests {
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
         let eye = cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 3.5, 0.5]);
-        game.sim.player = Player::new(eye, 0.0, -1.5);
+        game.server.sim.player = Player::new(eye, 0.0, -1.5);
         (game, ground.block)
     }
 
     #[test]
     fn breaking_a_block_puts_its_item_in_the_inventory() {
         let (mut game, block) = game_looking_at_ground();
-        let terrain = game.terrain.expect("assets are set");
+        let terrain = game.server.terrain.expect("assets are set");
         let broken = game.world().block_at(block[0], block[1], block[2], terrain);
         let name = game
+            .server
             .blocks_registry
             .as_ref()
             .unwrap()
@@ -1356,8 +1398,9 @@ mod tests {
 
         game.break_block().expect("a block was in reach");
 
-        let items = game.items.as_ref().unwrap();
+        let items = game.server.items.as_ref().unwrap();
         let stack = game
+            .server
             .sim
             .player
             .inventory
@@ -1378,24 +1421,25 @@ mod tests {
         // this test does not depend on which materials happen to ship -- only
         // on the block and its item sharing a name, which is the drop policy.
         let stone_name = game
+            .server
             .blocks_registry
             .as_ref()
             .unwrap()
-            .name_of(game.terrain.unwrap().stone)
+            .name_of(game.server.terrain.unwrap().stone)
             .expect("terrain stone has a name")
             .to_string();
-        let items = game.items.as_ref().unwrap();
+        let items = game.server.items.as_ref().unwrap();
         let held = items
             .id_of(&stone_name)
             .expect("every shipped block needs an item of the same name to be placeable");
         let stack = items.new_stack(held, 5).unwrap();
-        game.sim.player.inventory.add(stack, items);
+        game.server.sim.player.inventory.add(stack, items);
         game.select_hotbar(0);
 
         game.place_block().expect("a face was in reach");
 
         assert_eq!(
-            game.sim.player.inventory.slot(0).map(|s| s.count()),
+            game.server.sim.player.inventory.slot(0).map(|s| s.count()),
             Some(4),
             "placing spends exactly one"
         );
@@ -1415,11 +1459,12 @@ mod tests {
         // spend the stick -- an action that fails silently should not also
         // cost you something.
         let (mut game, _) = game_looking_at_ground();
-        let items = game.items.as_ref().unwrap();
+        let items = game.server.items.as_ref().unwrap();
         let stick = items
             .id_of("cubara:stick")
             .expect("assets/items has a stick");
-        game.sim
+        game.server
+            .sim
             .player
             .inventory
             .add(items.new_stack(stick, 3).unwrap(), items);
@@ -1429,7 +1474,7 @@ mod tests {
         assert_eq!(game.place_block(), None);
         assert_eq!(game.world().edit_count(), before, "nothing was placed");
         assert_eq!(
-            game.sim.player.inventory.slot(0).map(|s| s.count()),
+            game.server.sim.player.inventory.slot(0).map(|s| s.count()),
             Some(3),
             "and nothing was consumed"
         );
@@ -1441,10 +1486,11 @@ mod tests {
         // (2.5). Recorded behaviour, not a silent bug: what must not happen is
         // the block refusing to break, which would read as the game being stuck.
         let (mut game, block) = game_looking_at_ground();
-        let items = game.items.as_ref().unwrap();
+        let items = game.server.items.as_ref().unwrap();
         let filler = items.id_of("cubara:stick").unwrap();
         for _ in 0..cubara_sim::SLOT_COUNT {
-            game.sim
+            game.server
+                .sim
                 .player
                 .inventory
                 .add(items.new_stack(filler, 64).unwrap(), items);
@@ -1463,34 +1509,36 @@ mod tests {
     fn number_keys_select_hotbar_slots_on_press_only() {
         let mut game = Game::new();
         assert!(game.key_input(KeyCode::Digit4, true));
-        assert_eq!(game.sim.player.inventory.selected_slot(), 3);
+        assert_eq!(game.server.sim.player.inventory.selected_slot(), 3);
 
         // Releasing must not reselect -- otherwise every key-up would snap the
         // selection back to whichever number was let go of last.
         game.key_input(KeyCode::Digit1, true);
         game.key_input(KeyCode::Digit4, false);
-        assert_eq!(game.sim.player.inventory.selected_slot(), 0);
+        assert_eq!(game.server.sim.player.inventory.selected_slot(), 0);
     }
 
     /// Place a bench right where the player is looking, and aim at it.
     fn game_facing_a_bench() -> (Game, [i32; 3]) {
         let (mut game, ground) = game_looking_at_ground();
         let bench = game
+            .server
             .blocks_registry
             .as_ref()
             .unwrap()
             .id_of("cubara:crafting_bench")
             .expect("assets/blocks defines the bench");
-        std::sync::Arc::make_mut(&mut game.world).set_block(ground[0], ground[1], ground[2], bench);
+        std::sync::Arc::make_mut(&mut game.server.world)
+            .set_block(ground[0], ground[1], ground[2], bench);
         (game, ground)
     }
 
     #[test]
     fn right_clicking_a_bench_opens_the_three_by_three_grid() {
         let (mut game, _) = game_facing_a_bench();
-        let items = game.items.as_ref().unwrap();
+        let items = game.server.items.as_ref().unwrap();
         // Holding something placeable, to prove interaction wins over placing.
-        game.sim.player.inventory.add(
+        game.server.sim.player.inventory.add(
             items
                 .new_stack(items.id_of("cubara:stone").unwrap(), 5)
                 .unwrap(),
@@ -1502,14 +1550,14 @@ mod tests {
         assert_eq!(game.place_block(), None, "no block was placed");
         assert_eq!(game.world().edit_count(), before, "the world is unchanged");
         assert!(game.inventory_open(), "the screen opened");
-        assert_eq!(game.sim.player.crafting.width(), 3, "at bench size");
+        assert_eq!(game.server.sim.player.crafting.width(), 3, "at bench size");
     }
 
     #[test]
     fn right_clicking_anything_else_still_places() {
         let (mut game, _) = game_looking_at_ground();
-        let items = game.items.as_ref().unwrap();
-        game.sim.player.inventory.add(
+        let items = game.server.items.as_ref().unwrap();
+        game.server.sim.player.inventory.add(
             items
                 .new_stack(items.id_of("cubara:stone").unwrap(), 5)
                 .unwrap(),
@@ -1526,11 +1574,11 @@ mod tests {
     /// rather than reaching into the cells keeps these tests honest about the
     /// path the real game takes.
     fn load_cell(game: &mut Game, cell: usize, item: cubara_voxel::ItemId, count: u8) {
-        let items = game.items.as_ref().unwrap();
-        let book = game.recipes.as_ref().unwrap();
+        let items = game.server.items.as_ref().unwrap();
+        let book = game.server.recipes.as_ref().unwrap();
         let mut scratch = cubara_sim::Inventory::new();
         scratch.add(items.new_stack(item, count).unwrap(), items);
-        let mut c = game.sim.player.crafting;
+        let mut c = game.server.sim.player.crafting;
         c.click(
             cubara_sim::SlotRef::Inventory(0),
             false,
@@ -1545,7 +1593,7 @@ mod tests {
             items,
             book,
         );
-        game.sim.player.crafting = c;
+        game.server.sim.player.crafting = c;
     }
 
     #[test]
@@ -1556,24 +1604,31 @@ mod tests {
         // says why that mattered.
         let (mut game, _) = game_facing_a_bench();
         game.place_block();
-        assert_eq!(game.sim.player.crafting.width(), 3);
+        assert_eq!(game.server.sim.player.crafting.width(), 3);
 
-        let stone = game.items.as_ref().unwrap().id_of("cubara:stone").unwrap();
+        let stone = game
+            .server
+            .items
+            .as_ref()
+            .unwrap()
+            .id_of("cubara:stone")
+            .unwrap();
         load_cell(&mut game, 8, stone, 4);
         assert!(
-            game.sim.player.crafting.cell(8).is_some(),
+            game.server.sim.player.crafting.cell(8).is_some(),
             "cell 8 is loaded"
         );
 
         game.toggle_inventory();
         assert!(!game.inventory_open(), "it closed");
-        assert_eq!(game.sim.player.crafting.width(), 2, "and narrowed");
+        assert_eq!(game.server.sim.player.crafting.width(), 2, "and narrowed");
         assert!(
-            game.sim.player.crafting.cell(8).is_none(),
+            game.server.sim.player.crafting.cell(8).is_none(),
             "the outer cell was emptied, not stranded"
         );
         assert!(
-            game.sim
+            game.server
+                .sim
                 .player
                 .inventory
                 .slots()
@@ -1591,7 +1646,7 @@ mod tests {
         game.place_block();
 
         let (plank, stick) = {
-            let items = game.items.as_ref().unwrap();
+            let items = game.server.items.as_ref().unwrap();
             (
                 items.id_of("cubara:plank").unwrap(),
                 items.id_of("cubara:stick").unwrap(),
@@ -1602,12 +1657,13 @@ mod tests {
             load_cell(&mut game, cell, item, 1);
         }
 
-        let items = game.items.as_ref().unwrap();
+        let items = game.server.items.as_ref().unwrap();
         let made = game
+            .server
             .sim
             .player
             .crafting
-            .result(game.recipes.as_ref().unwrap(), items)
+            .result(game.server.recipes.as_ref().unwrap(), items)
             .expect("the grid makes something");
         assert_eq!(
             items.name_of(made.item()),
@@ -1655,12 +1711,12 @@ mod tests {
     fn fly_toggle_flips_the_mode_on_a_single_press() {
         let mut game = Game::new();
         assert!(
-            !game.sim.player.is_free_fly(),
+            !game.server.sim.player.is_free_fly(),
             "walking is the default mode"
         );
         game.key_input(KeyCode::F4, true);
         game.advance(TICK_DT);
-        assert!(game.sim.player.is_free_fly());
+        assert!(game.server.sim.player.is_free_fly());
     }
 
     #[test]
@@ -1675,9 +1731,9 @@ mod tests {
         let mut game = Game::new();
         game.key_input(KeyCode::F4, true);
         game.advance(2.0 * TICK_DT);
-        assert_eq!(game.sim.tick, 2);
+        assert_eq!(game.server.sim.tick, 2);
         assert!(
-            game.sim.player.is_free_fly(),
+            game.server.sim.player.is_free_fly(),
             "one press should flip the mode once (false -> true), not twice (-> false)"
         );
     }
@@ -1685,18 +1741,21 @@ mod tests {
     #[test]
     fn advance_by_exactly_one_tick_worth_of_time_runs_one_tick() {
         let mut game = Game::new();
-        assert_eq!(game.sim.tick, 0);
+        assert_eq!(game.server.sim.tick, 0);
         game.advance(TICK_DT);
-        assert_eq!(game.sim.tick, 1);
+        assert_eq!(game.server.sim.tick, 1);
     }
 
     #[test]
     fn sub_tick_dt_does_not_run_a_tick_yet() {
         let mut game = Game::new();
         game.advance(TICK_DT * 0.5);
-        assert_eq!(game.sim.tick, 0, "half a tick's worth of time isn't a tick");
+        assert_eq!(
+            game.server.sim.tick, 0,
+            "half a tick's worth of time isn't a tick"
+        );
         game.advance(TICK_DT * 0.5);
-        assert_eq!(game.sim.tick, 1, "the other half completes it");
+        assert_eq!(game.server.sim.tick, 1, "the other half completes it");
     }
 
     #[test]
@@ -1712,21 +1771,21 @@ mod tests {
             spread.advance(TICK_DT * 0.1); // sub-tick: no tick runs yet
         }
         assert_eq!(
-            spread.sim.tick, 0,
+            spread.server.sim.tick, 0,
             "5 * 0.1 tick < one tick: nothing simulated"
         );
         spread.advance(TICK_DT); // now cross the threshold -> exactly one tick
-        assert_eq!(spread.sim.tick, 1);
+        assert_eq!(spread.server.sim.tick, 1);
 
         // The same 500 px of motion delivered in a single tick-sized frame.
         let mut once = Game::new();
         once.mouse_look(500.0, 0.0);
         once.advance(TICK_DT);
-        assert_eq!(once.sim.tick, 1);
+        assert_eq!(once.server.sim.tick, 1);
 
         assert_eq!(
-            spread.sim.player.look_dir(),
-            once.sim.player.look_dir(),
+            spread.server.sim.player.look_dir(),
+            once.server.sim.player.look_dir(),
             "mouse motion spread over sub-tick frames must turn the player by \
              the same total as the same motion in one frame -- none dropped"
         );
@@ -1746,11 +1805,11 @@ mod tests {
         burst.mouse_look(1000.0, 0.0);
         burst.advance(3.0 * TICK_DT); // three ticks in one catch-up burst
 
-        assert_eq!(single.sim.tick, 1);
-        assert_eq!(burst.sim.tick, 3);
+        assert_eq!(single.server.sim.tick, 1);
+        assert_eq!(burst.server.sim.tick, 3);
         assert_eq!(
-            single.sim.player.look_dir(),
-            burst.sim.player.look_dir(),
+            single.server.sim.player.look_dir(),
+            burst.server.sim.player.look_dir(),
             "the same single mouse-look delta must turn the player by the same \
              amount regardless of how many ticks ran in the same `advance` call"
         );
@@ -1761,7 +1820,7 @@ mod tests {
         let mut game = Game::new();
         game.advance(1000.0 * TICK_DT); // a 1000-tick backlog in one call
         assert_eq!(
-            game.sim.tick, MAX_TICKS_PER_FRAME as u64,
+            game.server.sim.tick, MAX_TICKS_PER_FRAME as u64,
             "capped at MAX_TICKS_PER_FRAME, not fully caught up"
         );
         assert_eq!(
@@ -1804,8 +1863,8 @@ mod tests {
             i += 1;
         }
 
-        assert_eq!(steady.sim.tick, jittery.sim.tick);
-        assert_eq!(steady.sim.player, jittery.sim.player);
+        assert_eq!(steady.server.sim.tick, jittery.server.sim.tick);
+        assert_eq!(steady.server.sim.player, jittery.server.sim.player);
     }
 
     /// Put `block` directly in front of the player and aim at it, so a test can
@@ -1813,6 +1872,7 @@ mod tests {
     /// underfoot. Returns the position it was placed at.
     fn stand_over(game: &mut Game, block_name: &str) -> [i32; 3] {
         let id = game
+            .server
             .blocks_registry
             .as_ref()
             .unwrap()
@@ -1823,28 +1883,28 @@ mod tests {
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
         let b = ground.block;
-        Arc::make_mut(&mut game.world).set_block(b[0], b[1], b[2], id);
+        Arc::make_mut(&mut game.server.world).set_block(b[0], b[1], b[2], id);
         b
     }
 
     /// Give the player `item` in the selected hotbar slot.
     fn hold(game: &mut Game, item: &str) {
-        let items = game.items.as_ref().unwrap();
+        let items = game.server.items.as_ref().unwrap();
         let id = items
             .id_of(item)
             .unwrap_or_else(|| panic!("no item {item}"));
         let stack = items.new_stack(id, 1).expect("a stack of one");
-        let slot = game.sim.player.inventory.selected_slot() as usize;
-        game.sim.player.inventory.set_slot(slot, Some(stack));
+        let slot = game.server.sim.player.inventory.selected_slot() as usize;
+        game.server.sim.player.inventory.set_slot(slot, Some(stack));
     }
 
     fn count_of(game: &Game, item: &str) -> u8 {
-        let items = game.items.as_ref().unwrap();
+        let items = game.server.items.as_ref().unwrap();
         let Some(id) = items.id_of(item) else {
             return 0;
         };
         (0..cubara_sim::SLOT_COUNT)
-            .filter_map(|i| game.sim.player.inventory.slot(i))
+            .filter_map(|i| game.server.sim.player.inventory.slot(i))
             .filter(|s| s.item() == id)
             .map(|s| s.count())
             .sum()
@@ -1924,14 +1984,30 @@ mod tests {
         let (mut game, _) = game_looking_at_ground();
         stand_over(&mut game, "cubara:stone");
         hold(&mut game, "cubara:stone_pick");
-        let before = match game.sim.player.inventory.selected_stack().unwrap().state() {
+        let before = match game
+            .server
+            .sim
+            .player
+            .inventory
+            .selected_stack()
+            .unwrap()
+            .state()
+        {
             ItemState::Durability { remaining } => remaining,
             other => panic!("a pick should carry durability, got {other:?}"),
         };
 
         game.break_block().expect("a block was in reach");
 
-        let after = match game.sim.player.inventory.selected_stack().unwrap().state() {
+        let after = match game
+            .server
+            .sim
+            .player
+            .inventory
+            .selected_stack()
+            .unwrap()
+            .state()
+        {
             ItemState::Durability { remaining } => remaining,
             other => panic!("still a pick, got {other:?}"),
         };
@@ -1944,14 +2020,30 @@ mod tests {
         let (mut game, _) = game_looking_at_ground();
         stand_over(&mut game, "cubara:iron_ore");
         hold(&mut game, "cubara:wooden_pick");
-        let before = match game.sim.player.inventory.selected_stack().unwrap().state() {
+        let before = match game
+            .server
+            .sim
+            .player
+            .inventory
+            .selected_stack()
+            .unwrap()
+            .state()
+        {
             ItemState::Durability { remaining } => remaining,
             other => panic!("a pick should carry durability, got {other:?}"),
         };
 
         game.break_block().expect("a block was in reach");
 
-        let after = match game.sim.player.inventory.selected_stack().unwrap().state() {
+        let after = match game
+            .server
+            .sim
+            .player
+            .inventory
+            .selected_stack()
+            .unwrap()
+            .state()
+        {
             ItemState::Durability { remaining } => remaining,
             other => panic!("still a pick, got {other:?}"),
         };
@@ -1961,7 +2053,7 @@ mod tests {
     #[test]
     fn a_tool_at_zero_durability_leaves_the_slot() {
         let (mut game, _) = game_looking_at_ground();
-        let items = game.items.as_ref().unwrap();
+        let items = game.server.items.as_ref().unwrap();
         let pick = items.id_of("cubara:stone_pick").unwrap();
         let nearly_dead = ItemStack::new(
             pick,
@@ -1970,14 +2062,18 @@ mod tests {
             items.max_stack(pick),
         )
         .expect("a worn pick");
-        let slot = game.sim.player.inventory.selected_slot() as usize;
-        game.sim.player.inventory.set_slot(slot, Some(nearly_dead));
+        let slot = game.server.sim.player.inventory.selected_slot() as usize;
+        game.server
+            .sim
+            .player
+            .inventory
+            .set_slot(slot, Some(nearly_dead));
         stand_over(&mut game, "cubara:stone");
 
         game.break_block().expect("a block was in reach");
 
         assert!(
-            game.sim.player.inventory.slot(slot).is_none(),
+            game.server.sim.player.inventory.slot(slot).is_none(),
             "the spent tool is gone"
         );
         assert_eq!(
@@ -2178,14 +2274,14 @@ mod tests {
     /// Place a furnace at the block the player is looking at and open it.
     fn open_a_furnace(game: &mut Game) -> [i32; 3] {
         let pos = stand_over(game, "cubara:furnace");
-        Arc::make_mut(&mut game.world).add_furnace(pos);
+        Arc::make_mut(&mut game.server.world).add_furnace(pos);
         game.open_furnace = Some(pos);
         game.inventory_open = true;
         pos
     }
 
     fn item(game: &Game, name: &str) -> cubara_voxel::ItemId {
-        game.items.as_ref().unwrap().id_of(name).expect(name)
+        game.server.items.as_ref().unwrap().id_of(name).expect(name)
     }
 
     #[test]
@@ -2213,7 +2309,7 @@ mod tests {
         assert!(game.interact());
         assert!(game.inventory_open());
         assert!(game.open_furnace().is_none(), "a bench, not a furnace");
-        assert_eq!(game.sim.player.crafting.width(), 3);
+        assert_eq!(game.server.sim.player.crafting.width(), 3);
     }
 
     #[test]
@@ -2227,7 +2323,9 @@ mod tests {
         let raw = item(&game, "cubara:raw_iron");
         let log = item(&game, "cubara:oak_log");
         {
-            let f = Arc::make_mut(&mut game.world).furnace_at_mut(pos).unwrap();
+            let f = Arc::make_mut(&mut game.server.world)
+                .furnace_at_mut(pos)
+                .unwrap();
             f.input = Some((raw, 1));
             f.fuel = Some((log, 4));
         }
@@ -2250,7 +2348,7 @@ mod tests {
         let (mut game, _) = game_looking_at_ground();
         let pos = open_a_furnace(&mut game);
         let raw = item(&game, "cubara:raw_iron");
-        Arc::make_mut(&mut game.world)
+        Arc::make_mut(&mut game.server.world)
             .furnace_at_mut(pos)
             .unwrap()
             .input = Some((raw, 1));
@@ -2269,8 +2367,14 @@ mod tests {
         let (mut game, _) = game_looking_at_ground();
         let pos = open_a_furnace(&mut game);
         let raw = item(&game, "cubara:raw_iron");
-        let stack = game.items.as_ref().unwrap().new_stack(raw, 3).unwrap();
-        game.sim.player.crafting.set_held(Some(stack));
+        let stack = game
+            .server
+            .items
+            .as_ref()
+            .unwrap()
+            .new_stack(raw, 3)
+            .unwrap();
+        game.server.sim.player.crafting.set_held(Some(stack));
 
         // Into the input slot.
         game.click_furnace(pos, PanelSlotKind::Grid, 0);
@@ -2279,12 +2383,18 @@ mod tests {
             Some((raw, 3)),
             "the held stack went in"
         );
-        assert!(game.sim.player.crafting.held().is_none(), "hand is empty");
+        assert!(
+            game.server.sim.player.crafting.held().is_none(),
+            "hand is empty"
+        );
 
         // And back out.
         game.click_furnace(pos, PanelSlotKind::Grid, 0);
         assert_eq!(game.open_furnace().unwrap().input, None);
-        assert_eq!(game.sim.player.crafting.held().map(|s| s.count()), Some(3));
+        assert_eq!(
+            game.server.sim.player.crafting.held().map(|s| s.count()),
+            Some(3)
+        );
     }
 
     #[test]
@@ -2294,13 +2404,22 @@ mod tests {
         let (mut game, _) = game_looking_at_ground();
         let pos = open_a_furnace(&mut game);
         let raw = item(&game, "cubara:raw_iron");
-        let stack = game.items.as_ref().unwrap().new_stack(raw, 1).unwrap();
-        game.sim.player.crafting.set_held(Some(stack));
+        let stack = game
+            .server
+            .items
+            .as_ref()
+            .unwrap()
+            .new_stack(raw, 1)
+            .unwrap();
+        game.server.sim.player.crafting.set_held(Some(stack));
 
         game.click_furnace(pos, PanelSlotKind::Result, 0);
 
         assert_eq!(game.open_furnace().unwrap().output, None, "nothing went in");
-        assert!(game.sim.player.crafting.held().is_some(), "still held");
+        assert!(
+            game.server.sim.player.crafting.held().is_some(),
+            "still held"
+        );
     }
 
     #[test]
@@ -2308,7 +2427,7 @@ mod tests {
         let (mut game, _) = game_looking_at_ground();
         let pos = open_a_furnace(&mut game);
         let raw = item(&game, "cubara:raw_iron");
-        Arc::make_mut(&mut game.world)
+        Arc::make_mut(&mut game.server.world)
             .furnace_at_mut(pos)
             .unwrap()
             .input = Some((raw, 5));
@@ -2325,16 +2444,17 @@ mod tests {
         // world hash must cover it either way.
         let (mut game, _) = game_looking_at_ground();
         let furnace = game
+            .server
             .blocks_registry
             .as_ref()
             .unwrap()
             .id_of("cubara:furnace")
             .unwrap();
-        let items = game.items.as_ref().unwrap();
+        let items = game.server.items.as_ref().unwrap();
         let id = items.id_of("cubara:furnace").unwrap();
         let stack = items.new_stack(id, 1).unwrap();
-        let slot = game.sim.player.inventory.selected_slot() as usize;
-        game.sim.player.inventory.set_slot(slot, Some(stack));
+        let slot = game.server.sim.player.inventory.selected_slot() as usize;
+        game.server.sim.player.inventory.set_slot(slot, Some(stack));
 
         let cc = game.place_block().expect("placed");
         let _ = (furnace, cc);
@@ -2352,7 +2472,7 @@ mod tests {
         let (mut game, _) = game_looking_at_ground();
         let pos = open_a_furnace(&mut game);
         let raw = item(&game, "cubara:raw_iron");
-        Arc::make_mut(&mut game.world)
+        Arc::make_mut(&mut game.server.world)
             .furnace_at_mut(pos)
             .unwrap()
             .input = Some((raw, 2));
@@ -2376,16 +2496,26 @@ mod tests {
         // Fill every slot with something that will not stack with soil.
         let raw = item(&game, "cubara:raw_iron");
         for i in 0..cubara_sim::SLOT_COUNT {
-            let full = game.items.as_ref().unwrap().new_stack(raw, 64).unwrap();
-            game.sim.player.inventory.set_slot(i, Some(full));
+            let full = game
+                .server
+                .items
+                .as_ref()
+                .unwrap()
+                .new_stack(raw, 64)
+                .unwrap();
+            game.server.sim.player.inventory.set_slot(i, Some(full));
         }
 
         game.break_at(b);
 
-        assert_eq!(game.sim.entities.len(), 1, "the drop is on the floor");
-        let (_, d) = game.sim.entities.sorted()[0];
         assert_eq!(
-            game.items.as_ref().unwrap().name_of(d.stack.item()),
+            game.server.sim.entities.len(),
+            1,
+            "the drop is on the floor"
+        );
+        let (_, d) = game.server.sim.entities.sorted()[0];
+        assert_eq!(
+            game.server.items.as_ref().unwrap().name_of(d.stack.item()),
             Some("cubara:soil")
         );
     }
@@ -2397,7 +2527,9 @@ mod tests {
         let raw = item(&game, "cubara:raw_iron");
         let log = item(&game, "cubara:oak_log");
         {
-            let f = Arc::make_mut(&mut game.world).furnace_at_mut(pos).unwrap();
+            let f = Arc::make_mut(&mut game.server.world)
+                .furnace_at_mut(pos)
+                .unwrap();
             f.input = Some((raw, 4));
             f.fuel = Some((log, 2));
         }
@@ -2407,9 +2539,9 @@ mod tests {
         // Three would-be-lost stacks: input, fuel, and the furnace's own drop
         // goes to the inventory, so two entities plus whatever did not fit.
         assert!(
-            game.sim.entities.len() >= 2,
+            game.server.sim.entities.len() >= 2,
             "input and fuel are on the floor, got {}",
-            game.sim.entities.len()
+            game.server.sim.entities.len()
         );
     }
 
@@ -2417,17 +2549,20 @@ mod tests {
     fn walking_over_a_dropped_item_picks_it_up() {
         let (mut game, _) = game_looking_at_ground();
         let stack = {
-            let items = game.items.as_ref().unwrap();
+            let items = game.server.items.as_ref().unwrap();
             let id = items.id_of("cubara:cobble").unwrap();
             items.new_stack(id, 7).unwrap()
         };
         // Right where the player is standing.
-        let at = game.sim.player.pos;
-        game.sim.entities.spawn_item(stack, at, FixedVec3::ZERO);
+        let at = game.server.sim.player.pos;
+        game.server
+            .sim
+            .entities
+            .spawn_item(stack, at, FixedVec3::ZERO);
 
         game.advance(TICK_DT);
 
-        assert_eq!(game.sim.entities.len(), 0, "collected");
+        assert_eq!(game.server.sim.entities.len(), 0, "collected");
         assert_eq!(count_of(&game, "cubara:cobble"), 7);
     }
 
@@ -2457,14 +2592,14 @@ mod tests {
                 // Exactly `total` ticks here too, or the comparison is against
                 // a different amount of elapsed time rather than against
                 // dormancy: one nearby, the middle away, one back home.
-                let home = game.sim.player.pos;
+                let home = game.server.sim.player.pos;
                 game.advance(TICK_DT);
-                game.sim.player.pos = home + FixedVec3::from_f32([4000.0, 0.0, 0.0]);
+                game.server.sim.player.pos = home + FixedVec3::from_f32([4000.0, 0.0, 0.0]);
                 for _ in 0..total - 2 {
                     game.advance(TICK_DT);
                 }
                 // Come back: the chunk wakes and catches up.
-                game.sim.player.pos = home;
+                game.server.sim.player.pos = home;
                 game.advance(TICK_DT);
                 game.world().furnace_at(pos).copied().expect("still there")
             };
@@ -2484,7 +2619,9 @@ mod tests {
     fn load_furnace(game: &mut Game, pos: [i32; 3]) {
         let raw = item(game, "cubara:raw_iron");
         let log = item(game, "cubara:oak_log");
-        let f = Arc::make_mut(&mut game.world).furnace_at_mut(pos).unwrap();
+        let f = Arc::make_mut(&mut game.server.world)
+            .furnace_at_mut(pos)
+            .unwrap();
         f.input = Some((raw, 8));
         f.fuel = Some((log, 32));
     }
@@ -2503,7 +2640,7 @@ mod tests {
             "active while the player is here"
         );
 
-        game.sim.player.pos += FixedVec3::from_f32([4000.0, 0.0, 0.0]);
+        game.server.sim.player.pos += FixedVec3::from_f32([4000.0, 0.0, 0.0]);
         game.advance(TICK_DT);
 
         assert!(
@@ -2525,7 +2662,7 @@ mod tests {
         game.advance(TICK_DT);
         let after_one = game.world().furnace_at(pos).copied().unwrap();
 
-        game.sim.player.pos += FixedVec3::from_f32([4000.0, 0.0, 0.0]);
+        game.server.sim.player.pos += FixedVec3::from_f32([4000.0, 0.0, 0.0]);
         for _ in 0..500 {
             game.advance(TICK_DT);
         }
@@ -2552,25 +2689,25 @@ mod tests {
         // it -- so a lethal fall reads as "no damage" here. That is what the
         // first version of this test measured, and it is why the lethal case
         // has its own test below, asserting the respawn instead.
-        game.sim.player = Player::new(
+        game.server.sim.player = Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 11.0, 0.5]),
             0.0,
             0.0,
         );
-        let full = game.sim.player.health;
+        let full = game.server.sim.player.health;
 
         for _ in 0..600 {
             game.advance(TICK_DT);
-            if game.sim.player.on_ground {
+            if game.server.sim.player.on_ground {
                 break;
             }
         }
 
-        assert!(game.sim.player.on_ground, "it landed");
+        assert!(game.server.sim.player.on_ground, "it landed");
         assert!(
-            game.sim.player.health < full,
+            game.server.sim.player.health < full,
             "landing from ten blocks left {} of {full} health",
-            game.sim.player.health
+            game.server.sim.player.health
         );
     }
 
@@ -2583,35 +2720,38 @@ mod tests {
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
         let spawn = cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 3.0, 0.5]);
-        game.sim.player = Player::new(spawn, 0.0, 0.0);
+        game.server.sim.player = Player::new(spawn, 0.0, 0.0);
         // Give them something to lose, then drop them from lethal height.
         hold(&mut game, "cubara:iron_pick");
-        let carried = game.sim.player.inventory;
-        game.sim.player.pos =
+        let carried = game.server.sim.player.inventory;
+        game.server.sim.player.pos =
             cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 60.0, 0.5]);
 
         for _ in 0..600 {
             game.advance(TICK_DT);
-            if game.sim.player.pos.y <= spawn.y && game.sim.player.on_ground {
+            if game.server.sim.player.pos.y <= spawn.y && game.server.sim.player.on_ground {
                 break;
             }
         }
 
         assert_eq!(
-            game.sim.player.health,
+            game.server.sim.player.health,
             cubara_sim::MAX_HEALTH,
             "respawned at full health"
         );
-        assert_eq!(game.sim.player.inventory, carried, "and kept the pick");
+        assert_eq!(
+            game.server.sim.player.inventory, carried,
+            "and kept the pick"
+        );
         // **Position too.** Without this the test passed while respawn did not
         // actually move anyone: `physics::step` wrote `player.pos` from its own
         // local box *after* the damage was applied, silently undoing the
         // respawn. Health and inventory alone could not see that.
         assert!(
-            game.sim.player.pos.distance_squared(spawn)
+            game.server.sim.player.pos.distance_squared(spawn)
                 < (5 * cubara_voxel::fixed::ONE as i128 / 2).pow(2),
             "respawned at {:?} rather than near spawn {spawn:?}",
-            game.sim.player.pos
+            game.server.sim.player.pos
         );
     }
 
@@ -2622,18 +2762,18 @@ mod tests {
             .world()
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
-        game.sim.player = Player::new(
+        game.server.sim.player = Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 2.5, 0.5]),
             0.0,
             0.0,
         );
-        let full = game.sim.player.health;
+        let full = game.server.sim.player.health;
 
         for _ in 0..300 {
             game.advance(TICK_DT);
         }
 
-        assert_eq!(game.sim.player.health, full, "a short drop is free");
+        assert_eq!(game.server.sim.player.health, full, "a short drop is free");
     }
 
     #[test]
@@ -2645,7 +2785,7 @@ mod tests {
             .world()
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
-        game.sim.player = Player::new(
+        game.server.sim.player = Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 80.0, 0.5]),
             0.0,
             -1.5,
@@ -2656,7 +2796,7 @@ mod tests {
         for _ in 0..600 {
             game.advance(TICK_DT);
         }
-        let health_in_flight = game.sim.player.health;
+        let health_in_flight = game.server.sim.player.health;
         assert_eq!(
             health_in_flight,
             cubara_sim::MAX_HEALTH,
@@ -2686,14 +2826,14 @@ mod tests {
         }
 
         assert!(
-            game.sim.player.on_ground,
+            game.server.sim.player.on_ground,
             "the player never settled on the ground"
         );
         assert_eq!(
-            game.sim.player.health,
+            game.server.sim.player.health,
             cubara_sim::MAX_HEALTH,
             "starting the game cost {} health",
-            cubara_sim::MAX_HEALTH - game.sim.player.health
+            cubara_sim::MAX_HEALTH - game.server.sim.player.health
         );
     }
 
@@ -2711,17 +2851,17 @@ mod tests {
         );
 
         // Kill them outright, then let the world run.
-        game.sim.player.take_damage(cubara_sim::MAX_HEALTH);
+        game.server.sim.player.take_damage(cubara_sim::MAX_HEALTH);
         for _ in 0..600 {
             game.advance(TICK_DT);
         }
 
         assert_eq!(
-            game.sim.player.health,
+            game.server.sim.player.health,
             cubara_sim::MAX_HEALTH,
             "respawning cost health, so death loops"
         );
-        assert!(game.sim.player.on_ground, "and it landed");
+        assert!(game.server.sim.player.on_ground, "and it landed");
     }
 
     #[test]
@@ -2729,8 +2869,8 @@ mod tests {
         // The world has no floor. Generation never had `y` bounds -- what was
         // missing was streaming and simulating anywhere but chunk layers 0..=2.
         let (game, _) = game_looking_at_ground();
-        let terrain = game.terrain.expect("assets are set");
-        let registry = game.blocks_registry.as_ref().unwrap();
+        let terrain = game.server.terrain.expect("assets are set");
+        let registry = game.server.blocks_registry.as_ref().unwrap();
         for y in [-1, -100, -5_000, -100_000] {
             let block = game.world().block_at(0, y, 0, terrain);
             assert_eq!(
@@ -2745,7 +2885,7 @@ mod tests {
     #[test]
     fn there_is_open_sky_however_far_up_you_go() {
         let (game, _) = game_looking_at_ground();
-        let terrain = game.terrain.expect("assets are set");
+        let terrain = game.server.terrain.expect("assets are set");
         for y in [100, 5_000, 100_000] {
             assert!(
                 !game.world().is_solid_at(0, y, 0, terrain),
@@ -2760,10 +2900,15 @@ mod tests {
         // persist like any other edit -- the overlay is keyed by world
         // position and never had a floor either.
         let (mut game, _) = game_looking_at_ground();
-        let terrain = game.terrain.expect("assets are set");
+        let terrain = game.server.terrain.expect("assets are set");
         let deep = [3, -2_000, 7];
 
-        let cc = Arc::make_mut(&mut game.world).set_block(deep[0], deep[1], deep[2], BlockId::AIR);
+        let cc = Arc::make_mut(&mut game.server.world).set_block(
+            deep[0],
+            deep[1],
+            deep[2],
+            BlockId::AIR,
+        );
         assert_eq!(cc, ChunkCoord::from_block(deep[0], deep[1], deep[2]));
         assert!(
             !game.world().is_solid_at(deep[0], deep[1], deep[2], terrain),
@@ -2782,13 +2927,13 @@ mod tests {
         // panicking one -- `ChunkCoord` is i32 and `region_of` uses div_euclid,
         // both of which were already correct for negative coordinates.
         let (game, _) = game_looking_at_ground();
-        let terrain = game.terrain.expect("assets are set");
+        let terrain = game.server.terrain.expect("assets are set");
         let deep = ChunkCoord::new(0, -64, 0);
         let chunk = game
             .world()
             .chunk_at(deep, terrain)
             .expect("a chunk that deep still generates");
-        let registry = game.blocks_registry.as_ref().unwrap();
+        let registry = game.server.blocks_registry.as_ref().unwrap();
         assert_eq!(
             registry.name_of(chunk.get(0, 0, 0)),
             Some("cubara:stone"),
@@ -2802,17 +2947,19 @@ mod tests {
         // player is next to it -- the simulated band moves with them now.
         let (mut game, _) = game_looking_at_ground();
         let deep = [0, -1_000, 0];
-        Arc::make_mut(&mut game.world).add_furnace(deep);
+        Arc::make_mut(&mut game.server.world).add_furnace(deep);
         let raw = item(&game, "cubara:raw_iron");
         let log = item(&game, "cubara:oak_log");
         {
-            let f = Arc::make_mut(&mut game.world).furnace_at_mut(deep).unwrap();
+            let f = Arc::make_mut(&mut game.server.world)
+                .furnace_at_mut(deep)
+                .unwrap();
             f.input = Some((raw, 2));
             f.fuel = Some((log, 4));
         }
         // Stand next to it.
-        game.sim.player.pos = cubara_voxel::FixedVec3::from_f32([0.5, -1_000.0, 0.5]);
-        game.sim.player.spawn = game.sim.player.pos;
+        game.server.sim.player.pos = cubara_voxel::FixedVec3::from_f32([0.5, -1_000.0, 0.5]);
+        game.server.sim.player.spawn = game.server.sim.player.pos;
 
         for _ in 0..250 {
             game.advance(TICK_DT);
@@ -2865,10 +3012,10 @@ mod tests {
                 .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
                 .expect("ground");
             mined = ground.block;
-            game.sim.player.pos =
+            game.server.sim.player.pos =
                 cubara_voxel::FixedVec3::from_f32([0.5, mined[1] as f32 + 3.5, 0.5]);
             game.break_at(mined);
-            carried = game.sim.player.inventory;
+            carried = game.server.sim.player.inventory;
 
             game.save_to(&dir);
         }
@@ -2883,7 +3030,7 @@ mod tests {
             "the mined block came back"
         );
         assert_eq!(
-            reopened.sim.player.inventory, carried,
+            reopened.server.sim.player.inventory, carried,
             "the inventory did not survive"
         );
         let _ = std::fs::remove_dir_all(&dir);

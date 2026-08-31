@@ -10,6 +10,7 @@ mod bench;
 mod caps;
 mod game;
 mod screenshot;
+mod server;
 mod streaming;
 
 use std::sync::Arc;
