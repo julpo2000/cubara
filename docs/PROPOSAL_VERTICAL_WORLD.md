@@ -50,17 +50,43 @@ So the limit is two constants, not the data model.
 The intuition — *"a taller world means more chunks, so it will be slower"* — is
 **wrong**, and measuring it first saved proposing the wrong work.
 
-**Vertical extent alone is nearly free.** Radius 64, terrain unchanged, only the
-streamed band varied:
+**Extending the band *upward* is free.** Radius 64, terrain unchanged, band
+`0..=N` — that is, adding chunk-layers above the surface:
 
 | Band | Nodes | Triangles | FPS |
 |---|---|---|---|
-| 3 layers (today) | 1,600 | 822,420 | 1,387 |
-| 8 layers | 1,600 | 822,420 | 1,382 |
-| 16 layers | 1,600 | 822,420 | 1,388 |
+| `0..=2` (today) | 1,600 | 822,420 | 1,387 |
+| `0..=7` | 1,600 | 822,420 | 1,382 |
+| `0..=15` | 1,600 | 822,420 | 1,388 |
 
-**Identical.** Terrain is a thin shell: empty air above and fully-solid rock
-below both mesh to nothing, so the extra chunks generate no geometry at all.
+**Identical** — air meshes to nothing.
+
+### §2.0 Correction: downward is *not* free, and the first version of this document said it was
+
+The table above was originally read as "vertical extent is nearly free". **That
+conclusion was wrong, and it was wrong because every band measured started at
+`0` and grew upward — into air.** Measuring downward, into rock, gives the
+opposite answer:
+
+| Band | Nodes | Triangles | FPS | Gate |
+|---|---|---|---|---|
+| `0..=2` (today, mostly air) | 1,600 | 822,420 | **1,390** | MET |
+| `-1..=1` | 2,635 | 1,406,392 | **866** | **FAILED** |
+| `-2..=2` | 3,138 | 1,512,280 | **790** | **FAILED** |
+| `-3..=3` | 3,819 | 1,679,574 | **706** | **FAILED** |
+| `-4..=4` | 4,260 | 1,760,268 | **670** | **FAILED** |
+
+`-1..=1` has the *same number of layers* as today and still nearly doubles the
+triangle count.
+
+**The cause is caves, and it is not waste.** The cave field (§8.3) is 3D noise
+with no lower bound, so it keeps carving at every depth — every underground chunk
+is full of real cave walls. That geometry is genuinely there; it is simply not
+visible from outside the rock.
+
+Which means **no choice of band fixes this.** Any underground rock within render
+range costs, so the answer is not a smaller vertical radius — it is not drawing
+what cannot be seen.
 
 **What costs is surface area — which is exactly what mountains and ravines are.**
 Same radius, terrain amplitude raised:
@@ -137,9 +163,12 @@ measurements rather than intuition.
 **It is blocked on perf work that is already on the books**, and this is the
 first thing that actually justifies it:
 
-- **[#42](../../issues/42) occlusion culling.** Mountains occlude enormously —
-  this is precisely the case where it pays, and the reason block 1.11 declined to
-  pull it forward was that *"the profile did not ask for it"*. This profile asks.
+- **[#42](../../issues/42) occlusion culling.** This is the whole blocker, and
+  §2.0 is why: underground cave surfaces are real geometry that is invisible from
+  outside the rock. Block 1.11 declined to pull occlusion culling forward because
+  *"the profile did not ask for it"*. **This profile asks**, and it asks for
+  nothing else first — even the simplest form of vertical world fails the gate
+  without it.
 - **[#32](../../issues/32)/[#33](../../issues/33) GPU culling.**
 - **Arena capacity** — sized or dynamic, per §2.1.
 
