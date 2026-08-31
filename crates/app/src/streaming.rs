@@ -45,6 +45,31 @@ pub(crate) fn to_meshed_node(built: BuiltNode) -> Option<MeshedNode> {
     })
 }
 
+/// Where a node is in the **rendering** lifecycle
+/// (`docs/PHASE2_ARCHITECTURE.md` §11.1).
+///
+/// This is the other half of block 2.6, and the half that deliberately did
+/// **not** move into `cubara-world`. A node is a rendering unit: it exists at
+/// the level it does because of its distance from a *camera*, and above level 0
+/// one node covers up to 512 chunks. The simulation's lifecycle
+/// ([`cubara_world::ChunkState`]) is per chunk and keyed off the *player*. As
+/// one enum, a chunk would go dormant because it was far from the camera.
+///
+/// The states were always here -- as `HashSet` membership plus whatever
+/// `MeshPool` was holding. This names them, and changes nothing: #47's bar for
+/// this half is explicitly "re-expressed in terms of states with no behaviour
+/// change", and restructuring the two containers into one would be a real
+/// change with real risk and no behavioural benefit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeResidency {
+    /// Not wanted, or not asked for yet.
+    Absent,
+    /// Requested; a worker is meshing it.
+    InFlight,
+    /// Meshed and handed to the renderer (or known to be empty).
+    Resident,
+}
+
 /// Owns the mesh-worker pool and the resident node set; drives
 /// [`Renderer::apply_node_updates`] each frame. One per live `Renderer` (they
 /// share a lifecycle -- see `main.rs`).
@@ -171,6 +196,26 @@ impl NodeStreaming {
         self.center = Some(center);
     }
 
+    /// Where `node` is in the rendering lifecycle (§11.1).
+    ///
+    /// Derived from the existing containers rather than stored separately --
+    /// two sources of truth for one fact is how they drift apart.
+    ///
+    /// Nothing calls this yet: naming the states is what #47 asked for, and the
+    /// streaming loop reads the containers directly because that is the code
+    /// that already worked. It is the accessor anything asking "what is this
+    /// node doing" should use rather than reaching into `resident`.
+    #[allow(dead_code)]
+    pub fn residency(&self, node: NodeKey) -> NodeResidency {
+        if self.resident.contains(&node) {
+            NodeResidency::Resident
+        } else if self.mesh_pool.is_in_flight(node) {
+            NodeResidency::InFlight
+        } else {
+            NodeResidency::Absent
+        }
+    }
+
     /// Take finished meshes from the worker pool and hand them to the
     /// renderer, in a fixed order (ascending `NodeKey`, [`sort_batch`])
     /// rather than whatever order the workers happened to finish in --
@@ -186,5 +231,29 @@ impl NodeStreaming {
             })
             .collect();
         renderer.apply_node_updates(std::iter::empty(), meshed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rendering lifecycle is a *different* lifecycle from the simulation's
+    /// (§11.1), and this is where that is asserted rather than only written
+    /// down: the two enums are not convertible, and nothing here mentions a
+    /// `ChunkCoord`.
+    #[test]
+    fn node_residency_names_the_states_that_already_existed() {
+        let states = [
+            NodeResidency::Absent,
+            NodeResidency::InFlight,
+            NodeResidency::Resident,
+        ];
+        // Distinct, and exhaustive: absent, asked for, arrived.
+        for (i, a) in states.iter().enumerate() {
+            for (j, b) in states.iter().enumerate() {
+                assert_eq!(i == j, a == b, "{a:?} vs {b:?}");
+            }
+        }
     }
 }

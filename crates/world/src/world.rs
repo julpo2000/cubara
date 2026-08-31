@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use cubara_voxel::{BlockId, Chunk, ChunkCoord};
 
 use crate::block_entity::{BlockEntities, Furnace};
+use crate::chunk_state::{ChunkStates, Woken};
 use crate::node::NodeKey;
 use crate::worldgen::{TerrainBlocks, WorldGen};
 
@@ -47,6 +48,10 @@ pub struct World {
     /// is one; see [`crate::block_entity`] for why they live beside `edits`
     /// rather than on the chunk.
     block_entities: BlockEntities,
+    /// Where each chunk is in its simulation lifecycle
+    /// (`PHASE2_ARCHITECTURE.md` §11). Sparse: a chunk with no entry is
+    /// `Generated`, which is what an untouched chunk is.
+    chunk_states: ChunkStates,
 }
 
 impl Default for World {
@@ -67,6 +72,7 @@ impl World {
             worldgen: WorldGen::new(seed),
             edits: BTreeMap::new(),
             block_entities: BlockEntities::new(),
+            chunk_states: ChunkStates::new(),
         }
     }
 
@@ -151,6 +157,66 @@ impl World {
     /// can mutate them one at a time without holding a borrow on the map.
     pub fn block_entity_positions(&self) -> Vec<[i32; 3]> {
         self.block_entities.keys().copied().collect()
+    }
+
+    /// The chunk lifecycle table (§11).
+    pub fn chunk_states(&self) -> &ChunkStates {
+        &self.chunk_states
+    }
+
+    /// Bring the simulation radius up to date around `centre` at tick `now`.
+    ///
+    /// Chunks inside `radius` become Active; chunks outside it go Dormant,
+    /// remembering `now`. Returns the chunks that just woke and how long each
+    /// slept, so the caller can catch their contents up (§11.3) -- this type
+    /// owns the lifecycle, not what lives inside a chunk.
+    ///
+    /// **Only chunks that already have a state, plus the ones now in range, are
+    /// considered.** Walking every chunk that has ever existed would make the
+    /// cost grow with explored area rather than with the radius, which is the
+    /// opposite of what dormancy is for.
+    pub fn update_simulation_radius(
+        &mut self,
+        centre: ChunkCoord,
+        radius: i32,
+        now: u64,
+    ) -> Vec<Woken> {
+        let in_range =
+            |c: ChunkCoord| (c.x - centre.x).abs() <= radius && (c.z - centre.z).abs() <= radius;
+
+        // Sleep anything currently Active that has left the radius. Collected
+        // first: `active()` borrows the table this then mutates.
+        let leaving: Vec<ChunkCoord> = self
+            .chunk_states
+            .active()
+            .filter(|c| !in_range(*c))
+            .collect();
+        for coord in leaving {
+            self.chunk_states.sleep(coord, now);
+        }
+
+        // Wake everything in range, in position order so the catch-up work
+        // happens in a defined sequence (Rule 1).
+        let mut woken = Vec::new();
+        for x in (centre.x - radius)..=(centre.x + radius) {
+            for z in (centre.z - radius)..=(centre.z + radius) {
+                for y in self.chunk_y_range() {
+                    let coord = ChunkCoord::new(x, y, z);
+                    match self.chunk_states.wake(coord, now) {
+                        Some(w) if w.elapsed > 0 => woken.push(w),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        woken
+    }
+
+    /// The vertical band of chunks the simulation covers. Terrain sits inside
+    /// it; this mirrors the streamer's own band rather than simulating an
+    /// unbounded column.
+    fn chunk_y_range(&self) -> std::ops::RangeInclusive<i32> {
+        0..=2
     }
 
     /// Cast a ray through the world (terrain + edits) and return the first solid
