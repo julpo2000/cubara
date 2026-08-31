@@ -100,7 +100,8 @@ frames after 200 warmup.
 | 2026-08-30 | **Oak trees via the structure pass** [#154], radius 64³⁵ | **1,600** | **766,476** | ~1,442 | **0.484 ms** | ~0.89 ms | `89ca231` |
 | 2026-08-31 | **Iron ore as a density-pass threshold** [#156], radius 64³⁶ | 1,600 | **822,420** | ~1,381 | 0.509 ms | ~0.86 ms | `a0b8108` |
 | 2026-08-31 | Drops and tool tiers from data [#158], radius 64³⁷ | 1,600 | 822,420 | ~1,385 | 0.509 ms | ~0.86 ms | `b78ab56` |
-| 2026-08-31 | Mining takes time [#159], radius 64³⁷ | 1,600 | 822,420 | ~1,380 | 0.502 ms | ~0.92 ms | *(this PR)* |
+| 2026-08-31 | Mining takes time [#159], radius 64³⁷ | 1,600 | 822,420 | ~1,380 | 0.502 ms | ~0.92 ms | `d4ee268` |
+| 2026-08-31 | The furnace: block entities, wood fuel, smelting [#160], radius 64³⁷ | 1,600 | 822,420 | ~1,381 | 0.499 ms | ~0.90 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -1030,6 +1031,14 @@ nothing -- so the honest reading is that this row measures the unchanged scene,
 not the feature. What the feature costs when actually mining is one raycast per
 tick, which is the same raycast the block highlight (#52) already does every
 frame.
+
+**The furnace (#160)** is the third such row, and the same caveat applies twice
+over: 822,420 triangles, 1,381 FPS, 0.499 ms. `--bench` places no furnace, so
+the per-tick furnace loop iterates an empty `BTreeMap` and costs nothing
+measurable. What it costs *with* furnaces is one `BTreeMap` walk plus a handful
+of integer operations per furnace per tick -- worth measuring properly when
+block 2.6/2.7 make dormant chunks a thing and a world can hold thousands of
+them, which is exactly the scenario those blocks exist to make cheap.
 
 ## Detailed run logs
 

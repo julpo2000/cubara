@@ -190,6 +190,7 @@ mod tests {
                     durability,
                     tier: 0,
                     speed: None,
+                    burn_ticks: None,
                 },
             )
         };

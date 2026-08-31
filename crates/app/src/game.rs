@@ -21,8 +21,10 @@ use cubara_sim::{InputFrame, Player, Sim, REACH, TICK_DT};
 use cubara_sim::{SlotRef, HOTBAR_WIDTH};
 use cubara_voxel::ChunkCoord;
 use cubara_voxel::{
-    BlockId, BlockRegistry, DropRule, ItemRegistry, ItemStack, ItemState, RecipeBook,
+    BlockId, BlockRegistry, DropRule, Interact, ItemRegistry, ItemStack, ItemState, RecipeBook,
+    SmeltBook,
 };
+use cubara_world::Furnace;
 use cubara_world::TerrainBlocks;
 use cubara_world::World;
 
@@ -56,6 +58,12 @@ pub fn load_structure_registry() -> cubara_voxel::StructureRegistry {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     cubara_voxel::StructureRegistry::load(&repo_root.join("assets/structures"))
         .expect("assets/structures must load")
+}
+
+/// Load `assets/smelting/*.ron`, resolving item names through `items`.
+pub fn load_smelt_book(items: &ItemRegistry) -> SmeltBook {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    SmeltBook::load(&repo_root.join("assets/smelting"), items).expect("assets/smelting must load")
 }
 
 /// Load `assets/ores/*.ron` -- which ores exist, and how common they are.
@@ -108,17 +116,14 @@ pub struct Game {
     items: Option<ItemRegistry>,
     /// Every recipe, loaded alongside the items they name.
     recipes: Option<RecipeBook>,
-    /// The crafting bench, resolved by name. Right-clicking one opens the 3x3
-    /// grid instead of placing whatever is held.
-    ///
-    /// Name-based, like the drop policy (`PHASE2_ARCHITECTURE.md` 4.1), and
-    /// for the same reason: block 2.4 needs the same treatment for the furnace,
-    /// and designing an `interact:` field in the block format now would mean
-    /// designing it without the second case in hand.
-    bench_block: Option<BlockId>,
     /// Whether the inventory screen is open. Screen state, not world state --
     /// what the *grid* holds is world state and lives on the player.
     inventory_open: bool,
+    /// The furnace whose screen is open, by world position. `None` when the
+    /// open screen is the plain inventory or a bench.
+    open_furnace: Option<[i32; 3]>,
+    /// Every smelting recipe, loaded alongside the items they name.
+    smelting: Option<SmeltBook>,
     /// Whether the break button is currently held. Read once per `advance`
     /// into [`InputFrame::breaking`].
     breaking: bool,
@@ -177,8 +182,9 @@ impl Game {
             terrain: None,
             items: None,
             recipes: None,
-            bench_block: None,
             inventory_open: false,
+            open_furnace: None,
+            smelting: None,
             breaking: false,
             mining: None,
             accumulator: 0.0,
@@ -351,6 +357,7 @@ impl Game {
             if let Some(cc) = self.tick_mining(input.breaking) {
                 dirty.push(cc);
             }
+            self.tick_furnaces();
             input.jump = false;
             input.toggle_fly = false;
             input.look_delta = [0.0, 0.0];
@@ -402,12 +409,9 @@ impl Game {
                 .with_ores(&load_ore_registry(), &registry),
         );
         self.blocks_registry = Some(registry);
+        self.smelting = Some(load_smelt_book(&items));
         self.items = Some(items);
         self.recipes = Some(recipes);
-        self.bench_block = self
-            .blocks_registry
-            .as_ref()
-            .and_then(|r| r.id_of("cubara:crafting_bench"));
     }
 
     /// Break the targeted block and put its drop in the inventory.
@@ -532,6 +536,14 @@ impl Game {
     /// so the two cannot drift apart on what a break *yields*.
     fn break_at(&mut self, block: [i32; 3]) -> ChunkCoord {
         let [x, y, z] = block;
+        // Whatever state the block owned goes with it (§7). Its contents are
+        // lost rather than spilled: dropped-item entities need ECS (block 2.5),
+        // and quietly moving them to the player would be a rule nobody decided.
+        Arc::make_mut(&mut self.world).remove_block_entity(block);
+        if self.open_furnace == Some(block) {
+            self.open_furnace = None;
+            self.inventory_open = false;
+        }
 
         // The drop is the optional part; the break is not. Assets are always
         // set in the real app, but making the whole action depend on them
@@ -662,7 +674,20 @@ impl Game {
         let slot = self.sim.player.inventory.selected_slot() as usize;
         self.sim.player.inventory.take_one(slot, items)?;
 
-        Some(Arc::make_mut(&mut self.world).set_block(target[0], target[1], target[2], block))
+        // A block that owns state gets it the moment it is placed, rather than
+        // on first use -- so a furnace someone never opens still ticks, and the
+        // world hash covers it either way.
+        let interactive = self
+            .blocks_registry
+            .as_deref()
+            .map(|r| r.interact(block) == Interact::Furnace)
+            .unwrap_or(false);
+        let world = Arc::make_mut(&mut self.world);
+        let cc = world.set_block(target[0], target[1], target[2], block);
+        if interactive {
+            world.add_furnace(target);
+        }
+        Some(cc)
     }
 
     /// The hotbar reduced to what drawing needs: a swatch colour and a count
@@ -696,11 +721,13 @@ impl Game {
 
     /// If the targeted block is interactive, act on it and report `true`.
     ///
-    /// Only the bench so far. Block 2.4 adds the furnace and is the point at
-    /// which this should become a property of the block rather than a name
-    /// comparison -- with two real cases to design against.
+    /// Reads [`Interact`] off the block registry rather than comparing names.
+    /// The name comparison this replaces carried a note saying block 2.4 was
+    /// the point to generalise it, "with two real cases to design against" --
+    /// the furnace is that second case.
     fn interact(&mut self) -> bool {
-        let (Some(bench), Some(terrain)) = (self.bench_block, self.terrain) else {
+        let (Some(registry), Some(terrain)) = (self.blocks_registry.as_deref(), self.terrain)
+        else {
             return false;
         };
         let origin = self.sim.player.pos.to_array();
@@ -709,15 +736,65 @@ impl Game {
             return false;
         };
         let [x, y, z] = hit.block;
-        if self.world.block_at(x, y, z, terrain) != bench {
-            return false;
+        match registry.interact(self.world.block_at(x, y, z, terrain)) {
+            Interact::None => false,
+            Interact::Bench => {
+                // Width lives on `Crafting` (world state), not on the screen: a
+                // 3x3 grid holding items in its outer cells is a different world
+                // from a 2x2 one, and the hash already covers it.
+                self.sim.player.crafting.set_width(3);
+                self.open_furnace = None;
+                self.inventory_open = true;
+                true
+            }
+            Interact::Furnace => {
+                // A furnace placed before this block existed (or loaded from an
+                // older save) has no entity yet; give it one on first use rather
+                // than refusing to open.
+                Arc::make_mut(&mut self.world).add_furnace([x, y, z]);
+                self.open_furnace = Some([x, y, z]);
+                self.inventory_open = true;
+                true
+            }
         }
-        // Width lives on `Crafting` (world state), not on the screen: a 3x3
-        // grid holding items in its outer cells is a different world from a
-        // 2x2 one, and the hash already covers it.
-        self.sim.player.crafting.set_width(3);
-        self.inventory_open = true;
-        true
+    }
+
+    /// One tick of every furnace in the world (`PHASE2_ARCHITECTURE.md` §7).
+    ///
+    /// Iterates positions in `BTreeMap` order, so which furnace ticks first is
+    /// the positions' own order rather than a hash seed's -- Rule 1, and the
+    /// same reason the hash iterates them that way.
+    ///
+    /// In this scope every furnace ticks every tick, because every loaded chunk
+    /// is active. Block 2.6's dormant chunks and 2.7's catch-up are what change
+    /// that, and [`Furnace::advance`] already takes an elapsed count so they can.
+    fn tick_furnaces(&mut self) {
+        let (Some(items), Some(smelting)) = (self.items.as_ref(), self.smelting.as_ref()) else {
+            return;
+        };
+        let positions = self.world.block_entity_positions();
+        if positions.is_empty() {
+            return;
+        }
+        let world = Arc::make_mut(&mut self.world);
+        for pos in positions {
+            let Some(f) = world.furnace_at_mut(pos) else {
+                continue;
+            };
+            let recipe = f.input.and_then(|(id, _)| smelting.for_input(id));
+            f.advance(
+                1,
+                recipe,
+                |id| items.burn_ticks(id),
+                |id| items.max_stack(id),
+            );
+        }
+    }
+
+    /// The furnace screen currently open, if any.
+    pub fn open_furnace(&self) -> Option<Furnace> {
+        let pos = self.open_furnace?;
+        self.world.furnace_at(pos).copied()
     }
 
     /// Which ids the terrain is made of, or a treeless default before assets
@@ -751,6 +828,25 @@ impl Game {
             self.inventory_open = true;
             return;
         }
+        // A furnace screen has no crafting grid to empty -- its slots belong to
+        // the block and stay in it. Only the cursor needs somewhere to go.
+        if self.open_furnace.take().is_some() {
+            self.inventory_open = false;
+            if let Some(items) = self.items.as_ref() {
+                let player = &mut self.sim.player;
+                if let Some(held) = player.crafting.held() {
+                    if let Some(lost) = player.inventory.add(held, items) {
+                        log::debug!(
+                            "inventory full: {} x{} lost closing a furnace",
+                            items.name_of(lost.item()).unwrap_or("?"),
+                            lost.count()
+                        );
+                    }
+                    player.crafting.set_held(None);
+                }
+            }
+            return;
+        }
         let Some(items) = self.items.as_ref() else {
             self.inventory_open = false;
             return;
@@ -775,19 +871,85 @@ impl Game {
         let (Some(items), Some(book)) = (self.items.as_ref(), self.recipes.as_ref()) else {
             return;
         };
-        let panel = InventoryPanel::layout(width, height, self.sim.player.crafting.width());
+        let panel = match self.open_furnace {
+            Some(_) => InventoryPanel::layout_furnace(width, height),
+            None => InventoryPanel::layout(width, height, self.sim.player.crafting.width()),
+        };
         let Some((kind, index)) = panel.hit(x, y) else {
             return;
         };
+        if let Some(pos) = self.open_furnace {
+            self.click_furnace(pos, kind, index);
+            return;
+        }
         let slot = match kind {
             PanelSlotKind::Inventory => SlotRef::Inventory(index),
             PanelSlotKind::Grid => SlotRef::Grid(index),
             PanelSlotKind::Result => SlotRef::Result,
+            // A furnace slot cannot appear in the crafting layout; ignoring it
+            // is the safe branch rather than mapping it to a grid cell.
+            PanelSlotKind::Fuel => return,
         };
         let player = &mut self.sim.player;
         player
             .crafting
             .click(slot, right, &mut player.inventory, items, book);
+    }
+
+    /// A click on the open furnace's screen.
+    ///
+    /// Swap-on-click, matching the crafting cursor's feel: clicking a furnace
+    /// slot with something held puts it in, clicking with an empty hand takes
+    /// what is there. The output slot is take-only -- putting an ingot back
+    /// into the output would be a way to duplicate work when the next smelt
+    /// completes and stacks onto it.
+    ///
+    /// Uses the crafting cursor (`player.crafting.held()`) rather than a second
+    /// one, so a player never has two things in hand at once and closing either
+    /// screen has one rule for what happens to it.
+    fn click_furnace(&mut self, pos: [i32; 3], kind: PanelSlotKind, index: usize) {
+        let Some(items) = self.items.as_ref() else {
+            return;
+        };
+        if kind == PanelSlotKind::Inventory {
+            let player = &mut self.sim.player;
+            player
+                .crafting
+                .click_inventory_only(index, &mut player.inventory, items);
+            return;
+        }
+        let held = self.sim.player.crafting.held();
+        let world = Arc::make_mut(&mut self.world);
+        let Some(f) = world.furnace_at_mut(pos) else {
+            return;
+        };
+        let slot = match kind {
+            PanelSlotKind::Grid => &mut f.input,
+            PanelSlotKind::Fuel => &mut f.fuel,
+            PanelSlotKind::Result => {
+                // Take-only.
+                if held.is_none() {
+                    if let Some((id, count)) = f.output.take() {
+                        if let Ok(stack) = items.new_stack(id, count) {
+                            self.sim.player.crafting.set_held(Some(stack));
+                        }
+                    }
+                }
+                return;
+            }
+            PanelSlotKind::Inventory => return,
+        };
+        match held {
+            Some(stack) => {
+                let previous = slot.replace((stack.item(), stack.count()));
+                let give_back = previous.and_then(|(id, c)| items.new_stack(id, c).ok());
+                self.sim.player.crafting.set_held(give_back);
+            }
+            None => {
+                let taken = slot.take().and_then(|(id, c)| items.new_stack(id, c).ok());
+                self.sim.player.crafting.set_held(taken);
+            }
+        }
     }
 
     /// The screen's layout and contents, or `None` when it is closed.
@@ -806,7 +968,11 @@ impl Game {
         let items = self.items.as_ref()?;
         let crafting = &self.sim.player.crafting;
         let book = self.recipes.as_ref();
-        let panel = InventoryPanel::layout(width, height, crafting.width());
+        let furnace = self.open_furnace();
+        let panel = match self.open_furnace {
+            Some(_) => InventoryPanel::layout_furnace(width, height),
+            None => InventoryPanel::layout(width, height, crafting.width()),
+        };
 
         let swatch = |stack: cubara_voxel::ItemStack| {
             items.name_of(stack.item()).map(|name| HotbarSlot {
@@ -814,18 +980,33 @@ impl Game {
                 count: stack.count(),
             })
         };
+        // A furnace slot holds `(id, count)` rather than an `ItemStack`, since
+        // nothing in a furnace has durability.
+        let furnace_swatch = |slot: Option<(cubara_voxel::ItemId, u8)>| {
+            slot.and_then(|(id, count)| {
+                items.name_of(id).map(|name| HotbarSlot {
+                    color: swatch_color(name),
+                    count,
+                })
+            })
+        };
 
         let contents = panel
             .slots()
             .iter()
-            .map(|s| match s.kind {
-                PanelSlotKind::Inventory => {
+            .map(|s| match (s.kind, furnace) {
+                (PanelSlotKind::Inventory, _) => {
                     self.sim.player.inventory.slot(s.index).and_then(swatch)
                 }
-                PanelSlotKind::Grid => crafting.cell(s.index).and_then(swatch),
-                PanelSlotKind::Result => book
+                (PanelSlotKind::Grid, Some(f)) => furnace_swatch(f.input),
+                (PanelSlotKind::Fuel, Some(f)) => furnace_swatch(f.fuel),
+                (PanelSlotKind::Result, Some(f)) => furnace_swatch(f.output),
+                (PanelSlotKind::Grid, None) => crafting.cell(s.index).and_then(swatch),
+                (PanelSlotKind::Result, None) => book
                     .and_then(|b| crafting.result(b, items))
                     .and_then(swatch),
+                // Only a furnace layout produces a fuel slot.
+                (PanelSlotKind::Fuel, None) => None,
             })
             .collect();
         let held = crafting.held().and_then(swatch);
@@ -1754,6 +1935,198 @@ mod tests {
         assert!(
             game.advance(TICK_DT * 20.0).is_empty(),
             "capped at five ticks, and stone at speed 4 needs eight"
+        );
+    }
+
+    /// Place a furnace at the block the player is looking at and open it.
+    fn open_a_furnace(game: &mut Game) -> [i32; 3] {
+        let pos = stand_over(game, "cubara:furnace");
+        Arc::make_mut(&mut game.world).add_furnace(pos);
+        game.open_furnace = Some(pos);
+        game.inventory_open = true;
+        pos
+    }
+
+    fn item(game: &Game, name: &str) -> cubara_voxel::ItemId {
+        game.items.as_ref().unwrap().id_of(name).expect(name)
+    }
+
+    #[test]
+    fn right_clicking_a_furnace_opens_its_screen() {
+        // And it reads `Interact` off the registry rather than comparing names,
+        // which is what block 2.4c generalised.
+        let (mut game, _) = game_looking_at_ground();
+        stand_over(&mut game, "cubara:furnace");
+
+        assert!(game.interact(), "the furnace is interactive");
+        assert!(game.inventory_open());
+        assert!(
+            game.open_furnace().is_some(),
+            "a furnace screen, not a bench"
+        );
+    }
+
+    #[test]
+    fn a_bench_still_opens_the_three_by_three_grid() {
+        // The same registry lookup must keep the bench working -- Rule 5's
+        // "one implementation" cuts both ways.
+        let (mut game, _) = game_looking_at_ground();
+        stand_over(&mut game, "cubara:crafting_bench");
+
+        assert!(game.interact());
+        assert!(game.inventory_open());
+        assert!(game.open_furnace().is_none(), "a bench, not a furnace");
+        assert_eq!(game.sim.player.crafting.width(), 3);
+    }
+
+    #[test]
+    fn a_furnace_smelts_raw_iron_into_an_ingot_over_ticks() {
+        // The last rung of REQUIREMENTS #5: ore you mined becomes metal you can
+        // craft with. 200 ticks per ingot, and a log burns 80 -- so this needs
+        // three logs' worth of fuel, which is the point of checking it end to
+        // end rather than trusting the unit tests.
+        let (mut game, _) = game_looking_at_ground();
+        let pos = open_a_furnace(&mut game);
+        let raw = item(&game, "cubara:raw_iron");
+        let log = item(&game, "cubara:oak_log");
+        {
+            let f = Arc::make_mut(&mut game.world).furnace_at_mut(pos).unwrap();
+            f.input = Some((raw, 1));
+            f.fuel = Some((log, 4));
+        }
+
+        for _ in 0..210 {
+            game.advance(TICK_DT);
+        }
+
+        let f = game.open_furnace().expect("still open");
+        assert_eq!(
+            f.output,
+            Some((item(&game, "cubara:iron_ingot"), 1)),
+            "one ingot"
+        );
+        assert_eq!(f.input, None, "the raw iron was consumed");
+    }
+
+    #[test]
+    fn a_furnace_with_no_fuel_smelts_nothing() {
+        let (mut game, _) = game_looking_at_ground();
+        let pos = open_a_furnace(&mut game);
+        let raw = item(&game, "cubara:raw_iron");
+        Arc::make_mut(&mut game.world)
+            .furnace_at_mut(pos)
+            .unwrap()
+            .input = Some((raw, 1));
+
+        for _ in 0..400 {
+            game.advance(TICK_DT);
+        }
+
+        let f = game.open_furnace().unwrap();
+        assert_eq!(f.output, None);
+        assert_eq!(f.input, Some((raw, 1)), "nothing consumed either");
+    }
+
+    #[test]
+    fn clicking_the_furnace_slots_puts_items_in_and_takes_them_out() {
+        let (mut game, _) = game_looking_at_ground();
+        let pos = open_a_furnace(&mut game);
+        let raw = item(&game, "cubara:raw_iron");
+        let stack = game.items.as_ref().unwrap().new_stack(raw, 3).unwrap();
+        game.sim.player.crafting.set_held(Some(stack));
+
+        // Into the input slot.
+        game.click_furnace(pos, PanelSlotKind::Grid, 0);
+        assert_eq!(
+            game.open_furnace().unwrap().input,
+            Some((raw, 3)),
+            "the held stack went in"
+        );
+        assert!(game.sim.player.crafting.held().is_none(), "hand is empty");
+
+        // And back out.
+        game.click_furnace(pos, PanelSlotKind::Grid, 0);
+        assert_eq!(game.open_furnace().unwrap().input, None);
+        assert_eq!(game.sim.player.crafting.held().map(|s| s.count()), Some(3));
+    }
+
+    #[test]
+    fn the_output_slot_is_take_only() {
+        // Putting something back into the output would let the next completed
+        // smelt stack onto it, which is work out of nothing.
+        let (mut game, _) = game_looking_at_ground();
+        let pos = open_a_furnace(&mut game);
+        let raw = item(&game, "cubara:raw_iron");
+        let stack = game.items.as_ref().unwrap().new_stack(raw, 1).unwrap();
+        game.sim.player.crafting.set_held(Some(stack));
+
+        game.click_furnace(pos, PanelSlotKind::Result, 0);
+
+        assert_eq!(game.open_furnace().unwrap().output, None, "nothing went in");
+        assert!(game.sim.player.crafting.held().is_some(), "still held");
+    }
+
+    #[test]
+    fn breaking_a_furnace_takes_its_state_with_it() {
+        let (mut game, _) = game_looking_at_ground();
+        let pos = open_a_furnace(&mut game);
+        let raw = item(&game, "cubara:raw_iron");
+        Arc::make_mut(&mut game.world)
+            .furnace_at_mut(pos)
+            .unwrap()
+            .input = Some((raw, 5));
+
+        game.break_at(pos);
+
+        assert!(game.world().furnace_at(pos).is_none(), "the entity is gone");
+        assert!(!game.inventory_open(), "and its screen closed");
+    }
+
+    #[test]
+    fn placing_a_furnace_gives_it_state_immediately() {
+        // Not on first use: a furnace nobody opens must still tick, and the
+        // world hash must cover it either way.
+        let (mut game, _) = game_looking_at_ground();
+        let furnace = game
+            .blocks_registry
+            .as_ref()
+            .unwrap()
+            .id_of("cubara:furnace")
+            .unwrap();
+        let items = game.items.as_ref().unwrap();
+        let id = items.id_of("cubara:furnace").unwrap();
+        let stack = items.new_stack(id, 1).unwrap();
+        let slot = game.sim.player.inventory.selected_slot() as usize;
+        game.sim.player.inventory.set_slot(slot, Some(stack));
+
+        let cc = game.place_block().expect("placed");
+        let _ = (furnace, cc);
+        assert_eq!(
+            game.world().block_entities().count(),
+            1,
+            "the placed furnace owns state"
+        );
+    }
+
+    #[test]
+    fn closing_a_furnace_screen_keeps_its_contents_in_the_block() {
+        // Unlike a crafting grid, whose cells are emptied into the inventory on
+        // close: a furnace's slots belong to the block, not to the screen.
+        let (mut game, _) = game_looking_at_ground();
+        let pos = open_a_furnace(&mut game);
+        let raw = item(&game, "cubara:raw_iron");
+        Arc::make_mut(&mut game.world)
+            .furnace_at_mut(pos)
+            .unwrap()
+            .input = Some((raw, 2));
+
+        game.toggle_inventory();
+
+        assert!(!game.inventory_open(), "closed");
+        assert_eq!(
+            game.world().furnace_at(pos).unwrap().input,
+            Some((raw, 2)),
+            "contents stayed in the furnace"
         );
     }
 }

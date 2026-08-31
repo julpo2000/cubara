@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 
 use cubara_voxel::{BlockId, Chunk, ChunkCoord};
 
+use crate::block_entity::{BlockEntities, Furnace};
 use crate::node::NodeKey;
 use crate::worldgen::{TerrainBlocks, WorldGen};
 
@@ -41,6 +42,11 @@ pub struct World {
     /// observable state once this is saved or hashed, and `ARCHITECTURE.md` Rule 1
     /// forbids results that depend on unordered iteration.
     edits: BTreeMap<[i32; 3], BlockId>,
+    /// Blocks that own state over time, by world position
+    /// (`PHASE2_ARCHITECTURE.md` §7). `BTreeMap` for the same reason `edits`
+    /// is one; see [`crate::block_entity`] for why they live beside `edits`
+    /// rather than on the chunk.
+    block_entities: BlockEntities,
 }
 
 impl Default for World {
@@ -60,6 +66,7 @@ impl World {
         Self {
             worldgen: WorldGen::new(seed),
             edits: BTreeMap::new(),
+            block_entities: BlockEntities::new(),
         }
     }
 
@@ -106,6 +113,44 @@ impl World {
     pub fn set_block(&mut self, x: i32, y: i32, z: i32, block: BlockId) -> ChunkCoord {
         self.edits.insert([x, y, z], block);
         ChunkCoord::from_block(x, y, z)
+    }
+
+    /// The furnace at `pos`, if one has been placed there.
+    pub fn furnace_at(&self, pos: [i32; 3]) -> Option<&Furnace> {
+        self.block_entities.get(&pos)
+    }
+
+    /// The furnace at `pos`, for mutation.
+    pub fn furnace_at_mut(&mut self, pos: [i32; 3]) -> Option<&mut Furnace> {
+        self.block_entities.get_mut(&pos)
+    }
+
+    /// Give the block at `pos` a furnace's state. Called when one is placed.
+    pub fn add_furnace(&mut self, pos: [i32; 3]) {
+        self.block_entities.entry(pos).or_default();
+    }
+
+    /// Drop the block entity at `pos`, if any. Called when the block is broken.
+    ///
+    /// **Its contents go with it.** Spilling them would need dropped-item
+    /// entities, which do not exist until ECS (block 2.5), and quietly moving
+    /// them to the player's inventory would be a gameplay rule nobody has
+    /// decided. Returned so the caller can decide, once there is something to
+    /// decide with.
+    pub fn remove_block_entity(&mut self, pos: [i32; 3]) -> Option<Furnace> {
+        self.block_entities.remove(&pos)
+    }
+
+    /// Every block entity, in position order. The order is load-bearing: it
+    /// feeds the world-state hash (Rule 1).
+    pub fn block_entities(&self) -> impl Iterator<Item = (&[i32; 3], &Furnace)> {
+        self.block_entities.iter()
+    }
+
+    /// Every block-entity position, in order — what a tick loop iterates so it
+    /// can mutate them one at a time without holding a borrow on the map.
+    pub fn block_entity_positions(&self) -> Vec<[i32; 3]> {
+        self.block_entities.keys().copied().collect()
     }
 
     /// Cast a ray through the world (terrain + edits) and return the first solid
@@ -278,7 +323,7 @@ mod tests {
     use super::*;
     use crate::streaming;
     use crate::worldgen::OreSet;
-    use cubara_voxel::{BlockRegistry, DropRule, Faces, Material, MeshContext, Shape};
+    use cubara_voxel::{BlockRegistry, DropRule, Faces, Interact, Material, MeshContext, Shape};
 
     /// A registry with a single solid material -- air (0) plus one other
     /// material sorts to id 1, matching `BlockId::STONE`, which is what
@@ -297,6 +342,7 @@ mod tests {
                 drops: DropRule::SameName,
                 requires_tier: 0,
                 hardness: Some(1),
+                interact: Interact::None,
             },
         )])
         .expect("fixture registry is valid")

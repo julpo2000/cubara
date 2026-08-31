@@ -7,7 +7,7 @@
 //! that can exercise the real pipeline end to end.
 
 use cubara_render::ChunkArena;
-use cubara_voxel::{BlockRegistry, ChunkCoord, DropRule, Faces, Material, Shape};
+use cubara_voxel::{BlockRegistry, ChunkCoord, DropRule, Faces, Interact, Material, Shape};
 use cubara_world::mesh::{mesh_node, sort_batch, BuiltNode};
 use cubara_world::node::desired_nodes;
 use cubara_world::{TerrainBlocks, World};
@@ -29,6 +29,7 @@ fn test_registry() -> BlockRegistry {
                 drops: DropRule::SameName,
                 requires_tier: 0,
                 hardness: Some(1),
+                interact: Interact::None,
             },
         )
     };

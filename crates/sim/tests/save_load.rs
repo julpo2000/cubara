@@ -5,7 +5,9 @@
 use std::path::PathBuf;
 
 use cubara_sim::{load_world, save_world, InputFrame, LoadError, Player, Sim, WorldHash};
-use cubara_voxel::{BlockId, BlockRegistry, ChunkCoord, DropRule, Faces, Material, Shape};
+use cubara_voxel::{
+    BlockId, BlockRegistry, ChunkCoord, DropRule, Faces, Interact, Material, Shape,
+};
 use cubara_world::{TerrainBlocks, World, WORLDGEN_VERSION};
 
 /// No real registry loaded from disk here (that's `cubara-render`'s job) --
@@ -23,6 +25,7 @@ fn test_registry() -> BlockRegistry {
                 drops: DropRule::SameName,
                 requires_tier: 0,
                 hardness: Some(1),
+                interact: Interact::None,
             },
         ),
         (
@@ -35,6 +38,7 @@ fn test_registry() -> BlockRegistry {
                 drops: DropRule::SameName,
                 requires_tier: 0,
                 hardness: Some(1),
+                interact: Interact::None,
             },
         ),
         (
@@ -47,6 +51,7 @@ fn test_registry() -> BlockRegistry {
                 drops: DropRule::SameName,
                 requires_tier: 0,
                 hardness: Some(1),
+                interact: Interact::None,
             },
         ),
     ])
@@ -353,6 +358,7 @@ fn loading_with_a_registry_missing_a_saved_block_name_is_a_named_error() {
                 drops: DropRule::SameName,
                 requires_tier: 0,
                 hardness: Some(1),
+                interact: Interact::None,
             },
         ),
         (
@@ -365,6 +371,7 @@ fn loading_with_a_registry_missing_a_saved_block_name_is_a_named_error() {
                 drops: DropRule::SameName,
                 requires_tier: 0,
                 hardness: Some(1),
+                interact: Interact::None,
             },
         ),
     ])

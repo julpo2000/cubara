@@ -644,7 +644,7 @@ fn push_skirt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{DropRule, Faces, Material, Shape};
+    use crate::registry::{DropRule, Faces, Interact, Material, Shape};
 
     fn empty() -> Chunk {
         Chunk {
@@ -678,6 +678,7 @@ mod tests {
                 drops: DropRule::SameName,
                 requires_tier: 0,
                 hardness: Some(1),
+                interact: Interact::None,
             },
         )])
         .expect("fixture registry is valid")
@@ -786,6 +787,7 @@ mod tests {
                     drops: DropRule::SameName,
                     requires_tier: 0,
                     hardness: Some(1),
+                    interact: Interact::None,
                 },
             )
         };
@@ -1059,6 +1061,7 @@ mod tests {
                     drops: DropRule::SameName,
                     requires_tier: 0,
                     hardness: Some(1),
+                    interact: Interact::None,
                 },
             ),
             (
@@ -1071,6 +1074,7 @@ mod tests {
                     drops: DropRule::SameName,
                     requires_tier: 0,
                     hardness: Some(1),
+                    interact: Interact::None,
                 },
             ),
         ])
@@ -1118,6 +1122,7 @@ mod tests {
                 drops: DropRule::SameName,
                 requires_tier: 0,
                 hardness: Some(1),
+                interact: Interact::None,
             },
         )])
         .unwrap();

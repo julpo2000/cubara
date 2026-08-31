@@ -21,11 +21,34 @@ pub struct Frame {
 
 /// What to render. Deliberately small and explicit: a golden test's scene must be
 /// reproducible from these numbers alone.
-/// An open inventory screen in a [`Shot`]: the grid width, one entry per slot
-/// in `InventoryPanel::layout(..).slots()` order, what the cursor holds, and
-/// where the cursor is in pixels.
+/// Which screen a [`Shot`] has open.
+///
+/// An enum rather than a bare width because the furnace screen (block 2.4c) is
+/// not a grid of any width -- it is input, fuel and output. Encoding it as a
+/// magic width would make `Shot` unreadable at the call site, and `Shot`'s whole
+/// contract is that a golden's scene is reproducible from these values alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanelLayout {
+    /// The inventory or a bench: a grid this many cells on a side.
+    Grid(usize),
+    /// A furnace: input, fuel, output.
+    Furnace,
+}
+
+impl PanelLayout {
+    pub(crate) fn build(self, width: u32, height: u32) -> crate::panel::InventoryPanel {
+        match self {
+            PanelLayout::Grid(w) => crate::panel::InventoryPanel::layout(width, height, w),
+            PanelLayout::Furnace => crate::panel::InventoryPanel::layout_furnace(width, height),
+        }
+    }
+}
+
+/// An open inventory screen in a [`Shot`]: which screen, one entry per slot in
+/// its layout's `slots()` order, what the cursor holds, and where the cursor is
+/// in pixels.
 pub type PanelShot = (
-    usize,
+    PanelLayout,
     Vec<Option<crate::scene::HotbarSlot>>,
     Option<crate::scene::HotbarSlot>,
     (f32, f32),
@@ -170,13 +193,8 @@ fn render_arena(
     let hotbar_selected = 0u8;
     // The open screen, if this shot wants one: the layout, its contents, the
     // cursor's stack and where the cursor is.
-    let panel_view = panel.map(|(grid_width, contents, held, cursor)| {
-        (
-            crate::panel::InventoryPanel::layout(width, height, grid_width),
-            contents,
-            held,
-            cursor,
-        )
+    let panel_view = panel.map(|(layout, contents, held, cursor)| {
+        (layout.build(width, height), contents, held, cursor)
     });
 
     let (mesh_assets, tex_view, tex_sampler) = load_mesh_assets(&device, &queue);

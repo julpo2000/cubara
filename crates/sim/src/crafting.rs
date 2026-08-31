@@ -140,6 +140,34 @@ impl Crafting {
         }
     }
 
+    /// Set what the cursor is holding.
+    ///
+    /// For screens that own their own slots -- the furnace (block 2.4c) -- which
+    /// need the same single cursor rather than a second one, so a player can
+    /// never end up holding two things at once.
+    pub fn set_held(&mut self, held: Option<ItemStack>) {
+        self.held = held;
+    }
+
+    /// An inventory click on a screen that has no crafting grid of its own.
+    ///
+    /// The same [`exchange`](Self::exchange) rules as [`click`](Self::click),
+    /// reached without pretending the screen has a grid or a result. Left-click
+    /// only: a furnace screen has no half-stack case that differs from the
+    /// inventory's, and routing right-click here would need the caller to say
+    /// which, for no behaviour it does not already have.
+    pub fn click_inventory_only(
+        &mut self,
+        index: usize,
+        inventory: &mut Inventory,
+        items: &ItemRegistry,
+    ) {
+        let current = inventory.slot(index);
+        let (new_slot, new_held) = Self::exchange(current, self.held, false, items);
+        inventory.set_slot(index, new_slot);
+        self.held = new_held;
+    }
+
     /// The one place the click rules live, shared by every kind of slot -- an
     /// inventory slot and a grid cell behave identically, and writing that
     /// twice is how they would drift apart.
@@ -306,6 +334,7 @@ mod tests {
                     durability: dur,
                     tier: 0,
                     speed: None,
+                    burn_ticks: None,
                 },
             )
         };

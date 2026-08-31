@@ -24,7 +24,7 @@ mod text;
 
 pub use arena::{ArenaUsage, ChunkArena, MeshedNode, NodeId};
 pub use culling::{Aabb, Frustum};
-pub use headless::{Frame, Shot};
+pub use headless::{Frame, PanelLayout, Shot};
 pub use materials::{swatch_color, MeshAssets};
 pub use panel::{InventoryPanel, PanelSlot, PanelSlotKind};
 pub use profiling::Profiler;

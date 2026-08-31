@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use cubara_render::headless::{self, Frame, Shot};
 use cubara_render::materials::TextureLayers;
-use cubara_render::{HotbarSlot, InventoryPanel, MeshedNode, NodeId, PanelSlotKind};
+use cubara_render::{HotbarSlot, InventoryPanel, MeshedNode, NodeId, PanelLayout, PanelSlotKind};
 use cubara_voxel::{BlockId, BlockRegistry, Chunk, ChunkCoord};
 use cubara_world::mesh::mesh_region;
 use cubara_world::node::schedule_for_radius;
@@ -499,7 +499,7 @@ fn the_inventory_screen_shows_slots_a_recipe_and_the_cursor() {
         highlighted_block: None,
         hotbar: None,
         panel: Some((
-            2,
+            PanelLayout::Grid(2),
             contents,
             swatch(0.66, 0.50, 0.31, 7),
             // Over a slot rather than in open space, so the golden shows the
@@ -508,6 +508,55 @@ fn the_inventory_screen_shows_slots_a_recipe_and_the_cursor() {
         )),
     };
     assert_golden("inventory_screen", &world, shot);
+}
+
+#[test]
+fn the_furnace_screen_shows_input_fuel_and_output() {
+    // Block 2.4c's own bar: the furnace screen is a *different* screen from the
+    // inventory, and the only automated way to say the three slots landed where
+    // they should -- input above fuel on the left, output to the right -- is to
+    // look at it.
+    //
+    // Built from the layout directly, no sim and no world (Rule 3), same as
+    // `the_inventory_screen_shows_slots_a_recipe_and_the_cursor`.
+    let panel = InventoryPanel::layout_furnace(960, 540);
+    let swatch = |r: f32, g: f32, b: f32, count: u8| {
+        Some(HotbarSlot {
+            color: [r, g, b],
+            count,
+        })
+    };
+
+    let contents: Vec<Option<HotbarSlot>> = panel
+        .slots()
+        .iter()
+        .map(|s| match s.kind {
+            // Raw iron waiting to be smelted, logs burning, ingots produced.
+            PanelSlotKind::Grid => swatch(0.70, 0.35, 0.25, 8),
+            PanelSlotKind::Fuel => swatch(0.45, 0.31, 0.18, 12),
+            PanelSlotKind::Result => swatch(0.85, 0.85, 0.88, 3),
+            PanelSlotKind::Inventory if s.index == 0 => swatch(0.52, 0.52, 0.55, 64),
+            PanelSlotKind::Inventory => None,
+        })
+        .collect();
+
+    let world = World::new();
+    let shot = Shot {
+        width: 960,
+        height: 540,
+        region_radius: 2,
+        orbit_t: 0.0,
+        camera: None,
+        highlighted_block: None,
+        hotbar: None,
+        panel: Some((
+            PanelLayout::Furnace,
+            contents,
+            swatch(0.70, 0.35, 0.25, 5),
+            (panel.slots()[0].x + 30.0, panel.slots()[0].y + 30.0),
+        )),
+    };
+    assert_golden("furnace_screen", &world, shot);
 }
 
 #[test]

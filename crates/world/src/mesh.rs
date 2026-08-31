@@ -267,7 +267,7 @@ impl Default for MeshPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cubara_voxel::{DropRule, Faces, Material, Shape};
+    use cubara_voxel::{DropRule, Faces, Interact, Material, Shape};
     use std::collections::HashMap;
 
     /// A registry with the three real material *names* -- `mesh_node` resolves
@@ -290,6 +290,7 @@ mod tests {
                     drops: DropRule::SameName,
                     requires_tier: 0,
                     hardness: Some(1),
+                    interact: Interact::None,
                 },
             )
         };

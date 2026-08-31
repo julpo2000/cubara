@@ -1,0 +1,12 @@
+// The last rung of REQUIREMENTS #5's ladder: ore you mined becomes metal you
+// can craft with.
+//
+// One input, no pattern -- which is why smelting recipes live in their own
+// directory rather than alongside the shaped crafting recipes: the matcher is
+// a different shape, not a special case of the same one.
+SmeltRecipe(
+    name:   "cubara:iron_ingot",
+    input:  "cubara:raw_iron",
+    output: (item: "cubara:iron_ingot", count: 1),
+    ticks:  200,
+)

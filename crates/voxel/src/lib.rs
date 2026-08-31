@@ -13,6 +13,7 @@ pub mod mesh;
 pub mod ore;
 pub mod recipe;
 pub mod registry;
+pub mod smelt;
 pub mod storage;
 pub mod structure;
 pub mod voxel;
@@ -26,7 +27,10 @@ pub use item::{
 pub use mesh::{Face, Mesh, Vertex};
 pub use ore::{OreDef, OreError, OreRegistry};
 pub use recipe::{Recipe, RecipeBook, RecipeDef, RecipeError, RecipeOutputDef, MAX_GRID};
-pub use registry::{BlockRegistry, DropRule, Faces, ItemDrop, Material, RegistryError, Shape};
+pub use registry::{
+    BlockRegistry, DropRule, Faces, Interact, ItemDrop, Material, RegistryError, Shape,
+};
+pub use smelt::{SmeltBook, SmeltError, SmeltRecipe, SmeltRecipeDef};
 pub use storage::{ChunkPayloadError, ChunkStorage};
 pub use structure::{StructureDef, StructureError, StructureRegistry};
 pub use voxel::{Chunk, MeshContext};
