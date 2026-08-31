@@ -102,7 +102,8 @@ frames after 200 warmup.
 | 2026-08-31 | Drops and tool tiers from data [#158], radius 64³⁷ | 1,600 | 822,420 | ~1,385 | 0.509 ms | ~0.86 ms | `b78ab56` |
 | 2026-08-31 | Mining takes time [#159], radius 64³⁷ | 1,600 | 822,420 | ~1,380 | 0.502 ms | ~0.92 ms | `d4ee268` |
 | 2026-08-31 | The furnace: block entities, wood fuel, smelting [#160], radius 64³⁷ | 1,600 | 822,420 | ~1,381 | 0.499 ms | ~0.90 ms | `19f0fa9` |
-| 2026-08-31 | ECS + dropped items [#56], radius 64³⁷ | 1,600 | 822,420 | ~1,381 | 0.505 ms | ~0.86 ms | *(this PR)* |
+| 2026-08-31 | ECS + dropped items [#56], radius 64³⁷ | 1,600 | 822,420 | ~1,381 | 0.505 ms | ~0.86 ms | `9ec31bb` |
+| 2026-08-31 | Chunk state machine + dormancy [#47], radius 64³⁷ | 1,600 | 822,420 | ~1,375 | 0.498 ms | ~0.87 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -1048,6 +1049,14 @@ them, which is exactly the scenario those blocks exist to make cheap.
 nothing about the scene -- and confirming the guard: adding an ECS to the tick
 loop is exactly the kind of change that could have cost something per frame
 whether or not there were entities, and it did not.
+
+**The chunk state machine (#47)** is the fifth and the last of this run:
+822,420 triangles, 1,375 FPS, 0.498 ms. It adds a per-tick
+`update_simulation_radius` walk over a `(2r+1)² x 3` box -- 243 chunk lookups a
+tick at radius 4 -- and that does not show either. Worth noting the direction:
+this block makes the simulation cost *less* as a world grows, since a furnace
+outside the radius stops ticking entirely. `--bench` has no furnaces, so what
+this row shows is that the bookkeeping itself is free.
 
 ## Detailed run logs
 

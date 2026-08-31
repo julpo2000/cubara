@@ -15,6 +15,7 @@
 //! production code streams through it anymore.
 
 pub mod block_entity;
+pub mod chunk_state;
 pub mod mesh;
 pub mod node;
 mod noise;
@@ -25,6 +26,7 @@ mod world;
 mod worldgen;
 
 pub use block_entity::{BlockEntities, Furnace, FurnaceOutcome};
+pub use chunk_state::{ChunkState, ChunkStates, Woken};
 pub use raycast::{raycast, RayHit};
 pub use world::World;
 pub use worldgen::{OreGen, OreSet, TerrainBlocks, WorldGen, MAX_ORES, WORLDGEN_VERSION};

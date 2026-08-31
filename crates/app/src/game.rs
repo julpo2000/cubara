@@ -95,6 +95,46 @@ struct Mining {
     progress: u32,
 }
 
+/// How far from the player, in chunks, the simulation keeps running
+/// (`PHASE2_ARCHITECTURE.md` §11.4).
+///
+/// **Deliberately unrelated to render distance.** Coupling them would let the
+/// settings menu quietly change what the world simulates. Small, because
+/// simulation is the expensive part and dormancy is what makes a big world
+/// affordable; expected to grow once block 2.7 makes a dormant chunk nearly
+/// free.
+const SIM_RADIUS_CHUNKS: i32 = 4;
+
+/// Every block-entity position inside `coord`.
+fn block_entity_positions_in(world: &World, coord: ChunkCoord) -> Vec<[i32; 3]> {
+    world
+        .block_entity_positions()
+        .into_iter()
+        .filter(|p| ChunkCoord::from_block(p[0], p[1], p[2]) == coord)
+        .collect()
+}
+
+/// Advance one furnace by `ticks`, whether that is one ordinary tick or a
+/// dormant chunk's whole backlog.
+fn advance_furnace(
+    world: &mut World,
+    pos: [i32; 3],
+    ticks: u32,
+    items: &ItemRegistry,
+    smelting: &SmeltBook,
+) {
+    let Some(f) = world.furnace_at_mut(pos) else {
+        return;
+    };
+    let recipe = f.input.and_then(|(id, _)| smelting.for_input(id));
+    f.advance(
+        ticks,
+        recipe,
+        |id| items.burn_ticks(id),
+        |id| items.max_stack(id),
+    );
+}
+
 /// The middle of block `b`, where an item dropped by breaking it appears.
 fn drop_centre(b: [i32; 3]) -> glam::Vec3 {
     glam::Vec3::new(b[0] as f32 + 0.5, b[1] as f32 + 0.5, b[2] as f32 + 0.5)
@@ -795,22 +835,33 @@ impl Game {
         let (Some(items), Some(smelting)) = (self.items.as_ref(), self.smelting.as_ref()) else {
             return;
         };
-        let positions = self.world.block_entity_positions();
-        if positions.is_empty() {
-            return;
-        }
+
+        // Bring the simulation radius up to date first (§11): chunks the player
+        // has left go dormant, chunks they have reached wake up and are caught
+        // up by exactly the ticks they missed.
+        let centre = ChunkCoord::from_world_pos(self.sim.player.pos.to_array());
+        let now = self.sim.tick;
+        let woken =
+            Arc::make_mut(&mut self.world).update_simulation_radius(centre, SIM_RADIUS_CHUNKS, now);
+
+        // Catch-up, then the ordinary tick. Both go through `Furnace::advance`
+        // with an elapsed count -- the property block 2.4c built and proved
+        // (§11.3), which is why waking a chunk is not a special case.
         let world = Arc::make_mut(&mut self.world);
-        for pos in positions {
-            let Some(f) = world.furnace_at_mut(pos) else {
-                continue;
-            };
-            let recipe = f.input.and_then(|(id, _)| smelting.for_input(id));
-            f.advance(
-                1,
-                recipe,
-                |id| items.burn_ticks(id),
-                |id| items.max_stack(id),
-            );
+        for w in woken {
+            for pos in block_entity_positions_in(world, w.coord) {
+                advance_furnace(world, pos, w.elapsed as u32, items, smelting);
+            }
+        }
+
+        // Only Active chunks tick. A dormant chunk's furnaces are not stopped,
+        // they are deferred -- the catch-up above is what makes that the same
+        // thing.
+        let active: Vec<ChunkCoord> = world.chunk_states().active().collect();
+        for coord in active {
+            for pos in block_entity_positions_in(world, coord) {
+                advance_furnace(world, pos, 1, items, smelting);
+            }
         }
     }
 
@@ -2215,5 +2266,111 @@ mod tests {
 
         assert_eq!(game.sim.entities.len(), 0, "collected");
         assert_eq!(count_of(&game, "cubara:cobble"), 7);
+    }
+
+    #[test]
+    fn a_dormant_chunk_ends_where_a_continuously_ticked_one_would() {
+        // **The phase 2 exit gate's dormant test** (§11.3), and the reason
+        // block 2.4c insisted `Furnace::advance` take an elapsed count.
+        //
+        // Run the same furnace two ways for the same number of ticks: once with
+        // the player standing next to it the whole time, and once with the
+        // player far away so the chunk sleeps and is caught up on return.
+        for total in [50u64, 199, 200, 201, 450] {
+            let continuous = {
+                let (mut game, _) = game_looking_at_ground();
+                let pos = open_a_furnace(&mut game);
+                load_furnace(&mut game, pos);
+                for _ in 0..total {
+                    game.advance(TICK_DT);
+                }
+                game.world().furnace_at(pos).copied().expect("still there")
+            };
+
+            let slept = {
+                let (mut game, _) = game_looking_at_ground();
+                let pos = open_a_furnace(&mut game);
+                load_furnace(&mut game, pos);
+                // Exactly `total` ticks here too, or the comparison is against
+                // a different amount of elapsed time rather than against
+                // dormancy: one nearby, the middle away, one back home.
+                let home = game.sim.player.pos;
+                game.advance(TICK_DT);
+                game.sim.player.pos = home + glam::Vec3::new(4000.0, 0.0, 0.0);
+                for _ in 0..total - 2 {
+                    game.advance(TICK_DT);
+                }
+                // Come back: the chunk wakes and catches up.
+                game.sim.player.pos = home;
+                game.advance(TICK_DT);
+                game.world().furnace_at(pos).copied().expect("still there")
+            };
+
+            assert_eq!(
+                continuous.output, slept.output,
+                "output diverged after {total} ticks"
+            );
+            assert_eq!(
+                continuous.input, slept.input,
+                "input diverged after {total} ticks"
+            );
+        }
+    }
+
+    /// A furnace with enough raw iron and fuel to run for a long while.
+    fn load_furnace(game: &mut Game, pos: [i32; 3]) {
+        let raw = item(game, "cubara:raw_iron");
+        let log = item(game, "cubara:oak_log");
+        let f = Arc::make_mut(&mut game.world).furnace_at_mut(pos).unwrap();
+        f.input = Some((raw, 8));
+        f.fuel = Some((log, 32));
+    }
+
+    #[test]
+    fn a_chunk_the_player_leaves_goes_dormant() {
+        let (mut game, _) = game_looking_at_ground();
+        let pos = open_a_furnace(&mut game);
+        load_furnace(&mut game, pos);
+        game.advance(TICK_DT);
+
+        let coord = ChunkCoord::from_block(pos[0], pos[1], pos[2]);
+        assert_eq!(
+            game.world().chunk_states().get(coord),
+            cubara_world::ChunkState::Active,
+            "active while the player is here"
+        );
+
+        game.sim.player.pos += glam::Vec3::new(4000.0, 0.0, 0.0);
+        game.advance(TICK_DT);
+
+        assert!(
+            matches!(
+                game.world().chunk_states().get(coord),
+                cubara_world::ChunkState::Dormant { .. }
+            ),
+            "dormant once they leave"
+        );
+    }
+
+    #[test]
+    fn a_furnace_in_a_dormant_chunk_does_not_tick() {
+        // Not "does nothing" -- deferred. The catch-up test above is the other
+        // half, and together they are what makes dormancy invisible.
+        let (mut game, _) = game_looking_at_ground();
+        let pos = open_a_furnace(&mut game);
+        load_furnace(&mut game, pos);
+        game.advance(TICK_DT);
+        let after_one = game.world().furnace_at(pos).copied().unwrap();
+
+        game.sim.player.pos += glam::Vec3::new(4000.0, 0.0, 0.0);
+        for _ in 0..500 {
+            game.advance(TICK_DT);
+        }
+
+        let now = game.world().furnace_at(pos).copied().unwrap();
+        assert_eq!(
+            now.progress, after_one.progress,
+            "a dormant furnace did not advance"
+        );
     }
 }

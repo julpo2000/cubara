@@ -554,6 +554,92 @@ item that says nothing is a thing you can afford to lose.
 
 ---
 
+## §11 The chunk lifecycle (block 2.6)
+
+Issue #47 asks for `Ungenerated → Generated → Meshed → Active ⇄ Dormant →
+Unloaded` as one enum. Written against the engine as it now stands, that is
+**two different lifecycles wearing one name**, and building it as one would tie
+the renderer to the simulation in exactly the way Rule 3 forbids.
+
+### §11.1 Two lifecycles, not one
+
+| | Unit | Owner | States |
+|---|---|---|---|
+| **Rendering** | `NodeKey` (level + position) | `NodeStreaming` (app) | absent → in flight → resident |
+| **Simulation** | `ChunkCoord` | `World` | Ungenerated → Generated → Active ⇄ Dormant → Unloaded |
+
+They are not the same thing and cannot be merged:
+
+- A **node** above level 0 covers up to 512 chunks. "Meshed" is a property of a
+  node, and a node is a rendering unit — it exists because of how far away it is
+  from a camera, which the simulation must not care about (Rule 3).
+- A **chunk** is the simulation unit: it is what owns block entities (§7), what
+  a furnace's position falls in, and what dormancy is about.
+
+So `Meshed` is deliberately **not** in the simulation enum. It is node
+residency, it already exists as `NodeStreaming::resident`, and #47's "streaming
+re-expressed in terms of states with no behaviour change" is satisfied by naming
+what is already there rather than by moving it into `cubara-world`.
+
+**The tell that this is right:** if the two were one enum, a chunk would become
+Dormant because it was far from the *camera*. It should become dormant because it
+is far from the *player* — and in a future with more than one of either, those
+diverge immediately.
+
+### §11.2 The simulation states
+
+```
+Ungenerated ──> Generated ──> Active <──> Dormant ──> Unloaded
+```
+
+- **Ungenerated** — nothing exists; `World` can produce it from `(seed, coord)`
+  at any time (§8.1). Not stored: it is the absence of an entry.
+- **Generated** — terrain exists and edits apply, but nothing in it is ticking.
+- **Active** — inside the simulation radius. Its block entities tick every tick.
+- **Dormant** — outside the radius. Nothing in it ticks, and it remembers **the
+  tick it went dormant**.
+- **Unloaded** — dropped from memory. Edits and block entities are persisted
+  first (block 2.8); until then, unloading is not done at all rather than done
+  lossily.
+
+### §11.3 Dormancy must not change the answer
+
+This is the whole point, and it is the phase's own exit-gate test:
+
+> A chunk left dormant for N ticks and then activated ends in the same state as
+> one simulated continuously for N ticks.
+
+**Block 2.4c already built what makes this possible.** `Furnace::advance` takes
+an *elapsed tick count* rather than being a tick-once call, and
+`furnace_catch_up_matches_ticking_one_at_a_time` already proves `advance(n)`
+equals `advance(1)` done `n` times. So reactivation is:
+
+```rust
+let elapsed = now - dormant_since;
+for entity in chunk { entity.advance(elapsed, ...); }
+```
+
+That is why §7 insisted on the property one block before anything needed it.
+
+**Block 2.7 is not made redundant by this.** 2.6 catches up *the processes that
+already know how*, by calling the same method with a bigger number. 2.7 is the
+general framework — a timer queue, so a chunk dormant for a million ticks costs
+one computation rather than a million — and the worked process that tests it.
+2.6 is correct but not yet cheap; 2.7 makes it cheap.
+
+### §11.4 The radius is not the render distance
+
+The simulation radius is its own number, in chunks, around the **player** —
+deliberately unrelated to `DEFAULT_RING_SCHEDULE`'s render rings. Coupling them
+would mean turning render distance down changed what the world simulated, which
+is a settings menu quietly changing the game.
+
+It is small: simulation is expensive and dormancy is the mechanism that makes a
+big world affordable. Tuning is data, and the number is expected to move once
+2.7 makes dormant chunks nearly free.
+
+---
+
 ## §9 Not in this scope — and which are the owner's call
 
 Engineering-deferred, mine to sequence: ECS (2.5), the chunk state machine (2.6),
