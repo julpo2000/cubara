@@ -74,6 +74,114 @@ pub struct FurnaceOutcome {
     pub changed: bool,
 }
 
+/// A process whose state after `n` ticks depends only on `n` and its starting
+/// state (`PHASE2_ARCHITECTURE.md` §12.3).
+///
+/// **The contract is the whole point:** `advance(n)` must equal `advance(1)`
+/// done `n` times. A process that cannot honour that is not
+/// time-parameterizable, and dormancy would change its answer -- so it does not
+/// belong behind this trait.
+pub trait TimedProcess {
+    /// Everything the process needs that is not its own state. Plain data, not
+    /// closures, so a test can build one without a registry.
+    type Ctx;
+
+    /// Advance by `ticks`, in time bounded by the *work available* rather than
+    /// by `ticks` (§12.1).
+    fn advance(&mut self, ticks: u64, ctx: &Self::Ctx) -> FurnaceOutcome;
+}
+
+/// What a furnace needs to know that is not its own state.
+///
+/// Resolved to plain numbers by the caller: a furnace only ever asks about the
+/// one item in its fuel slot and the one its recipe outputs, so there is nothing
+/// here that needs a registry lookup at tick time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct SmeltCtx {
+    /// What the input slot currently smelts into, if anything.
+    pub recipe: Option<SmeltRecipe>,
+    /// How long one item from the fuel slot burns. `None` if it is not fuel.
+    pub fuel_burn: Option<u32>,
+    /// Stack limit of the recipe's output item.
+    pub output_max: u8,
+}
+
+impl TimedProcess for Furnace {
+    type Ctx = SmeltCtx;
+
+    /// Catch up by `ticks`, jumping from event to event (§12.1).
+    ///
+    /// Every iteration either completes one item or consumes one fuel unit, so
+    /// the loop runs at most `input + fuel` times -- **bounded by the stack
+    /// sizes involved, never by `ticks`.** A chunk dormant for a million ticks
+    /// costs the same as one dormant for a thousand.
+    ///
+    /// Checked against [`Furnace::advance_one_by_one`], which is the
+    /// specification (§12.2).
+    fn advance(&mut self, ticks: u64, ctx: &SmeltCtx) -> FurnaceOutcome {
+        let mut out = FurnaceOutcome::default();
+        let before = *self;
+        let mut left = ticks;
+
+        while left > 0 {
+            // Stall cases end the whole catch-up in one step: nothing further
+            // can happen no matter how long we wait, except lit fuel burning
+            // down. Each mirrors the matching early return in `step`.
+            let Some(recipe) = ctx.recipe.filter(|_| self.input.is_some()) else {
+                self.burning = self
+                    .burning
+                    .saturating_sub(left.min(u32::MAX as u64) as u32);
+                self.progress = 0;
+                break;
+            };
+            if !self.output_has_room_for(recipe, ctx.output_max) {
+                // Progress is kept, unlike the no-recipe case -- `step` keeps it
+                // too.
+                self.burning = self
+                    .burning
+                    .saturating_sub(left.min(u32::MAX as u64) as u32);
+                break;
+            }
+            if self.burning == 0 {
+                // Lighting is free (same tick in `step`), but needs fuel.
+                let Some((fuel_id, count)) = self.fuel else {
+                    self.progress = 0;
+                    break;
+                };
+                let Some(burn) = ctx.fuel_burn else {
+                    self.progress = 0;
+                    break;
+                };
+                self.fuel = (count > 1).then_some((fuel_id, count - 1));
+                self.burning = burn;
+                if burn == 0 {
+                    // A zero-burn fuel would spin forever; treat it as not fuel.
+                    self.progress = 0;
+                    break;
+                }
+            }
+
+            // Run until the nearer of: this item finishing, or the fire going
+            // out. Never past `left`.
+            let to_finish = (recipe.ticks - self.progress) as u64;
+            let run = to_finish.min(self.burning as u64).min(left);
+            self.progress += run as u32;
+            self.burning -= run as u32;
+            left -= run;
+
+            if self.progress >= recipe.ticks {
+                self.progress = 0;
+                self.take_one_input();
+                self.push_output(recipe);
+                out.smelted += 1;
+            }
+        }
+
+        out.changed = *self != before;
+        out
+    }
+}
+
 impl Furnace {
     /// Run `ticks` ticks of this furnace against `recipe` (whatever the input
     /// slot currently smelts into) and `fuel_ticks` (how long one of the fuel
@@ -88,7 +196,7 @@ impl Furnace {
     /// one-at-a-time path, which is the exact bug the property exists to
     /// prevent. Optimising this is block 2.7's problem, with its test already
     /// in place.
-    pub fn advance(
+    pub fn advance_one_by_one(
         &mut self,
         ticks: u32,
         recipe: Option<SmeltRecipe>,
@@ -117,7 +225,18 @@ impl Furnace {
         // Nothing smeltable in the input: burn down whatever is already alight
         // but never light a new item. Fuel is only spent on work -- §7's
         // furnace does not idle away a stack of logs while empty.
-        let Some(recipe) = recipe else {
+        //
+        // **`input.is_some()` is part of this check, and was missing until
+        // block 2.7a.** Without it, a caller passing a recipe while the input
+        // slot is empty would burn fuel and push output *from nothing*: the
+        // `take_one_input` below is a no-op on an empty slot while
+        // `push_output` still fires. Nothing reached it -- `Game` resolves the
+        // recipe *from* the input, so it passes `None` when the slot is empty --
+        // but the guard was the caller's, not this function's, and block 2.7a's
+        // context carries the recipe as data where that is easy to get wrong.
+        // Found by `bounded_catch_up_agrees_with_the_one_tick_reference`, which
+        // is exactly the kind of latent bug keeping the reference path is for.
+        let Some(recipe) = recipe.filter(|_| self.input.is_some()) else {
             self.burning = self.burning.saturating_sub(1);
             self.progress = 0;
             return;
@@ -159,7 +278,16 @@ impl Furnace {
     fn output_has_room(&self, recipe: SmeltRecipe, max_stack: &impl Fn(ItemId) -> u8) -> bool {
         match self.output {
             None => true,
-            Some((id, count)) => id == recipe.output && count + recipe.count <= max_stack(id),
+            Some((id, _)) => self.output_has_room_for(recipe, max_stack(id)),
+        }
+    }
+
+    /// The same rule against an already-resolved stack limit -- what the bounded
+    /// path uses, so the two cannot disagree about what "full" means.
+    fn output_has_room_for(&self, recipe: SmeltRecipe, max_stack: u8) -> bool {
+        match self.output {
+            None => true,
+            Some((id, count)) => id == recipe.output && count + recipe.count <= max_stack,
         }
     }
 
@@ -223,7 +351,7 @@ mod tests {
             input: Some((RAW, 3)),
             ..Furnace::default()
         };
-        let out = f.advance(100, Some(recipe()), fuel, max_stack);
+        let out = f.advance_one_by_one(100, Some(recipe()), fuel, max_stack);
         assert_eq!(out.smelted, 0);
         assert_eq!(f.input, Some((RAW, 3)), "input untouched");
         assert_eq!(f.output, None);
@@ -236,14 +364,14 @@ mod tests {
             fuel: Some((LOG, 2)),
             ..Furnace::default()
         };
-        f.advance(500, None, fuel, max_stack);
+        f.advance_one_by_one(500, None, fuel, max_stack);
         assert_eq!(f.fuel, Some((LOG, 2)), "no work, no burn");
     }
 
     #[test]
     fn smelting_consumes_input_and_produces_output() {
         let mut f = loaded();
-        let out = f.advance(10, Some(recipe()), fuel, max_stack);
+        let out = f.advance_one_by_one(10, Some(recipe()), fuel, max_stack);
         assert_eq!(out.smelted, 1);
         assert_eq!(f.input, Some((RAW, 2)));
         assert_eq!(f.output, Some((INGOT, 1)));
@@ -258,7 +386,7 @@ mod tests {
             fuel: Some((LOG, 1)),
             ..Furnace::default()
         };
-        let out = f.advance(1000, Some(recipe()), fuel, max_stack);
+        let out = f.advance_one_by_one(1000, Some(recipe()), fuel, max_stack);
         assert_eq!(out.smelted, 2);
         assert_eq!(f.fuel, None, "the one log is gone");
         assert_eq!(f.output, Some((INGOT, 2)));
@@ -272,7 +400,7 @@ mod tests {
             output: Some((INGOT, 64)),
             ..Furnace::default()
         };
-        let out = f.advance(100, Some(recipe()), fuel, max_stack);
+        let out = f.advance_one_by_one(100, Some(recipe()), fuel, max_stack);
         assert_eq!(out.smelted, 0);
         assert_eq!(f.output, Some((INGOT, 64)), "nothing lost");
         assert_eq!(f.input, Some((RAW, 5)), "and nothing consumed");
@@ -289,11 +417,11 @@ mod tests {
         // emptying entirely.
         for n in 0..120 {
             let mut bulk = loaded();
-            bulk.advance(n, Some(recipe()), fuel, max_stack);
+            bulk.advance_one_by_one(n, Some(recipe()), fuel, max_stack);
 
             let mut one_at_a_time = loaded();
             for _ in 0..n {
-                one_at_a_time.advance(1, Some(recipe()), fuel, max_stack);
+                one_at_a_time.advance_one_by_one(1, Some(recipe()), fuel, max_stack);
             }
 
             assert_eq!(bulk, one_at_a_time, "diverged after {n} ticks");
@@ -309,12 +437,129 @@ mod tests {
             fuel: Some((LOG, 1)),
             ..Furnace::default()
         };
-        f.advance(5, Some(recipe()), fuel, max_stack);
+        f.advance_one_by_one(5, Some(recipe()), fuel, max_stack);
         assert!(f.progress > 0 && f.burning > 0);
         let lit = f.burning;
 
-        f.advance(1, None, fuel, max_stack);
+        f.advance_one_by_one(1, None, fuel, max_stack);
         assert_eq!(f.progress, 0, "progress abandoned");
         assert_eq!(f.burning, lit - 1, "but the lit fuel keeps burning");
+    }
+
+    fn ctx() -> SmeltCtx {
+        SmeltCtx {
+            recipe: Some(recipe()),
+            fuel_burn: Some(25),
+            output_max: 64,
+        }
+    }
+
+    #[test]
+    fn bounded_catch_up_agrees_with_the_one_tick_reference() {
+        // **The safety argument for the whole block** (§12.2). The bounded path
+        // is fast and subtle; `advance_one_by_one` is slow and obviously
+        // correct. Running both over many starting states and many elapsed
+        // counts, and asserting they agree, is what makes the fast one
+        // trustworthy.
+        //
+        // The states are chosen to sit on and around every boundary the bounded
+        // path jumps between: mid-item, mid-fuel, empty fuel, empty input, and
+        // a nearly-full output.
+        let states = [
+            loaded(),
+            Furnace {
+                input: Some((RAW, 1)),
+                fuel: Some((LOG, 1)),
+                ..Furnace::default()
+            },
+            Furnace {
+                input: Some((RAW, 5)),
+                fuel: Some((LOG, 3)),
+                burning: 7,
+                progress: 9,
+                ..Furnace::default()
+            },
+            Furnace {
+                input: Some((RAW, 2)),
+                fuel: None,
+                burning: 4,
+                progress: 3,
+                ..Furnace::default()
+            },
+            Furnace {
+                input: None,
+                fuel: Some((LOG, 2)),
+                burning: 10,
+                ..Furnace::default()
+            },
+            Furnace {
+                input: Some((RAW, 4)),
+                fuel: Some((LOG, 4)),
+                output: Some((INGOT, 63)),
+                ..Furnace::default()
+            },
+            Furnace {
+                input: Some((RAW, 4)),
+                fuel: Some((LOG, 4)),
+                output: Some((INGOT, 64)),
+                ..Furnace::default()
+            },
+        ];
+        let c = ctx();
+        for (i, start) in states.iter().enumerate() {
+            for n in [0u64, 1, 2, 9, 10, 11, 24, 25, 26, 49, 50, 137, 500, 5_000] {
+                let mut fast = *start;
+                fast.advance(n, &c);
+
+                let mut slow = *start;
+                slow.advance_one_by_one(n as u32, c.recipe, fuel, max_stack);
+
+                assert_eq!(
+                    fast, slow,
+                    "state {i} diverged after {n} ticks\n  fast: {fast:?}\n  slow: {slow:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn catch_up_cost_does_not_grow_with_elapsed_time() {
+        // §12.1's actual promise. The bounded path's iteration count is capped
+        // by the work available, so a furnace with one item and one fuel must
+        // reach the same end state whether it slept 1,000 ticks or 100 million
+        // -- and the huge one must not take meaningfully longer.
+        let c = ctx();
+        let start = Furnace {
+            input: Some((RAW, 1)),
+            fuel: Some((LOG, 1)),
+            ..Furnace::default()
+        };
+
+        let mut short = start;
+        short.advance(1_000, &c);
+        let mut astronomical = start;
+        astronomical.advance(100_000_000, &c);
+
+        assert_eq!(
+            short, astronomical,
+            "a furnace out of work ends in the same place however long it waits"
+        );
+        // If this were still per-tick, the call above would run a hundred
+        // million iterations; the test finishing at all is the evidence.
+    }
+
+    #[test]
+    fn a_zero_burn_fuel_cannot_spin_forever() {
+        // A data file declaring `burn_ticks: Some(0)` would make the
+        // light-fuel/consume-fuel cycle make no progress. The one-tick path
+        // cannot loop (it does one tick and returns); the bounded path could,
+        // so it stops instead.
+        let c = SmeltCtx {
+            fuel_burn: Some(0),
+            ..ctx()
+        };
+        let mut f = loaded();
+        f.advance(1_000_000, &c);
+        assert_eq!(f.progress, 0, "it stalled rather than hanging");
     }
 }

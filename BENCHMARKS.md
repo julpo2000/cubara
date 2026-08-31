@@ -103,7 +103,8 @@ frames after 200 warmup.
 | 2026-08-31 | Mining takes time [#159], radius 64³⁷ | 1,600 | 822,420 | ~1,380 | 0.502 ms | ~0.92 ms | `d4ee268` |
 | 2026-08-31 | The furnace: block entities, wood fuel, smelting [#160], radius 64³⁷ | 1,600 | 822,420 | ~1,381 | 0.499 ms | ~0.90 ms | `19f0fa9` |
 | 2026-08-31 | ECS + dropped items [#56], radius 64³⁷ | 1,600 | 822,420 | ~1,381 | 0.505 ms | ~0.86 ms | `9ec31bb` |
-| 2026-08-31 | Chunk state machine + dormancy [#47], radius 64³⁷ | 1,600 | 822,420 | ~1,375 | 0.498 ms | ~0.87 ms | *(this PR)* |
+| 2026-08-31 | Chunk state machine + dormancy [#47], radius 64³⁷ | 1,600 | 822,420 | ~1,375 | 0.498 ms | ~0.87 ms | `511f58e` |
+| 2026-08-31 | Bounded dormant catch-up [#58], radius 64³⁷ | 1,600 | 822,420 | ~1,367 | 0.496 ms | ~0.95 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -1057,6 +1058,15 @@ tick at radius 4 -- and that does not show either. Worth noting the direction:
 this block makes the simulation cost *less* as a world grows, since a furnace
 outside the radius stops ticking entirely. `--bench` has no furnaces, so what
 this row shows is that the bookkeeping itself is free.
+
+**Bounded catch-up (#58)** is the sixth, and the one where `--bench` is least
+able to say anything: 822,420 triangles, 1,367 FPS, 0.496 ms. The whole point of
+the block is the cost of *waking a chunk that slept for a long time*, and
+`--bench` neither sleeps nor wakes anything. The measurement that matters is a
+unit test instead: `catch_up_cost_does_not_grow_with_elapsed_time` advances a
+furnace by **100,000,000 ticks** and finishes instantly, which the previous
+per-tick loop could not have done at all. That is the number for this block, and
+it is not an FPS.
 
 ## Detailed run logs
 
