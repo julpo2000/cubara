@@ -97,7 +97,8 @@ frames after 200 warmup.
 | 2026-08-11 | Arena capacity re-sized for the node tree [#111], radius 12²⁹ | 957 | 367,026 | ~2,474 | 0.270 ms | ~0.92 ms | `da55704` |
 | 2026-08-11 | Arena capacity re-sized for the node tree [#111], radius 64²⁹ | 1,585 | 829,608 | ~1,275 | 0.535 ms | ~1.50 ms | `da55704` |
 | 2026-08-30 | macOS baseline caught up to `main` — skirt fix, reversed-Z, mips, blocks 2.1–2.2, radius 64³⁵ | 1,585 | 758,754 | ~1,462 | **0.483 ms** | ~0.89 ms | `f9080f7` |
-| 2026-08-30 | **Oak trees via the structure pass** [#154], radius 64³⁵ | **1,600** | **766,476** | ~1,442 | **0.484 ms** | ~0.89 ms | *(this PR)* |
+| 2026-08-30 | **Oak trees via the structure pass** [#154], radius 64³⁵ | **1,600** | **766,476** | ~1,442 | **0.484 ms** | ~0.89 ms | `89ca231` |
+| 2026-08-31 | **Iron ore as a density-pass threshold** [#156], radius 64³⁶ | 1,600 | **822,420** | ~1,381 | 0.509 ms | ~0.86 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -976,6 +977,39 @@ the skirt fix's −8.5% geometry (829,608 → 758,754) doing most of that work.
 
 Gate: **MET on both sides**, at ~1.44× the 1,000-FPS bar with trees in the
 world.
+
+³⁶ **Iron ore (#156) — the cost is greedy meshing, not the ore.** Same paired
+A/B as ³⁵: three runs a side, alternating ore / `main` on an idle machine.
+
+```
+ore     1379 / 1381 / 1383 FPS    CPU/frame 0.510 / 0.505 / 0.512 ms
+main    1451 / 1448 / 1438 FPS    CPU/frame 0.486 / 0.489 / 0.493 ms
+```
+
+**−4.5% throughput and +4.1% CPU/frame**, and unlike the trees row this one is
+outside the run-to-run spread — it is a real cost. The cause is worth stating,
+because the obvious explanation is the wrong one:
+
+**Ore adds no blocks to the world.** It is a material substitution
+(`PHASE2_ARCHITECTURE.md` §6) — a solid voxel becomes a different solid voxel,
+and the solidity field is bit-identical with and without it (pinned by
+`ore_never_changes_whether_a_voxel_is_solid`). Yet geometry rose **+7.3%**,
+766,476 → 822,420 triangles.
+
+That is entirely **greedy-mesh fragmentation**: a stone wall that merged into
+one large quad now has ore blocks punched through it, and each one splits the
+quad around it. Scattering ~1% of a material through a solid volume costs far
+more than 1% of its geometry, because the merged neighbours are what pay.
+
+The levers, if this ever needs to come down, are all in `assets/ores/iron.ron`
+and need no recompile: fewer/larger veins fragment less than the same volume of
+ore scattered widely, and `max_y` bounds the affected depth. None was pulled
+here — the gate is **MET at ~1.38×** and the tuning that costs this is the
+tuning that makes ore look like ore (see the file's own comment for how it was
+measured).
+
+Node count is unchanged at 1,600: same world, same chunks, more triangles
+inside them.
 
 ## Detailed run logs
 

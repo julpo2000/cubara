@@ -56,6 +56,12 @@ pub fn load_structure_registry() -> cubara_voxel::StructureRegistry {
         .expect("assets/structures must load")
 }
 
+/// Load `assets/ores/*.ron` -- which ores exist, and how common they are.
+pub fn load_ore_registry() -> cubara_voxel::OreRegistry {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    cubara_voxel::OreRegistry::load(&repo_root.join("assets/ores")).expect("assets/ores must load")
+}
+
 /// Load `assets/recipes/*.ron`, resolving ingredient names through `items`.
 pub fn load_recipe_book(items: &ItemRegistry) -> RecipeBook {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -340,7 +346,9 @@ impl Game {
         recipes: RecipeBook,
     ) {
         self.terrain = Some(
-            TerrainBlocks::from_registry(&registry).with_oak(&load_structure_registry(), &registry),
+            TerrainBlocks::from_registry(&registry)
+                .with_oak(&load_structure_registry(), &registry)
+                .with_ores(&load_ore_registry(), &registry),
         );
         self.blocks_registry = Some(registry);
         self.items = Some(items);
@@ -510,6 +518,7 @@ impl Game {
     fn terrain(&self) -> TerrainBlocks {
         self.terrain.unwrap_or(TerrainBlocks {
             oak: None,
+            ores: cubara_world::OreSet::EMPTY,
             grass: BlockId::AIR,
             soil: BlockId::AIR,
             stone: BlockId::AIR,

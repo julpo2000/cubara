@@ -260,12 +260,13 @@ pub fn save_regions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worldgen::TerrainBlocks;
+    use crate::worldgen::{OreSet, TerrainBlocks};
     use cubara_voxel::BlockId;
 
     fn stone_blocks() -> TerrainBlocks {
         TerrainBlocks {
             oak: None,
+            ores: OreSet::EMPTY,
             grass: BlockId::STONE,
             soil: BlockId::STONE,
             stone: BlockId::STONE,

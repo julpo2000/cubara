@@ -25,4 +25,4 @@ mod worldgen;
 
 pub use raycast::{raycast, RayHit};
 pub use world::World;
-pub use worldgen::{TerrainBlocks, WorldGen, WORLDGEN_VERSION};
+pub use worldgen::{OreGen, OreSet, TerrainBlocks, WorldGen, MAX_ORES, WORLDGEN_VERSION};

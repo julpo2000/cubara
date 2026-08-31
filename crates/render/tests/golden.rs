@@ -31,13 +31,17 @@ use cubara_world::{TerrainBlocks, World};
 /// The real `assets/blocks` registry -- the same one every entry point
 /// (window, `--bench`, `--screenshot`, these tests) meshes and renders
 /// against.
-/// The real terrain palette, trees included -- the same one the game plays
-/// with, so a golden shows what a player sees.
+/// The real terrain palette, trees and ores included -- the same one the game
+/// plays with, so a golden shows what a player sees.
 fn real_blocks() -> TerrainBlocks {
     let r = real_registry();
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/structures");
-    let structures = cubara_voxel::StructureRegistry::load(&dir).expect("assets/structures");
-    TerrainBlocks::from_registry(&r).with_oak(&structures, &r)
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let structures = cubara_voxel::StructureRegistry::load(&root.join("assets/structures"))
+        .expect("assets/structures");
+    let ores = cubara_voxel::OreRegistry::load(&root.join("assets/ores")).expect("assets/ores");
+    TerrainBlocks::from_registry(&r)
+        .with_oak(&structures, &r)
+        .with_ores(&ores, &r)
 }
 
 fn real_registry() -> BlockRegistry {
@@ -308,6 +312,39 @@ fn a_cave_mouth_is_visible() {
         panel: None,
     };
     assert_golden("cave_mouth", &world, shot);
+}
+
+#[test]
+fn iron_ore_is_visible_in_a_cave_wall() {
+    // Block 2.3b (#156)'s own bar: ore actually reaches the render path and is
+    // distinguishable from the stone around it. `PHASE2_ARCHITECTURE.md` §6
+    // makes ore a *material* substitution inside the density pass, which means
+    // the only way to see it is where stone is already exposed -- so this frames
+    // a vein in a cave wall from inside the chamber.
+    //
+    // Seed 119 is the same one `a_cave_mouth_is_visible` uses, and the eye/target
+    // are not hand-placed: a scan over the region around the origin looked for
+    // ore with a large air pocket around it (a chamber big enough to stand in)
+    // and then for a viewpoint with clear line of sight to it. This vein is at
+    // (-31, 17, 5) with 160 of the 343 cells in a 7³ box around it open.
+    //
+    // Note the ore is *below* the surface by construction (`max_y: 40`), which
+    // is why none of the other goldens moved when ore was switched on -- they
+    // all frame the surface, and ore never surfaces.
+    let world = World::with_seed(119);
+    let eye = glam::vec3(-25.5, 17.5, 5.5);
+    let target = glam::vec3(-31.0, 17.5, 5.5);
+    let shot = Shot {
+        width: 960,
+        height: 540,
+        region_radius: 3,
+        orbit_t: 0.0,
+        camera: Some((eye, target - eye)),
+        highlighted_block: None,
+        hotbar: None,
+        panel: None,
+    };
+    assert_golden("iron_ore", &world, shot);
 }
 
 #[test]

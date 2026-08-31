@@ -28,6 +28,7 @@ const FIXTURE_SEED: u64 = 0x00C0_FFEE_D0D0;
 fn fixture_blocks() -> TerrainBlocks {
     TerrainBlocks {
         oak: None,
+        ores: cubara_world::OreSet::EMPTY,
         grass: BlockId(1),
         soil: BlockId(2),
         stone: BlockId(3),

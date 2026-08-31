@@ -1,0 +1,12 @@
+// The ore block itself, in the hand.
+//
+// Every block needs an item of the *same name* to drop anything at all --
+// the placeholder drop policy (PHASE2_ARCHITECTURE.md §4.1), replaced by
+// real `drops:` tables in block 2.4. Until then, breaking iron ore yields
+// the ore block, not `cubara:raw_iron`: `drops:` is what turns an ore into
+// a different item, and Material does not carry it yet.
+ItemDef(
+    name:       "cubara:iron_ore",
+    max_stack:  64,
+    durability: None,
+)

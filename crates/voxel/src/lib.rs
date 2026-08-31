@@ -10,6 +10,7 @@ pub mod bounds;
 pub mod coord;
 pub mod item;
 pub mod mesh;
+pub mod ore;
 pub mod recipe;
 pub mod registry;
 pub mod storage;
@@ -23,6 +24,7 @@ pub use item::{
     ItemDef, ItemId, ItemRegistry, ItemRegistryError, ItemStack, ItemState, StackError,
 };
 pub use mesh::{Face, Mesh, Vertex};
+pub use ore::{OreDef, OreError, OreRegistry};
 pub use recipe::{Recipe, RecipeBook, RecipeDef, RecipeError, RecipeOutputDef, MAX_GRID};
 pub use registry::{BlockRegistry, Faces, Material, RegistryError, Shape};
 pub use storage::{ChunkPayloadError, ChunkStorage};

@@ -80,10 +80,12 @@ pub fn run(radius: i32) {
         ChunkCoord::new(0, 0, 0),
         0..=2,
         &schedule,
-        cubara_world::TerrainBlocks::from_registry(&mesh_assets.registry).with_oak(
-            &crate::game::load_structure_registry(),
-            &mesh_assets.registry,
-        ),
+        cubara_world::TerrainBlocks::from_registry(&mesh_assets.registry)
+            .with_oak(
+                &crate::game::load_structure_registry(),
+                &mesh_assets.registry,
+            )
+            .with_ores(&crate::game::load_ore_registry(), &mesh_assets.registry),
     )
     .into_iter()
     .filter_map(to_meshed_node);

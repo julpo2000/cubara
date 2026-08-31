@@ -118,6 +118,7 @@ mod tests {
     fn blocks() -> TerrainBlocks {
         TerrainBlocks {
             oak: None,
+            ores: cubara_world::OreSet::EMPTY,
             grass: cubara_voxel::BlockId::STONE,
             soil: cubara_voxel::BlockId::STONE,
             stone: cubara_voxel::BlockId::STONE,

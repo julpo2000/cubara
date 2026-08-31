@@ -277,6 +277,7 @@ impl World {
 mod tests {
     use super::*;
     use crate::streaming;
+    use crate::worldgen::OreSet;
     use cubara_voxel::{BlockRegistry, Faces, Material, MeshContext, Shape};
 
     /// A registry with a single solid material -- air (0) plus one other
@@ -307,6 +308,7 @@ mod tests {
     fn stone_blocks() -> TerrainBlocks {
         TerrainBlocks {
             oak: None,
+            ores: OreSet::EMPTY,
             grass: BlockId::STONE,
             soil: BlockId::STONE,
             stone: BlockId::STONE,
@@ -373,6 +375,7 @@ mod tests {
         let stone = registry.id_of("cubara:stone").unwrap();
         let blocks = TerrainBlocks {
             oak: None,
+            ores: OreSet::EMPTY,
             grass: stone,
             soil: stone,
             stone,
@@ -405,6 +408,7 @@ mod tests {
         // contract, pinned in `worldgen::tests::terrain_layers_by_depth`.
         let blocks = TerrainBlocks {
             oak: None,
+            ores: OreSet::EMPTY,
             grass: BlockId(4),
             soil: BlockId(4),
             stone: BlockId(3),
