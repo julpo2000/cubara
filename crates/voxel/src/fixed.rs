@@ -95,6 +95,15 @@ impl Fixed {
         (self.0 >> FRAC_BITS) as i32
     }
 
+    /// The block *above* this position -- `ceil`, the mirror of
+    /// [`floor_block`](Self::floor_block).
+    ///
+    /// `ceil(x) == -floor(-x)`, which keeps it exact and keeps it correct on
+    /// both sides of zero without a branch.
+    pub const fn ceil_block(self) -> i32 {
+        (-((-self.0) >> FRAC_BITS)) as i32
+    }
+
     /// The fractional part, always in `0..ONE` — never negative, matching
     /// [`floor_block`](Self::floor_block).
     pub const fn fract_raw(self) -> i64 {
@@ -221,6 +230,23 @@ impl FixedVec3 {
         ]
     }
 
+    /// Interpolate toward `other` by `t` in `0..=1`.
+    ///
+    /// **Presentation only** (§3.5: authority is integer, presentation may be
+    /// float). This exists so the renderer can smooth a 60 Hz simulation across
+    /// frames; nothing that decides anything may call it, and a wrong last bit
+    /// here is a sub-pixel difference rather than a divergence.
+    pub fn lerp(self, other: Self, t: f32) -> Self {
+        let mix = |a: Fixed, b: Fixed| {
+            Fixed::from_raw(a.raw() + ((b.raw() - a.raw()) as f64 * t as f64) as i64)
+        };
+        Self::new(
+            mix(self.x, other.x),
+            mix(self.y, other.y),
+            mix(self.z, other.z),
+        )
+    }
+
     /// Squared distance, in sub-units squared.
     ///
     /// Squared rather than a real distance because a square root is either a
@@ -231,6 +257,30 @@ impl FixedVec3 {
         let d = |a: Fixed, b: Fixed| (a.0 - b.0) as i128;
         let (dx, dy, dz) = (d(self.x, other.x), d(self.y, other.y), d(self.z, other.z));
         dx * dx + dy * dy + dz * dz
+    }
+}
+
+impl std::ops::Index<usize> for FixedVec3 {
+    type Output = Fixed;
+    /// Axis order is x, y, z. The collision sweep resolves one axis at a time
+    /// and is written generically over which, so it indexes rather than
+    /// branching three ways at every step.
+    fn index(&self, axis: usize) -> &Fixed {
+        match axis {
+            0 => &self.x,
+            1 => &self.y,
+            _ => &self.z,
+        }
+    }
+}
+
+impl std::ops::IndexMut<usize> for FixedVec3 {
+    fn index_mut(&mut self, axis: usize) -> &mut Fixed {
+        match axis {
+            0 => &mut self.x,
+            1 => &mut self.y,
+            _ => &mut self.z,
+        }
     }
 }
 
@@ -372,6 +422,19 @@ mod tests {
             (1_000_000i128 * ONE as i128).pow(2),
             "large coordinates overflowed or lost precision"
         );
+    }
+
+    #[test]
+    fn ceil_is_the_mirror_of_floor() {
+        let half = Fixed::from_raw(ONE / 2);
+        assert_eq!(Fixed::from_blocks(5).ceil_block(), 5, "already whole");
+        assert_eq!((Fixed::from_blocks(5) + half).ceil_block(), 6);
+        assert_eq!((-half).ceil_block(), 0);
+        assert_eq!((Fixed::from_blocks(-3) - half).ceil_block(), -3);
+        for raw in [-5 * ONE - 3, -ONE, -1, 0, 1, ONE, 7 * ONE + 9] {
+            let f = Fixed::from_raw(raw);
+            assert_eq!(f.ceil_block(), -((-f).floor_block()), "raw {raw}");
+        }
     }
 
     #[test]

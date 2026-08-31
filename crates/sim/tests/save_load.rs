@@ -119,7 +119,14 @@ fn round_trip_edit_hash_save_load_hash_is_equal() {
     let seed = 0x00AB_CDEF_0123_4567;
 
     let mut world = World::with_seed(seed);
-    let mut sim = Sim::new(seed, Player::new(glam::vec3(0.5, 40.0, 0.5), 0.6, -0.2));
+    let mut sim = Sim::new(
+        seed,
+        Player::new(
+            cubara_voxel::FixedVec3::from_f32([0.5, 40.0, 0.5]),
+            0.6,
+            -0.2,
+        ),
+    );
 
     // A scripted edit sequence, then some ticks so tick/RNG/player state are
     // all non-trivial too, not just the world's edit overlay.
@@ -164,7 +171,7 @@ fn an_unedited_chunk_is_bit_identical_after_a_save_load_round_trip() {
     let unedited = ChunkCoord::new(6, 1, -6); // far from the edit below
 
     let mut world = World::with_seed(seed);
-    let sim = Sim::new(seed, Player::new(glam::Vec3::ZERO, 0.0, 0.0));
+    let sim = Sim::new(seed, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
     world.set_block(0, 0, 0, BlockId::AIR); // an edit elsewhere, so save/load has real work
 
     let original = world
@@ -208,7 +215,14 @@ fn a_placed_block_keeps_its_own_material_across_a_round_trip() {
     let (x, y, z) = (4, -60, 2);
     let mut world = World::with_seed(seed);
     world.set_block(x, y, z, blocks.grass);
-    let sim = Sim::new(seed, Player::new(glam::vec3(0.5, 40.0, 0.5), 0.0, 0.0));
+    let sim = Sim::new(
+        seed,
+        Player::new(
+            cubara_voxel::FixedVec3::from_f32([0.5, 40.0, 0.5]),
+            0.0,
+            0.0,
+        ),
+    );
 
     let dir = scratch_dir("placed-material-round-trip");
     save_world(&dir, &sim, &world, &registry, &test_items(), blocks).expect("save");
@@ -236,7 +250,14 @@ fn saving_the_same_world_twice_produces_byte_identical_files() {
     let mut world = World::with_seed(seed);
     world.set_block(1, 1, 1, blocks.stone);
     world.set_block(-9, 4, 20, BlockId::AIR);
-    let sim = Sim::new(seed, Player::new(glam::vec3(1.0, 2.0, 3.0), 0.5, -0.1));
+    let sim = Sim::new(
+        seed,
+        Player::new(
+            cubara_voxel::FixedVec3::from_f32([1.0, 2.0, 3.0]),
+            0.5,
+            -0.1,
+        ),
+    );
 
     let dir_a = scratch_dir("byte-stability-a");
     let dir_b = scratch_dir("byte-stability-b");
@@ -295,11 +316,19 @@ fn saving_the_same_world_twice_produces_byte_identical_files() {
 /// | `0xf1cf_74d0_987d_efb4` | block 2.1b (#136), inventory added to the hash |
 /// | `0x01ba_197a_381f_63c2` | block 2.2b (#148), crafting grid + cursor added |
 /// | `0x4d7d_54f3_c4cb_fcf2` | block 2.9a (#172), health + regen counter added |
+/// | `0xfdea_8337_8a61_7fcc` | fixed-point positions — representation, not new state |
 ///
 /// Four moves is worth noticing rather than shrugging at. All four are the same
 /// *kind* of change -- new player state joining the digest -- and each is a
 /// one-line addition to `write_sim`, so the trigger the previous note set (a
 /// move for a *different* reason) has not fired.
+///
+/// The fifth move is a different *kind* from the first four. Those added new
+/// player state to the digest; this one changed the **representation** of state
+/// already in it — positions and velocities are integers, so the digest no
+/// longer contains raw `f32` bits at all. The fixture's `region/` files did not
+/// change at all, which is the evidence that the world itself is untouched and
+/// only the header moved.
 ///
 /// It is worth saying plainly that this will keep happening: hunger and mobs
 /// will each add player state and each move both pinned hashes again. That is
@@ -307,7 +336,7 @@ fn saving_the_same_world_twice_produces_byte_identical_files() {
 /// worth paying while the alternative -- pinning per subsystem -- would let a
 /// real divergence hide in a subsystem nobody re-pinned. Revisit if the two
 /// values ever move *apart*.
-const FIXTURE_HASH: u64 = 0x4d7d_54f3_c4cb_fcf2;
+const FIXTURE_HASH: u64 = 0xfdea_8337_8a61_7fcc;
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/save_fixture")
@@ -319,7 +348,14 @@ fn fixture_dir() -> PathBuf {
 fn fixture_state() -> (Sim, World) {
     const SEED: u64 = 0x00FE_ED5A_7E5E_ED01;
     let mut world = World::with_seed(SEED);
-    let mut sim = Sim::new(SEED, Player::new(glam::vec3(0.5, 40.0, 0.5), 0.3, -0.1));
+    let mut sim = Sim::new(
+        SEED,
+        Player::new(
+            cubara_voxel::FixedVec3::from_f32([0.5, 40.0, 0.5]),
+            0.3,
+            -0.1,
+        ),
+    );
 
     // Resolved from the fixture's own registry, not `BlockId::STONE`: ids are
     // assigned by sorted name, so the constant is `cubara:grass` here, not
@@ -381,7 +417,7 @@ fn loading_with_a_registry_missing_a_saved_block_name_is_a_named_error() {
     let blocks = TerrainBlocks::from_registry(&full_registry);
     let seed = 0x0066_6677_7788_8899;
     let world = World::with_seed(seed);
-    let sim = Sim::new(seed, Player::new(glam::Vec3::ZERO, 0.0, 0.0));
+    let sim = Sim::new(seed, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
 
     let dir = scratch_dir("missing-name");
     save_world(&dir, &sim, &world, &full_registry, &test_items(), blocks).expect("save");
@@ -436,7 +472,7 @@ fn loading_a_worldgen_version_mismatch_is_a_named_error() {
     let blocks = TerrainBlocks::from_registry(&registry);
     let seed = 0x0088_8899_99AA_AABB;
     let world = World::with_seed(seed);
-    let sim = Sim::new(seed, Player::new(glam::Vec3::ZERO, 0.0, 0.0));
+    let sim = Sim::new(seed, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
 
     let dir = scratch_dir("version-mismatch");
     save_world(&dir, &sim, &world, &registry, &test_items(), blocks).expect("save");
@@ -470,7 +506,7 @@ fn loading_an_unsupported_format_version_is_a_named_error() {
     let blocks = TerrainBlocks::from_registry(&registry);
     let seed = 0x00CC_CCDD_DDEE_EEFF;
     let world = World::with_seed(seed);
-    let sim = Sim::new(seed, Player::new(glam::Vec3::ZERO, 0.0, 0.0));
+    let sim = Sim::new(seed, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
 
     let dir = scratch_dir("format-version-mismatch");
     save_world(&dir, &sim, &world, &registry, &test_items(), blocks).expect("save");
@@ -544,8 +580,8 @@ fn a_world_saved_mid_script_finishes_where_an_uninterrupted_one_does() {
         for i in 0..3 {
             sim.entities.spawn_item(
                 items.new_stack(stone, i + 1).unwrap(),
-                glam::Vec3::new(i as f32, 45.0, 0.0),
-                glam::Vec3::ZERO,
+                cubara_voxel::FixedVec3::from_f32([i as f32, 45.0, 0.0]),
+                cubara_voxel::FixedVec3::ZERO,
             );
         }
     };
@@ -559,13 +595,27 @@ fn a_world_saved_mid_script_finishes_where_an_uninterrupted_one_does() {
 
     // The uninterrupted run.
     let mut world_a = World::with_seed(seed);
-    let mut sim_a = Sim::new(seed, Player::new(glam::Vec3::new(0.5, 50.0, 0.5), 0.0, 0.0));
+    let mut sim_a = Sim::new(
+        seed,
+        Player::new(
+            cubara_voxel::FixedVec3::from_f32([0.5, 50.0, 0.5]),
+            0.0,
+            0.0,
+        ),
+    );
     setup(&mut sim_a, &mut world_a);
     tick_n(&mut sim_a, &mut world_a, 20);
 
     // The interrupted one: same script, saved and reloaded at the halfway mark.
     let mut world_b = World::with_seed(seed);
-    let mut sim_b = Sim::new(seed, Player::new(glam::Vec3::new(0.5, 50.0, 0.5), 0.0, 0.0));
+    let mut sim_b = Sim::new(
+        seed,
+        Player::new(
+            cubara_voxel::FixedVec3::from_f32([0.5, 50.0, 0.5]),
+            0.0,
+            0.0,
+        ),
+    );
     setup(&mut sim_b, &mut world_b);
     tick_n(&mut sim_b, &mut world_b, 10);
 

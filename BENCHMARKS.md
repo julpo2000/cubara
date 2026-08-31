@@ -108,7 +108,8 @@ frames after 200 warmup.
 | 2026-08-31 | Save format covers phase 2 state [#170], radius 64³⁷ | 1,600 | 822,420 | ~1,387 | 0.513 ms | ~0.85 ms | `4b4b131` |
 | 2026-08-31 | Health, fall damage, regeneration [#172], radius 64³⁷ | 1,600 | 822,420 | ~1,379 | 0.496 ms | ~0.93 ms | `3df7b28` |
 | 2026-08-31 | Caves at level 0 only [#175], radius 64, **old 3-layer slab**³⁸ | 1,600 | **675,962** | **~1,553** | **0.447 ms** | ~0.78 ms | *(this PR)* |
-| 2026-08-31 | **World with no height limit** [#175], radius 64, band ±2³⁸ | **3,138** | 912,964 | ~1,115 | 0.613 ms | ~1.08 ms | *(this PR)* |
+| 2026-08-31 | **World with no height limit** [#175], radius 64, band ±2³⁸ | **3,138** | 912,964 | ~1,115 | 0.613 ms | ~1.08 ms | `4da25da` |
+| 2026-08-31 | Fixed-point positions, radius 64, band ±2³⁹ | 3,138 | 912,964 | ~1,109 | 0.622 ms | ~1.04 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -1122,6 +1123,17 @@ figure taken while over that cap was measured on a world with holes in it.
 Going down is what costs: air meshes to nothing, rock is full of caves, and cave
 surfaces are real geometry. Going *up* remains free -- `0..=2`, `0..=7` and
 `0..=15` all measured identically.
+
+³⁹ **Positions became integers, and it cost nothing.** 912,964 triangles and
+3,138 nodes -- identical to the row above, which is the point: this changed how
+positions are *represented*, not what the world contains. 1,109 FPS against
+~1,115 is inside the run-to-run spread.
+
+That is worth recording because integer arithmetic replacing floating point is
+exactly the kind of change people assume is slower. It is not: the work is the
+same additions and comparisons, and the collision sweep lost its epsilon skin
+along the way -- `move_axis` no longer nudges every bound by 1e-4 before
+flooring it, because an exact `pos <-> feet` round trip does not need the nudge.
 
 ## Detailed run logs
 

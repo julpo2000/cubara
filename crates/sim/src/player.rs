@@ -8,6 +8,7 @@
 
 use crate::crafting::Crafting;
 use crate::inventory::Inventory;
+use cubara_voxel::{Fixed, FixedVec3};
 use glam::Vec3;
 
 use crate::input::InputFrame;
@@ -29,11 +30,11 @@ pub struct Player {
     /// The eye/camera position. Walking physics derives its collision box
     /// from this by subtracting a fixed eye height (`crate::physics`), so
     /// this field's meaning doesn't change between modes.
-    pub pos: Vec3,
+    pub pos: FixedVec3,
     /// Blocks/second. Driven by gravity and walking input in walking mode;
     /// held at zero in free-fly (there's nothing to carry across the mode
     /// switch back).
-    pub velocity: Vec3,
+    pub velocity: FixedVec3,
     /// Whether the last walking-physics tick ended standing on solid ground.
     /// Always `false` in free-fly (not meaningful there -- nothing reads it
     /// as "falling").
@@ -79,10 +80,10 @@ pub struct Player {
     /// **Not saved.** It is transient and derived: a loaded world starts the
     /// player on the ground, and carrying a half-completed fall across a reload
     /// would be a fall the player never made.
-    pub fall_distance: f32,
+    pub fall_distance: Fixed,
     /// Where death returns the player to (§13.4). Set when the player is
     /// created, at the position they start from.
-    pub spawn: Vec3,
+    pub spawn: FixedVec3,
 }
 
 /// Full health, in points. Ten hearts of two points each (§13.1).
@@ -98,16 +99,16 @@ pub const HEART: u8 = 2;
 pub const REGEN_INTERVAL: u32 = 300;
 
 /// Blocks you may fall without being hurt (§13.3). Tuning.
-pub const SAFE_FALL: f32 = 3.0;
+pub const SAFE_FALL: Fixed = Fixed::from_raw(3 * cubara_voxel::fixed::ONE);
 
 /// Damage per block fallen beyond [`SAFE_FALL`]. Tuning.
 pub const FALL_DAMAGE_PER_BLOCK: u8 = 1;
 
 impl Player {
-    pub fn new(pos: Vec3, yaw: f32, pitch: f32) -> Self {
+    pub fn new(pos: FixedVec3, yaw: f32, pitch: f32) -> Self {
         Self {
             pos,
-            velocity: Vec3::ZERO,
+            velocity: FixedVec3::ZERO,
             on_ground: false,
             free_fly: false,
             yaw,
@@ -116,7 +117,7 @@ impl Player {
             crafting: Crafting::default(),
             health: MAX_HEALTH,
             ticks_since_damage: 0,
-            fall_distance: 0.0,
+            fall_distance: Fixed::ZERO,
             spawn: pos,
         }
     }
@@ -148,8 +149,8 @@ impl Player {
     /// on landing.
     pub fn respawn(&mut self) {
         self.pos = self.spawn;
-        self.velocity = Vec3::ZERO;
-        self.fall_distance = 0.0;
+        self.velocity = FixedVec3::ZERO;
+        self.fall_distance = Fixed::ZERO;
         self.on_ground = false;
         self.health = MAX_HEALTH;
         self.ticks_since_damage = 0;
@@ -176,12 +177,16 @@ impl Player {
     }
 
     /// How many points a fall of `blocks` deals (§13.3).
-    pub fn fall_damage_for(blocks: f32) -> u8 {
-        let beyond = (blocks - SAFE_FALL).floor();
-        if beyond <= 0.0 {
+    pub fn fall_damage_for(distance: Fixed) -> u8 {
+        let beyond = (distance - SAFE_FALL).floor_block();
+        if beyond <= 0 {
             return 0;
         }
-        (beyond as u32).min(u8::MAX as u32) as u8 * FALL_DAMAGE_PER_BLOCK
+        // Saturating on both the cast and the multiply: a fall from the top of
+        // an unbounded world is a very large number, and `u8` is not.
+        (beyond as u32)
+            .saturating_mul(FALL_DAMAGE_PER_BLOCK as u32)
+            .min(u8::MAX as u32) as u8
     }
 
     /// Whether the player is currently in free-fly (noclip) debug mode
@@ -231,7 +236,10 @@ impl Player {
         let delta =
             look * input.move_axes[2] + right * input.move_axes[0] + Vec3::Y * input.move_axes[1];
         if delta != Vec3::ZERO {
-            self.pos += delta.normalize() * SPEED * dt;
+            // Free-fly is a debug mode and never authoritative, so converting
+            // through f32 here costs nothing that matters.
+            let step = delta.normalize() * SPEED * dt;
+            self.pos += FixedVec3::from_f32([step.x, step.y, step.z]);
         }
     }
 
@@ -277,21 +285,25 @@ mod tests {
 
     #[test]
     fn default_orientation_looks_along_negative_z() {
-        let player = Player::new(Vec3::ZERO, 0.0, 0.0);
+        let player = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
         let d = player.look_dir();
         assert!((d - Vec3::new(0.0, 0.0, -1.0)).length() < 1e-5, "{d:?}");
     }
 
     #[test]
     fn yaw_ninety_degrees_looks_along_positive_x() {
-        let player = Player::new(Vec3::ZERO, std::f32::consts::FRAC_PI_2, 0.0);
+        let player = Player::new(
+            cubara_voxel::FixedVec3::ZERO,
+            std::f32::consts::FRAC_PI_2,
+            0.0,
+        );
         let d = player.look_dir();
         assert!((d - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-5, "{d:?}");
     }
 
     #[test]
     fn pitch_is_clamped() {
-        let mut player = Player::new(Vec3::ZERO, 0.0, 0.0);
+        let mut player = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
         let look_up = InputFrame {
             look_delta: [0.0, -100_000.0],
             ..InputFrame::default()
@@ -303,11 +315,14 @@ mod tests {
 
     #[test]
     fn forward_axis_moves_along_look_dir() {
-        let mut player = Player::new(Vec3::ZERO, 0.0, 0.0);
+        let mut player = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
         player.apply_free_fly(&moving([0.0, 0.0, 1.0]), 1.0);
         // One second of SPEED along −Z.
         assert!(
-            (player.pos - Vec3::new(0.0, 0.0, -SPEED)).length() < 1e-4,
+            player
+                .pos
+                .distance_squared(FixedVec3::from_f32([0.0, 0.0, -SPEED]))
+                < (cubara_voxel::fixed::ONE as i128).pow(2) / 10_000,
             "{:?}",
             player.pos
         );
@@ -318,22 +333,22 @@ mod tests {
         // A caller building InputFrame from held keys already cancels W+S
         // etc. into a zero axis -- this pins that a zero axis truly means no
         // movement on that axis, not that it happens to net out via floats.
-        let mut player = Player::new(Vec3::ZERO, 0.0, 0.0);
+        let mut player = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
         player.apply_free_fly(&moving([0.0, 0.0, 0.0]), 1.0);
-        assert_eq!(player.pos, Vec3::ZERO);
+        assert_eq!(player.pos, FixedVec3::ZERO);
     }
 
     #[test]
     fn zero_dt_does_not_move_even_with_input_held() {
-        let mut player = Player::new(Vec3::ZERO, 0.0, 0.0);
+        let mut player = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
         player.apply_free_fly(&moving([1.0, 1.0, 1.0]), 0.0);
-        assert_eq!(player.pos, Vec3::ZERO);
+        assert_eq!(player.pos, FixedVec3::ZERO);
     }
 
     #[test]
     fn lerp_at_zero_and_one_returns_the_endpoints() {
-        let a = Player::new(Vec3::ZERO, 0.0, 0.0);
-        let b = Player::new(Vec3::new(10.0, 0.0, 0.0), 1.0, 0.2);
+        let a = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
+        let b = Player::new(FixedVec3::from_blocks(10, 0, 0), 1.0, 0.2);
 
         // The *interpolated* fields hit the endpoints. Whole-struct equality is
         // deliberately not asserted: `lerp` documents that fields which are not
@@ -357,10 +372,14 @@ mod tests {
 
     #[test]
     fn lerp_at_half_is_halfway_between() {
-        let a = Player::new(Vec3::ZERO, 0.0, 0.0);
-        let b = Player::new(Vec3::new(10.0, 0.0, 0.0), 1.0, 0.2);
+        let a = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
+        let b = Player::new(FixedVec3::from_blocks(10, 0, 0), 1.0, 0.2);
         let mid = a.lerp(&b, 0.5);
-        assert!((mid.pos - Vec3::new(5.0, 0.0, 0.0)).length() < 1e-5);
+        assert_eq!(
+            mid.pos,
+            FixedVec3::from_blocks(5, 0, 0),
+            "halfway between two whole-block positions is exact in integers"
+        );
         assert!((mid.yaw - 0.5).abs() < 1e-5);
         assert!((mid.pitch - 0.1).abs() < 1e-5);
     }
@@ -369,25 +388,25 @@ mod tests {
     fn a_fall_inside_the_safe_distance_costs_nothing() {
         // The boundary, from both sides. SAFE_FALL is 3, so 3 blocks is free
         // and 4 costs one point.
-        assert_eq!(Player::fall_damage_for(0.0), 0);
-        assert_eq!(Player::fall_damage_for(3.0), 0);
-        assert_eq!(Player::fall_damage_for(3.99), 0);
-        assert_eq!(Player::fall_damage_for(4.0), 1);
-        assert_eq!(Player::fall_damage_for(10.0), 7);
+        assert_eq!(Player::fall_damage_for(Fixed::from_f32(0.0)), 0);
+        assert_eq!(Player::fall_damage_for(Fixed::from_f32(3.0)), 0);
+        assert_eq!(Player::fall_damage_for(Fixed::from_f32(3.99)), 0);
+        assert_eq!(Player::fall_damage_for(Fixed::from_f32(4.0)), 1);
+        assert_eq!(Player::fall_damage_for(Fixed::from_f32(10.0)), 7);
     }
 
     #[test]
     fn a_long_enough_fall_kills_and_respawns() {
-        let mut p = Player::new(Vec3::new(5.0, 70.0, 5.0), 0.0, 0.0);
-        p.pos = Vec3::new(5.0, 2.0, 5.0);
+        let mut p = Player::new(FixedVec3::from_blocks(5, 70, 5), 0.0, 0.0);
+        p.pos = FixedVec3::from_blocks(5, 2, 5);
 
         // 23 blocks: 20 points beyond the safe distance, which is exactly full
         // health.
-        let died = p.take_damage(Player::fall_damage_for(23.0));
+        let died = p.take_damage(Player::fall_damage_for(Fixed::from_f32(23.0)));
 
         assert!(died);
         assert_eq!(p.health, MAX_HEALTH, "respawned at full health");
-        assert_eq!(p.pos, Vec3::new(5.0, 70.0, 5.0), "back at spawn");
+        assert_eq!(p.pos, FixedVec3::from_blocks(5, 70, 5), "back at spawn");
     }
 
     #[test]
@@ -395,7 +414,7 @@ mod tests {
         // The owner's decision (§13.4). Worth its own test because the obvious
         // alternative -- dropping everything -- is what the genre usually does,
         // and a future change here should have to say so out loud.
-        let mut p = Player::new(Vec3::ZERO, 0.0, 0.0);
+        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
         let before = p.inventory;
         p.take_damage(MAX_HEALTH);
         assert_eq!(p.health, MAX_HEALTH);
@@ -404,7 +423,7 @@ mod tests {
 
     #[test]
     fn a_heart_comes_back_every_interval_without_damage() {
-        let mut p = Player::new(Vec3::ZERO, 0.0, 0.0);
+        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
         p.take_damage(6);
         assert_eq!(p.health, 14);
 
@@ -427,7 +446,7 @@ mod tests {
     #[test]
     fn damage_restarts_the_regeneration_clock() {
         // Sustained damage means no healing at all, rather than slow healing.
-        let mut p = Player::new(Vec3::ZERO, 0.0, 0.0);
+        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
         p.take_damage(10);
         for _ in 0..REGEN_INTERVAL - 1 {
             p.tick_regeneration();
@@ -443,19 +462,19 @@ mod tests {
     fn a_harmless_fall_does_not_interrupt_healing() {
         // Zero damage is not damage: landing inside the safe distance must not
         // reset the counter, or a player hopping around would never heal.
-        let mut p = Player::new(Vec3::ZERO, 0.0, 0.0);
+        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
         p.take_damage(4);
         for _ in 0..REGEN_INTERVAL - 1 {
             p.tick_regeneration();
         }
-        p.take_damage(Player::fall_damage_for(2.0)); // a 2-block hop: 0 points
+        p.take_damage(Player::fall_damage_for(Fixed::from_f32(2.0))); // a 2-block hop: 0 points
         p.tick_regeneration();
         assert_eq!(p.health, MAX_HEALTH - 4 + HEART, "healed on schedule");
     }
 
     #[test]
     fn regeneration_stops_at_full_health() {
-        let mut p = Player::new(Vec3::ZERO, 0.0, 0.0);
+        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
         for _ in 0..REGEN_INTERVAL * 3 {
             p.tick_regeneration();
         }
@@ -464,7 +483,7 @@ mod tests {
 
     #[test]
     fn health_never_wraps_past_zero() {
-        let mut p = Player::new(Vec3::ZERO, 0.0, 0.0);
+        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
         // Far more than full health in one hit: saturating, then a respawn.
         p.take_damage(u8::MAX);
         assert_eq!(p.health, MAX_HEALTH);

@@ -66,6 +66,10 @@ impl WorldHash {
         self.write_bytes(&v.to_le_bytes());
     }
 
+    fn write_i64(&mut self, v: i64) {
+        self.write_bytes(&v.to_le_bytes());
+    }
+
     fn write_u64(&mut self, v: u64) {
         self.write_bytes(&v.to_le_bytes());
     }
@@ -94,12 +98,16 @@ impl WorldHash {
         self.write_u64(sim.rng.state);
         self.write_u64(sim.rng.inc);
         let p = &sim.player;
-        self.write_f32(p.pos.x);
-        self.write_f32(p.pos.y);
-        self.write_f32(p.pos.z);
-        self.write_f32(p.velocity.x);
-        self.write_f32(p.velocity.y);
-        self.write_f32(p.velocity.z);
+        // Integers now (block 2.x, fixed-point positions): a hash folding raw
+        // f32 bits is a hash that can differ between compilers. What remains
+        // float here is `yaw`/`pitch` below -- named in
+        // `docs/RESEARCH_MULTIPLAYER.md` §3.5 as the other half of the work.
+        self.write_i64(p.pos.x.raw());
+        self.write_i64(p.pos.y.raw());
+        self.write_i64(p.pos.z.raw());
+        self.write_i64(p.velocity.x.raw());
+        self.write_i64(p.velocity.y.raw());
+        self.write_i64(p.velocity.z.raw());
         self.write_bool(p.on_ground);
         self.write_bool(p.free_fly);
         self.write_f32(p.yaw);
@@ -222,9 +230,9 @@ impl WorldHash {
             self.write_u64(key.0);
             self.write_u16(d.stack.item().0);
             self.write_u8(d.stack.count());
-            self.write_f32(d.pos.x);
-            self.write_f32(d.pos.y);
-            self.write_f32(d.pos.z);
+            self.write_i64(d.pos.x.raw());
+            self.write_i64(d.pos.y.raw());
+            self.write_i64(d.pos.z.raw());
             self.write_u32(d.age);
         }
     }
@@ -351,7 +359,7 @@ mod tests {
     #[test]
     fn identical_sims_and_worlds_hash_equal() {
         let world = World::with_seed(1);
-        let sim = Sim::new(1, Player::new(glam::Vec3::ZERO, 0.0, 0.0));
+        let sim = Sim::new(1, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
         let a = WorldHash::compute(&sim, &world, &region(), blocks(), 1);
         let b = WorldHash::compute(&sim, &world, &region(), blocks(), 1);
         assert_eq!(a, b);
@@ -360,8 +368,8 @@ mod tests {
     #[test]
     fn a_different_tick_count_changes_the_hash() {
         let world = World::with_seed(1);
-        let mut a = Sim::new(1, Player::new(glam::Vec3::ZERO, 0.0, 0.0));
-        let b = Sim::new(1, Player::new(glam::Vec3::ZERO, 0.0, 0.0));
+        let mut a = Sim::new(1, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
+        let b = Sim::new(1, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
         a.tick += 1;
         assert_ne!(
             WorldHash::compute(&a, &world, &region(), blocks(), 1),
@@ -371,7 +379,7 @@ mod tests {
 
     #[test]
     fn an_edit_changes_the_hash() {
-        let sim = Sim::new(1, Player::new(glam::Vec3::ZERO, 0.0, 0.0));
+        let sim = Sim::new(1, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
         let mut world = World::with_seed(1);
         // (0, 0, 0) is deep underground -- already solid stone -- so
         // *placing* there (`true`) would be a no-op on content; break it
@@ -389,7 +397,7 @@ mod tests {
     #[test]
     fn region_order_in_the_caller_does_not_matter() {
         let world = World::with_seed(2);
-        let sim = Sim::new(2, Player::new(glam::Vec3::ZERO, 0.0, 0.0));
+        let sim = Sim::new(2, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
         let forward = region();
         let mut reversed = forward.clone();
         reversed.reverse();

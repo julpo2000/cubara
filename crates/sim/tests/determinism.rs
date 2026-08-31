@@ -52,7 +52,14 @@ fn fixture_region() -> Vec<ChunkCoord> {
 /// `Game::edit_block`, deliberately out of this issue's scope).
 fn replay(seed: u64, script: &[InputFrame]) -> (Sim, World) {
     let mut world = World::with_seed(seed);
-    let mut sim = Sim::new(seed, Player::new(glam::vec3(0.5, 40.0, 0.5), 0.0, 0.0));
+    let mut sim = Sim::new(
+        seed,
+        Player::new(
+            cubara_voxel::FixedVec3::from_f32([0.5, 40.0, 0.5]),
+            0.0,
+            0.0,
+        ),
+    );
     for input in script {
         sim.tick(&mut world, input, fixture_blocks());
     }
@@ -69,7 +76,14 @@ fn replay_with_edits(
     edits: &[(usize, [i32; 3], BlockId)],
 ) -> (Sim, World) {
     let mut world = World::with_seed(seed);
-    let mut sim = Sim::new(seed, Player::new(glam::vec3(0.5, 40.0, 0.5), 0.0, 0.0));
+    let mut sim = Sim::new(
+        seed,
+        Player::new(
+            cubara_voxel::FixedVec3::from_f32([0.5, 40.0, 0.5]),
+            0.0,
+            0.0,
+        ),
+    );
     for (i, input) in script.iter().enumerate() {
         sim.tick(&mut world, input, fixture_blocks());
         for &(tick, coord, block) in edits {
@@ -160,7 +174,15 @@ fn fixture_edits() -> Vec<(usize, [i32; 3], BlockId)> {
 /// | `0xede5_39f2_ee54_4d2a` | block 2.1b (#136), inventory added to the hash |
 /// | `0xc763_3252_db46_3e78` | block 2.2b (#148), crafting grid + cursor added |
 /// | `0x4f74_448e_2b83_20bb` | block 2.9a (#172), health + regen counter added |
-const KNOWN_FIXTURE_HASH: u64 = 0x4f74_448e_2b83_20bb;
+/// | `0xe7dc_d72a_011b_4f9b` | fixed-point positions — the hash stopped folding in `f32` bits |
+///
+/// The last one is a different *kind* of change from the four before it, which
+/// were all "new player state joined the digest". This one changed the
+/// representation of state that was already there: positions and velocities are
+/// integers now, so the digest no longer contains raw `f32` bits at all. That is
+/// the point — a hash built from float bits is a hash two compilers can disagree
+/// about, which is exactly what a desync is.
+const KNOWN_FIXTURE_HASH: u64 = 0xe7dc_d72a_011b_4f9b;
 
 #[test]
 fn replay_of_the_same_seed_and_script_is_deterministic() {

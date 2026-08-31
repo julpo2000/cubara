@@ -20,6 +20,7 @@ use cubara_render::{swatch_color, HotbarSlot, InventoryPanel, PanelSlotKind};
 use cubara_sim::{InputFrame, Player, Sim, REACH, TICK_DT};
 use cubara_sim::{SlotRef, HOTBAR_WIDTH};
 use cubara_voxel::ChunkCoord;
+use cubara_voxel::FixedVec3;
 use cubara_voxel::{
     BlockId, BlockRegistry, DropRule, Interact, ItemRegistry, ItemStack, ItemState, RecipeBook,
     SmeltBook,
@@ -145,8 +146,9 @@ fn advance_furnace(
 }
 
 /// The middle of block `b`, where an item dropped by breaking it appears.
-fn drop_centre(b: [i32; 3]) -> glam::Vec3 {
-    glam::Vec3::new(b[0] as f32 + 0.5, b[1] as f32 + 0.5, b[2] as f32 + 0.5)
+fn drop_centre(b: [i32; 3]) -> FixedVec3 {
+    let half = cubara_voxel::Fixed::from_raw(cubara_voxel::fixed::ONE / 2);
+    FixedVec3::from_blocks(b[0], b[1], b[2]) + FixedVec3::new(half, half, half)
 }
 
 pub struct Game {
@@ -230,7 +232,7 @@ impl Game {
     /// you land in and walk, not one you start already flying over) -- gravity
     /// carries the player down onto the terrain below.
     pub fn new() -> Self {
-        let player = Player::new(glam::vec3(0.0, 48.0, 0.0), 0.6, -0.3);
+        let player = Player::new(FixedVec3::from_blocks(0, 48, 0), 0.6, -0.3);
         Self {
             world: Arc::new(World::new()),
             sim: Sim::new(0, player),
@@ -270,7 +272,10 @@ impl Game {
         let alpha = (self.accumulator / TICK_DT as f64).clamp(0.0, 1.0) as f32;
         let player = self.prev_player.lerp(&self.sim.player, alpha);
         CameraPose {
-            eye: player.pos,
+            // The renderer works in floats, and that is the correct side of the
+            // seam for it: a wrong last bit in a camera matrix is a sub-pixel
+            // difference (§3.5, presentation may be float).
+            eye: glam::Vec3::from_array(player.pos.to_f32()),
             look_dir: player.look_dir(),
         }
     }
@@ -460,16 +465,17 @@ impl Game {
             return;
         };
         let p = self.sim.player.pos;
+        let [px, _, pz] = p.to_f32();
         let Some(hit) = self
             .world
-            .raycast([p.x, 200.0, p.z], [0.0, -1.0, 0.0], 400.0, terrain)
+            .raycast([px, 200.0, pz], [0.0, -1.0, 0.0], 400.0, terrain)
         else {
             return;
         };
-        let standing = glam::vec3(p.x, hit.block[1] as f32 + 2.0, p.z);
+        let standing = FixedVec3::new(p.x, cubara_voxel::Fixed::from_blocks(hit.block[1] + 2), p.z);
         self.sim.player.pos = standing;
-        self.sim.player.velocity = glam::Vec3::ZERO;
-        self.sim.player.fall_distance = 0.0;
+        self.sim.player.velocity = FixedVec3::ZERO;
+        self.sim.player.fall_distance = cubara_voxel::Fixed::ZERO;
         // Death returns here, not to wherever `Game::new` happened to start.
         self.sim.player.spawn = standing;
         self.prev_player = self.sim.player;
@@ -636,7 +642,7 @@ impl Game {
     /// than holding a button for eight ticks to assert one drop.
     #[allow(dead_code)]
     pub fn break_block(&mut self) -> Option<ChunkCoord> {
-        let origin = self.sim.player.pos.to_array();
+        let origin = self.sim.player.pos.to_f32();
         let dir = self.sim.player.look_dir().to_array();
         let hit = self.world.raycast(origin, dir, REACH, self.terrain())?;
         Some(self.break_at(hit.block))
@@ -654,7 +660,7 @@ impl Game {
             self.mining = None;
             return None;
         }
-        let origin = self.sim.player.pos.to_array();
+        let origin = self.sim.player.pos.to_f32();
         let dir = self.sim.player.look_dir().to_array();
         let Some(hit) = self.world.raycast(origin, dir, REACH, self.terrain()) else {
             // Looking at nothing in reach: whatever was in progress is gone.
@@ -740,7 +746,7 @@ impl Game {
                 for stack in spawned {
                     self.sim
                         .entities
-                        .spawn_item(stack, drop_centre(block), glam::Vec3::ZERO);
+                        .spawn_item(stack, drop_centre(block), FixedVec3::ZERO);
                 }
             }
         }
@@ -792,7 +798,7 @@ impl Game {
                     if let Some(rest) = self.sim.player.inventory.add(stack, items) {
                         self.sim
                             .entities
-                            .spawn_item(rest, drop_centre(block), glam::Vec3::ZERO);
+                            .spawn_item(rest, drop_centre(block), FixedVec3::ZERO);
                     }
                     // Only a break that yielded something wears the tool.
                     self.wear_held_tool();
@@ -865,7 +871,7 @@ impl Game {
         let held = self.sim.player.inventory.selected_stack()?;
         let block = registry.id_of(items.name_of(held.item())?)?;
 
-        let origin = self.sim.player.pos.to_array();
+        let origin = self.sim.player.pos.to_f32();
         let dir = self.sim.player.look_dir().to_array();
         let hit = self.world.raycast(origin, dir, REACH, self.terrain())?;
         let target = [
@@ -934,7 +940,7 @@ impl Game {
         else {
             return false;
         };
-        let origin = self.sim.player.pos.to_array();
+        let origin = self.sim.player.pos.to_f32();
         let dir = self.sim.player.look_dir().to_array();
         let Some(hit) = self.world.raycast(origin, dir, REACH, self.terrain()) else {
             return false;
@@ -984,7 +990,7 @@ impl Game {
         // change no chunk's state, and this walks a (2r+1)²x3 box -- 243
         // lookups at radius 4 -- which is pure waste every tick the player is
         // not moving, which is most of them.
-        let centre = ChunkCoord::from_world_pos(self.sim.player.pos.to_array());
+        let centre = ChunkCoord::from_world_pos(self.sim.player.pos.to_f32());
         let now = self.sim.tick;
         let woken = if self.sim_centre == Some(centre) {
             Vec::new()
@@ -1266,7 +1272,11 @@ mod tests {
         // No GPU involved — this is why gameplay does not belong on the renderer.
         let mut game = Game::new();
         // Look straight down from above the terrain.
-        game.sim.player = Player::new(glam::vec3(0.5, 60.0, 0.5), 0.0, -1.5);
+        game.sim.player = Player::new(
+            cubara_voxel::FixedVec3::from_f32([0.5, 60.0, 0.5]),
+            0.0,
+            -1.5,
+        );
         let hit = game
             .world()
             .raycast([0.5, 60.0, 0.5], [0.0, -1.0, 0.0], 100.0, game.terrain())
@@ -1287,7 +1297,7 @@ mod tests {
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
         // Stand just above the surface, looking down — now it is within reach.
-        let eye = glam::vec3(0.5, ground.block[1] as f32 + 3.5, 0.5);
+        let eye = cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 3.5, 0.5]);
         game.sim.player = Player::new(eye, 0.0, -1.5);
 
         let dirty = game.break_block().expect("a block was in reach");
@@ -1326,7 +1336,7 @@ mod tests {
             .world()
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
-        let eye = glam::vec3(0.5, ground.block[1] as f32 + 3.5, 0.5);
+        let eye = cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 3.5, 0.5]);
         game.sim.player = Player::new(eye, 0.0, -1.5);
         (game, ground.block)
     }
@@ -2413,7 +2423,7 @@ mod tests {
         };
         // Right where the player is standing.
         let at = game.sim.player.pos;
-        game.sim.entities.spawn_item(stack, at, glam::Vec3::ZERO);
+        game.sim.entities.spawn_item(stack, at, FixedVec3::ZERO);
 
         game.advance(TICK_DT);
 
@@ -2449,7 +2459,7 @@ mod tests {
                 // dormancy: one nearby, the middle away, one back home.
                 let home = game.sim.player.pos;
                 game.advance(TICK_DT);
-                game.sim.player.pos = home + glam::Vec3::new(4000.0, 0.0, 0.0);
+                game.sim.player.pos = home + FixedVec3::from_f32([4000.0, 0.0, 0.0]);
                 for _ in 0..total - 2 {
                     game.advance(TICK_DT);
                 }
@@ -2493,7 +2503,7 @@ mod tests {
             "active while the player is here"
         );
 
-        game.sim.player.pos += glam::Vec3::new(4000.0, 0.0, 0.0);
+        game.sim.player.pos += FixedVec3::from_f32([4000.0, 0.0, 0.0]);
         game.advance(TICK_DT);
 
         assert!(
@@ -2515,7 +2525,7 @@ mod tests {
         game.advance(TICK_DT);
         let after_one = game.world().furnace_at(pos).copied().unwrap();
 
-        game.sim.player.pos += glam::Vec3::new(4000.0, 0.0, 0.0);
+        game.sim.player.pos += FixedVec3::from_f32([4000.0, 0.0, 0.0]);
         for _ in 0..500 {
             game.advance(TICK_DT);
         }
@@ -2543,7 +2553,7 @@ mod tests {
         // first version of this test measured, and it is why the lethal case
         // has its own test below, asserting the respawn instead.
         game.sim.player = Player::new(
-            glam::vec3(0.5, ground.block[1] as f32 + 11.0, 0.5),
+            cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 11.0, 0.5]),
             0.0,
             0.0,
         );
@@ -2572,16 +2582,17 @@ mod tests {
             .world()
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
-        let spawn = glam::vec3(0.5, ground.block[1] as f32 + 3.0, 0.5);
+        let spawn = cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 3.0, 0.5]);
         game.sim.player = Player::new(spawn, 0.0, 0.0);
         // Give them something to lose, then drop them from lethal height.
         hold(&mut game, "cubara:iron_pick");
         let carried = game.sim.player.inventory;
-        game.sim.player.pos = glam::vec3(0.5, ground.block[1] as f32 + 60.0, 0.5);
+        game.sim.player.pos =
+            cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 60.0, 0.5]);
 
         for _ in 0..600 {
             game.advance(TICK_DT);
-            if game.sim.player.pos.y <= spawn.y + 0.001 && game.sim.player.on_ground {
+            if game.sim.player.pos.y <= spawn.y && game.sim.player.on_ground {
                 break;
             }
         }
@@ -2597,8 +2608,9 @@ mod tests {
         // local box *after* the damage was applied, silently undoing the
         // respawn. Health and inventory alone could not see that.
         assert!(
-            game.sim.player.pos.distance(spawn) < 2.5,
-            "respawned at {} rather than near spawn {spawn}",
+            game.sim.player.pos.distance_squared(spawn)
+                < (5 * cubara_voxel::fixed::ONE as i128 / 2).pow(2),
+            "respawned at {:?} rather than near spawn {spawn:?}",
             game.sim.player.pos
         );
     }
@@ -2610,7 +2622,11 @@ mod tests {
             .world()
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
-        game.sim.player = Player::new(glam::vec3(0.5, ground.block[1] as f32 + 2.5, 0.5), 0.0, 0.0);
+        game.sim.player = Player::new(
+            cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 2.5, 0.5]),
+            0.0,
+            0.0,
+        );
         let full = game.sim.player.health;
 
         for _ in 0..300 {
@@ -2630,7 +2646,7 @@ mod tests {
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
         game.sim.player = Player::new(
-            glam::vec3(0.5, ground.block[1] as f32 + 80.0, 0.5),
+            cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 80.0, 0.5]),
             0.0,
             -1.5,
         );
@@ -2795,7 +2811,7 @@ mod tests {
             f.fuel = Some((log, 4));
         }
         // Stand next to it.
-        game.sim.player.pos = glam::vec3(0.5, -1_000.0, 0.5);
+        game.sim.player.pos = cubara_voxel::FixedVec3::from_f32([0.5, -1_000.0, 0.5]);
         game.sim.player.spawn = game.sim.player.pos;
 
         for _ in 0..250 {
@@ -2849,7 +2865,8 @@ mod tests {
                 .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
                 .expect("ground");
             mined = ground.block;
-            game.sim.player.pos = glam::vec3(0.5, mined[1] as f32 + 3.5, 0.5);
+            game.sim.player.pos =
+                cubara_voxel::FixedVec3::from_f32([0.5, mined[1] as f32 + 3.5, 0.5]);
             game.break_at(mined);
             carried = game.sim.player.inventory;
 
