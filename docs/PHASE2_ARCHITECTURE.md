@@ -640,6 +640,71 @@ big world affordable. Tuning is data, and the number is expected to move once
 
 ---
 
+## §12 Catch-up that is cheap, not just correct (block 2.7a)
+
+Block 2.6 made dormancy **correct**: a chunk that slept for N ticks is caught up
+by `advance(N)`, and lands where a continuously-ticked one would (§11.3). It is
+not yet **cheap** — `advance` is a loop, so a chunk dormant for a million ticks
+runs a million iterations the moment a player walks near it. That is a frame
+spike exactly when the player is arriving, which is the worst possible moment.
+
+`REQUIREMENTS.md` #4's Factorio-style timers are this block.
+
+### §12.1 Bounded, not closed-form
+
+#58 asks for "closed-form / bounded catch-up". **Bounded is the design**, and
+the distinction is deliberate.
+
+A true closed form — one arithmetic expression for the state after N ticks — is
+possible for a furnace but has to special-case every interaction between fuel
+running out, an item completing, the input emptying and the output filling.
+Those are exactly the boundaries where a wrong formula is invisible in testing
+and wrong in play. §7 already refused that trade once, for the same reason.
+
+Instead, **jump from event to event.** From any state the next thing that can
+happen is one of:
+
+- the current item finishes (`recipe.ticks - progress` ticks away),
+- the lit fuel runs out (`burning` ticks away),
+- the process stalls (no fuel, no input, or no room in the output).
+
+Advance by the smallest of those, apply that one event, repeat. Every iteration
+either completes an item or consumes one fuel unit, so the iteration count is
+bounded by **the stack sizes involved — at most a few hundred — and never by the
+elapsed time.** A stall consumes all remaining ticks in one step.
+
+That is the property that matters: catch-up cost depends on what the process had
+to work with, not on how long the player was away.
+
+### §12.2 The one-tick path stays, as the reference
+
+`step` — the original per-tick state machine — is **not deleted**. It becomes
+the specification the bounded path is checked against: a property test runs both
+over many starting states and many N, and asserts they agree.
+
+Keeping a slow, obviously-correct implementation next to a fast, subtle one, and
+testing them against each other, is the cheapest way to be sure the fast one is
+right. Deleting it would leave the bounded algorithm as its own specification,
+which is how a subtle catch-up bug survives.
+
+### §12.3 The trait
+
+```rust
+pub trait TimedProcess {
+    type Ctx;
+    fn advance(&mut self, ticks: u64, ctx: &Self::Ctx) -> ProcessOutcome;
+}
+```
+
+**The contract, and it is the whole point:** `advance(n)` must equal `advance(1)`
+done `n` times. A process that cannot honour that does not belong here — it is
+not time-parameterizable, and dormancy would change its answer.
+
+The context is an associated type and plain data rather than closures, so a
+process's inputs can be constructed in a test without a registry.
+
+---
+
 ## §9 Not in this scope — and which are the owner's call
 
 Engineering-deferred, mine to sequence: ECS (2.5), the chunk state machine (2.6),

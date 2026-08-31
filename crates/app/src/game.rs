@@ -24,9 +24,9 @@ use cubara_voxel::{
     BlockId, BlockRegistry, DropRule, Interact, ItemRegistry, ItemStack, ItemState, RecipeBook,
     SmeltBook,
 };
-use cubara_world::Furnace;
 use cubara_world::TerrainBlocks;
 use cubara_world::World;
+use cubara_world::{Furnace, SmeltCtx, TimedProcess};
 
 use winit::keyboard::KeyCode;
 
@@ -119,20 +119,25 @@ fn block_entity_positions_in(world: &World, coord: ChunkCoord) -> Vec<[i32; 3]> 
 fn advance_furnace(
     world: &mut World,
     pos: [i32; 3],
-    ticks: u32,
+    ticks: u64,
     items: &ItemRegistry,
     smelting: &SmeltBook,
 ) {
     let Some(f) = world.furnace_at_mut(pos) else {
         return;
     };
+    // Resolved to plain numbers once, here: a furnace only ever asks about the
+    // one item in its fuel slot and the one its recipe outputs, so nothing in
+    // the catch-up needs a registry (§12.3).
     let recipe = f.input.and_then(|(id, _)| smelting.for_input(id));
-    f.advance(
-        ticks,
+    let ctx = SmeltCtx {
         recipe,
-        |id| items.burn_ticks(id),
-        |id| items.max_stack(id),
-    );
+        fuel_burn: f.fuel.and_then(|(id, _)| items.burn_ticks(id)),
+        output_max: recipe.map(|r| items.max_stack(r.output)).unwrap_or(64),
+    };
+    // Bounded catch-up (§12.1): one ordinary tick and a million-tick backlog go
+    // through the same call, and cost the same.
+    f.advance(ticks, &ctx);
 }
 
 /// The middle of block `b`, where an item dropped by breaking it appears.
@@ -850,7 +855,7 @@ impl Game {
         let world = Arc::make_mut(&mut self.world);
         for w in woken {
             for pos in block_entity_positions_in(world, w.coord) {
-                advance_furnace(world, pos, w.elapsed as u32, items, smelting);
+                advance_furnace(world, pos, w.elapsed, items, smelting);
             }
         }
 
