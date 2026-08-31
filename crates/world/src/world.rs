@@ -30,6 +30,15 @@ use crate::worldgen::{TerrainBlocks, WorldGen};
 #[allow(clippy::unusual_byte_groupings)] // grouped to spell "seed" / "coffee", not by nibble
 const DEFAULT_SEED: u64 = 0x5EED_0000_C0FF_EE;
 
+/// How many chunk-layers above and below the player the simulation follows
+/// (`PHASE2_ARCHITECTURE.md` §11.4).
+///
+/// The world has no height limit, so this band moves with the player exactly as
+/// the horizontal radius does. Kept small for the same reason the horizontal one
+/// is: simulation is the expensive part, and dormancy is what makes a big world
+/// affordable.
+const SIM_VERTICAL_CHUNK_RADIUS: i32 = 2;
+
 /// Deterministic terrain source, overlaid with player [edits](World::set_block).
 ///
 /// Cloning is how an edit publishes a new snapshot to readers; the overlay is the
@@ -160,6 +169,7 @@ impl World {
     }
 
     /// The chunk lifecycle table (§11).
+    ///
     pub fn chunk_states(&self) -> &ChunkStates {
         &self.chunk_states
     }
@@ -200,7 +210,8 @@ impl World {
         let mut woken = Vec::new();
         for x in (centre.x - radius)..=(centre.x + radius) {
             for z in (centre.z - radius)..=(centre.z + radius) {
-                for y in self.chunk_y_range() {
+                for y in (centre.y - SIM_VERTICAL_CHUNK_RADIUS)..=(centre.y + SIM_VERTICAL_CHUNK_RADIUS)
+            {
                     let coord = ChunkCoord::new(x, y, z);
                     match self.chunk_states.wake(coord, now) {
                         Some(w) if w.elapsed > 0 => woken.push(w),
@@ -212,12 +223,6 @@ impl World {
         woken
     }
 
-    /// The vertical band of chunks the simulation covers. Terrain sits inside
-    /// it; this mirrors the streamer's own band rather than simulating an
-    /// unbounded column.
-    fn chunk_y_range(&self) -> std::ops::RangeInclusive<i32> {
-        0..=2
-    }
 
     /// Cast a ray through the world (terrain + edits) and return the first solid
     /// block hit (see [`raycast`](crate::raycast)) — the basis for targeting a block

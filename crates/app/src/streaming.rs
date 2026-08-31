@@ -18,10 +18,20 @@ use cubara_world::node::{self, NodeKey};
 use cubara_world::TerrainBlocks;
 use cubara_world::World;
 
-/// Vertical chunk band to stream -- the terrain sits comfortably inside it.
-/// How far out (and at what LOD) is [`node::DEFAULT_RING_SCHEDULE`]'s job.
-const STREAM_Y_MIN: i32 = 0;
-const STREAM_Y_MAX: i32 = 2;
+/// How many chunk-layers above and below the player to stream.
+///
+/// **The world has no height limit** (`docs/PROPOSAL_VERTICAL_WORLD.md`): this
+/// band follows the player rather than sitting at a fixed `y`, so digging down
+/// or building up simply streams more world. Below the surface generation is
+/// solid stone at any depth, and above it air at any height -- `WorldGen`'s
+/// density has never had `y` bounds, so nothing there had to change.
+///
+/// Nine layers (144 blocks) rather than three. Measured, not guessed: vertical
+/// extent is close to free, because a chunk of nothing but air and a chunk of
+/// nothing but solid rock both mesh to *no geometry at all*. Streaming 3, 8 or
+/// 16 layers gave identical node counts, triangle counts and frame rates. What
+/// costs is exposed surface, and there is none inside solid rock.
+const VERTICAL_CHUNK_RADIUS: i32 = 4;
 
 pub(crate) fn to_node_id(node: NodeKey) -> NodeId {
     NodeId {
@@ -160,7 +170,7 @@ impl NodeStreaming {
     /// limitation (see issue #107) -- the same category as the
     /// LOD-boundary cracks skirts (#108) fix, not a correctness bug.
     fn stream_around(&mut self, renderer: &mut Renderer, world: &Arc<World>, center: ChunkCoord) {
-        let y_range = STREAM_Y_MIN..=STREAM_Y_MAX;
+        let y_range = (center.y - VERTICAL_CHUNK_RADIUS)..=(center.y + VERTICAL_CHUNK_RADIUS);
         let desired_set: HashSet<NodeKey> =
             node::desired_nodes(center, y_range.clone(), node::DEFAULT_RING_SCHEDULE)
                 .into_iter()
