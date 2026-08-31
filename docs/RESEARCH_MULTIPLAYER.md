@@ -234,6 +234,26 @@ received states is a display concern (§9 of `PHASE1_ARCHITECTURE.md` already
 draws that line for the local camera), and a wrong last bit there shows as a
 sub-pixel difference rather than a divergence.
 
+**Positions are not the whole float surface, and it is worth naming the rest
+before the work starts.** `WorldHash::write_sim` currently folds in six `f32`
+position/velocity components *and* `yaw` and `pitch`. Angles are the awkward
+ones: they feed `look_dir()` through `sin`/`cos`, and the resulting ray decides
+**which block gets mined** — an edit, and therefore authority. `sin` and `cos`
+are among the least portable functions in any standard library.
+
+So the migration has two halves, and only the first is scheduled:
+
+| | Status |
+|---|---|
+| Positions and velocities → [`Fixed`] | the work starting now |
+| **Angles → fixed-point (e.g. 1/65536 turn), with a lookup or integer trig** | **not yet — named here so it is not discovered during netcode** |
+
+Angles are deliberately second: positions are the larger surface and the one
+that also fixes a real precision limit, while angles only matter once two
+machines must agree on what a third player is looking at. But shipping netcode
+with `f32` angles in the authority hash would be exactly the kind of thing this
+document exists to catch early.
+
 The practical test is the one already in the repo: two platforms agreeing on a
 world-state hash. If that hash is computed only from integers, it cannot drift
 with a compiler version, and the pin returns to being about lints.
