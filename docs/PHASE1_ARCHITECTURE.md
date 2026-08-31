@@ -673,6 +673,42 @@ exists to answer, checked on every push rather than assumed.
 
 ---
 
+## §8.6 Caves are carved at level 0 only
+
+**Added when the world lost its height limit (phase 2).** The cave field is
+carved only when `generate` is called with `step == 1`. Coarser LOD nodes get the
+height field alone: solid rock below the surface, air above.
+
+This is §8.4's decision about structures, applied to the thing §8.4 did not
+cover. That section put trees at level 0 only because *"a tree sampled every 8
+blocks is one stray voxel"*. **A cave sampled every 8 blocks is the same
+mistake**, and it was not noticed until the world went underground, because a
+3-chunk-tall world has almost no rock in it to sample.
+
+What it produced was not caves. It was fragmented noise: holes punched through
+distant terrain, and a large amount of geometry describing surfaces that no
+player can be inside of.
+
+**Measured, at radius 64:**
+
+| | Triangles | FPS |
+|---|---|---|
+| caves at every level | 822,420 | 1,390 |
+| caves at level 0 only | 675,962 | **1,559** |
+
+An 18% reduction in a world with only one chunk-layer of rock, and it is what
+makes a vertical world affordable at all: with the band following the player,
+the same change is the difference between 866 FPS and 1,260.
+
+**What it costs**, stated plainly: a cave mouth in the distance renders as solid
+ground until the player is close enough for it to be a level-0 node. Caves are
+enclosed by definition, so this is visible only at mouths, and `lod_boundary`'s
+golden shows the trade is favourable — the previous image had holes in distant
+ground, which read as rendering artefacts rather than as caves.
+
+If ravines ever need to be visible from far away, they belong in the **height
+field**, not the cave carve — the height field is sampled at every level.
+
 ## §9 The tick loop and the sim/render seam
 
 `cubara-sim` is new, small, and GPU-free.

@@ -106,7 +106,9 @@ frames after 200 warmup.
 | 2026-08-31 | Chunk state machine + dormancy [#47], radius 64³⁷ | 1,600 | 822,420 | ~1,375 | 0.498 ms | ~0.87 ms | `511f58e` |
 | 2026-08-31 | Bounded dormant catch-up [#58], radius 64³⁷ | 1,600 | 822,420 | ~1,367 | 0.496 ms | ~0.95 ms | `55ce3e5` |
 | 2026-08-31 | Save format covers phase 2 state [#170], radius 64³⁷ | 1,600 | 822,420 | ~1,387 | 0.513 ms | ~0.85 ms | `4b4b131` |
-| 2026-08-31 | Health, fall damage, regeneration [#172], radius 64³⁷ | 1,600 | 822,420 | ~1,379 | 0.496 ms | ~0.93 ms | *(this PR)* |
+| 2026-08-31 | Health, fall damage, regeneration [#172], radius 64³⁷ | 1,600 | 822,420 | ~1,379 | 0.496 ms | ~0.93 ms | `3df7b28` |
+| 2026-08-31 | Caves at level 0 only [#175], radius 64, **old 3-layer slab**³⁸ | 1,600 | **675,962** | **~1,553** | **0.447 ms** | ~0.78 ms | *(this PR)* |
+| 2026-08-31 | **World with no height limit** [#175], radius 64, band ±2³⁸ | **3,138** | 912,964 | ~1,115 | 0.613 ms | ~1.08 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -1083,6 +1085,43 @@ and a regeneration counter) and a row of quads to the HUD, and neither shows.
 The run of identical triangle counts is now long enough to be worth stating as a
 property rather than a coincidence: **since block 2.3b, every change has been to
 what the world *does*, not to what it draws.**
+
+³⁸ **The world lost its height limit, and caves stopped being carved above
+level 0.** Two rows because the second changes what the benchmark *measures*.
+
+**The first row is the old scene**, so it is comparable with every row above it:
+the same fixed 3-layer slab, with only §8.6's change (caves carved at `step == 1`
+only). **822,420 → 675,962 triangles, 1,379 → 1,553 FPS.** An 18% geometry
+reduction in a world with barely any rock in it, because coarse LOD nodes had
+been sampling the cave field every 4-8 blocks and meshing the fragments. That is
+not caves; it is noise, and §8.4 had already made exactly this call for trees.
+
+**The second row is a different scene, deliberately.** The streamed band now
+follows the player (±2 chunk-layers) instead of sitting at `0..=2`, so the
+benchmark measures the world the game actually builds. Leaving it on the old slab
+would have let the gate pass while the real thing failed it.
+
+The vertical radius was **chosen by measurement, not preference**. Honest figures
+at radius 64, caves already restricted:
+
+| band | nodes | triangles | FPS |
+|---|---|---|---|
+| ±1 | 2,635 | 807,076 | 1,260 |
+| **±2** | **3,138** | **912,964** | **1,115** |
+| ±3 | 3,819 | 1,015,508 | 994 |
+| ±4 | 4,260 | 1,096,202 | 923 |
+
+±2 is the largest that clears the 1,000 gate with real headroom.
+
+**A warning about the numbers this replaces.** Before `MAX_DRAWS` was raised from
+4,096 to 16,384, bands of ±4 and above reported *higher* frame rates than ±3 --
+because they exceeded the draw cap and simply stopped drawing nodes. A capacity
+whose failure mode is a better benchmark score is the worst kind, and every
+figure taken while over that cap was measured on a world with holes in it.
+
+Going down is what costs: air meshes to nothing, rock is full of caves, and cave
+surfaces are real geometry. Going *up* remains free -- `0..=2`, `0..=7` and
+`0..=15` all measured identically.
 
 ## Detailed run logs
 

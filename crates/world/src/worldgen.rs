@@ -391,7 +391,7 @@ impl WorldGen {
     /// of hashing) is computed by the caller once per column and passed in,
     /// not recomputed per voxel. See [`generate`](Self::generate)'s doc
     /// comment for why that matters.
-    fn density_at(&self, x: i32, y: i32, z: i32, surface: i32) -> f32 {
+    fn density_at(&self, x: i32, y: i32, z: i32, surface: i32, caves: bool) -> f32 {
         let terrain = (surface - y + 1) as f32;
         if terrain <= 0.0 {
             // Already air from the height field alone. `carved` below is
@@ -405,6 +405,9 @@ impl WorldGen {
             // rounds of 3D value noise, 8 hashed corners each) -- see
             // `generate`'s doc comment for the regression this and the
             // surface-amortization above it together fix.
+            return terrain;
+        }
+        if !caves {
             return terrain;
         }
         let carve = fbm3(
@@ -438,7 +441,7 @@ impl WorldGen {
     /// solid" and "the surface block is solid" contradict each other by
     /// exactly one block.
     pub fn density(&self, x: i32, y: i32, z: i32) -> f32 {
-        self.density_at(x, y, z, self.surface_height(x, z))
+        self.density_at(x, y, z, self.surface_height(x, z), true)
     }
 
     /// Shorthand for `density(x, y, z) > 0.0` -- what a single-block
@@ -576,7 +579,7 @@ impl WorldGen {
         // The density check is the second half: a cave can carve the ground
         // out from under a surface height, and a tree must not grow on air.
         if self.material_at(x, surface, z, surface, blocks) != oak.grows_on
-            || self.density_at(x, surface, z, surface) <= 0.0
+            || self.density_at(x, surface, z, surface, true) <= 0.0
         {
             return None;
         }
@@ -637,8 +640,9 @@ impl WorldGen {
         z: i32,
         surface: i32,
         blocks: TerrainBlocks,
+        caves: bool,
     ) -> Option<BlockId> {
-        (self.density_at(x, y, z, surface) > 0.0)
+        (self.density_at(x, y, z, surface, caves) > 0.0)
             .then(|| self.material_at(x, y, z, surface, blocks))
     }
 
@@ -660,7 +664,7 @@ impl WorldGen {
         z: i32,
         blocks: TerrainBlocks,
     ) -> Option<BlockId> {
-        self.block_at_on_surface(x, y, z, self.surface_height(x, z), blocks)
+        self.block_at_on_surface(x, y, z, self.surface_height(x, z), blocks, true)
     }
 
     pub fn block_at(&self, x: i32, y: i32, z: i32, blocks: TerrainBlocks) -> Option<BlockId> {
@@ -674,7 +678,7 @@ impl WorldGen {
                 return Some(block);
             }
         }
-        self.block_at_on_surface(x, y, z, self.surface_height(x, z), blocks)
+        self.block_at_on_surface(x, y, z, self.surface_height(x, z), blocks, true)
     }
 
     /// Whether `(x, y, z)` is solid **including trees**, given the ids that
@@ -746,7 +750,7 @@ impl WorldGen {
             let x = origin[0] + lx as i32 * step;
             let y = origin[1] + ly as i32 * step;
             let z = origin[2] + lz as i32 * step;
-            self.block_at_on_surface(x, y, z, surfaces[lz][lx], blocks)
+            self.block_at_on_surface(x, y, z, surfaces[lz][lx], blocks, step == 1)
                 .unwrap_or(BlockId::AIR)
         })
     }
@@ -995,27 +999,75 @@ mod tests {
 
     #[test]
     fn step_samples_a_coarser_lattice_at_the_same_origin() {
-        // Every local cell (lx, ly, lz) of a `step`-N chunk must match what
-        // block_at says at world position origin + local*step directly --
-        // generate() must not be generating full-resolution and
-        // downsampling (the exact thing §2's "factor of 65" is about).
+        // `generate()` must sample the same functions on a coarser lattice, not
+        // generate full-resolution and downsample (§2's "factor of 65").
+        //
+        // **At step 1 that means exact agreement with `block_at`.** Above it,
+        // the two deliberately differ -- §8.6 carves caves at level 0 only, the
+        // same decision §8.4 made for trees and for the same reason: a feature
+        // sampled every 8 blocks is noise, not the feature. So a coarse node is
+        // the *height field alone*, which is what the second half asserts.
         let gen = WorldGen::new(99);
         let blocks = test_blocks();
         let origin = [0, 0, 0];
+
+        let fine = gen.generate(origin, 1, blocks);
+        for lz in 0..Chunk::SIZE {
+            for ly in 0..Chunk::SIZE {
+                for lx in 0..Chunk::SIZE {
+                    let (x, y, z) = (lx as i32, ly as i32, lz as i32);
+                    let expected = gen.block_at(x, y, z, blocks).unwrap_or(BlockId::AIR);
+                    assert_eq!(fine.get(lx, ly, lz), expected, "step 1 ({lx},{ly},{lz})");
+                }
+            }
+        }
+
         let step = 4;
         let coarse = gen.generate(origin, step, blocks);
-
         for lz in 0..Chunk::SIZE {
             for ly in 0..Chunk::SIZE {
                 for lx in 0..Chunk::SIZE {
                     let x = origin[0] + lx as i32 * step;
                     let y = origin[1] + ly as i32 * step;
                     let z = origin[2] + lz as i32 * step;
-                    let expected = gen.block_at(x, y, z, blocks).unwrap_or(BlockId::AIR);
-                    assert_eq!(coarse.get(lx, ly, lz), expected, "cell ({lx},{ly},{lz})");
+                    // The height field alone: solid at or below the surface.
+                    let want_solid = y <= gen.surface_height(x, z);
+                    assert_eq!(
+                        coarse.get(lx, ly, lz) != BlockId::AIR,
+                        want_solid,
+                        "step {step} ({lx},{ly},{lz}) at world ({x},{y},{z})"
+                    );
                 }
             }
         }
+    }
+
+    #[test]
+    fn coarse_nodes_have_no_caves_carved_into_them() {
+        // §8.6, stated as its own property rather than left implicit in the
+        // sampling test: this is what makes an underground world affordable,
+        // and what a future change would have to break knowingly.
+        let gen = WorldGen::new(0x5EED);
+        let blocks = test_blocks();
+        // A position the cave field actually carves at full resolution.
+        let carved = (0..2_000)
+            .map(|i| [i % 64, 4, i / 64])
+            .find(|p| {
+                let surface = gen.surface_height(p[0], p[2]);
+                p[1] < surface && !gen.is_solid(p[0], p[1], p[2])
+            })
+            .expect("the seed carves a cave somewhere in the probed volume");
+
+        assert!(
+            !gen.is_solid(carved[0], carved[1], carved[2]),
+            "level 0 has the cave"
+        );
+        let coarse = gen.generate([carved[0], carved[1], carved[2]], 4, blocks);
+        assert_ne!(
+            coarse.get(0, 0, 0),
+            BlockId::AIR,
+            "a coarse node fills that cave in with rock"
+        );
     }
 
     #[test]

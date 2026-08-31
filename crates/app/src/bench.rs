@@ -78,7 +78,12 @@ pub fn run(radius: i32) {
         &mesh_assets.registry,
         &layer_of,
         ChunkCoord::new(0, 0, 0),
-        0..=2,
+        // The same player-relative band the live game streams (± the
+        // streaming module's VERTICAL_CHUNK_RADIUS), centred on the bench
+        // origin. Measuring the old fixed 0..=2 slab would measure a world the
+        // game no longer builds -- and would let the gate pass while the real
+        // thing failed it.
+        -2..=2,
         &schedule,
         cubara_world::TerrainBlocks::from_registry(&mesh_assets.registry)
             .with_oak(

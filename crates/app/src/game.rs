@@ -2720,5 +2720,4 @@ mod tests {
             "a furnace at y = -1000 never ticked"
         );
     }
-
 }

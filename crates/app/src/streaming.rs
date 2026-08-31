@@ -26,12 +26,18 @@ use cubara_world::World;
 /// solid stone at any depth, and above it air at any height -- `WorldGen`'s
 /// density has never had `y` bounds, so nothing there had to change.
 ///
-/// Nine layers (144 blocks) rather than three. Measured, not guessed: vertical
-/// extent is close to free, because a chunk of nothing but air and a chunk of
-/// nothing but solid rock both mesh to *no geometry at all*. Streaming 3, 8 or
-/// 16 layers gave identical node counts, triangle counts and frame rates. What
-/// costs is exposed surface, and there is none inside solid rock.
-const VERTICAL_CHUNK_RADIUS: i32 = 4;
+/// **Two, chosen by measurement against the perf gate, not by preference.** At
+/// radius 64 the honest figures are ±1 → 1,260 FPS, ±2 → 1,113, ±3 → 994, ±4 →
+/// 923. The gate is 1,000, so ±2 is the largest that passes with real headroom.
+///
+/// Going *down* is what costs: air meshes to nothing, but rock is full of caves,
+/// and cave surfaces are real geometry. Going up is free.
+///
+/// This is full-detail range. Coarser rings cover far more: at level 3 one node
+/// spans 8 chunks, so the same band reaches ~256 blocks vertically at distance.
+/// And it *follows the player*, so digging is unbounded -- you carry the window
+/// with you rather than running out of world.
+const VERTICAL_CHUNK_RADIUS: i32 = 2;
 
 pub(crate) fn to_node_id(node: NodeKey) -> NodeId {
     NodeId {

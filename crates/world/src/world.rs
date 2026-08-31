@@ -210,8 +210,9 @@ impl World {
         let mut woken = Vec::new();
         for x in (centre.x - radius)..=(centre.x + radius) {
             for z in (centre.z - radius)..=(centre.z + radius) {
-                for y in (centre.y - SIM_VERTICAL_CHUNK_RADIUS)..=(centre.y + SIM_VERTICAL_CHUNK_RADIUS)
-            {
+                for y in
+                    (centre.y - SIM_VERTICAL_CHUNK_RADIUS)..=(centre.y + SIM_VERTICAL_CHUNK_RADIUS)
+                {
                     let coord = ChunkCoord::new(x, y, z);
                     match self.chunk_states.wake(coord, now) {
                         Some(w) if w.elapsed > 0 => woken.push(w),
@@ -222,7 +223,6 @@ impl World {
         }
         woken
     }
-
 
     /// Cast a ray through the world (terrain + edits) and return the first solid
     /// block hit (see [`raycast`](crate::raycast)) — the basis for targeting a block

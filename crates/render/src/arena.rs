@@ -66,7 +66,16 @@ const INDEX_CAPACITY: u32 = 6_000_000;
 /// isn't sized as a small fraction of residency). 4,096 is ~2.5× headroom
 /// over that -- matching #89's own ~2.6× precedent, just against the new,
 /// far smaller peak -- down from 16,384 (a 4× reduction, ~0.23 MiB saved).
-const MAX_DRAWS: u32 = 4_096;
+///
+/// **Raised back to 16,384 for the vertical world.** #109 sized 4,096 against a
+/// world three chunk-layers tall; once the streamed band follows the player
+/// vertically the resident set is several times that, and 4,096 stops being
+/// headroom and becomes a *truncation*. Exceeding it does not warn and does not
+/// slow down -- it silently stops drawing nodes, which then measures as a
+/// *higher* frame rate on a world with holes in it. A capacity constant whose
+/// failure mode is "the benchmark looks better" is the worst kind, and it is why
+/// this is sized for the world now streamed rather than the one #109 measured.
+const MAX_DRAWS: u32 = 16_384;
 /// Max simultaneously *resident* nodes with an origin slot -- unlike
 /// `MAX_DRAWS` (the per-frame visible-set cap), this bounds the whole
 /// streamed set, and is kept at the same 4× multiple over `MAX_DRAWS` #89
