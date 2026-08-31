@@ -18,10 +18,26 @@ use cubara_world::node::{self, NodeKey};
 use cubara_world::TerrainBlocks;
 use cubara_world::World;
 
-/// Vertical chunk band to stream -- the terrain sits comfortably inside it.
-/// How far out (and at what LOD) is [`node::DEFAULT_RING_SCHEDULE`]'s job.
-const STREAM_Y_MIN: i32 = 0;
-const STREAM_Y_MAX: i32 = 2;
+/// How many chunk-layers above and below the player to stream.
+///
+/// **The world has no height limit** (`docs/PROPOSAL_VERTICAL_WORLD.md`): this
+/// band follows the player rather than sitting at a fixed `y`, so digging down
+/// or building up simply streams more world. Below the surface generation is
+/// solid stone at any depth, and above it air at any height -- `WorldGen`'s
+/// density has never had `y` bounds, so nothing there had to change.
+///
+/// **Two, chosen by measurement against the perf gate, not by preference.** At
+/// radius 64 the honest figures are ±1 → 1,260 FPS, ±2 → 1,113, ±3 → 994, ±4 →
+/// 923. The gate is 1,000, so ±2 is the largest that passes with real headroom.
+///
+/// Going *down* is what costs: air meshes to nothing, but rock is full of caves,
+/// and cave surfaces are real geometry. Going up is free.
+///
+/// This is full-detail range. Coarser rings cover far more: at level 3 one node
+/// spans 8 chunks, so the same band reaches ~256 blocks vertically at distance.
+/// And it *follows the player*, so digging is unbounded -- you carry the window
+/// with you rather than running out of world.
+const VERTICAL_CHUNK_RADIUS: i32 = 2;
 
 pub(crate) fn to_node_id(node: NodeKey) -> NodeId {
     NodeId {
@@ -160,7 +176,7 @@ impl NodeStreaming {
     /// limitation (see issue #107) -- the same category as the
     /// LOD-boundary cracks skirts (#108) fix, not a correctness bug.
     fn stream_around(&mut self, renderer: &mut Renderer, world: &Arc<World>, center: ChunkCoord) {
-        let y_range = STREAM_Y_MIN..=STREAM_Y_MAX;
+        let y_range = (center.y - VERTICAL_CHUNK_RADIUS)..=(center.y + VERTICAL_CHUNK_RADIUS);
         let desired_set: HashSet<NodeKey> =
             node::desired_nodes(center, y_range.clone(), node::DEFAULT_RING_SCHEDULE)
                 .into_iter()

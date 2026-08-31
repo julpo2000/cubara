@@ -2619,4 +2619,105 @@ mod tests {
         );
         assert!(game.sim.player.on_ground, "and it landed");
     }
+
+    #[test]
+    fn there_is_solid_stone_however_far_down_you_go() {
+        // The world has no floor. Generation never had `y` bounds -- what was
+        // missing was streaming and simulating anywhere but chunk layers 0..=2.
+        let (game, _) = game_looking_at_ground();
+        let terrain = game.terrain.expect("assets are set");
+        let registry = game.blocks_registry.as_ref().unwrap();
+        for y in [-1, -100, -5_000, -100_000] {
+            let block = game.world().block_at(0, y, 0, terrain);
+            assert_eq!(
+                registry.name_of(block),
+                Some("cubara:stone"),
+                "expected stone at y = {y}"
+            );
+            assert!(game.world().is_solid_at(0, y, 0, terrain), "solid at {y}");
+        }
+    }
+
+    #[test]
+    fn there_is_open_sky_however_far_up_you_go() {
+        let (game, _) = game_looking_at_ground();
+        let terrain = game.terrain.expect("assets are set");
+        for y in [100, 5_000, 100_000] {
+            assert!(
+                !game.world().is_solid_at(0, y, 0, terrain),
+                "expected air at y = {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_block_can_be_placed_and_broken_far_below_the_old_world_floor() {
+        // y = 0 used to be the bottom of the world. Editing below it has to
+        // persist like any other edit -- the overlay is keyed by world
+        // position and never had a floor either.
+        let (mut game, _) = game_looking_at_ground();
+        let terrain = game.terrain.expect("assets are set");
+        let deep = [3, -2_000, 7];
+
+        let cc = Arc::make_mut(&mut game.world).set_block(deep[0], deep[1], deep[2], BlockId::AIR);
+        assert_eq!(cc, ChunkCoord::from_block(deep[0], deep[1], deep[2]));
+        assert!(
+            !game.world().is_solid_at(deep[0], deep[1], deep[2], terrain),
+            "the deep block was mined out"
+        );
+
+        // And its neighbours are still stone, so the edit is local.
+        assert!(game
+            .world()
+            .is_solid_at(deep[0] + 1, deep[1], deep[2], terrain));
+    }
+
+    #[test]
+    fn a_chunk_far_below_the_old_floor_generates_and_meshes() {
+        // Generating at depth must produce a real chunk, not an empty or
+        // panicking one -- `ChunkCoord` is i32 and `region_of` uses div_euclid,
+        // both of which were already correct for negative coordinates.
+        let (game, _) = game_looking_at_ground();
+        let terrain = game.terrain.expect("assets are set");
+        let deep = ChunkCoord::new(0, -64, 0);
+        let chunk = game
+            .world()
+            .chunk_at(deep, terrain)
+            .expect("a chunk that deep still generates");
+        let registry = game.blocks_registry.as_ref().unwrap();
+        assert_eq!(
+            registry.name_of(chunk.get(0, 0, 0)),
+            Some("cubara:stone"),
+            "a chunk a thousand blocks down is solid rock"
+        );
+    }
+
+    #[test]
+    fn the_simulation_follows_the_player_downward() {
+        // A furnace a long way below the old world floor must tick when the
+        // player is next to it -- the simulated band moves with them now.
+        let (mut game, _) = game_looking_at_ground();
+        let deep = [0, -1_000, 0];
+        Arc::make_mut(&mut game.world).add_furnace(deep);
+        let raw = item(&game, "cubara:raw_iron");
+        let log = item(&game, "cubara:oak_log");
+        {
+            let f = Arc::make_mut(&mut game.world).furnace_at_mut(deep).unwrap();
+            f.input = Some((raw, 2));
+            f.fuel = Some((log, 4));
+        }
+        // Stand next to it.
+        game.sim.player.pos = glam::vec3(0.5, -1_000.0, 0.5);
+        game.sim.player.spawn = game.sim.player.pos;
+
+        for _ in 0..250 {
+            game.advance(TICK_DT);
+        }
+
+        let f = game.world().furnace_at(deep).expect("still there");
+        assert!(
+            f.progress > 0 || f.output.is_some(),
+            "a furnace at y = -1000 never ticked"
+        );
+    }
 }
