@@ -212,7 +212,36 @@ It is the same property dormancy needed, reused.
 from data it already has, and may never be *believed* about any of it. Prediction
 is for latency, never for truth.
 
-### §3.5 The one question this leaves open
+### §3.5 What crosses the wire, and why the toolchain pin becomes load-bearing
+
+**Raised by the Windows session**, and it is the sharpest constraint on §4's
+fixed-point work.
+
+Determinism currently holds partly because both machines run the same compiler —
+which is now pinned (§5.1). Fixed-point removes floating point from the
+*simulation*, but that is only half the surface. **If any value that crosses the
+wire, or that a client uses to reconcile, is still `f32`/`f64`, the pin stops
+being a lint convenience and becomes load-bearing for correctness.**
+
+So the rule for the netcode block:
+
+> **Nothing that crosses the wire is a float.** Positions, velocities and any
+> value a client reconciles against are integers — fixed-point where a fraction
+> is needed.
+
+Floats may still exist *after* the seam: interpolation for rendering between two
+received states is a display concern (§9 of `PHASE1_ARCHITECTURE.md` already
+draws that line for the local camera), and a wrong last bit there shows as a
+sub-pixel difference rather than a divergence.
+
+The practical test is the one already in the repo: two platforms agreeing on a
+world-state hash. If that hash is computed only from integers, it cannot drift
+with a compiler version, and the pin returns to being about lints.
+
+**Worth stating because it is easy to get backwards:** the goal is not "avoid
+floats". It is that *authority* is integer and *presentation* may be float.
+
+### §3.6 The one question this leaves open
 
 **5,000 in a single shared world, or 5,000 across servers?** They are different
 projects: the second is items 1–4 and is a normal (large) netcode effort; the

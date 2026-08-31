@@ -21,6 +21,16 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      # `@stable` is deliberate, and `rust-toolchain.toml` is what actually
+      # decides the version. The action installs stable; rustup then honours the
+      # file when cargo runs in this directory, so both runners end up on the
+      # pinned toolchain regardless of what stable is that day.
+      #
+      # Do not "tidy" this to `@1.98` and do not delete the file. Pinning here
+      # instead would pin CI only, and leave developer machines drifting -- which
+      # is the bug the file exists to fix: a clippy lint that CI denied and that
+      # did not exist on either developer machine passed locally and failed on
+      # both runners.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -47,6 +57,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # `@stable` is deliberate, and `rust-toolchain.toml` is what actually
+      # decides the version. The action installs stable; rustup then honours the
+      # file when cargo runs in this directory, so both runners end up on the
+      # pinned toolchain regardless of what stable is that day.
+      #
+      # Do not "tidy" this to `@1.98` and do not delete the file. Pinning here
+      # instead would pin CI only, and leave developer machines drifting -- which
+      # is the bug the file exists to fix: a clippy lint that CI denied and that
+      # did not exist on either developer machine passed locally and failed on
+      # both runners.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
