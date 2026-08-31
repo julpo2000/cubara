@@ -171,7 +171,48 @@ world and edit it directly. That refactor is the real cost of entering this
 architecture, and it is much cheaper now — at ten thousand lines and one player
 — than later.
 
-### §3.4 The one question this leaves open
+### §3.4 What the client is allowed to simulate
+
+**Raised by the Windows session while checking this document**, and it was a real
+gap: an authoritative server changes what Rule 1 is *for*. Determinism stops
+being only a testability property and becomes the thing that lets a client
+predict without drifting. That only pays if the split is stated.
+
+| | Who simulates it | Why |
+|---|---|---|
+| **Terrain** | **The client, from the seed** | The big one — see below. |
+| The client's own player | Client predicts; server corrects | Otherwise every step costs a round trip. |
+| Block edits by this client | Client predicts optimistically | Mining must feel instant; the server may reject. |
+| Other players | Interpolate received state | Never simulated locally: their inputs are not known. |
+| Mobs | Server only | Same reason, plus they are the obvious cheat surface. |
+| Block entities (furnaces) | Server owns; client *may* run forward | See below. |
+| Item despawn, hunger, damage | Server only | Anything that can kill or destroy is authority's. |
+
+**Terrain is the one that matters most, and this project is unusually well placed
+for it.** `WorldGen::density` is a pure function of `(seed, x, y, z)`, and
+generation being bit-identical across platforms is *already proven on every
+merged PR* by the fixture-hash test running on both CI runners. So:
+
+> **The server never sends terrain. It sends the seed once, and edits thereafter.**
+
+A joining client generates the world itself and applies an edit overlay — which
+is exactly what `World` already is (`worldgen` + `edits`). Bandwidth then scales
+with *how much players have changed the world*, not with how much world they can
+see. For a 5,000-player target that is not an optimisation, it is the difference
+between feasible and not.
+
+**Block entities are the interesting case**, and block 2.7a already built the
+answer. `Furnace::advance` takes an elapsed tick count and is proved equal to
+ticking one at a time, so a client that knows a furnace's contents at tick *N*
+can display its state at tick *N+k* without asking. That is a *display*
+prediction, not authority: the server's value always wins on the next update.
+It is the same property dormancy needed, reused.
+
+**The rule underneath the table:** a client may simulate anything it can derive
+from data it already has, and may never be *believed* about any of it. Prediction
+is for latency, never for truth.
+
+### §3.5 The one question this leaves open
 
 **5,000 in a single shared world, or 5,000 across servers?** They are different
 projects: the second is items 1–4 and is a normal (large) netcode effort; the
@@ -240,6 +281,21 @@ cross-platform desync is exactly the failure lockstep must catch. The two
 machines are also the two platforms CI already covers, so a desync between them
 is a real signal rather than an artefact.
 
+### §5.1 The toolchain is not pinned, and that already cost a CI failure
+
+**Found by the Windows session** while comparing versions across the two
+machines. `.github/workflows/ci.yml` uses `dtolnay/rust-toolchain@stable` in both
+jobs and there is no `rust-toolchain.toml`, so **CI runs whatever stable is on
+the day** — currently 1.98, against 1.97.1 on the Windows laptop and clippy
+0.1.97 on the Mac.
+
+That is not a curiosity. `chunks_exact_to_as_chunks` is denied by CI's clippy and
+**does not exist in 1.97**, so it passed locally on both machines and failed on
+both CI runners. It will keep happening, and it will drift further.
+
+`CONTRIBUTING.md`'s standing instruction is to run the checks before pushing;
+that instruction is only worth anything if the checks are the same checks.
+
 **Concrete plan, when the time comes:**
 
 1. Both machines run the same commit.
@@ -280,6 +336,11 @@ Each step is useful on its own and does not require the next one to exist:
 4. **Interest management** (§3.2 item 2). The step that decides whether the
    player-count target is reachable, and the one that wants §3.4 answered first.
 5. **Untrusted clients.** What "public" actually costs.
+
+Step 1 has a prerequisite worth naming: **local checks must match CI.** The
+toolchain drift found while writing this (§5.1) means a lint CI enforces may not
+exist on either developer machine, which makes "clippy is clean locally"
+unreliable — and netcode is where a missed lint costs most.
 
 Steps 1 and 2 are worth starting regardless of when the rest is scheduled,
 because both get harder as the codebase grows and neither commits to a

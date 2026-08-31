@@ -1,0 +1,18 @@
+# Pin the toolchain so a local check is the same check CI runs.
+#
+# CI used `dtolnay/rust-toolchain@stable` with nothing pinned, so it ran
+# whatever stable happened to be released that day. That is not a theoretical
+# drift: clippy's `chunks_exact_to_as_chunks` is denied by CI and does not exist
+# in 1.97, so it passed on both developer machines and failed on both CI runners.
+#
+# `CONTRIBUTING.md` tells you to run the checks before pushing. That is only
+# worth anything if they are the same checks. The `dtolnay` action reads this
+# file, so pinning here pins CI too.
+#
+# The cost is deliberate: new lints arrive when this line is bumped, not on the
+# day upstream ships them. Bumping it is a normal PR, and the diff says what
+# changed -- which is the opposite of a lint appearing in CI for no reason
+# anyone can point at.
+[toolchain]
+channel = "1.98"
+components = ["rustfmt", "clippy"]
