@@ -188,6 +188,7 @@ mod tests {
                     name: name.to_string(),
                     max_stack,
                     durability,
+                    tier: 0,
                 },
             )
         };

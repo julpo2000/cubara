@@ -296,6 +296,42 @@ directories in step, and names the offenders when they drift. Block 2.4 replaces
 the policy with real `drops:` tables; when it does, that test's failure message
 should point at the table instead.
 
+### §4.3 Mining takes time — hardness per block, speed per tool
+
+**Decided by the project owner, 2026-08-31**, resolving the §9 question "is
+breaking a block instant, or is there a mining *time* per block?". It is
+recorded here rather than in an issue because it changes what a tool *is*: not
+just a key that unlocks drops, but the thing that makes mining faster.
+
+The rule, and it is one rule:
+
+```
+ticks_to_break = ceil(hardness / speed)
+```
+
+- **`hardness`** is a property of the block, in `assets/blocks/*.ron`. Air and
+  anything unbreakable is absent, not zero.
+- **`speed`** is a property of the held tool, in `assets/items/*.ron`. The empty
+  hand has speed 1 and is not a special case — it is the floor of the same
+  scale, which is what keeps "mine dirt by hand" and "mine stone with an iron
+  pick" the same code path.
+- Both are integers, and the division is integer division. Mining progress is
+  **tick-counted, never wall-clock**: Rule 1, and the same reason the tick loop
+  exists at all. A player mining the same block from the same tick with the same
+  tool breaks it on the same tick on every machine.
+
+**Progress is per-position and is abandoned, not banked.** Look away, switch
+tools, or break the block's neighbour and the counter resets. Storing partial
+progress per position would be a block-entity-sized problem (§7) for something
+the player cannot see, and "come back and it is half-mined" is a mechanic nobody
+asked for.
+
+**Tier still gates drops, exactly as §4 says, and the two are independent.** A
+tier-too-low tool still breaks the block — it just yields nothing. Hardness
+decides *how long*; tier decides *whether you get anything*. Keeping them
+separate is what lets a wooden pick chew slowly through stone and get cobble,
+while never getting iron out of iron ore no matter how long it takes.
+
 ## §5 Trees
 
 Placement is already decided and is not re-opened here:
@@ -343,6 +379,35 @@ already tests for.
 
 A furnace has an input slot, a fuel slot, an output slot and a progress counter.
 That is state attached to *one block position*, which nothing in phase 1 has.
+
+**What burns: wood. Decided by the project owner, 2026-08-31.**
+
+Logs and planks are fuel; there is **no coal**, and no coal ore is generated.
+The reasoning is that it closes the ladder with content that already exists —
+you chop trees in block 2.3a, so the furnace works the moment you can build one,
+and no new ore, item or texture is needed to smelt the iron `REQUIREMENTS.md` #5
+asks for.
+
+Fuel is declared in data, per `REQUIREMENTS.md` #3, as a burn duration in ticks
+on the item:
+
+```ron
+ItemDef(
+    name:       "cubara:oak_log",
+    max_stack:  64,
+    durability: None,
+    burn_ticks: Some(80),
+)
+```
+
+An item with no `burn_ticks` is not fuel. That is a property of the *item*
+rather than a separate fuel table, so "can this go in the fuel slot" is one
+lookup and cannot disagree with itself.
+
+**If coal is ever added**, it is a data file and not a rewrite: block 2.3b's
+`OreSet` holds four ores precisely so a second one costs a RON file, and
+`burn_ticks` on a coal item is the whole of the rest. This decision is
+deliberately *not* closing that door, only declining to open it now.
 
 **Block entities: a per-chunk side table.**
 
@@ -397,9 +462,14 @@ dormant catch-up (2.7), health/hunger/mobs (2.9).
 
 - Do leaves decay when their trunk is removed?
 - Do saplings drop, and can trees be replanted?
-- Is breaking a block instant, or is there a mining *time* per block?
 - Does a broken tool leave anything behind?
 - Is crafting instant, or is there a result preview to confirm?
+
+**Answered since, and moved into the sections that implement them** (kept here
+so the trail from question to decision is readable):
+
+- *Is breaking a block instant, or is there a mining time?* → **timed**, §4.3.
+- *What does the furnace burn?* → **wood; no coal**, §7.
 
 None of these block the ladder to iron. Each is listed so that it gets asked
 rather than invented — a plausible-sounding invention is worse than a question,

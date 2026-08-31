@@ -403,6 +403,7 @@ mod tests {
                     name: name.to_string(),
                     max_stack: 64,
                     durability: None,
+                    tier: 0,
                 },
             )
         };
@@ -622,7 +623,9 @@ mod tests {
         let log = Some(id("cubara:oak_log"));
         let p = Some(id("cubara:plank"));
         let st = Some(id("cubara:stick"));
-        let sn = Some(id("cubara:stone"));
+        // Cobble, not stone: block 2.4a made mined stone drop `cubara:cobble`,
+        // so cobble is what the ladder actually has in hand at this rung.
+        let cb = Some(id("cubara:cobble"));
         let ir = Some(id("cubara:iron_ingot"));
 
         // 1. A log makes four planks -- a 1x1 recipe, so it works in the
@@ -641,13 +644,13 @@ mod tests {
             1,
         );
         makes(
-            &[sn, sn, sn, None, st, None, None, st, None],
+            &[cb, cb, cb, None, st, None, None, st, None],
             3,
             "cubara:stone_pick",
             1,
         );
         makes(
-            &[sn, sn, sn, sn, None, sn, sn, sn, sn],
+            &[cb, cb, cb, cb, None, cb, cb, cb, cb],
             3,
             "cubara:furnace",
             1,

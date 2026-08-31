@@ -26,7 +26,7 @@ pub use item::{
 pub use mesh::{Face, Mesh, Vertex};
 pub use ore::{OreDef, OreError, OreRegistry};
 pub use recipe::{Recipe, RecipeBook, RecipeDef, RecipeError, RecipeOutputDef, MAX_GRID};
-pub use registry::{BlockRegistry, Faces, Material, RegistryError, Shape};
+pub use registry::{BlockRegistry, DropRule, Faces, ItemDrop, Material, RegistryError, Shape};
 pub use storage::{ChunkPayloadError, ChunkStorage};
 pub use structure::{StructureDef, StructureError, StructureRegistry};
 pub use voxel::{Chunk, MeshContext};

@@ -8,4 +8,6 @@ ItemDef(
     name:       "cubara:iron_pick",
     max_stack:  1,
     durability: Some(400),
+    // 0 hand, 1 wood, 2 stone, 3 iron (PHASE2_ARCHITECTURE.md 4).
+    tier:       3,
 )

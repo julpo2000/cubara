@@ -151,6 +151,16 @@ pub struct ItemDef {
     /// `Some(n)`: this kind is created with `ItemState::Durability { remaining: n }`
     /// and must declare `max_stack: 1`. `None`: created stateless.
     pub durability: Option<u16>,
+    /// How good a tool this is: **0 hand, 1 wood, 2 stone, 3 iron**
+    /// (`PHASE2_ARCHITECTURE.md` §4). A block whose `requires_tier` exceeds
+    /// this still breaks, but yields nothing.
+    ///
+    /// Defaulted rather than required, so an item that is not a tool -- which
+    /// is most of them -- says nothing at all. That also makes "empty hand"
+    /// and "a plank in your hand" the same case rather than a special one:
+    /// both are tier 0.
+    #[serde(default)]
+    pub tier: u8,
 }
 
 #[derive(Debug)]
@@ -222,6 +232,7 @@ struct Entry {
     name: String,
     max_stack: u8,
     durability: Option<u16>,
+    tier: u8,
 }
 
 /// Which items exist, and the runtime ids assigned to them.
@@ -304,6 +315,7 @@ impl ItemRegistry {
             name: "cubara:none".to_string(),
             max_stack: 1,
             durability: None,
+            tier: 0,
         }];
         let mut by_name = HashMap::new();
         by_name.insert("cubara:none".to_string(), ItemId::NONE);
@@ -315,6 +327,7 @@ impl ItemRegistry {
                 name: def.name,
                 max_stack: def.max_stack,
                 durability: def.durability,
+                tier: def.tier,
             });
         }
 
@@ -345,6 +358,15 @@ impl ItemRegistry {
         self.entries.get(id.0 as usize).and_then(|e| e.durability)
     }
 
+    /// This item's tool tier (§4): 0 hand, 1 wood, 2 stone, 3 iron.
+    ///
+    /// Unknown ids report 0 rather than panicking, the same stance
+    /// [`max_stack`](Self::max_stack) takes -- and 0 is the safe answer, since
+    /// it can only ever cost a drop, never grant one.
+    pub fn tier(&self, id: ItemId) -> u8 {
+        self.entries.get(id.0 as usize).map(|e| e.tier).unwrap_or(0)
+    }
+
     pub fn ids(&self) -> impl Iterator<Item = ItemId> + '_ {
         (0..self.entries.len()).map(|i| ItemId(i as u16))
     }
@@ -372,6 +394,7 @@ mod tests {
                 name: name.to_string(),
                 max_stack,
                 durability,
+                tier: 0,
             },
         )
     }

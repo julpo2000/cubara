@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use cubara_sim::{load_world, save_world, InputFrame, LoadError, Player, Sim, WorldHash};
-use cubara_voxel::{BlockId, BlockRegistry, ChunkCoord, Faces, Material, Shape};
+use cubara_voxel::{BlockId, BlockRegistry, ChunkCoord, DropRule, Faces, Material, Shape};
 use cubara_world::{TerrainBlocks, World, WORLDGEN_VERSION};
 
 /// No real registry loaded from disk here (that's `cubara-render`'s job) --
@@ -20,6 +20,8 @@ fn test_registry() -> BlockRegistry {
                 solid: true,
                 faces: Faces::All("grass".to_string()),
                 shapes: vec![Shape::Full],
+                drops: DropRule::SameName,
+                requires_tier: 0,
             },
         ),
         (
@@ -29,6 +31,8 @@ fn test_registry() -> BlockRegistry {
                 solid: true,
                 faces: Faces::All("soil".to_string()),
                 shapes: vec![Shape::Full],
+                drops: DropRule::SameName,
+                requires_tier: 0,
             },
         ),
         (
@@ -38,6 +42,8 @@ fn test_registry() -> BlockRegistry {
                 solid: true,
                 faces: Faces::All("stone".to_string()),
                 shapes: vec![Shape::Full],
+                drops: DropRule::SameName,
+                requires_tier: 0,
             },
         ),
     ])
@@ -341,6 +347,8 @@ fn loading_with_a_registry_missing_a_saved_block_name_is_a_named_error() {
                 solid: true,
                 faces: Faces::All("grass".to_string()),
                 shapes: vec![Shape::Full],
+                drops: DropRule::SameName,
+                requires_tier: 0,
             },
         ),
         (
@@ -350,6 +358,8 @@ fn loading_with_a_registry_missing_a_saved_block_name_is_a_named_error() {
                 solid: true,
                 faces: Faces::All("stone".to_string()),
                 shapes: vec![Shape::Full],
+                drops: DropRule::SameName,
+                requires_tier: 0,
             },
         ),
     ])

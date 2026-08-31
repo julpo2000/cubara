@@ -98,7 +98,8 @@ frames after 200 warmup.
 | 2026-08-11 | Arena capacity re-sized for the node tree [#111], radius 64²⁹ | 1,585 | 829,608 | ~1,275 | 0.535 ms | ~1.50 ms | `da55704` |
 | 2026-08-30 | macOS baseline caught up to `main` — skirt fix, reversed-Z, mips, blocks 2.1–2.2, radius 64³⁵ | 1,585 | 758,754 | ~1,462 | **0.483 ms** | ~0.89 ms | `f9080f7` |
 | 2026-08-30 | **Oak trees via the structure pass** [#154], radius 64³⁵ | **1,600** | **766,476** | ~1,442 | **0.484 ms** | ~0.89 ms | `89ca231` |
-| 2026-08-31 | **Iron ore as a density-pass threshold** [#156], radius 64³⁶ | 1,600 | **822,420** | ~1,381 | 0.509 ms | ~0.86 ms | *(this PR)* |
+| 2026-08-31 | **Iron ore as a density-pass threshold** [#156], radius 64³⁶ | 1,600 | **822,420** | ~1,381 | 0.509 ms | ~0.86 ms | `a0b8108` |
+| 2026-08-31 | Drops and tool tiers from data [#158], radius 64³⁷ | 1,600 | 822,420 | ~1,385 | 0.509 ms | ~0.86 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -1010,6 +1011,16 @@ measured).
 
 Node count is unchanged at 1,600: same world, same chunks, more triangles
 inside them.
+
+³⁷ **Drops and tool tiers (#158) — measured to show it changed nothing.** This
+block is inventory and registry work: it touches neither worldgen nor the render
+path, so the scene should be identical, and it is — **822,420 triangles and
+1,600 nodes, the same figures to the digit** as the ore row above it. 1,385 FPS
+against that row's ~1,381, and 0.509 ms CPU/frame against 0.509.
+
+Recorded rather than skipped because "it obviously cannot affect performance" is
+exactly the assumption worth spending one run to check; the row's value is the
+identical triangle count, not the FPS.
 
 ## Detailed run logs
 
