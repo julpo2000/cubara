@@ -159,7 +159,8 @@ fn fixture_edits() -> Vec<(usize, [i32; 3], BlockId)> {
 /// | `0x84d6_5897_33af_263a` | block 1.8 (#90), the original pin |
 /// | `0xede5_39f2_ee54_4d2a` | block 2.1b (#136), inventory added to the hash |
 /// | `0xc763_3252_db46_3e78` | block 2.2b (#148), crafting grid + cursor added |
-const KNOWN_FIXTURE_HASH: u64 = 0xc763_3252_db46_3e78;
+/// | `0x4f74_448e_2b83_20bb` | block 2.9a (#172), health + regen counter added |
+const KNOWN_FIXTURE_HASH: u64 = 0x4f74_448e_2b83_20bb;
 
 #[test]
 fn replay_of_the_same_seed_and_script_is_deterministic() {

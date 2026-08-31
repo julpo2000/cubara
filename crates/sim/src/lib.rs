@@ -23,7 +23,7 @@ pub use entity::{despawn_ticks, DroppedItem, Entities, EntityKey, PICKUP_RADIUS}
 pub use hash::{hash_region, WorldHash};
 pub use input::InputFrame;
 pub use inventory::{Inventory, HOTBAR_WIDTH, SLOT_COUNT};
-pub use player::Player;
+pub use player::{Player, FALL_DAMAGE_PER_BLOCK, HEART, MAX_HEALTH, REGEN_INTERVAL, SAFE_FALL};
 pub use rng::WorldRng;
 pub use save::{load_world, save_world, LoadError, SaveError, FORMAT_VERSION};
 
@@ -119,12 +119,18 @@ impl Sim {
         if self.player.free_fly {
             self.player.velocity = glam::Vec3::ZERO;
             self.player.on_ground = false;
+            // Free-fly is a debug mode and must never hurt: dropping out of it
+            // should not kill you (§13.3), so the accumulated fall goes with it.
+            self.player.fall_distance = 0.0;
             self.player.apply_free_fly(input, TICK_DT);
         } else {
             physics::step(&mut self.player, input, TICK_DT, |x, y, z| {
                 world.is_solid_at(x, y, z, blocks)
             });
         }
+        // After physics, so damage taken this tick resets the counter before it
+        // is incremented -- a tick you were hurt on is not a damage-free tick.
+        self.player.tick_regeneration();
         self.target = world
             .raycast(
                 self.player.pos.to_array(),

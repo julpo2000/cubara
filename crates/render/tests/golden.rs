@@ -410,6 +410,7 @@ fn a_cave_mouth_is_visible() {
         highlighted_block: None,
         hotbar: None,
         panel: None,
+        health: None,
     };
     assert_golden("cave_mouth", &world, shot);
 }
@@ -443,6 +444,7 @@ fn iron_ore_is_visible_in_a_cave_wall() {
         highlighted_block: None,
         hotbar: None,
         panel: None,
+        health: None,
     };
     assert_golden("iron_ore", &world, shot);
 }
@@ -510,6 +512,7 @@ fn the_selected_block_shows_an_outline() {
         highlighted_block: Some(hit.block),
         hotbar: None,
         panel: None,
+        health: None,
     };
     assert_golden("outline", &world, shot);
 }
@@ -552,6 +555,7 @@ fn the_hotbar_shows_slots_counts_and_the_held_one() {
         highlighted_block: None,
         hotbar: Some(hotbar),
         panel: None,
+        health: None,
     };
     assert_golden("hotbar", &world, shot);
 }
@@ -598,6 +602,7 @@ fn the_inventory_screen_shows_slots_a_recipe_and_the_cursor() {
         camera: None,
         highlighted_block: None,
         hotbar: None,
+        health: None,
         panel: Some((
             PanelLayout::Grid(2),
             contents,
@@ -608,6 +613,28 @@ fn the_inventory_screen_shows_slots_a_recipe_and_the_cursor() {
         )),
     };
     assert_golden("inventory_screen", &world, shot);
+}
+
+#[test]
+fn hearts_show_health_including_a_half() {
+    // Block 2.9a's own bar. Twenty points drawn as ten hearts, and the reason
+    // it is twenty rather than ten is that a **half** heart has to be
+    // representable -- so the shot picks an odd number to prove it.
+    //
+    // 13 of 20: six full hearts, one half, three empty.
+    let world = World::new();
+    let shot = Shot {
+        width: 960,
+        height: 540,
+        region_radius: 2,
+        orbit_t: 0.0,
+        camera: None,
+        highlighted_block: None,
+        hotbar: Some([None; 9]),
+        panel: None,
+        health: Some((13, 20)),
+    };
+    assert_golden("hearts", &world, shot);
 }
 
 #[test]
@@ -649,6 +676,7 @@ fn the_furnace_screen_shows_input_fuel_and_output() {
         camera: None,
         highlighted_block: None,
         hotbar: None,
+        health: None,
         panel: Some((
             PanelLayout::Furnace,
             contents,
@@ -698,6 +726,7 @@ fn distinct_materials_render_with_distinct_textures() {
         highlighted_block: None,
         hotbar: None,
         panel: None,
+        health: None,
     };
 
     let Some(frame) = headless::render_chunks(&chunks, shot) else {

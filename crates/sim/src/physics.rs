@@ -113,10 +113,25 @@ pub(crate) fn step(
     let feet = Vec3::new(player.pos.x, player.pos.y - EYE_HEIGHT, player.pos.z);
     let aabb = Aabb::from_feet(feet);
 
+    let before_y = aabb.feet().y;
     let (aabb, y_blocked, y_negative) = move_axis(aabb, 1, player.velocity.y * dt, &is_solid);
     player.on_ground = y_blocked && y_negative;
     if y_blocked {
         player.velocity.y = 0.0;
+    }
+
+    // Fall damage is measured in **distance fallen**, not impact speed
+    // (`docs/PHASE2_ARCHITECTURE.md` §13.3): distance is what a player can
+    // judge before jumping, speed is a number they cannot see. Accumulate
+    // while descending and airborne; spend it on landing.
+    let dropped = before_y - aabb.feet().y;
+    if !player.on_ground && dropped > 0.0 {
+        player.fall_distance += dropped;
+    }
+    if player.on_ground {
+        let damage = Player::fall_damage_for(player.fall_distance);
+        player.fall_distance = 0.0;
+        player.take_damage(damage);
     }
 
     let aabb = move_axis_with_step(aabb, 0, player.velocity.x * dt, was_on_ground, &is_solid);

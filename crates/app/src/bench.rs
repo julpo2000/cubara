@@ -168,6 +168,8 @@ pub fn run(radius: i32) {
                     draw_count,
                     selected_block: None,
                     overlay: None,
+                    // The benchmark measures the scene, not the HUD.
+                    health: None,
                     // The bench measures the world, not a HUD.
                     hotbar: None,
                     panel: None,

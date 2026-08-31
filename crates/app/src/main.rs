@@ -175,7 +175,13 @@ impl ApplicationHandler for App {
                     held: *held,
                     cursor: self.cursor,
                 });
-                renderer.render(camera, self.game.selected_block(), hotbar, panel);
+                renderer.render(
+                    camera,
+                    self.game.selected_block(),
+                    hotbar,
+                    panel,
+                    Some(self.game.health_view()),
+                );
                 // Immediately queue the next frame — we render continuously.
                 renderer.window().request_redraw();
             }

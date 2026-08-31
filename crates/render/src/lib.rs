@@ -32,5 +32,6 @@ pub use render::{
     build_pipeline, camera_bind_group_layout, create_depth_view, gpu_driven_features, grab_cursor,
     load_mesh_assets, load_registry, CameraPose, CameraUniform, Renderer,
 };
+pub use scene::HealthView;
 pub use scene::{HotbarSlot, HotbarView, PanelView, SceneFrame, SceneRenderer};
 pub use text::TextRenderer;
