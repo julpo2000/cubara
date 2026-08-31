@@ -99,16 +99,18 @@ if [ "$phase" = "2" ]; then
     # the world mid-script, reload it, run the rest of the script, and land on
     # the same hash as the uninterrupted run."
     #
-    # Block 2.8. Block entities (2.4c) and entities (2.5) are in the world hash
-    # but not yet in the save format, so a reload loses them by construction.
-    not_implemented "round-trip covering phase 2 state (block entities, entities, inventory)"
+    # Landed in block 2.8 (#170). The test asserts the reloaded state is
+    # non-empty before comparing hashes, so it cannot pass by both runs being
+    # equally empty.
+    run "round-trip covering phase 2 state (block entities, entities, inventory)" \
+        cargo test -p cubara-sim --test save_load a_world_saved_mid_script_finishes_where_an_uninterrupted_one_does
 
     echo
     echo "$pass passed, $fail failed."
     if [ "$fail" -gt 0 ]; then
         echo
-        echo "Phase 2 is NOT finished. Remaining: blocks 2.8 (save format) and"
-        echo "2.9 (health, hunger, damage, mobs), plus the survival replay harness."
+        echo "Phase 2 is NOT finished. Remaining: block 2.9 (health, hunger,"
+        echo "damage, mobs) and the survival replay harness it makes possible."
         exit 1
     fi
     echo "OK: phase 2 exit gate met."

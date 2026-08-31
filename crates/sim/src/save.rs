@@ -19,7 +19,9 @@ use crate::inventory::Inventory;
 use std::collections::HashMap;
 use std::path::Path;
 
-use cubara_voxel::{BlockId, BlockRegistry, ChunkCoord};
+use cubara_voxel::{
+    BlockId, BlockRegistry, ChunkCoord, ItemId, ItemRegistry, ItemStack, ItemState,
+};
 use cubara_world::{region, TerrainBlocks, World, WORLDGEN_VERSION};
 use serde::{Deserialize, Serialize};
 
@@ -31,12 +33,47 @@ use crate::Sim;
 /// [`cubara_world::region::REGION_FORMAT_VERSION`] and of
 /// [`cubara_world::WORLDGEN_VERSION`]; each names a different thing that
 /// can change on its own schedule.
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SavedRng {
     state: u64,
     inc: u64,
+}
+
+/// One item stack, by **name** rather than by id.
+///
+/// Item ids are assigned per registry by sorted name (§1.2), exactly like block
+/// ids -- so a save storing raw ids would silently mean *different items* the
+/// moment an item file is added or removed. The header's id table exists to
+/// bridge that, and this is the form every saved stack takes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedStack {
+    item: String,
+    count: u8,
+    /// `None` for a plain stack; `Some(n)` for a tool with `n` uses left.
+    durability: Option<u16>,
+}
+
+/// A furnace, by position (§7, §8.2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedFurnace {
+    pos: (i32, i32, i32),
+    input: Option<SavedStack>,
+    fuel: Option<SavedStack>,
+    output: Option<SavedStack>,
+    burning: u32,
+    progress: u32,
+}
+
+/// One item lying on the ground (§10.4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedEntity {
+    key: u64,
+    stack: SavedStack,
+    pos: (f32, f32, f32),
+    vel: (f32, f32, f32),
+    age: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +84,23 @@ struct SavedPlayer {
     pitch: f32,
     on_ground: bool,
     free_fly: bool,
+    /// 36 entries, `None` for an empty slot. Block 2.8.
+    #[serde(default)]
+    inventory: Vec<Option<SavedStack>>,
+    #[serde(default)]
+    selected_slot: u8,
+    /// The 3x3 crafting grid, its usable width, and whatever the cursor holds.
+    #[serde(default)]
+    grid: Vec<Option<SavedStack>>,
+    #[serde(default = "default_grid_width")]
+    grid_width: usize,
+    #[serde(default)]
+    held: Option<SavedStack>,
+}
+
+/// A save written before block 2.8 has no grid width; 2 is the inventory's own.
+fn default_grid_width() -> usize {
+    2
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +115,22 @@ struct SavedHeader {
     /// Loading resolves each name against the *current* registry, so ids
     /// may be reassigned freely between runs.
     blocks: Vec<(u16, String)>,
+    /// The item id → name table, for the same reason `blocks` exists (§8.1).
+    #[serde(default)]
+    items: Vec<(u16, String)>,
+    /// Block entities, in position order (§7). In the world header rather than
+    /// the chunk payload because that is where they live in memory: keyed by
+    /// world position beside `World::edits`, since chunks are regenerated from
+    /// the seed on load (§7.4) and so cannot carry player state.
+    #[serde(default)]
+    block_entities: Vec<SavedFurnace>,
+    /// Items on the ground, and the counter that names them.
+    #[serde(default)]
+    entities: Vec<SavedEntity>,
+    /// World state (§10.2): without it, keys would restart at 0 after a reload
+    /// and two different histories could collide.
+    #[serde(default)]
+    next_entity_key: u64,
 }
 
 /// A save failed. Every variant names the problem.
@@ -145,16 +215,56 @@ impl std::fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
+/// A furnace slot's `(id, count)` as an [`ItemStack`], so the same
+/// [`to_saved`] path serialises it. Furnace slots never hold durability.
+fn stack_of(slot: Option<(ItemId, u8)>, items: &ItemRegistry) -> Option<ItemStack> {
+    let (id, count) = slot?;
+    ItemStack::new(id, count, ItemState::None, items.max_stack(id)).ok()
+}
+
+/// A live stack in its saved form, or `None` for an empty slot.
+fn to_saved(stack: Option<ItemStack>, items: &ItemRegistry) -> Option<SavedStack> {
+    let stack = stack?;
+    Some(SavedStack {
+        item: items.name_of(stack.item())?.to_string(),
+        count: stack.count(),
+        durability: match stack.state() {
+            ItemState::Durability { remaining } => Some(remaining),
+            ItemState::None => None,
+        },
+    })
+}
+
+/// A saved stack resolved against *this* run's registry.
+///
+/// **An item whose name no longer exists is dropped, not fatal.** A world should
+/// survive an item being renamed or removed; refusing to load the whole save is
+/// a worse answer than a missing stack, and the same stance `with_oak` and
+/// `with_ores` take for missing data.
+fn from_saved(saved: &Option<SavedStack>, items: &ItemRegistry) -> Option<ItemStack> {
+    let saved = saved.as_ref()?;
+    let Some(id) = items.id_of(&saved.item) else {
+        log::debug!("save names unknown item {:?}; dropping it", saved.item);
+        return None;
+    };
+    let state = match saved.durability {
+        Some(remaining) => ItemState::Durability { remaining },
+        None => ItemState::None,
+    };
+    ItemStack::new(id, saved.count, state, items.max_stack(id)).ok()
+}
+
 /// Save `sim`/`world` to `dir` (created if it doesn't exist): `level.ron`
 /// plus one region file per dirty region under `dir/region/`. `registry`
-/// supplies the id → name table (§7.2); `blocks` is what
-/// [`cubara_world::World::edited_chunk_at`] resolves grass/soil/stone
-/// against, same as everywhere else that materializes a chunk.
+/// supplies the block id → name table (§7.2) and `items` the item one (§8.1);
+/// `blocks` is what [`cubara_world::World::edited_chunk_at`] resolves
+/// grass/soil/stone against, same as everywhere else that materializes a chunk.
 pub fn save_world(
     dir: &Path,
     sim: &Sim,
     world: &World,
     registry: &BlockRegistry,
+    items: &ItemRegistry,
     blocks: TerrainBlocks,
 ) -> Result<(), SaveError> {
     std::fs::create_dir_all(dir).map_err(SaveError::Io)?;
@@ -180,8 +290,47 @@ pub fn save_world(
             pitch: sim.player.pitch,
             on_ground: sim.player.on_ground,
             free_fly: sim.player.free_fly,
+            inventory: (0..crate::inventory::SLOT_COUNT)
+                .map(|i| to_saved(sim.player.inventory.slot(i), items))
+                .collect(),
+            selected_slot: sim.player.inventory.selected_slot(),
+            grid: (0..cubara_voxel::MAX_GRID * cubara_voxel::MAX_GRID)
+                .map(|i| to_saved(sim.player.crafting.cell(i), items))
+                .collect(),
+            grid_width: sim.player.crafting.width(),
+            held: to_saved(sim.player.crafting.held(), items),
         },
         blocks: blocks_table,
+        items: items
+            .ids()
+            .filter_map(|id| items.name_of(id).map(|n| (id.0, n.to_string())))
+            .collect(),
+        block_entities: world
+            .block_entities()
+            .map(|(pos, f)| SavedFurnace {
+                pos: (pos[0], pos[1], pos[2]),
+                input: to_saved(stack_of(f.input, items), items),
+                fuel: to_saved(stack_of(f.fuel, items), items),
+                output: to_saved(stack_of(f.output, items), items),
+                burning: f.burning,
+                progress: f.progress,
+            })
+            .collect(),
+        entities: sim
+            .entities
+            .sorted()
+            .into_iter()
+            .filter_map(|(key, d)| {
+                Some(SavedEntity {
+                    key: key.0,
+                    stack: to_saved(Some(d.stack), items)?,
+                    pos: d.pos.into(),
+                    vel: d.velocity.into(),
+                    age: d.age,
+                })
+            })
+            .collect(),
+        next_entity_key: sim.entities.next_key(),
     };
 
     let text = ron::ser::to_string_pretty(&header, ron::ser::PrettyConfig::default())
@@ -201,6 +350,7 @@ pub fn save_world(
 pub fn load_world(
     dir: &Path,
     registry: &BlockRegistry,
+    items: &ItemRegistry,
     blocks: TerrainBlocks,
 ) -> Result<(Sim, World), LoadError> {
     let text = std::fs::read_to_string(dir.join("level.ron")).map_err(LoadError::Io)?;
@@ -262,16 +412,24 @@ pub fn load_world(
         free_fly: header.player.free_fly,
         yaw: header.player.yaw,
         pitch: header.player.pitch,
-        // Not in the format yet -- the save extension is block 2.8, which adds
-        // the item id table this needs (PHASE2_ARCHITECTURE.md §8). A loaded
-        // world starts empty-handed until then, deliberately and visibly,
-        // rather than silently half-restoring an inventory.
-        inventory: Inventory::new(),
-        // Same as the inventory: not in the format until block 2.8. A loaded
-        // world opens with an empty grid, which is also the only sane state to
-        // resume in -- a half-filled grid restored without its screen open
-        // would be items the player cannot see.
-        crafting: Crafting::default(),
+        // Block 2.8: restored by name, so a registry that assigns different ids
+        // this run still lands the right items in the right slots (§8.1).
+        inventory: {
+            let mut inv = Inventory::new();
+            for (i, saved) in header.player.inventory.iter().enumerate() {
+                inv.set_slot(i, from_saved(saved, items));
+            }
+            inv.select(header.player.selected_slot);
+            inv
+        },
+        crafting: {
+            let mut c = Crafting::new(header.player.grid_width);
+            for (i, saved) in header.player.grid.iter().enumerate() {
+                c.set_cell(i, from_saved(saved, items));
+            }
+            c.set_held(from_saved(&header.player.held, items));
+            c
+        },
     };
 
     let sim = Sim {
@@ -282,11 +440,51 @@ pub fn load_world(
         },
         player,
         target: None, // recomputed by the first tick; not part of saved state
-        // Entities are not in the save format yet -- that is block 2.8's
-        // version bump, exactly as block entities are not (§8). A loaded world
-        // starts with an empty floor.
-        entities: crate::Entities::default(),
+        entities: {
+            // Block 2.8. Keys are restored as saved, not reassigned: an
+            // `EntityKey` that came back would let two different histories hash
+            // alike (§10.2).
+            let mut e = crate::Entities::default();
+            for saved in &header.entities {
+                let Some(stack) = from_saved(&Some(saved.stack.clone()), items) else {
+                    continue;
+                };
+                e.restore_item(
+                    crate::EntityKey(saved.key),
+                    crate::DroppedItem {
+                        stack,
+                        pos: glam::Vec3::new(saved.pos.0, saved.pos.1, saved.pos.2),
+                        velocity: glam::Vec3::new(saved.vel.0, saved.vel.1, saved.vel.2),
+                        age: saved.age,
+                        // Recomputed on the first tick rather than saved: it is
+                        // derived from the terrain under it, which is
+                        // regenerated anyway.
+                        on_ground: false,
+                    },
+                );
+            }
+            e.set_next_key(header.next_entity_key);
+            e
+        },
     };
+
+    // Block entities, after the edits that placed their blocks (§7, §8.2).
+    // Restored by name like everything else, and in the order the file lists
+    // them -- which `save_world` wrote in position order, so the `BTreeMap` this
+    // fills comes out identical either way.
+    for f in &header.block_entities {
+        let pos = [f.pos.0, f.pos.1, f.pos.2];
+        world.add_furnace(pos);
+        if let Some(furnace) = world.furnace_at_mut(pos) {
+            let slot =
+                |s: &Option<SavedStack>| from_saved(s, items).map(|st| (st.item(), st.count()));
+            furnace.input = slot(&f.input);
+            furnace.fuel = slot(&f.fuel);
+            furnace.output = slot(&f.output);
+            furnace.burning = f.burning;
+            furnace.progress = f.progress;
+        }
+    }
 
     Ok((sim, world))
 }
