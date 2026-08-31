@@ -472,6 +472,7 @@ dependencies = [
  "cubara-world",
  "glam",
  "hecs",
+ "log",
  "ron",
  "serde",
 ]

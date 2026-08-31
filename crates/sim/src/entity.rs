@@ -95,6 +95,27 @@ impl Entities {
         self.world.len() as usize
     }
 
+    /// The next key that will be handed out. World state, so it is saved
+    /// (§10.2): restarting it at 0 after a reload would let two different
+    /// histories collide.
+    pub fn next_key(&self) -> u64 {
+        self.next_key
+    }
+
+    /// Restore an entity from a save, with its original key.
+    ///
+    /// Separate from [`spawn_item`](Self::spawn_item) because that one *assigns*
+    /// a key; loading must preserve the one the world already used.
+    pub fn restore_item(&mut self, key: EntityKey, item: DroppedItem) {
+        self.world.spawn((key, item));
+        self.next_key = self.next_key.max(key.0 + 1);
+    }
+
+    /// Set the counter after restoring a save.
+    pub fn set_next_key(&mut self, next: u64) {
+        self.next_key = self.next_key.max(next);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

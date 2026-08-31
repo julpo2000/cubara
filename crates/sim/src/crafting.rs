@@ -145,6 +145,14 @@ impl Crafting {
     /// For screens that own their own slots -- the furnace (block 2.4c) -- which
     /// need the same single cursor rather than a second one, so a player can
     /// never end up holding two things at once.
+    /// Put `stack` in cell `index`. For restoring a saved grid (block 2.8);
+    /// play goes through [`click`](Self::click), which has the rules.
+    pub fn set_cell(&mut self, index: usize, stack: Option<ItemStack>) {
+        if index < MAX_GRID * MAX_GRID {
+            self.cells[index] = stack;
+        }
+    }
+
     pub fn set_held(&mut self, held: Option<ItemStack>) {
         self.held = held;
     }

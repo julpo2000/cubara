@@ -10,6 +10,10 @@ authors.workspace = true
 cubara-voxel = { path = "../voxel" }
 cubara-world = { path = "../world" }
 glam.workspace = true
+# Already a workspace dependency (app and render use it). Loading a save needs
+# to say when it dropped an item whose name no longer exists, rather than doing
+# it silently.
+log.workspace = true
 hecs.workspace = true
 serde.workspace = true
 ron.workspace = true
