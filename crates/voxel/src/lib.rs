@@ -22,7 +22,7 @@ pub use block::BlockId;
 pub use bounds::{build_mesh_bounded, Aabb};
 pub use coord::ChunkCoord;
 pub use item::{
-    ItemDef, ItemId, ItemRegistry, ItemRegistryError, ItemStack, ItemState, StackError,
+    ItemDef, ItemId, ItemRegistry, ItemRegistryError, ItemStack, ItemState, Rarity, StackError,
 };
 pub use mesh::{Face, Mesh, Vertex};
 pub use ore::{OreDef, OreError, OreRegistry};

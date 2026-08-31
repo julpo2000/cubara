@@ -393,7 +393,7 @@ fn trim(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::item::ItemDef;
+    use crate::item::{ItemDef, Rarity};
 
     fn items() -> ItemRegistry {
         let def = |name: &str| {
@@ -406,6 +406,7 @@ mod tests {
                     tier: 0,
                     speed: None,
                     burn_ticks: None,
+                    rarity: Rarity::Common,
                 },
             )
         };

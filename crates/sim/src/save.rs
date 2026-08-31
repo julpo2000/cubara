@@ -282,6 +282,10 @@ pub fn load_world(
         },
         player,
         target: None, // recomputed by the first tick; not part of saved state
+        // Entities are not in the save format yet -- that is block 2.8's
+        // version bump, exactly as block entities are not (§8). A loaded world
+        // starts with an empty floor.
+        entities: crate::Entities::default(),
     };
 
     Ok((sim, world))

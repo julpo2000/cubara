@@ -12,4 +12,7 @@ ItemDef(
     tier:       3,
     // Blocks break in ceil(hardness / speed) ticks; the empty hand is 1.
     speed:      Some(6),
+    // A real trip's worth of work: 30 minutes on the floor, not 5
+    // (PHASE2_ARCHITECTURE.md 10.5).
+    rarity:     Uncommon,
 )

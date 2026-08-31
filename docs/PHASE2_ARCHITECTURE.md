@@ -453,6 +453,107 @@ fixture covers a world with an inventory and a running furnace.
 
 ---
 
+## §10 Entities, and the things that fall on the floor (block 2.5)
+
+Blocks 2.1 – 2.4 deferred the same thing five times: **a drop with nowhere to go
+is destroyed.** Break a block with a full inventory and the item is gone; break a
+furnace and its contents go with it. Each site says "until ECS, 2.5". This is
+that block.
+
+### §10.1 The ECS is `hecs`
+
+Chosen over `bevy_ecs` and over writing our own. The deciding property is that
+`hecs` is a **data store, not a framework**: a `World` is a plain value we own
+and pass in, with no scheduler and no global. `bevy_ecs` brings a scheduler that
+wants to own the main loop, which pulls directly against the hand-written
+fixed-timestep loop block 1.6 built, and against Rule 2 (no ambient state).
+
+The `ROADMAP.md` note — *"ECS arrives when there are entities worth having —
+dropped items and mobs — not before"* — is satisfied: dropped items are real,
+already deferred to here five times, and the first thing this block makes work.
+
+### §10.2 The determinism contract — the part that matters
+
+**`hecs` query iteration order is not specified.** It follows internal archetype
+layout, which depends on the order components were inserted and on entity reuse.
+That is a direct hazard to Rule 1, the keystone rule, and it is the reason this
+section exists rather than "we added an ECS".
+
+The contract, and it is not optional:
+
+1. **Every entity carries an `EntityKey`** — a `u64` from a counter in world
+   state, assigned at spawn and never reused. `hecs::Entity` is generational and
+   its bits depend on allocation history; it must never reach the world hash, a
+   save file, or any ordering decision.
+2. **No system may let query order change the result.** Either the per-entity
+   update is independent of the others (the common case: gravity, despawn
+   timers), or the system **collects into a `Vec` and sorts by `EntityKey`**
+   before acting. Anything that resolves a conflict between two entities — two
+   items reaching the same slot, two mobs claiming one target — is in the second
+   category.
+3. **The world hash iterates entities sorted by `EntityKey`**, never in query
+   order, exactly as it iterates `edits` and block entities in `BTreeMap` order.
+
+**Enforced by** a test that spawns the same entities in a different order,
+despawns and respawns some to force archetype churn, and asserts an identical
+world hash and identical simulation results. Without that test this section is a
+wish.
+
+### §10.3 The player is *not* an entity
+
+Issue #56 as originally written said "model the player as an entity ... the
+player is an ECS entity driving the camera". **That is not done here**, and the
+issue was rewritten to say so.
+
+The player is a singleton with a large, well-tested struct hanging off it —
+inventory, crafting grid, mining progress, physics. Moving it into the ECS buys
+nothing at one instance, and would put the determinism harness, the save format
+and the world hash all through a refactor at once, in the same block that
+introduces the ECS. The ECS earns its place by holding the things there are
+*many* of. If a later block finds a real reason, it can move then, against a
+harness that still works.
+
+### §10.4 Dropped items
+
+**Decided by the project owner, 2026-08-31.** An item that cannot go in the
+inventory falls on the ground as an entity, and the player picks it up by walking
+near it. Nothing is silently destroyed.
+
+- **Spawned** wherever an item currently vanishes: a break whose drop does not
+  fit, a broken block entity's contents, and (later) a player's inventory on
+  death.
+- **Falls** under gravity and rests on the ground, reusing the same AABB sweep
+  the player already uses — one implementation, not a second physics path.
+- **Picked up** when the player comes within a small radius, which is tuning and
+  therefore data.
+
+### §10.5 Despawn is a property of rarity, not of the item
+
+Also the owner's decision, and the reason it is a *system* rather than a number
+per item: how long something survives on the floor is a statement about **how
+much it would hurt to lose it**.
+
+| Rarity | Despawns after | What it is for |
+|---|---|---|
+| `Common` | 5 minutes (18,000 ticks) | Stone, soil, wood — the things you throw away |
+| `Uncommon` | 30 minutes (108,000 ticks) | Ores, ingots, tools — a real trip's worth of work |
+| `Treasured` | **never** | Things that cannot be re-made, and the pile you leave when you die |
+
+Ticks, not wall-clock: Rule 1, the same reason mining is tick-counted (§4.3).
+
+`Treasured` **has no items in it yet.** It is built now because the owner named
+the case — irreplaceable items, and death piles — and because retrofitting "this
+one never despawns" into a system that assumed a single timer is exactly the kind
+of change that goes wrong. What eventually occupies that tier is a content
+decision for a later phase, and it will be an original one: `REQUIREMENTS.md` #6
+is explicit that our content is our own, so the tier is named for what it *does*,
+not after another game's materials.
+
+Rarity lives on the item (`assets/items/*.ron`), defaulting to `Common`, so an
+item that says nothing is a thing you can afford to lose.
+
+---
+
 ## §9 Not in this scope — and which are the owner's call
 
 Engineering-deferred, mine to sequence: ECS (2.5), the chunk state machine (2.6),
@@ -470,6 +571,8 @@ so the trail from question to decision is readable):
 
 - *Is breaking a block instant, or is there a mining time?* → **timed**, §4.3.
 - *What does the furnace burn?* → **wood; no coal**, §7.
+- *What happens to a drop with nowhere to go?* → **it falls on the floor**, and
+  despawns on a timer set by its rarity, §10.4–§10.5.
 
 None of these block the ladder to iron. Each is listed so that it gets asked
 rather than invented — a plausible-sounding invention is worse than a question,

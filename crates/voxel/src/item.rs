@@ -175,6 +175,32 @@ pub struct ItemDef {
     /// go in the fuel slot" is one lookup that cannot disagree with itself.
     #[serde(default)]
     pub burn_ticks: Option<u32>,
+    /// How much it would hurt to lose one, which is what decides how long it
+    /// survives on the floor (`PHASE2_ARCHITECTURE.md` §10.5).
+    ///
+    /// Defaults to [`Rarity::Common`], so an item that says nothing is a thing
+    /// you can afford to lose.
+    #[serde(default)]
+    pub rarity: Rarity,
+}
+
+/// How long a dropped item survives before it despawns (§10.5).
+///
+/// A rarity rather than a per-item duration deliberately: how long something
+/// should survive on the floor is a statement about how replaceable it is, and
+/// making that one decision per item -- rather than a number to tune per item --
+/// is what keeps the answers consistent as items are added.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum Rarity {
+    /// Stone, soil, wood. Five minutes.
+    #[default]
+    Common,
+    /// Ores, ingots, tools -- a real trip's worth of work. Thirty minutes.
+    Uncommon,
+    /// Never despawns: things that cannot be re-made, and the pile left on
+    /// death. **No item is in this tier yet** -- see §10.5 for why it exists
+    /// anyway.
+    Treasured,
 }
 
 #[derive(Debug)]
@@ -249,6 +275,7 @@ struct Entry {
     tier: u8,
     speed: Option<u32>,
     burn_ticks: Option<u32>,
+    rarity: Rarity,
 }
 
 /// Which items exist, and the runtime ids assigned to them.
@@ -334,6 +361,7 @@ impl ItemRegistry {
             tier: 0,
             speed: None,
             burn_ticks: None,
+            rarity: Rarity::Common,
         }];
         let mut by_name = HashMap::new();
         by_name.insert("cubara:none".to_string(), ItemId::NONE);
@@ -348,6 +376,7 @@ impl ItemRegistry {
                 tier: def.tier,
                 speed: def.speed,
                 burn_ticks: def.burn_ticks,
+                rarity: def.rarity,
             });
         }
 
@@ -385,6 +414,14 @@ impl ItemRegistry {
     /// it can only ever cost a drop, never grant one.
     pub fn tier(&self, id: ItemId) -> u8 {
         self.entries.get(id.0 as usize).map(|e| e.tier).unwrap_or(0)
+    }
+
+    /// How replaceable `id` is, which decides its despawn timer (§10.5).
+    pub fn rarity(&self, id: ItemId) -> Rarity {
+        self.entries
+            .get(id.0 as usize)
+            .map(|e| e.rarity)
+            .unwrap_or(Rarity::Common)
     }
 
     /// How long one `id` burns for, or `None` if it is not fuel (§7).
@@ -431,6 +468,7 @@ mod tests {
                 tier: 0,
                 speed: None,
                 burn_ticks: None,
+                rarity: Rarity::Common,
             },
         )
     }
