@@ -26,7 +26,7 @@ use cubara_voxel::{
 };
 use cubara_world::TerrainBlocks;
 use cubara_world::World;
-use cubara_world::{Furnace, SmeltCtx, TimedProcess};
+use cubara_world::{ChunkState, Furnace, SmeltCtx, TimedProcess};
 
 use winit::keyboard::KeyCode;
 
@@ -105,15 +105,6 @@ struct Mining {
 /// free.
 const SIM_RADIUS_CHUNKS: i32 = 4;
 
-/// Every block-entity position inside `coord`.
-fn block_entity_positions_in(world: &World, coord: ChunkCoord) -> Vec<[i32; 3]> {
-    world
-        .block_entity_positions()
-        .into_iter()
-        .filter(|p| ChunkCoord::from_block(p[0], p[1], p[2]) == coord)
-        .collect()
-}
-
 /// Advance one furnace by `ticks`, whether that is one ordinary tick or a
 /// dormant chunk's whole backlog.
 fn advance_furnace(
@@ -169,6 +160,9 @@ pub struct Game {
     /// Whether the inventory screen is open. Screen state, not world state --
     /// what the *grid* holds is world state and lives on the player.
     inventory_open: bool,
+    /// The chunk the simulation radius was last updated around. `None` until
+    /// the first tick, so it always runs once.
+    sim_centre: Option<ChunkCoord>,
     /// The furnace whose screen is open, by world position. `None` when the
     /// open screen is the plain inventory or a bench.
     open_furnace: Option<[i32; 3]>,
@@ -233,6 +227,7 @@ impl Game {
             items: None,
             recipes: None,
             inventory_open: false,
+            sim_centre: None,
             open_furnace: None,
             smelting: None,
             breaking: false,
@@ -429,6 +424,44 @@ impl Game {
         dirty
     }
 
+    /// Stand the player on the terrain under their column, and make that their
+    /// spawn point.
+    ///
+    /// **Without this the game is unplayable.** `Game::new` places the player at
+    /// y = 48 because terrain does not exist yet at that point -- but the
+    /// surface under that column is at y = 15, a 32-block drop. Once block 2.9a
+    /// made falling hurt, that is 29 damage against 20 health: the player dies
+    /// on the first landing, respawns at the same point in mid-air, and dies
+    /// again, forever.
+    ///
+    /// Every test missed it because they all reposition the player just above
+    /// the ground before doing anything. `the_game_does_not_start_by_killing_the_player`
+    /// is the one that starts the way the app does.
+    ///
+    /// Two blocks above the surface, not exactly on it: the eye is 1.62 above
+    /// the feet, so this leaves a fraction of a block to settle -- well inside
+    /// the 3-block safe fall, and it avoids having to reach for the private
+    /// eye-height constant from another crate.
+    fn place_player_on_ground(&mut self) {
+        let Some(terrain) = self.terrain else {
+            return;
+        };
+        let p = self.sim.player.pos;
+        let Some(hit) = self
+            .world
+            .raycast([p.x, 200.0, p.z], [0.0, -1.0, 0.0], 400.0, terrain)
+        else {
+            return;
+        };
+        let standing = glam::vec3(p.x, hit.block[1] as f32 + 2.0, p.z);
+        self.sim.player.pos = standing;
+        self.sim.player.velocity = glam::Vec3::ZERO;
+        self.sim.player.fall_distance = 0.0;
+        // Death returns here, not to wherever `Game::new` happened to start.
+        self.sim.player.spawn = standing;
+        self.prev_player = self.sim.player;
+    }
+
     /// The player's health, reduced to what the renderer draws
     /// (`PHASE2_ARCHITECTURE.md` §13.1).
     ///
@@ -477,6 +510,9 @@ impl Game {
         );
         self.blocks_registry = Some(registry);
         self.smelting = Some(load_smelt_book(&items));
+        // Terrain is known for the first time here, so this is where the player
+        // can be put somewhere that exists.
+        self.place_player_on_ground();
         self.items = Some(items);
         self.recipes = Some(recipes);
     }
@@ -853,32 +889,44 @@ impl Game {
             return;
         };
 
-        // Bring the simulation radius up to date first (§11): chunks the player
-        // has left go dormant, chunks they have reached wake up and are caught
-        // up by exactly the ticks they missed.
+        // Bring the simulation radius up to date (§11): chunks the player has
+        // left go dormant, chunks they have reached wake up.
+        //
+        // Only when the player has actually changed chunk. Standing still can
+        // change no chunk's state, and this walks a (2r+1)²x3 box -- 243
+        // lookups at radius 4 -- which is pure waste every tick the player is
+        // not moving, which is most of them.
         let centre = ChunkCoord::from_world_pos(self.sim.player.pos.to_array());
         let now = self.sim.tick;
-        let woken =
-            Arc::make_mut(&mut self.world).update_simulation_radius(centre, SIM_RADIUS_CHUNKS, now);
+        let woken = if self.sim_centre == Some(centre) {
+            Vec::new()
+        } else {
+            self.sim_centre = Some(centre);
+            Arc::make_mut(&mut self.world).update_simulation_radius(centre, SIM_RADIUS_CHUNKS, now)
+        };
+        let caught_up: std::collections::BTreeMap<ChunkCoord, u64> =
+            woken.into_iter().map(|w| (w.coord, w.elapsed)).collect();
 
-        // Catch-up, then the ordinary tick. Both go through `Furnace::advance`
-        // with an elapsed count -- the property block 2.4c built and proved
-        // (§11.3), which is why waking a chunk is not a special case.
         let world = Arc::make_mut(&mut self.world);
-        for w in woken {
-            for pos in block_entity_positions_in(world, w.coord) {
-                advance_furnace(world, pos, w.elapsed, items, smelting);
-            }
+        let positions = world.block_entity_positions();
+        if positions.is_empty() {
+            return;
         }
 
-        // Only Active chunks tick. A dormant chunk's furnaces are not stopped,
-        // they are deferred -- the catch-up above is what makes that the same
-        // thing.
-        let active: Vec<ChunkCoord> = world.chunk_states().active().collect();
-        for coord in active {
-            for pos in block_entity_positions_in(world, coord) {
-                advance_furnace(world, pos, 1, items, smelting);
+        // **One pass over the block entities**, not one pass per chunk. The
+        // obvious shape -- for each active chunk, find the entities in it --
+        // is O(chunks x entities) and allocates a vector of every block entity
+        // in the world for each of the 243 chunks in range. This is O(entities).
+        for pos in positions {
+            let coord = ChunkCoord::from_block(pos[0], pos[1], pos[2]);
+            if world.chunk_states().get(coord) != ChunkState::Active {
+                continue;
             }
+            // A chunk that woke this tick owes the ticks it slept through *plus*
+            // this one -- the same total the two-pass version produced, which is
+            // what keeps the dormancy gate test passing.
+            let ticks = caught_up.get(&coord).copied().unwrap_or(0) + 1;
+            advance_furnace(world, pos, ticks, items, smelting);
         }
     }
 
@@ -2456,6 +2504,15 @@ mod tests {
             "respawned at full health"
         );
         assert_eq!(game.sim.player.inventory, carried, "and kept the pick");
+        // **Position too.** Without this the test passed while respawn did not
+        // actually move anyone: `physics::step` wrote `player.pos` from its own
+        // local box *after* the damage was applied, silently undoing the
+        // respawn. Health and inventory alone could not see that.
+        assert!(
+            game.sim.player.pos.distance(spawn) < 2.5,
+            "respawned at {} rather than near spawn {spawn}",
+            game.sim.player.pos
+        );
     }
 
     #[test]
@@ -2501,5 +2558,65 @@ mod tests {
             cubara_sim::MAX_HEALTH,
             "free-fly descent cost health"
         );
+    }
+
+    #[test]
+    fn the_game_does_not_start_by_killing_the_player() {
+        // **The test that was missing.** Every other test in this file
+        // repositions the player just above the ground before doing anything,
+        // so none of them started the game the way the app does -- and the app
+        // started it 32 blocks above the terrain, which block 2.9a turned into
+        // 29 damage against 20 health. The player died on the first landing,
+        // respawned at the same mid-air point, and died again, forever.
+        let mut game = Game::new();
+        let items = load_item_registry();
+        let recipes = load_recipe_book(&items);
+        game.set_assets(
+            std::sync::Arc::new(cubara_render::load_registry()),
+            items,
+            recipes,
+        );
+
+        for _ in 0..600 {
+            game.advance(TICK_DT);
+        }
+
+        assert!(
+            game.sim.player.on_ground,
+            "the player never settled on the ground"
+        );
+        assert_eq!(
+            game.sim.player.health,
+            cubara_sim::MAX_HEALTH,
+            "starting the game cost {} health",
+            cubara_sim::MAX_HEALTH - game.sim.player.health
+        );
+    }
+
+    #[test]
+    fn the_spawn_point_is_somewhere_survivable() {
+        // The other half: respawning must not drop the player into a lethal
+        // fall, or death becomes a loop rather than a setback.
+        let mut game = Game::new();
+        let items = load_item_registry();
+        let recipes = load_recipe_book(&items);
+        game.set_assets(
+            std::sync::Arc::new(cubara_render::load_registry()),
+            items,
+            recipes,
+        );
+
+        // Kill them outright, then let the world run.
+        game.sim.player.take_damage(cubara_sim::MAX_HEALTH);
+        for _ in 0..600 {
+            game.advance(TICK_DT);
+        }
+
+        assert_eq!(
+            game.sim.player.health,
+            cubara_sim::MAX_HEALTH,
+            "respawning cost health, so death loops"
+        );
+        assert!(game.sim.player.on_ground, "and it landed");
     }
 }

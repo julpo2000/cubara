@@ -128,17 +128,25 @@ pub(crate) fn step(
     if !player.on_ground && dropped > 0.0 {
         player.fall_distance += dropped;
     }
-    if player.on_ground {
-        let damage = Player::fall_damage_for(player.fall_distance);
-        player.fall_distance = 0.0;
-        player.take_damage(damage);
-    }
-
     let aabb = move_axis_with_step(aabb, 0, player.velocity.x * dt, was_on_ground, &is_solid);
     let aabb = move_axis_with_step(aabb, 2, player.velocity.z * dt, was_on_ground, &is_solid);
 
     let feet = aabb.feet();
     player.pos = Vec3::new(feet.x, feet.y + EYE_HEIGHT, feet.z);
+
+    // **Fall damage is applied last, after the position write above.**
+    //
+    // `take_damage` can kill, and dying respawns -- which sets `pos` and
+    // `velocity`. Anything that writes `player.pos` afterwards silently undoes
+    // that, leaving a dead player standing at full health exactly where they
+    // fell. This was a real bug: applying the damage during the Y phase, which
+    // reads naturally, put it *before* the write and the respawn never took
+    // effect. `a_lethal_fall_actually_moves_the_player_to_spawn` pins it.
+    if player.on_ground {
+        let damage = Player::fall_damage_for(player.fall_distance);
+        player.fall_distance = 0.0;
+        player.take_damage(damage);
+    }
 }
 
 /// Half-extent of a dropped item's collision box. Small enough to rest in a
@@ -381,8 +389,19 @@ mod tests {
 
     #[test]
     fn never_tunnels_through_the_floor_across_a_spread_of_velocities() {
+        // Fifteen blocks up, not thirty. The subject here is the **sweep** --
+        // that a fast-moving box never passes through the floor -- and speed is
+        // what varies. Height only has to leave room to accelerate.
+        //
+        // Thirty was fine until block 2.9a made falling hurt: a 30-block drop
+        // deals 26 damage against 20 health, so the player died on landing and
+        // respawned back at the drop point, which is where `Player::new` put
+        // their spawn. The test then looped forever without ever landing. That
+        // was the test correctly objecting to something real -- see
+        // `the_game_does_not_start_by_killing_the_player` -- but it is not what
+        // *this* test is about.
         for speed in [1.0_f32, 10.0, 32.0, 60.0, 100.0, 250.0] {
-            let mut player = Player::new(vec3(0.5, 30.0, 0.5), 0.0, 0.0);
+            let mut player = Player::new(vec3(0.5, 15.0, 0.5), 0.0, 0.0);
             player.velocity.y = -speed;
             for _ in 0..600 {
                 step(&mut player, &no_input(), 1.0 / 60.0, flat_floor);
@@ -498,6 +517,36 @@ mod tests {
         assert!(
             player.pos.y < -5.0,
             "free-fly flew straight through the floor"
+        );
+    }
+}
+
+#[cfg(test)]
+mod respawn_tests {
+    use super::*;
+    use crate::player::MAX_HEALTH;
+    use crate::InputFrame;
+
+    /// Solid below y = 0.
+    fn floor(_x: i32, y: i32, _z: i32) -> bool {
+        y < 0
+    }
+
+    #[test]
+    fn a_lethal_fall_actually_moves_the_player_to_spawn() {
+        let spawn = Vec3::new(100.0, 50.0, 100.0);
+        let mut p = Player::new(spawn, 0.0, 0.0);
+        // Falling fast enough, far above the floor, with a killing fall banked.
+        p.pos = Vec3::new(0.0, 1.9, 0.0);
+        p.velocity = Vec3::new(0.0, -60.0, 0.0);
+        p.fall_distance = 100.0;
+
+        step(&mut p, &InputFrame::default(), 1.0 / 60.0, floor);
+
+        assert_eq!(p.health, MAX_HEALTH, "died and respawned at full health");
+        assert_eq!(
+            p.pos, spawn,
+            "but the position was left at the death site instead of spawn"
         );
     }
 }
