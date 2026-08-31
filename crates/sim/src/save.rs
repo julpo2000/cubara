@@ -33,7 +33,7 @@ use crate::Sim;
 /// [`cubara_world::region::REGION_FORMAT_VERSION`] and of
 /// [`cubara_world::WORLDGEN_VERSION`]; each names a different thing that
 /// can change on its own schedule.
-pub const FORMAT_VERSION: u16 = 2;
+pub const FORMAT_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SavedRng {
@@ -71,15 +71,15 @@ struct SavedFurnace {
 struct SavedEntity {
     key: u64,
     stack: SavedStack,
-    pos: (f32, f32, f32),
-    vel: (f32, f32, f32),
+    pos: (i64, i64, i64),
+    vel: (i64, i64, i64),
     age: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SavedPlayer {
-    pos: (f32, f32, f32),
-    vel: (f32, f32, f32),
+    pos: (i64, i64, i64),
+    vel: (i64, i64, i64),
     yaw: f32,
     pitch: f32,
     on_ground: bool,
@@ -103,7 +103,7 @@ struct SavedPlayer {
     ticks_since_damage: u32,
     /// Where death returns the player to.
     #[serde(default)]
-    spawn: (f32, f32, f32),
+    spawn: (i64, i64, i64),
 }
 
 /// A save written before block 2.9a has no health field; a loaded player is
@@ -229,6 +229,23 @@ impl std::fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
+/// A position in the saved form: **raw sub-units**, not blocks-as-float.
+///
+/// Saving `f32` would throw away the precision fixed-point exists to keep, and
+/// would put a float back into a file two machines must agree on.
+fn to_xyz(v: cubara_voxel::FixedVec3) -> (i64, i64, i64) {
+    (v.x.raw(), v.y.raw(), v.z.raw())
+}
+
+/// The inverse of [`to_xyz`].
+fn from_xyz(v: (i64, i64, i64)) -> cubara_voxel::FixedVec3 {
+    cubara_voxel::FixedVec3::new(
+        cubara_voxel::Fixed::from_raw(v.0),
+        cubara_voxel::Fixed::from_raw(v.1),
+        cubara_voxel::Fixed::from_raw(v.2),
+    )
+}
+
 /// A furnace slot's `(id, count)` as an [`ItemStack`], so the same
 /// [`to_saved`] path serialises it. Furnace slots never hold durability.
 fn stack_of(slot: Option<(ItemId, u8)>, items: &ItemRegistry) -> Option<ItemStack> {
@@ -298,8 +315,8 @@ pub fn save_world(
             inc: sim.rng.inc,
         },
         player: SavedPlayer {
-            pos: sim.player.pos.into(),
-            vel: sim.player.velocity.into(),
+            pos: to_xyz(sim.player.pos),
+            vel: to_xyz(sim.player.velocity),
             yaw: sim.player.yaw,
             pitch: sim.player.pitch,
             on_ground: sim.player.on_ground,
@@ -315,7 +332,7 @@ pub fn save_world(
             held: to_saved(sim.player.crafting.held(), items),
             health: sim.player.health,
             ticks_since_damage: sim.player.ticks_since_damage,
-            spawn: sim.player.spawn.into(),
+            spawn: to_xyz(sim.player.spawn),
         },
         blocks: blocks_table,
         items: items
@@ -341,8 +358,8 @@ pub fn save_world(
                 Some(SavedEntity {
                     key: key.0,
                     stack: to_saved(Some(d.stack), items)?,
-                    pos: d.pos.into(),
-                    vel: d.velocity.into(),
+                    pos: to_xyz(d.pos),
+                    vel: to_xyz(d.velocity),
                     age: d.age,
                 })
             })
@@ -415,16 +432,8 @@ pub fn load_world(
     }
 
     let player = Player {
-        pos: glam::Vec3::new(
-            header.player.pos.0,
-            header.player.pos.1,
-            header.player.pos.2,
-        ),
-        velocity: glam::Vec3::new(
-            header.player.vel.0,
-            header.player.vel.1,
-            header.player.vel.2,
-        ),
+        pos: from_xyz(header.player.pos),
+        velocity: from_xyz(header.player.vel),
         on_ground: header.player.on_ground,
         free_fly: header.player.free_fly,
         yaw: header.player.yaw,
@@ -444,12 +453,8 @@ pub fn load_world(
         // Transient and derived (§13.3): a loaded world starts the player on
         // the ground, and carrying a half-completed fall across a reload would
         // be a fall the player never made.
-        fall_distance: 0.0,
-        spawn: glam::Vec3::new(
-            header.player.spawn.0,
-            header.player.spawn.1,
-            header.player.spawn.2,
-        ),
+        fall_distance: cubara_voxel::Fixed::ZERO,
+        spawn: from_xyz(header.player.spawn),
         crafting: {
             let mut c = Crafting::new(header.player.grid_width);
             for (i, saved) in header.player.grid.iter().enumerate() {
@@ -481,8 +486,8 @@ pub fn load_world(
                     crate::EntityKey(saved.key),
                     crate::DroppedItem {
                         stack,
-                        pos: glam::Vec3::new(saved.pos.0, saved.pos.1, saved.pos.2),
-                        velocity: glam::Vec3::new(saved.vel.0, saved.vel.1, saved.vel.2),
+                        pos: from_xyz(saved.pos),
+                        velocity: from_xyz(saved.vel),
                         age: saved.age,
                         // Recomputed on the first tick rather than saved: it is
                         // derived from the terrain under it, which is

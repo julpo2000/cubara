@@ -27,7 +27,7 @@
 //! than merely stated: it forces archetype churn and asserts the simulation
 //! lands in the same place.
 
-use glam::Vec3;
+use cubara_voxel::{Fixed, FixedVec3};
 
 use cubara_voxel::{ItemRegistry, ItemStack, Rarity};
 
@@ -46,8 +46,8 @@ pub struct EntityKey(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DroppedItem {
     pub stack: ItemStack,
-    pub pos: Vec3,
-    pub velocity: Vec3,
+    pub pos: FixedVec3,
+    pub velocity: FixedVec3,
     /// Ticks since it was dropped, against its rarity's despawn time (§10.5).
     pub age: u32,
     pub on_ground: bool,
@@ -55,7 +55,10 @@ pub struct DroppedItem {
 
 /// How close the player must come to collect an item, in blocks. Tuning, so it
 /// is one named constant rather than a literal in the pickup loop.
-pub const PICKUP_RADIUS: f32 = 1.5;
+pub const PICKUP_RADIUS_SQ: i128 = {
+    let r = 3 * cubara_voxel::fixed::ONE / 2; // 1.5 blocks, in sub-units
+    (r as i128) * (r as i128)
+};
 
 /// The world's entities, and the counter that names them.
 ///
@@ -121,7 +124,12 @@ impl Entities {
     }
 
     /// Drop `stack` at `pos` with an initial `velocity`.
-    pub fn spawn_item(&mut self, stack: ItemStack, pos: Vec3, velocity: Vec3) -> EntityKey {
+    pub fn spawn_item(
+        &mut self,
+        stack: ItemStack,
+        pos: FixedVec3,
+        velocity: FixedVec3,
+    ) -> EntityKey {
         let key = EntityKey(self.next_key);
         self.next_key += 1;
         self.world.spawn((
@@ -175,20 +183,15 @@ impl Entities {
     ///
     /// Pickup is *not* here — it is order-dependent and lives in
     /// [`collect_nearby`](Self::collect_nearby), which sorts first.
-    pub fn tick(
-        &mut self,
-        dt: f32,
-        items: &ItemRegistry,
-        is_solid: impl Fn(i32, i32, i32) -> bool + Copy,
-    ) {
+    pub fn tick(&mut self, items: &ItemRegistry, is_solid: impl Fn(i32, i32, i32) -> bool + Copy) {
         let mut expired: Vec<hecs::Entity> = Vec::new();
         for (_, entity, _) in self.all() {
             let Ok(mut d) = self.world.get::<&mut DroppedItem>(entity) else {
                 continue;
             };
-            if !d.on_ground || d.velocity.y != 0.0 {
+            if !d.on_ground || d.velocity.y != Fixed::ZERO {
                 let (mut pos, mut vel) = (d.pos, d.velocity);
-                d.on_ground = physics::step_item(&mut pos, &mut vel, dt, is_solid);
+                d.on_ground = physics::step_item(&mut pos, &mut vel, is_solid);
                 d.pos = pos;
                 d.velocity = vel;
             }
@@ -219,14 +222,14 @@ impl Entities {
     /// is the bug this whole block exists to fix.
     pub fn collect_nearby(
         &mut self,
-        player_pos: Vec3,
+        player_pos: FixedVec3,
         inventory: &mut Inventory,
         items: &ItemRegistry,
     ) -> u32 {
         let mut candidates: Vec<(EntityKey, hecs::Entity, DroppedItem)> = self
             .all()
             .into_iter()
-            .filter(|(_, _, d)| d.pos.distance(player_pos) <= PICKUP_RADIUS)
+            .filter(|(_, _, d)| d.pos.distance_squared(player_pos) <= PICKUP_RADIUS_SQ)
             .collect();
         candidates.sort_by_key(|(k, _, _)| *k);
 
@@ -310,19 +313,19 @@ mod tests {
         let mut e = Entities::new();
         e.spawn_item(
             stack(&items, "cubara:stone", 1),
-            Vec3::new(0.5, 8.0, 0.5),
-            Vec3::ZERO,
+            FixedVec3::from_f32([0.5, 8.0, 0.5]),
+            FixedVec3::ZERO,
         );
 
         for _ in 0..240 {
-            e.tick(1.0 / 60.0, &items, floor);
+            e.tick(&items, floor);
         }
 
         let (_, d) = e.sorted()[0];
         assert!(d.on_ground, "it landed");
         assert!(
-            (d.pos.y - physics::ITEM_HALF).abs() < 0.01,
-            "resting on the floor, not sunk through it: y = {}",
+            (d.pos.y - physics::ITEM_HALF).abs() < Fixed::from_raw(cubara_voxel::fixed::ONE / 100),
+            "resting on the floor, not sunk through it: y = {:?}",
             d.pos.y
         );
     }
@@ -334,20 +337,20 @@ mod tests {
         let mut inv = Inventory::default();
         e.spawn_item(
             stack(&items, "cubara:stone", 5),
-            Vec3::new(0.0, 0.0, 0.0),
-            Vec3::ZERO,
+            FixedVec3::from_f32([0.0, 0.0, 0.0]),
+            FixedVec3::ZERO,
         );
 
         // Too far.
         assert_eq!(
-            e.collect_nearby(Vec3::new(10.0, 0.0, 0.0), &mut inv, &items),
+            e.collect_nearby(FixedVec3::from_f32([10.0, 0.0, 0.0]), &mut inv, &items),
             0
         );
         assert_eq!(e.len(), 1);
 
         // Close enough.
         assert_eq!(
-            e.collect_nearby(Vec3::new(0.5, 0.0, 0.0), &mut inv, &items),
+            e.collect_nearby(FixedVec3::from_f32([0.5, 0.0, 0.0]), &mut inv, &items),
             1
         );
         assert_eq!(e.len(), 0, "the entity is gone");
@@ -364,9 +367,13 @@ mod tests {
         for i in 0..crate::inventory::SLOT_COUNT {
             inv.set_slot(i, Some(stack(&items, "cubara:raw_iron", 64)));
         }
-        e.spawn_item(stack(&items, "cubara:stone", 3), Vec3::ZERO, Vec3::ZERO);
+        e.spawn_item(
+            stack(&items, "cubara:stone", 3),
+            FixedVec3::ZERO,
+            FixedVec3::ZERO,
+        );
 
-        assert_eq!(e.collect_nearby(Vec3::ZERO, &mut inv, &items), 0);
+        assert_eq!(e.collect_nearby(FixedVec3::ZERO, &mut inv, &items), 0);
         assert_eq!(e.len(), 1, "still on the floor");
         assert_eq!(e.sorted()[0].1.stack.count(), 3, "and still all of it");
     }
@@ -381,16 +388,16 @@ mod tests {
         ];
         for (name, limit) in cases {
             let mut e = Entities::new();
-            e.spawn_item(stack(&items, name, 1), Vec3::ZERO, Vec3::ZERO);
+            e.spawn_item(stack(&items, name, 1), FixedVec3::ZERO, FixedVec3::ZERO);
             let run = limit.unwrap_or(200_000);
 
             // One tick short of the boundary it must still be there.
             for _ in 0..run - 1 {
-                e.tick(1.0 / 60.0, &items, floor);
+                e.tick(&items, floor);
             }
             assert_eq!(e.len(), 1, "{name} vanished early");
 
-            e.tick(1.0 / 60.0, &items, floor);
+            e.tick(&items, floor);
             match limit {
                 Some(_) => assert_eq!(e.len(), 0, "{name} should have despawned"),
                 None => assert_eq!(e.len(), 1, "{name} must never despawn"),
@@ -416,25 +423,25 @@ mod tests {
                 for _ in 0..8 {
                     keys.push(e.spawn_item(
                         stack(&items, "cubara:stone", 1),
-                        Vec3::ZERO,
-                        Vec3::ZERO,
+                        FixedVec3::ZERO,
+                        FixedVec3::ZERO,
                     ));
                 }
                 // Age them past Common's despawn so they are removed.
                 for _ in 0..18_000 {
-                    e.tick(1.0 / 60.0, &items, floor);
+                    e.tick(&items, floor);
                 }
                 assert!(e.is_empty(), "churn removed them");
             }
             for &i in order {
                 e.spawn_item(
                     stack(&items, names[i], 2),
-                    Vec3::new(i as f32, 4.0, 0.0),
-                    Vec3::ZERO,
+                    FixedVec3::from_f32([i as f32, 4.0, 0.0]),
+                    FixedVec3::ZERO,
                 );
             }
             for _ in 0..600 {
-                e.tick(1.0 / 60.0, &items, floor);
+                e.tick(&items, floor);
             }
             e.sorted()
         };
@@ -462,12 +469,20 @@ mod tests {
         // alike, which is exactly what `hecs::Entity`'s generation does.
         let items = registry();
         let mut e = Entities::new();
-        let first = e.spawn_item(stack(&items, "cubara:stone", 1), Vec3::ZERO, Vec3::ZERO);
+        let first = e.spawn_item(
+            stack(&items, "cubara:stone", 1),
+            FixedVec3::ZERO,
+            FixedVec3::ZERO,
+        );
         for _ in 0..18_000 {
-            e.tick(1.0 / 60.0, &items, floor);
+            e.tick(&items, floor);
         }
         assert!(e.is_empty());
-        let second = e.spawn_item(stack(&items, "cubara:stone", 1), Vec3::ZERO, Vec3::ZERO);
+        let second = e.spawn_item(
+            stack(&items, "cubara:stone", 1),
+            FixedVec3::ZERO,
+            FixedVec3::ZERO,
+        );
         assert_ne!(first, second);
         assert!(second.0 > first.0);
     }
@@ -478,20 +493,23 @@ mod tests {
         let mut e = Entities::new();
         e.spawn_item(
             stack(&items, "cubara:stone", 1),
-            Vec3::new(0.5, 2.0, 0.5),
-            Vec3::new(3.0, 0.0, -2.0),
+            FixedVec3::from_f32([0.5, 2.0, 0.5]),
+            FixedVec3::from_f32([3.0, 0.0, -2.0]),
         );
         for _ in 0..120 {
-            e.tick(1.0 / 60.0, &items, floor);
+            e.tick(&items, floor);
         }
         let settled = e.sorted()[0].1.pos;
         for _ in 0..600 {
-            e.tick(1.0 / 60.0, &items, floor);
+            e.tick(&items, floor);
         }
         let later = e.sorted()[0].1.pos;
-        assert!(
-            settled.distance(later) < 1e-3,
-            "a resting item slid from {settled} to {later}"
+        // Exactly zero, not "within a tolerance". A resting item in integer
+        // arithmetic does not drift a little; it does not drift at all, and
+        // asserting the weaker thing would stop noticing if it started to.
+        assert_eq!(
+            settled, later,
+            "a resting item moved: {settled:?} then {later:?}"
         );
         let _ = ItemState::None;
     }

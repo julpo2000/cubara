@@ -19,7 +19,7 @@ mod rng;
 mod save;
 
 pub use crafting::{Crafting, SlotRef};
-pub use entity::{despawn_ticks, DroppedItem, Entities, EntityKey, PICKUP_RADIUS};
+pub use entity::{despawn_ticks, DroppedItem, Entities, EntityKey, PICKUP_RADIUS_SQ};
 pub use hash::{hash_region, WorldHash};
 pub use input::InputFrame;
 pub use inventory::{Inventory, HOTBAR_WIDTH, SLOT_COUNT};
@@ -107,7 +107,7 @@ impl Sim {
             return;
         }
         self.entities
-            .tick(TICK_DT, items, |x, y, z| world.is_solid_at(x, y, z, blocks));
+            .tick(items, |x, y, z| world.is_solid_at(x, y, z, blocks));
         self.entities
             .collect_nearby(self.player.pos, &mut self.player.inventory, items);
     }
@@ -117,14 +117,14 @@ impl Sim {
             self.player.free_fly = !self.player.free_fly;
         }
         if self.player.free_fly {
-            self.player.velocity = glam::Vec3::ZERO;
+            self.player.velocity = cubara_voxel::FixedVec3::ZERO;
             self.player.on_ground = false;
             // Free-fly is a debug mode and must never hurt: dropping out of it
             // should not kill you (§13.3), so the accumulated fall goes with it.
-            self.player.fall_distance = 0.0;
+            self.player.fall_distance = cubara_voxel::Fixed::ZERO;
             self.player.apply_free_fly(input, TICK_DT);
         } else {
-            physics::step(&mut self.player, input, TICK_DT, |x, y, z| {
+            physics::step(&mut self.player, input, |x, y, z| {
                 world.is_solid_at(x, y, z, blocks)
             });
         }
@@ -133,7 +133,12 @@ impl Sim {
         self.player.tick_regeneration();
         self.target = world
             .raycast(
-                self.player.pos.to_array(),
+                // Raycasting takes floats, and its answer is a *block* -- the
+                // conversion cannot move which block is hit by more than a
+                // sub-unit. The ray direction is float regardless, since it
+                // comes from `yaw`/`pitch` through trig; angles are the other
+                // half of this migration (RESEARCH_MULTIPLAYER §3.5).
+                self.player.pos.to_f32(),
                 self.player.look_dir().to_array(),
                 REACH,
                 blocks,
@@ -166,7 +171,7 @@ mod tests {
     #[test]
     fn tick_counter_advances_by_exactly_one_per_call() {
         let mut world = World::new();
-        let mut sim = Sim::new(0, Player::new(glam::Vec3::ZERO, 0.0, 0.0));
+        let mut sim = Sim::new(0, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
         for expected in 1..=100u64 {
             sim.tick(&mut world, &no_input(), blocks());
             assert_eq!(sim.tick, expected);
@@ -180,7 +185,7 @@ mod tests {
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, blocks())
             .expect("ground below");
         // Hover just above the surface, looking straight down at it.
-        let eye = glam::vec3(0.5, ground.block[1] as f32 + 3.5, 0.5);
+        let eye = cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 3.5, 0.5]);
         let mut sim = Sim::new(0, Player::new(eye, 0.0, -std::f32::consts::FRAC_PI_2));
         sim.player.free_fly = true; // hold position -- only the raycast matters here
         sim.tick(&mut world, &no_input(), blocks());
@@ -192,7 +197,14 @@ mod tests {
         let mut world = World::new();
         // High above the terrain, looking straight up into open sky: nothing
         // solid within REACH in either direction.
-        let mut sim = Sim::new(0, Player::new(glam::vec3(0.5, 500.0, 0.5), 0.0, 0.0));
+        let mut sim = Sim::new(
+            0,
+            Player::new(
+                cubara_voxel::FixedVec3::from_f32([0.5, 500.0, 0.5]),
+                0.0,
+                0.0,
+            ),
+        );
         sim.player.free_fly = true;
         sim.tick(&mut world, &no_input(), blocks());
         assert_eq!(sim.target, None);
@@ -201,8 +213,8 @@ mod tests {
     #[test]
     fn roll_draws_from_the_seeded_stream_not_a_global() {
         let mut world = World::new();
-        let mut a = Sim::new(1, Player::new(glam::Vec3::ZERO, 0.0, 0.0));
-        let mut b = Sim::new(1, Player::new(glam::Vec3::ZERO, 0.0, 0.0));
+        let mut a = Sim::new(1, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
+        let mut b = Sim::new(1, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
         a.tick(&mut world, &no_input(), blocks());
         b.tick(&mut world, &no_input(), blocks());
         assert_eq!(a.roll(), b.roll(), "same seed, same tick, same roll");
@@ -220,7 +232,7 @@ mod tests {
         let ground = world
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, blocks())
             .expect("ground below");
-        let spawn = glam::vec3(0.5, ground.block[1] as f32 + 10.0, 0.5);
+        let spawn = cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 10.0, 0.5]);
         let mut sim = Sim::new(7, Player::new(spawn, 0.0, 0.0));
         let wander = InputFrame {
             move_axes: [0.0, 0.0, 1.0],
@@ -240,8 +252,8 @@ mod tests {
                 "tick {i}: player collision box intersects a solid voxel"
             );
             assert!(
-                sim.player.pos.y > -1000.0,
-                "tick {i}: fell through the world, y = {}",
+                sim.player.pos.y > cubara_voxel::Fixed::from_blocks(-1000),
+                "tick {i}: fell through the world, y = {:?}",
                 sim.player.pos.y
             );
         }
