@@ -318,9 +318,14 @@ struct DifferingPixel {
 
 fn differing_pixels(a: &Frame, b: &Frame) -> Vec<DifferingPixel> {
     let w = a.width as usize;
+    // `as_chunks`, not `chunks_exact(4)`: clippy's
+    // `chunks_exact_to_as_chunks` denies the latter for a constant size, and
+    // `headless::compare` already reads its pixels this way.
     a.pixels
-        .chunks_exact(4)
-        .zip(b.pixels.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(b.pixels.as_chunks::<4>().0)
         .enumerate()
         .filter(|(_, (pa, pb))| pa != pb)
         .map(|(i, (pa, pb))| DifferingPixel {
