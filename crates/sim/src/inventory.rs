@@ -189,6 +189,7 @@ mod tests {
                     max_stack,
                     durability,
                     tier: 0,
+                    speed: None,
                 },
             )
         };

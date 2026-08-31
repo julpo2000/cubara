@@ -161,6 +161,13 @@ pub struct ItemDef {
     /// both are tier 0.
     #[serde(default)]
     pub tier: u8,
+    /// How fast this breaks blocks (`PHASE2_ARCHITECTURE.md` §4.3).
+    ///
+    /// Absent means **1**, which is also the empty hand's speed -- so "dig soil
+    /// by hand" and "mine stone with an iron pick" are the same code path with
+    /// different numbers, rather than one being a special case.
+    #[serde(default)]
+    pub speed: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -233,6 +240,7 @@ struct Entry {
     max_stack: u8,
     durability: Option<u16>,
     tier: u8,
+    speed: Option<u32>,
 }
 
 /// Which items exist, and the runtime ids assigned to them.
@@ -316,6 +324,7 @@ impl ItemRegistry {
             max_stack: 1,
             durability: None,
             tier: 0,
+            speed: None,
         }];
         let mut by_name = HashMap::new();
         by_name.insert("cubara:none".to_string(), ItemId::NONE);
@@ -328,6 +337,7 @@ impl ItemRegistry {
                 max_stack: def.max_stack,
                 durability: def.durability,
                 tier: def.tier,
+                speed: def.speed,
             });
         }
 
@@ -367,6 +377,15 @@ impl ItemRegistry {
         self.entries.get(id.0 as usize).map(|e| e.tier).unwrap_or(0)
     }
 
+    /// How fast `id` breaks blocks (§4.3). **1** for anything that does not
+    /// declare a speed, which is the same answer as an empty hand.
+    pub fn speed(&self, id: ItemId) -> u32 {
+        self.entries
+            .get(id.0 as usize)
+            .and_then(|e| e.speed)
+            .unwrap_or(1)
+    }
+
     pub fn ids(&self) -> impl Iterator<Item = ItemId> + '_ {
         (0..self.entries.len()).map(|i| ItemId(i as u16))
     }
@@ -395,6 +414,7 @@ mod tests {
                 max_stack,
                 durability,
                 tier: 0,
+                speed: None,
             },
         )
     }

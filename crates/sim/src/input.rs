@@ -30,4 +30,17 @@ pub struct InputFrame {
     /// Toggle free-fly debug mode, also a rising edge, same one-shot
     /// contract as [`Self::jump`].
     pub toggle_fly: bool,
+    /// Whether the break button is **held** this frame.
+    ///
+    /// Held state like [`Self::move_axes`], deliberately *not* a rising edge
+    /// like [`Self::jump`]: mining takes many ticks
+    /// (`PHASE2_ARCHITECTURE.md` §4.3) and the whole point is that holding is
+    /// what advances it. A catch-up burst applying this to every tick is
+    /// correct here, where for `jump` it would be a bug.
+    ///
+    /// It lives in the input value rather than being read from the mouse at
+    /// break time because a replay has to reproduce a mining session, and it
+    /// can only do that if "was the button down on this tick" is part of the
+    /// recorded input.
+    pub breaking: bool,
 }

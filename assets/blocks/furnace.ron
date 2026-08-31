@@ -4,4 +4,7 @@ Material(
     solid:  true,
     faces:  Sided(top: "furnace_top", side: "furnace_side", bottom: "furnace_top"),
     shapes: [Full],
+    // Ticks of work at speed 1 (PHASE2_ARCHITECTURE.md 4.3). Absent would
+    // mean unbreakable, so every shipped block declares one.
+    hardness: Some(30),
 )

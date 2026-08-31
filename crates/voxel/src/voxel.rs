@@ -677,6 +677,7 @@ mod tests {
                 shapes: vec![Shape::Full],
                 drops: DropRule::SameName,
                 requires_tier: 0,
+                hardness: Some(1),
             },
         )])
         .expect("fixture registry is valid")
@@ -784,6 +785,7 @@ mod tests {
                     shapes: vec![Shape::Full],
                     drops: DropRule::SameName,
                     requires_tier: 0,
+                    hardness: Some(1),
                 },
             )
         };
@@ -1056,6 +1058,7 @@ mod tests {
                     shapes: vec![Shape::Full],
                     drops: DropRule::SameName,
                     requires_tier: 0,
+                    hardness: Some(1),
                 },
             ),
             (
@@ -1067,6 +1070,7 @@ mod tests {
                     shapes: vec![Shape::Full],
                     drops: DropRule::SameName,
                     requires_tier: 0,
+                    hardness: Some(1),
                 },
             ),
         ])
@@ -1113,6 +1117,7 @@ mod tests {
                 shapes: vec![Shape::Full],
                 drops: DropRule::SameName,
                 requires_tier: 0,
+                hardness: Some(1),
             },
         )])
         .unwrap();

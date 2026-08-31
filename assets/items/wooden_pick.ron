@@ -10,4 +10,6 @@ ItemDef(
     durability: Some(50),
     // 0 hand, 1 wood, 2 stone, 3 iron (PHASE2_ARCHITECTURE.md 4).
     tier:       1,
+    // Blocks break in ceil(hardness / speed) ticks; the empty hand is 1.
+    speed:      Some(2),
 )

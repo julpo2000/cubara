@@ -22,6 +22,7 @@ fn test_registry() -> BlockRegistry {
                 shapes: vec![Shape::Full],
                 drops: DropRule::SameName,
                 requires_tier: 0,
+                hardness: Some(1),
             },
         ),
         (
@@ -33,6 +34,7 @@ fn test_registry() -> BlockRegistry {
                 shapes: vec![Shape::Full],
                 drops: DropRule::SameName,
                 requires_tier: 0,
+                hardness: Some(1),
             },
         ),
         (
@@ -44,6 +46,7 @@ fn test_registry() -> BlockRegistry {
                 shapes: vec![Shape::Full],
                 drops: DropRule::SameName,
                 requires_tier: 0,
+                hardness: Some(1),
             },
         ),
     ])
@@ -349,6 +352,7 @@ fn loading_with_a_registry_missing_a_saved_block_name_is_a_named_error() {
                 shapes: vec![Shape::Full],
                 drops: DropRule::SameName,
                 requires_tier: 0,
+                hardness: Some(1),
             },
         ),
         (
@@ -360,6 +364,7 @@ fn loading_with_a_registry_missing_a_saved_block_name_is_a_named_error() {
                 shapes: vec![Shape::Full],
                 drops: DropRule::SameName,
                 requires_tier: 0,
+                hardness: Some(1),
             },
         ),
     ])

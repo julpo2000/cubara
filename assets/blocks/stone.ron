@@ -10,4 +10,7 @@ Material(
     drops:  Item((item: "cubara:cobble", count: 1)),
     // Bare hands get nothing out of stone; any pick does.
     requires_tier: 1,
+    // Ticks of work at speed 1 (PHASE2_ARCHITECTURE.md 4.3). Absent would
+    // mean unbreakable, so every shipped block declares one.
+    hardness: Some(30),
 )
