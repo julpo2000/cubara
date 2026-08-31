@@ -33,3 +33,6 @@ Thumbs.db
 # Local worlds / saves (dev)
 /saves/
 /worlds/
+
+# The player's world, written by the game itself (#179). Not source.
+/saves/

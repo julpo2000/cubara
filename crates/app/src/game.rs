@@ -60,6 +60,19 @@ pub fn load_structure_registry() -> cubara_voxel::StructureRegistry {
         .expect("assets/structures must load")
 }
 
+/// Where the world lives on disk.
+///
+/// One world, in a fixed place next to the executable's project root. Named
+/// worlds and a world-picker are a gameplay/UI decision nobody has made
+/// (#179), and inventing one would be inventing a menu; this is the smallest
+/// thing that makes "still there after you close it" true, which is what
+/// `ROADMAP.md` says phase 1 delivers.
+pub fn world_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("saves/world")
+}
+
 /// Load `assets/smelting/*.ron`, resolving item names through `items`.
 pub fn load_smelt_book(items: &ItemRegistry) -> SmeltBook {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -460,6 +473,81 @@ impl Game {
         // Death returns here, not to wherever `Game::new` happened to start.
         self.sim.player.spawn = standing;
         self.prev_player = self.sim.player;
+    }
+
+    /// Write the world to disk (#179).
+    ///
+    /// Best-effort and non-fatal: a failed save is logged, not a crash. Losing
+    /// a session is bad; losing it *and* taking the window down with it is
+    /// worse, and the player may be quitting precisely because something is
+    /// already wrong.
+    pub fn save(&self) {
+        self.save_to(&world_dir());
+    }
+
+    /// [`save`](Self::save) into a specific directory -- what the tests drive,
+    /// so they never touch the real world folder.
+    pub fn save_to(&self, dir: &std::path::Path) {
+        let (Some(registry), Some(items), Some(blocks)) = (
+            self.blocks_registry.as_deref(),
+            self.items.as_ref(),
+            self.terrain,
+        ) else {
+            return;
+        };
+        match cubara_sim::save_world(dir, &self.sim, &self.world, registry, items, blocks) {
+            Ok(()) => log::info!("world saved to {}", dir.display()),
+            Err(e) => log::error!("could not save the world: {e}"),
+        }
+    }
+
+    /// Replace this game's world with the one on disk, if there is one (#179).
+    ///
+    /// Returns whether anything was loaded. A missing save is the normal first
+    /// run, not an error. A save that exists but *fails* to load is logged and
+    /// ignored rather than fatal -- most often it is a version mismatch after
+    /// the generator changed, and refusing to start the game over it would be
+    /// worse than starting a fresh world.
+    ///
+    /// **Called after `set_assets`**, which stands the player on the ground:
+    /// this overwrites that position with the saved one, so a player who
+    /// quit in a mineshaft comes back to the mineshaft.
+    pub fn load(&mut self) -> bool {
+        let dir = world_dir();
+        self.load_from(&dir)
+    }
+
+    /// [`load`](Self::load) from a specific directory.
+    pub fn load_from(&mut self, dir: &std::path::Path) -> bool {
+        let (Some(registry), Some(items), Some(blocks)) = (
+            self.blocks_registry.as_deref(),
+            self.items.as_ref(),
+            self.terrain,
+        ) else {
+            return false;
+        };
+        if !dir.join("level.ron").exists() {
+            return false;
+        }
+        match cubara_sim::load_world(dir, registry, items, blocks) {
+            Ok((sim, world)) => {
+                self.sim = sim;
+                self.world = Arc::new(world);
+                self.prev_player = self.sim.player;
+                // The simulation radius is recomputed from scratch: the saved
+                // world has no chunk lifecycle (§11), by design.
+                self.sim_centre = None;
+                log::info!("world loaded from {}", dir.display());
+                true
+            }
+            Err(e) => {
+                log::error!(
+                    "could not load {}: {e} -- starting a fresh world",
+                    dir.display()
+                );
+                false
+            }
+        }
     }
 
     /// The player's health, reduced to what the renderer draws
@@ -2718,6 +2806,80 @@ mod tests {
         assert!(
             f.progress > 0 || f.output.is_some(),
             "a furnace at y = -1000 never ticked"
+        );
+    }
+
+    /// A `Game` with assets wired, saving into a scratch directory rather than
+    /// the real world folder.
+    fn game_with_assets() -> Game {
+        let mut game = Game::new();
+        let items = load_item_registry();
+        let recipes = load_recipe_book(&items);
+        game.set_assets(
+            std::sync::Arc::new(cubara_render::load_registry()),
+            items,
+            recipes,
+        );
+        game
+    }
+
+    #[test]
+    fn a_world_survives_being_closed_and_reopened() {
+        // **#179's test, and the one that was missing.** The save *format* was
+        // tested from the start; nothing tested that a player action reaches
+        // it. `save_world`/`load_world` were never called from this crate at
+        // all, so the world was not still there after you closed it -- which is
+        // the one sentence ROADMAP.md uses to describe phase 1's result.
+        let dir = std::env::temp_dir().join(format!(
+            "cubara-app-roundtrip-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mined;
+        let carried;
+        {
+            let mut game = game_with_assets();
+            // Do something a player would: take a block, and move.
+            let ground = game
+                .world()
+                .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
+                .expect("ground");
+            mined = ground.block;
+            game.sim.player.pos = glam::vec3(0.5, mined[1] as f32 + 3.5, 0.5);
+            game.break_at(mined);
+            carried = game.sim.player.inventory;
+
+            game.save_to(&dir);
+        }
+
+        let mut reopened = game_with_assets();
+        assert!(reopened.load_from(&dir), "the save did not load");
+
+        assert!(
+            !reopened
+                .world()
+                .is_solid_at(mined[0], mined[1], mined[2], reopened.terrain()),
+            "the mined block came back"
+        );
+        assert_eq!(
+            reopened.sim.player.inventory, carried,
+            "the inventory did not survive"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_save_is_a_normal_first_run() {
+        let mut game = game_with_assets();
+        let empty = std::env::temp_dir().join("cubara-no-such-world-12345");
+        let _ = std::fs::remove_dir_all(&empty);
+        assert!(
+            !game.load_from(&empty),
+            "reported a load that did not happen"
         );
     }
 }

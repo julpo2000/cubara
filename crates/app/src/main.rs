@@ -62,6 +62,9 @@ impl ApplicationHandler for App {
         let items = load_item_registry();
         let recipes = load_recipe_book(&items);
         self.game.set_assets(registry.clone(), items, recipes);
+        // After `set_assets`, which stands the player on the ground -- loading
+        // replaces that with wherever they actually were (#179).
+        self.game.load();
         let structures = load_structure_registry();
         let ores = load_ore_registry();
         self.streaming = Some(NodeStreaming::new(
@@ -86,7 +89,14 @@ impl ApplicationHandler for App {
         };
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // #179: the world was never written anywhere. `ROADMAP.md` says
+                // phase 1 delivers a world that "is still there after you close
+                // it", and until now closing it was exactly when it stopped
+                // being there.
+                self.game.save();
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => renderer.resize(size.width, size.height),
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
@@ -97,6 +107,10 @@ impl ApplicationHandler for App {
                         grab_cursor(renderer.window(), self.cursor_captured);
                     } else if code == KeyCode::F3 && pressed {
                         renderer.toggle_debug();
+                    } else if code == KeyCode::F5 && pressed {
+                        // An explicit save as well as the one on exit: a crash
+                        // or a lost window should not have to cost the session.
+                        self.game.save();
                     } else if code == KeyCode::KeyE && pressed {
                         // The screen and the mouse are one thing: you cannot
                         // click slots while the cursor is locked to look around.
