@@ -405,6 +405,7 @@ pub(crate) fn player_intersects_solid(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cubara_voxel::Angle;
 
     /// A flat floor: solid at and below `y = 0`, air above.
     fn flat_floor(x: i32, y: i32, _z: i32) -> bool {
@@ -433,8 +434,8 @@ mod tests {
     fn gravity_pulls_a_falling_player_down() {
         let mut player = Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, 50.0, 0.5]),
-            0.0,
-            0.0,
+            Angle::ZERO,
+            Angle::ZERO,
         );
         step(&mut player, &no_input(), flat_floor);
         assert!(player.velocity.y < Fixed::ZERO);
@@ -445,8 +446,8 @@ mod tests {
     fn a_player_falling_onto_a_floor_comes_to_rest_on_ground() {
         let mut player = Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, 10.0, 0.5]),
-            0.0,
-            0.0,
+            Angle::ZERO,
+            Angle::ZERO,
         );
         for _ in 0..600 {
             step(&mut player, &no_input(), flat_floor);
@@ -475,8 +476,8 @@ mod tests {
         for speed in [1.0_f32, 10.0, 32.0, 60.0, 100.0, 250.0] {
             let mut player = Player::new(
                 cubara_voxel::FixedVec3::from_f32([0.5, 15.0, 0.5]),
-                0.0,
-                0.0,
+                Angle::ZERO,
+                Angle::ZERO,
             );
             player.velocity.y = Fixed::from_f32(-speed);
             for _ in 0..600 {
@@ -501,8 +502,8 @@ mod tests {
                 Fixed::ONE + EYE_HEIGHT,
                 Fixed::from_raw(ONE / 2),
             ),
-            0.0,
-            0.0,
+            Angle::ZERO,
+            Angle::ZERO,
         );
         // Settle onto the floor first.
         for _ in 0..60 {
@@ -538,8 +539,8 @@ mod tests {
                 Fixed::ONE + EYE_HEIGHT,
                 Fixed::from_raw(ONE / 2),
             ),
-            0.0,
-            0.0,
+            Angle::ZERO,
+            Angle::ZERO,
         );
         for _ in 0..60 {
             step(&mut player, &no_input(), flat_floor);
@@ -570,8 +571,8 @@ mod tests {
                 Fixed::ONE + EYE_HEIGHT,
                 Fixed::from_raw(ONE / 2),
             ),
-            0.0,
-            0.0,
+            Angle::ZERO,
+            Angle::ZERO,
         );
         for _ in 0..60 {
             step(&mut player, &no_input(), floor_with_one_block_step);
@@ -603,7 +604,11 @@ mod tests {
         // `player::tests`) -- this pins that free-fly is genuinely a
         // separate path with no collision, the thing that makes noclip
         // useful for debugging.
-        let mut player = Player::new(cubara_voxel::FixedVec3::from_f32([0.5, 0.5, 0.5]), 0.0, 0.0);
+        let mut player = Player::new(
+            cubara_voxel::FixedVec3::from_f32([0.5, 0.5, 0.5]),
+            Angle::ZERO,
+            Angle::ZERO,
+        );
         let down = InputFrame {
             move_axes: [0.0, -1.0, 0.0],
             ..InputFrame::default()
@@ -621,6 +626,7 @@ mod respawn_tests {
     use super::*;
     use crate::player::MAX_HEALTH;
     use crate::InputFrame;
+    use cubara_voxel::Angle;
 
     /// Solid below y = 0.
     fn floor(_x: i32, y: i32, _z: i32) -> bool {
@@ -630,7 +636,7 @@ mod respawn_tests {
     #[test]
     fn a_lethal_fall_actually_moves_the_player_to_spawn() {
         let spawn = FixedVec3::from_blocks(100, 50, 100);
-        let mut p = Player::new(spawn, 0.0, 0.0);
+        let mut p = Player::new(spawn, Angle::ZERO, Angle::ZERO);
         // Falling fast enough, far above the floor, with a killing fall banked.
         p.pos = FixedVec3::from_f32([0.0, 1.9, 0.0]);
         p.velocity = FixedVec3::from_f32([0.0, -60.0, 0.0]);

@@ -74,10 +74,6 @@ impl WorldHash {
         self.write_bytes(&v.to_le_bytes());
     }
 
-    fn write_f32(&mut self, v: f32) {
-        self.write_bytes(&v.to_le_bytes());
-    }
-
     /// Fold an independently-computed digest into this one. What lets
     /// [`hash_region`] combine each chunk's own digest into a running total
     /// in a fixed, *position*-determined order -- called once per chunk, in
@@ -98,10 +94,12 @@ impl WorldHash {
         self.write_u64(sim.rng.state);
         self.write_u64(sim.rng.inc);
         let p = &sim.player;
-        // Integers now (block 2.x, fixed-point positions): a hash folding raw
-        // f32 bits is a hash that can differ between compilers. What remains
-        // float here is `yaw`/`pitch` below -- named in
-        // `docs/RESEARCH_MULTIPLAYER.md` §3.5 as the other half of the work.
+        // **All integers.** A hash folding raw f32 bits is a hash that can
+        // differ between compilers, which would make the toolchain pin
+        // load-bearing for correctness rather than for lints
+        // (`docs/RESEARCH_MULTIPLAYER.md` §3.5). Positions moved to `Fixed` in
+        // block 2.x; yaw and pitch were the other half, and are `Angle` now.
+        // Nothing in this function is a float any more.
         self.write_i64(p.pos.x.raw());
         self.write_i64(p.pos.y.raw());
         self.write_i64(p.pos.z.raw());
@@ -110,8 +108,8 @@ impl WorldHash {
         self.write_i64(p.velocity.z.raw());
         self.write_bool(p.on_ground);
         self.write_bool(p.free_fly);
-        self.write_f32(p.yaw);
-        self.write_f32(p.pitch);
+        self.write_i32(p.yaw.raw());
+        self.write_i32(p.pitch.raw());
         // World state (§13.5): two worlds differing only in how hurt the player
         // is are different worlds, and the gate's survival replay has to see
         // damage happen. `fall_distance` is deliberately absent -- it is
@@ -337,6 +335,7 @@ pub fn hash_region(
 mod tests {
     use super::*;
     use crate::Player;
+    use cubara_voxel::Angle;
 
     fn blocks() -> TerrainBlocks {
         TerrainBlocks {
@@ -359,7 +358,10 @@ mod tests {
     #[test]
     fn identical_sims_and_worlds_hash_equal() {
         let world = World::with_seed(1);
-        let sim = Sim::new(1, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
+        let sim = Sim::new(
+            1,
+            Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO),
+        );
         let a = WorldHash::compute(&sim, &world, &region(), blocks(), 1);
         let b = WorldHash::compute(&sim, &world, &region(), blocks(), 1);
         assert_eq!(a, b);
@@ -368,8 +370,14 @@ mod tests {
     #[test]
     fn a_different_tick_count_changes_the_hash() {
         let world = World::with_seed(1);
-        let mut a = Sim::new(1, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
-        let b = Sim::new(1, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
+        let mut a = Sim::new(
+            1,
+            Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO),
+        );
+        let b = Sim::new(
+            1,
+            Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO),
+        );
         a.tick += 1;
         assert_ne!(
             WorldHash::compute(&a, &world, &region(), blocks(), 1),
@@ -379,7 +387,10 @@ mod tests {
 
     #[test]
     fn an_edit_changes_the_hash() {
-        let sim = Sim::new(1, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
+        let sim = Sim::new(
+            1,
+            Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO),
+        );
         let mut world = World::with_seed(1);
         // (0, 0, 0) is deep underground -- already solid stone -- so
         // *placing* there (`true`) would be a no-op on content; break it
@@ -397,7 +408,10 @@ mod tests {
     #[test]
     fn region_order_in_the_caller_does_not_matter() {
         let world = World::with_seed(2);
-        let sim = Sim::new(2, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
+        let sim = Sim::new(
+            2,
+            Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO),
+        );
         let forward = region();
         let mut reversed = forward.clone();
         reversed.reverse();

@@ -32,7 +32,7 @@ pub mod clock;
 pub mod headless;
 
 use cubara_sim::{InputFrame, Player, Sim};
-use cubara_voxel::{BlockRegistry, ChunkCoord, ItemRegistry, RecipeBook, SmeltBook};
+use cubara_voxel::{Angle, BlockRegistry, ChunkCoord, ItemRegistry, RecipeBook, SmeltBook};
 use std::sync::Arc;
 
 use cubara_sim::REACH;
@@ -159,7 +159,14 @@ impl Server {
     pub fn new() -> Self {
         Self {
             world: Arc::new(World::new()),
-            sim: Sim::new(0, Player::new(FixedVec3::from_blocks(0, 48, 0), 0.6, -0.3)),
+            sim: Sim::new(
+                0,
+                Player::new(
+                    FixedVec3::from_blocks(0, 48, 0),
+                    Angle::from_radians(0.6),
+                    Angle::from_radians(-0.3),
+                ),
+            ),
             blocks_registry: None,
             terrain: None,
             items: None,
@@ -656,7 +663,7 @@ impl Server {
             return None;
         };
         let origin = self.sim.player.pos.to_f32();
-        let dir = self.sim.player.look_dir().to_array();
+        let dir = self.sim.player.look_dir_f32().to_array();
         let hit = self.world.raycast(origin, dir, REACH, self.terrain())?;
         let [x, y, z] = hit.block;
         match registry.interact(self.world.block_at(x, y, z, terrain)) {
@@ -804,7 +811,7 @@ impl Server {
 
     fn break_looked_at(&mut self) -> Option<[i32; 3]> {
         let origin = self.sim.player.pos.to_f32();
-        let dir = self.sim.player.look_dir().to_array();
+        let dir = self.sim.player.look_dir_f32().to_array();
         let hit = self.world.raycast(origin, dir, REACH, self.terrain())?;
         self.break_at(hit.block);
         Some(hit.block)
@@ -826,7 +833,7 @@ impl Server {
         let block = registry.id_of(items.name_of(held.item())?)?;
 
         let origin = self.sim.player.pos.to_f32();
-        let dir = self.sim.player.look_dir().to_array();
+        let dir = self.sim.player.look_dir_f32().to_array();
         let hit = self.world.raycast(origin, dir, REACH, self.terrain())?;
         let target = [
             hit.block[0] + hit.normal[0],

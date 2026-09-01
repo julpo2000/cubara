@@ -5,6 +5,7 @@
 //! It knows nothing about the GPU beyond the vertex-buffer layout, so worldgen and
 //! the renderer can share these types without depending on each other.
 
+pub mod angle;
 pub mod block;
 pub mod bounds;
 pub mod coord;
@@ -19,6 +20,7 @@ pub mod storage;
 pub mod structure;
 pub mod voxel;
 
+pub use angle::Angle;
 pub use block::BlockId;
 pub use bounds::{build_mesh_bounded, Aabb};
 pub use coord::ChunkCoord;

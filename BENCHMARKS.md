@@ -1223,3 +1223,17 @@ p99 moved 1.04 → 1.22 ms, and the honest reading is that this scene's p99 is
 noisy rather than that a regression is hiding in it: the avg is what carries
 signal at this scale (see ¹), and the per-frame work added is one drain of an
 empty `Vec`.
+
+⁴¹ **Replacing the platform's `sin`/`cos` with a polynomial costs nothing
+measurable.** CPU/frame 0.628 → 0.630 ms, which is scatter.
+
+That is not surprising once you count the calls: trigonometry runs **twice per
+tick** (a look direction and a horizontal axis pair), or 120 times a second,
+against ~3,000 chunk nodes of meshing and culling per frame. Four multiplies and
+three adds, 120 times a second, is not measurable next to that.
+
+Worth stating because the instinct is that a hand-rolled polynomial must be
+slower than a hardware-assisted `sin`. It very well might be, per call — and it
+does not matter, because this is not a hot path. What it buys is that two
+machines cannot disagree about where a player is looking, which is not a
+performance property at all.

@@ -245,8 +245,8 @@ So the migration has two halves, and only the first is scheduled:
 
 | | Status |
 |---|---|
-| Positions and velocities → [`Fixed`] | the work starting now |
-| **Angles → fixed-point (e.g. 1/65536 turn), with a lookup or integer trig** | **not yet — named here so it is not discovered during netcode** |
+| Positions and velocities → [`Fixed`] | **done** (#184, #185) |
+| Angles → fixed-point, with integer trig | **done** — see §3.6 |
 
 Angles are deliberately second: positions are the larger surface and the one
 that also fixes a real precision limit, while angles only matter once two
@@ -598,3 +598,76 @@ authority too, and they are `ClickSlot` in §8.3's list — but they touch no wo
 state, so they cannot desynchronise a replica. They travel with the transport.
 
 **And there is still no transport.** Nothing listens on a port.
+
+
+### §3.6 Angles, and the last float out of the authority hash
+
+**Landed.** `cubara_voxel::Angle` is a **binary angle**: a full turn is 2³², so
+an `i32` covers exactly one turn.
+
+That single choice does most of the work. Wrapping is `wrapping_add` — exact, with
+no `% 2π` to get subtly wrong and no constant that is not representable. Every
+angle in the range is representable, so there is no edge to clamp at. Comparison
+is integer comparison, which is what pitch's clamp needs. Radians in [`Fixed`]
+would have had none of these: π is not representable, so wrapping would
+accumulate error, which is the exact failure this exists to prevent.
+
+`a_session_of_turning_returns_exactly_to_where_it_started` is that as a test:
+216,000 ticks of turning right and the same back lands on the identical integer.
+
+#### Integer trigonometry, and why a polynomial rather than a table
+
+`sin` and `cos` are gone from the simulation entirely. In their place, an odd
+polynomial `a₁z + a₃z³ + a₅z⁵ + a₇z⁷` in `z ∈ [0, 1]`, evaluated in 30-bit fixed
+point with `i128` intermediates, on a quarter turn folded out of the full turn by
+integer masking — the fold introduces no error of its own, because a quarter turn
+is a power of two.
+
+The coefficients are **fitted, not truncated**. The Taylor series to the same
+degree is off by 11 `Fixed` ULP: it is built to be exact near zero and spends its
+accuracy there rather than across the quarter turn. Fitting gets to **1 ULP with
+the same four multiplies**; Taylor needs five terms to match it. One ULP is the
+floor worth aiming at, because below it the precision is rounded away by `Fixed`.
+
+No table, so no build script, no 4KB of magic numbers in a source file, and no
+lazily-initialised static (which would be ambient state — Rule 2).
+
+`sine_matches_the_reference_within_one_ulp` checks it against `f64::sin` over
+200,000 angles spread across the turn, and the cardinal directions come out
+*exactly*: `sin(0) = 0`, `sin(¼ turn) = 1`, `cos(½ turn) = −1`.
+
+**It costs nothing.** CPU/frame 0.628 → 0.630 ms at radius 64, which is scatter —
+trigonometry runs twice per tick, 120 times a second, against ~3,000 chunk nodes
+of meshing per frame.
+
+#### What this changes downstream
+
+- **`WorldHash::write_sim` contains no floating-point value at all.** `write_f32`
+  is deleted, because nothing calls it. That is what returns the toolchain pin
+  to being about lints rather than being load-bearing for correctness.
+- **`InputFrame::look_delta` is an `Angle`, not pixels.** An `InputFrame` is the
+  first thing that will cross a socket, so it cannot carry a float. The
+  pixels-to-angle conversion moved to the client, which is where it belonged
+  anyway: sensitivity is a setting on the machine holding the mouse, not a fact
+  about the world.
+- **`level.ron` is at `FORMAT_VERSION` 4.** Same field names, different meaning,
+  which is exactly what a version number is for. The committed fixture was
+  re-blessed; the diff is four lines and is documented in `save_load.rs`, and
+  every file under `region/` is unchanged.
+- **A new architecture check.** `crates/**/src` in the simulation crates may not
+  call `.sin()`, `.cos()`, `.tan()`, `.atan2()`, `.asin()` or `.acos()`;
+  `angle.rs` is excluded by name, because its tests check our integer
+  trigonometry against the platform's. Verified by breaking it on purpose.
+
+#### What is still a float, honestly
+
+- **The raycast itself.** `World::raycast` takes `[f32; 3]` and steps in `f32`.
+  Basic arithmetic is correctly rounded and deterministic under IEEE 754; what
+  was *not* deterministic was the transcendental functions, and those are gone.
+  Moving the raycast to fixed-point is a separate piece of work, and this one
+  does not depend on it.
+- **`InputFrame::move_axes`** is still `[f32; 3]`, holding −1, 0 or 1. It will
+  cross the wire, so it should be integers — a small change, not named in §3.5,
+  and it travels with the transport.
+- **Free-fly movement** converts through `f32`. It is a debug mode and never
+  authoritative.

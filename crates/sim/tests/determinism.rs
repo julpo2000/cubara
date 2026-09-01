@@ -14,7 +14,7 @@
 //! with access to crate internals would be.
 
 use cubara_sim::{hash_region, InputFrame, Player, Sim, WorldHash};
-use cubara_voxel::{BlockId, ChunkCoord};
+use cubara_voxel::{Angle, BlockId, ChunkCoord};
 use cubara_world::{TerrainBlocks, World};
 
 /// Arbitrary, fixed -- the only requirement is that it never changes once
@@ -56,8 +56,8 @@ fn replay(seed: u64, script: &[InputFrame]) -> (Sim, World) {
         seed,
         Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, 40.0, 0.5]),
-            0.0,
-            0.0,
+            Angle::ZERO,
+            Angle::ZERO,
         ),
     );
     for input in script {
@@ -80,8 +80,8 @@ fn replay_with_edits(
         seed,
         Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, 40.0, 0.5]),
-            0.0,
-            0.0,
+            Angle::ZERO,
+            Angle::ZERO,
         ),
     );
     for (i, input) in script.iter().enumerate() {
@@ -110,7 +110,7 @@ fn fixture_script() -> Vec<InputFrame> {
 
     let walking = InputFrame {
         move_axes: [0.0, 0.0, 1.0],
-        look_delta: [1.0, 0.0],
+        look_delta: [pixels(1.0), Angle::ZERO],
         ..InputFrame::default()
     };
     for _ in 0..180 {
@@ -174,15 +174,24 @@ fn fixture_edits() -> Vec<(usize, [i32; 3], BlockId)> {
 /// | `0xede5_39f2_ee54_4d2a` | block 2.1b (#136), inventory added to the hash |
 /// | `0xc763_3252_db46_3e78` | block 2.2b (#148), crafting grid + cursor added |
 /// | `0x4f74_448e_2b83_20bb` | block 2.9a (#172), health + regen counter added |
-/// | `0xe7dc_d72a_011b_4f9b` | fixed-point positions — the hash stopped folding in `f32` bits |
+/// | `0xe7dc_d72a_011b_4f9b` | fixed-point positions — the hash stopped folding in most `f32` bits |
+/// | `0x7616_a4bd_6251_ca49` | fixed-point angles — **the last float left the digest** |
 ///
-/// The last one is a different *kind* of change from the four before it, which
-/// were all "new player state joined the digest". This one changed the
-/// representation of state that was already there: positions and velocities are
-/// integers now, so the digest no longer contains raw `f32` bits at all. That is
-/// the point — a hash built from float bits is a hash two compilers can disagree
-/// about, which is exactly what a desync is.
-const KNOWN_FIXTURE_HASH: u64 = 0xe7dc_d72a_011b_4f9b;
+/// The last two are a different *kind* of change from the four before them,
+/// which were all "new player state joined the digest". These changed the
+/// representation of state that was already there.
+///
+/// The first did positions and velocities. This one does yaw and pitch, which
+/// were the only floats still in it — and the ones that mattered most, because
+/// they reach the world through `sin`/`cos`, among the least portable functions
+/// in any standard library, and the resulting ray decides which block gets
+/// broken (`docs/RESEARCH_MULTIPLAYER.md` §3.5).
+///
+/// **This digest now contains no floating-point value at all.** That is what
+/// makes the toolchain pin a lint convenience again rather than load-bearing
+/// for correctness: a hash built from integers cannot drift with a compiler
+/// version.
+const KNOWN_FIXTURE_HASH: u64 = 0x7616_a4bd_6251_ca49;
 
 #[test]
 fn replay_of_the_same_seed_and_script_is_deterministic() {
@@ -243,4 +252,15 @@ fn chunk_hash_alone_is_independent_of_worker_count_at_fixture_scale() {
             "hash_region diverged at thread_count = {threads}"
         );
     }
+}
+
+/// The mouse motion these scripts used to be written in.
+///
+/// `InputFrame::look_delta` is an `Angle` now (§3.5: nothing that crosses the
+/// wire is a float), and the pixels-to-angle conversion moved to the client.
+/// These scripts predate that and are written in pixels, so this is the same
+/// conversion the client does -- which is what keeps them meaning what they
+/// meant, rather than quietly turning 454 times as far.
+fn pixels(px: f32) -> Angle {
+    Angle::from_raw((px * cubara_sim::SENSITIVITY_PER_PIXEL as f32) as i32)
 }

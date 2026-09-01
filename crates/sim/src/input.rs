@@ -8,6 +8,8 @@
 //! state is what makes a future replay (block 1.8) possible at all — a
 //! recorded sequence of `InputFrame`s reproduces a session exactly, and it's
 //! also the shape netcode eventually wants (send the input, not the result).
+use cubara_voxel::Angle;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct InputFrame {
     /// Movement input this frame, each axis in `-1.0..=1.0`: `[0]` strafe
@@ -15,11 +17,19 @@ pub struct InputFrame {
     /// direction). Not a raw key snapshot -- opposing keys held together are
     /// already cancelled out (`right - left`, etc.) by whoever builds this.
     pub move_axes: [f32; 3],
-    /// Raw mouse motion this frame, in pixels: `[0]` right, `[1]` down.
-    /// Deliberately unscaled -- look sensitivity is a gameplay tuning value,
-    /// applied where the rest of movement happens ([`crate::Player`]), not
-    /// baked into what counts as "the input".
-    pub look_delta: [f32; 2],
+    /// How far to turn this frame: `[0]` yaw (right is positive), `[1]` pitch
+    /// (down is positive, matching screen coordinates).
+    ///
+    /// **An [`Angle`], not pixels.** It used to be raw mouse motion, scaled by
+    /// a sensitivity constant inside [`crate::Player`]. `docs/RESEARCH_MULTIPLAYER.md`
+    /// §3.5 requires that nothing crossing the wire is a float, and an
+    /// `InputFrame` is the first thing that will — so the pixels-to-angle
+    /// conversion moved to the client, using
+    /// [`crate::SENSITIVITY_PER_PIXEL`].
+    ///
+    /// That is also where it belongs: sensitivity is a setting on the machine
+    /// holding the mouse, not a fact about the world.
+    pub look_delta: [Angle; 2],
     /// Jump, as a rising edge -- `true` only on the frame the key went down,
     /// not for as long as it's held. Walking mode consumes this once; it has
     /// no effect in free-fly. The caller (`cubara-app`) is responsible for
