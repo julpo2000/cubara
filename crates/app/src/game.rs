@@ -19,17 +19,10 @@ use cubara_render::CameraPose;
 use cubara_render::{swatch_color, HotbarSlot, InventoryPanel, PanelSlotKind};
 use cubara_sim::{InputFrame, Player, Sim, REACH, TICK_DT};
 use cubara_sim::{SlotRef, HOTBAR_WIDTH};
-use cubara_voxel::ChunkCoord;
-use cubara_voxel::FixedVec3;
-use cubara_voxel::{
-    BlockId, BlockRegistry, DropRule, Interact, ItemRegistry, ItemStack, ItemState, RecipeBook,
-    SmeltBook,
-};
-use cubara_world::TerrainBlocks;
-use cubara_world::World;
+use cubara_voxel::{BlockRegistry, ChunkCoord, FixedVec3, ItemRegistry, RecipeBook, SmeltBook};
+use cubara_world::{Furnace, TerrainBlocks, World};
 
-use crate::server::Server;
-use cubara_world::{ChunkState, Furnace, SmeltCtx, TimedProcess};
+use crate::server::{Action, Effect, Screen, Server};
 
 use winit::keyboard::KeyCode;
 
@@ -109,48 +102,6 @@ struct Mining {
     /// adds the tool's `speed`, so this reaching `hardness` is exactly
     /// `ceil(hardness / speed)` ticks -- the §4.3 formula, without a division.
     progress: u32,
-}
-
-/// How far from the player, in chunks, the simulation keeps running
-/// (`PHASE2_ARCHITECTURE.md` §11.4).
-///
-/// **Deliberately unrelated to render distance.** Coupling them would let the
-/// settings menu quietly change what the world simulates. Small, because
-/// simulation is the expensive part and dormancy is what makes a big world
-/// affordable; expected to grow once block 2.7 makes a dormant chunk nearly
-/// free.
-const SIM_RADIUS_CHUNKS: i32 = 4;
-
-/// Advance one furnace by `ticks`, whether that is one ordinary tick or a
-/// dormant chunk's whole backlog.
-fn advance_furnace(
-    world: &mut World,
-    pos: [i32; 3],
-    ticks: u64,
-    items: &ItemRegistry,
-    smelting: &SmeltBook,
-) {
-    let Some(f) = world.furnace_at_mut(pos) else {
-        return;
-    };
-    // Resolved to plain numbers once, here: a furnace only ever asks about the
-    // one item in its fuel slot and the one its recipe outputs, so nothing in
-    // the catch-up needs a registry (§12.3).
-    let recipe = f.input.and_then(|(id, _)| smelting.for_input(id));
-    let ctx = SmeltCtx {
-        recipe,
-        fuel_burn: f.fuel.and_then(|(id, _)| items.burn_ticks(id)),
-        output_max: recipe.map(|r| items.max_stack(r.output)).unwrap_or(64),
-    };
-    // Bounded catch-up (§12.1): one ordinary tick and a million-tick backlog go
-    // through the same call, and cost the same.
-    f.advance(ticks, &ctx);
-}
-
-/// The middle of block `b`, where an item dropped by breaking it appears.
-fn drop_centre(b: [i32; 3]) -> FixedVec3 {
-    let half = cubara_voxel::Fixed::from_raw(cubara_voxel::fixed::ONE / 2);
-    FixedVec3::from_blocks(b[0], b[1], b[2]) + FixedVec3::new(half, half, half)
 }
 
 pub struct Game {
@@ -422,7 +373,7 @@ impl Game {
             if let Some(cc) = self.tick_mining(input.breaking) {
                 dirty.push(cc);
             }
-            self.tick_furnaces();
+            self.server.tick_furnaces();
             // Dropped items fall, age out, and get picked up -- on the same
             // fixed clock as everything else (§10.4, Rule 1).
             if let Some(items) = self.server.items.as_ref() {
@@ -653,14 +604,18 @@ impl Game {
     /// entry point, which is what the drop and tier tests drive directly rather
     /// than holding a button for eight ticks to assert one drop.
     #[allow(dead_code)]
+    /// Break the block the player is looking at, returning the chunk whose
+    /// geometry is now stale.
+    ///
+    /// Reached only through [`apply`](Self::apply) -- the raycast is the
+    /// server's, which is what stops a client naming its own target (§8.3).
     pub fn break_block(&mut self) -> Option<ChunkCoord> {
-        let origin = self.server.sim.player.pos.to_f32();
-        let dir = self.server.sim.player.look_dir().to_array();
-        let hit = self
-            .server
-            .world
-            .raycast(origin, dir, REACH, self.terrain())?;
-        Some(self.break_at(hit.block))
+        let effects = self.server.apply(Action::Break);
+        self.absorb(&effects);
+        effects.iter().find_map(|e| match e {
+            Effect::Dirty(cc) => Some(*cc),
+            _ => None,
+        })
     }
 
     /// One tick of mining (`PHASE2_ARCHITECTURE.md` §4.3). Returns the chunk to
@@ -756,185 +711,65 @@ impl Game {
         Some((m.progress as f32 / hardness as f32).clamp(0.0, 1.0))
     }
 
-    /// Break the block at `block`, applying §4's drop and durability rules.
-    /// The shared tail of [`break_block`](Self::break_block) (instant, for
-    /// tests and for anything that bypasses mining) and
-    /// [`tick_mining`](Self::tick_mining) (timed, what the game actually does),
-    /// so the two cannot drift apart on what a break *yields*.
-    fn break_at(&mut self, block: [i32; 3]) -> ChunkCoord {
-        let [x, y, z] = block;
-        // Whatever state the block owned goes with it (§7) -- but its contents
-        // now spill onto the floor rather than being destroyed (block 2.5,
-        // §10.4). This is one of the five sites that used to lose items.
-        if let Some(f) = Arc::make_mut(&mut self.server.world).remove_block_entity(block) {
-            let contents: Vec<_> = [f.input, f.fuel, f.output].into_iter().flatten().collect();
-            if let Some(items) = self.server.items.as_ref() {
-                let spawned: Vec<_> = contents
-                    .into_iter()
-                    .filter_map(|(id, count)| items.new_stack(id, count).ok())
-                    .collect();
-                for stack in spawned {
-                    self.server
-                        .sim
-                        .entities
-                        .spawn_item(stack, drop_centre(block), FixedVec3::ZERO);
-                }
-            }
-        }
-        if self.open_furnace == Some(block) {
-            self.open_furnace = None;
-            self.inventory_open = false;
-        }
-
-        // The drop is the optional part; the break is not. Assets are always
-        // set in the real app, but making the whole action depend on them
-        // would mean a missing registry shows up as clicks that silently do
-        // nothing -- the least debuggable failure there is.
-        //
-        // Read the three as separate fields rather than through a helper: the
-        // borrow checker tracks disjoint field borrows, so `items` can stay
-        // borrowed while `self.server.sim.player.inventory` is mutated. A helper
-        // returning them all borrows the whole of `self`.
-        if let (Some(registry), Some(terrain), Some(items)) = (
-            self.server.blocks_registry.as_deref(),
-            self.server.terrain,
-            self.server.items.as_ref(),
-        ) {
-            let broken = self.server.world.block_at(x, y, z, terrain);
-            let held = self.server.sim.player.inventory.selected_stack();
-            let held_tier = held.map(|s| items.tier(s.item())).unwrap_or(0);
-
-            let drop = if held_tier < registry.requires_tier(broken) {
-                log::debug!(
-                    "{} needs tier {}, holding tier {held_tier}: breaks, yields nothing",
-                    registry.name_of(broken).unwrap_or("?"),
-                    registry.requires_tier(broken),
-                );
-                None
-            } else {
-                match registry.drops(broken) {
-                    DropRule::Nothing => None,
-                    DropRule::SameName => registry
-                        .name_of(broken)
-                        .and_then(|name| items.id_of(name))
-                        .map(|item| (item, 1u8)),
-                    DropRule::Item(d) => items.id_of(&d.item).map(|item| (item, d.count)),
-                }
-            };
-
-            match drop.and_then(|(item, count)| items.new_stack(item, count).ok()) {
-                Some(stack) => {
-                    // Block 2.5: what does not fit falls on the floor rather
-                    // than being destroyed (§10.4).
-                    if let Some(rest) = self.server.sim.player.inventory.add(stack, items) {
-                        self.server.sim.entities.spawn_item(
-                            rest,
-                            drop_centre(block),
-                            FixedVec3::ZERO,
-                        );
-                    }
-                    // Only a break that yielded something wears the tool.
-                    self.wear_held_tool();
-                }
-                None => log::debug!(
-                    "{} yielded nothing",
-                    registry.name_of(broken).unwrap_or("?")
-                ),
-            }
-        }
-
-        Arc::make_mut(&mut self.server.world).set_block(x, y, z, BlockId::AIR)
-    }
-
-    /// Spend one point of the held tool's durability, removing the stack when
-    /// it reaches zero (`PHASE2_ARCHITECTURE.md` §4, decision C).
-    ///
-    /// A no-op for anything that is not a tool: only an item declaring
-    /// `durability` carries [`ItemState::Durability`], so an empty hand or a
-    /// stack of planks falls through untouched.
-    ///
-    /// The worn stack is rebuilt rather than mutated because `ItemStack`
-    /// enforces its own invariant (a stack with state is a stack of one), and
-    /// going through `ItemStack::new` is what keeps that enforcement in one
-    /// place.
-    fn wear_held_tool(&mut self) {
-        let Some(items) = self.server.items.as_ref() else {
-            return;
-        };
-        let inv = &mut self.server.sim.player.inventory;
-        let slot = inv.selected_slot() as usize;
-        let Some(stack) = inv.slot(slot) else {
-            return;
-        };
-        let ItemState::Durability { remaining } = stack.state() else {
-            return;
-        };
-        let left = remaining.saturating_sub(1);
-        if left == 0 {
-            inv.set_slot(slot, None);
-            return;
-        }
-        let worn = ItemStack::new(
-            stack.item(),
-            stack.count(),
-            ItemState::Durability { remaining: left },
-            items.max_stack(stack.item()),
-        )
-        .ok();
-        inv.set_slot(slot, worn);
-    }
-
-    /// Place the held hotbar item's block against the targeted face, consuming
-    /// one of it.
-    ///
-    /// The same name mapping as [`break_block`](Self::break_block), backwards.
-    /// An item with no matching block -- a stick, an ingot -- places nothing
-    /// **and consumes nothing**: a click that does nothing must not quietly
-    /// spend an item.
+    /// Place the held block, or use an interactive block under the crosshair.
     pub fn place_block(&mut self) -> Option<ChunkCoord> {
-        // An interactive block under the crosshair takes precedence over
-        // placing. Otherwise a bench would be unusable the moment you are
-        // holding anything -- which is most of the time.
-        if self.interact() {
-            return None;
+        let effects = self.server.apply(Action::Place);
+        self.absorb(&effects);
+        effects.iter().find_map(|e| match e {
+            Effect::Dirty(cc) => Some(*cc),
+            _ => None,
+        })
+    }
+
+    /// Use whatever the player is looking at, reporting whether a screen
+    /// opened. The server decides *what* was used (§8.3).
+    ///
+    /// Nothing on the game's own path calls this: right-click goes through
+    /// [`Action::Place`], which tries interacting first so a bench stays usable
+    /// while holding a block. This is the direct entry point the interaction
+    /// tests drive, and the shape a second input binding would use.
+    #[allow(dead_code)]
+    fn interact(&mut self) -> bool {
+        let effects = self.server.apply(Action::Interact);
+        let opened = effects.iter().any(|e| matches!(e, Effect::Open(_)));
+        self.absorb(&effects);
+        opened
+    }
+
+    /// Break a specific block, bypassing the raycast.
+    ///
+    /// The direct entry point the drop and tier tests drive, rather than
+    /// holding a button for eight ticks to assert one drop. Play goes through
+    /// [`Action::Break`], where the server chooses the target.
+    fn break_at(&mut self, block: [i32; 3]) -> ChunkCoord {
+        let cc = self.server.break_at(block);
+        self.absorb(&[Effect::CloseIfAt(block)]);
+        cc
+    }
+
+    /// Apply the server's [`Effect`]s to client-side state: which screen is
+    /// open, and nothing else. Geometry invalidation is returned to the caller
+    /// instead, because the streamer owns that.
+    fn absorb(&mut self, effects: &[Effect]) {
+        for e in effects {
+            match e {
+                Effect::Open(Screen::Bench) => {
+                    self.open_furnace = None;
+                    self.inventory_open = true;
+                }
+                Effect::Open(Screen::Furnace(pos)) => {
+                    self.open_furnace = Some(*pos);
+                    self.inventory_open = true;
+                }
+                Effect::CloseIfAt(pos) => {
+                    if self.open_furnace == Some(*pos) {
+                        self.open_furnace = None;
+                        self.inventory_open = false;
+                    }
+                }
+                Effect::Dirty(_) => {}
+            }
         }
-
-        let registry = self.server.blocks_registry.as_deref()?;
-        let items = self.server.items.as_ref()?;
-        let held = self.server.sim.player.inventory.selected_stack()?;
-        let block = registry.id_of(items.name_of(held.item())?)?;
-
-        let origin = self.server.sim.player.pos.to_f32();
-        let dir = self.server.sim.player.look_dir().to_array();
-        let hit = self
-            .server
-            .world
-            .raycast(origin, dir, REACH, self.terrain())?;
-        let target = [
-            hit.block[0] + hit.normal[0],
-            hit.block[1] + hit.normal[1],
-            hit.block[2] + hit.normal[2],
-        ];
-
-        // Only now that the placement is certain to happen.
-        let slot = self.server.sim.player.inventory.selected_slot() as usize;
-        self.server.sim.player.inventory.take_one(slot, items)?;
-
-        // A block that owns state gets it the moment it is placed, rather than
-        // on first use -- so a furnace someone never opens still ticks, and the
-        // world hash covers it either way.
-        let interactive = self
-            .server
-            .blocks_registry
-            .as_deref()
-            .map(|r| r.interact(block) == Interact::Furnace)
-            .unwrap_or(false);
-        let world = Arc::make_mut(&mut self.server.world);
-        let cc = world.set_block(target[0], target[1], target[2], block);
-        if interactive {
-            world.add_furnace(target);
-        }
-        Some(cc)
     }
 
     /// The hotbar reduced to what drawing needs: a swatch colour and a count
@@ -964,112 +799,6 @@ impl Game {
             });
         }
         Some(out)
-    }
-
-    /// If the targeted block is interactive, act on it and report `true`.
-    ///
-    /// Reads [`Interact`] off the block registry rather than comparing names.
-    /// The name comparison this replaces carried a note saying block 2.4 was
-    /// the point to generalise it, "with two real cases to design against" --
-    /// the furnace is that second case.
-    fn interact(&mut self) -> bool {
-        let (Some(registry), Some(terrain)) =
-            (self.server.blocks_registry.as_deref(), self.server.terrain)
-        else {
-            return false;
-        };
-        let origin = self.server.sim.player.pos.to_f32();
-        let dir = self.server.sim.player.look_dir().to_array();
-        let Some(hit) = self
-            .server
-            .world
-            .raycast(origin, dir, REACH, self.terrain())
-        else {
-            return false;
-        };
-        let [x, y, z] = hit.block;
-        match registry.interact(self.server.world.block_at(x, y, z, terrain)) {
-            Interact::None => false,
-            Interact::Bench => {
-                // Width lives on `Crafting` (world state), not on the screen: a
-                // 3x3 grid holding items in its outer cells is a different world
-                // from a 2x2 one, and the hash already covers it.
-                self.server.sim.player.crafting.set_width(3);
-                self.open_furnace = None;
-                self.inventory_open = true;
-                true
-            }
-            Interact::Furnace => {
-                // A furnace placed before this block existed (or loaded from an
-                // older save) has no entity yet; give it one on first use rather
-                // than refusing to open.
-                Arc::make_mut(&mut self.server.world).add_furnace([x, y, z]);
-                self.open_furnace = Some([x, y, z]);
-                self.inventory_open = true;
-                true
-            }
-        }
-    }
-
-    /// One tick of every furnace in the world (`PHASE2_ARCHITECTURE.md` §7).
-    ///
-    /// Iterates positions in `BTreeMap` order, so which furnace ticks first is
-    /// the positions' own order rather than a hash seed's -- Rule 1, and the
-    /// same reason the hash iterates them that way.
-    ///
-    /// In this scope every furnace ticks every tick, because every loaded chunk
-    /// is active. Block 2.6's dormant chunks and 2.7's catch-up are what change
-    /// that, and [`Furnace::advance`] already takes an elapsed count so they can.
-    fn tick_furnaces(&mut self) {
-        let (Some(items), Some(smelting)) =
-            (self.server.items.as_ref(), self.server.smelting.as_ref())
-        else {
-            return;
-        };
-
-        // Bring the simulation radius up to date (§11): chunks the player has
-        // left go dormant, chunks they have reached wake up.
-        //
-        // Only when the player has actually changed chunk. Standing still can
-        // change no chunk's state, and this walks a (2r+1)²x3 box -- 243
-        // lookups at radius 4 -- which is pure waste every tick the player is
-        // not moving, which is most of them.
-        let centre = ChunkCoord::from_world_pos(self.server.sim.player.pos.to_f32());
-        let now = self.server.sim.tick;
-        let woken = if self.server.sim_centre == Some(centre) {
-            Vec::new()
-        } else {
-            self.server.sim_centre = Some(centre);
-            Arc::make_mut(&mut self.server.world).update_simulation_radius(
-                centre,
-                SIM_RADIUS_CHUNKS,
-                now,
-            )
-        };
-        let caught_up: std::collections::BTreeMap<ChunkCoord, u64> =
-            woken.into_iter().map(|w| (w.coord, w.elapsed)).collect();
-
-        let world = Arc::make_mut(&mut self.server.world);
-        let positions = world.block_entity_positions();
-        if positions.is_empty() {
-            return;
-        }
-
-        // **One pass over the block entities**, not one pass per chunk. The
-        // obvious shape -- for each active chunk, find the entities in it --
-        // is O(chunks x entities) and allocates a vector of every block entity
-        // in the world for each of the 243 chunks in range. This is O(entities).
-        for pos in positions {
-            let coord = ChunkCoord::from_block(pos[0], pos[1], pos[2]);
-            if world.chunk_states().get(coord) != ChunkState::Active {
-                continue;
-            }
-            // A chunk that woke this tick owes the ticks it slept through *plus*
-            // this one -- the same total the two-pass version produced, which is
-            // what keeps the dormancy gate test passing.
-            let ticks = caught_up.get(&coord).copied().unwrap_or(0) + 1;
-            advance_furnace(world, pos, ticks, items, smelting);
-        }
     }
 
     /// The furnace screen currently open, if any.
@@ -1307,6 +1036,7 @@ impl Default for Game {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cubara_voxel::{BlockId, ItemStack, ItemState};
 
     #[test]
     fn breaking_clears_the_targeted_block() {
