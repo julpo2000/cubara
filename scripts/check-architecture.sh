@@ -27,9 +27,15 @@ report() { # report <rule> <message>; reads offenders on stdin
 # ── Rule 1 — deterministic simulation ────────────────────────────────────────
 # The sim advances by tick, never by elapsed seconds. Wall-clock belongs to the
 # renderer and the profiler. (SIM_CRATES grows as the sim lands.)
-SIM_CRATES="crates/voxel/src crates/world/src crates/sim/src"
+SIM_CRATES="crates/voxel/src crates/world/src crates/sim/src crates/server/src"
+# `crates/server/src/clock.rs` is the dedicated server's wall-clock -> tick
+# boundary -- the headless equivalent of the client's `main.rs`
+# (docs/PHASE1_ARCHITECTURE.md §9). Something has to turn seconds into ticks or
+# a server would run the world as fast as the CPU allows. It is excluded **by
+# name**, so a second file reaching for the clock fails here rather than
+# quietly becoming precedent.
 for d in $SIM_CRATES; do [ -d "$d" ] || continue
-    grep -rn --include='*.rs' -E "Instant::now|SystemTime::now" "$d"
+    grep -rn --include='*.rs' --exclude='clock.rs' -E "Instant::now|SystemTime::now" "$d"
 done | report "Rule 1" "wall-clock time in a simulation crate — advance by tick instead"
 
 for d in $SIM_CRATES; do [ -d "$d" ] || continue
@@ -43,11 +49,15 @@ grep -rn --include='*.rs' -E "static +[A-Z_]+ *: *(OnceLock|Mutex|RwLock|LazyLoc
 
 # ── Rule 3 / 4 — dependency direction, and the sim runs without a GPU ────────
 # Data and simulation crates must not know the GPU exists.
-for c in voxel world sim; do [ -f "crates/$c/Cargo.toml" ] || continue
+# `server` is in this list for the reason Rule 4 exists: a dedicated server on a
+# headless host must not need a GPU stack installed for a process that will
+# never draw a pixel. `cubara-server` linking `wgpu` would not fail to compile —
+# it would fail to *run*, on someone else's machine, months later.
+for c in voxel world sim server; do [ -f "crates/$c/Cargo.toml" ] || continue
     grep -n -E "^(wgpu|winit|pollster)" "crates/$c/Cargo.toml" | sed "s|^|crates/$c/Cargo.toml:|"
 done | report "Rule 3/4" "GPU/windowing dependency in a data or simulation crate"
 
-for c in voxel world sim; do [ -d "crates/$c/src" ] || continue
+for c in voxel world sim server; do [ -d "crates/$c/src" ] || continue
     grep -rn --include='*.rs' -E "\bwgpu::|\bwinit::" "crates/$c/src"
 done | report "Rule 3/4" "GPU/windowing types in a data or simulation crate"
 

@@ -483,3 +483,51 @@ extraction in phase 1, because it cuts through the middle of the type every
 gameplay test drives. Its whole value is that it is **cheaper now than later**:
 at one player, ten thousand lines, and no netcode, the seam can be moved by
 changing which struct owns a field. After netcode exists it cannot.
+
+
+### §8.6 The crate split, and what a dedicated server proved
+
+**Landed.** `Server` moved out of `crates/app` into its own crate,
+`cubara-server`, which depends on `cubara-voxel`, `cubara-world` and
+`cubara-sim` and on nothing else.
+
+While it lived in the app it was correct by *content* — it imported no `wgpu` —
+and wrong by *construction*: anything linking it also linked a windowing library
+and a graphics API. The distinction is not academic, and the binaries say so:
+
+| | Links | Size (release, macOS) |
+|---|---|---|
+| `cubara` | Metal, AppKit, QuartzCore, CoreVideo | 6.8 MB |
+| `cubara-server` | `libSystem` only | 2.1 MB |
+
+That is §3.3's standalone deployment becoming real rather than notional: a
+headless host runs a world without installing a GPU stack for a process that
+will never draw a pixel.
+
+**Two entry points, one loop.** `cubara-server` and `cubara server` parse the
+same arguments and call the same `headless::run` (Rule 5). The subcommand exists
+because a machine that already has the game should not need a second download to
+host; the binary exists because a server host should not need the game.
+
+**What it made testable.** A headless tick loop is testable *to the tick*, which
+is the argument for building it before the transport (§8.5). The claims that now
+have tests rather than prose:
+
+- a world runs with no window, no adapter and no client;
+- a furnace smelts with nobody playing — the world does not stop when the player
+  does;
+- two servers opened on the same seed and ticked the same number of times
+  produce the same `WorldHash` (Rule 1, from the server's own entry point);
+- a world survives a restart, through `Session` rather than through `Game`, so
+  it holds for a host that has no client at all.
+
+**The architecture check grew with it.** `crates/server` is now in
+`check-architecture.sh`'s Rule 3/4 list, so `cubara-server` gaining a GPU
+dependency fails CI rather than failing on someone's headless box months later.
+It is also in the Rule 1 list, with `clock.rs` excluded **by name** — a
+dedicated server has to turn seconds into ticks somewhere, and naming the one
+file that may means a second one is a CI failure rather than a precedent.
+
+**Still not built: the transport.** Nothing listens on a port; no client can
+connect. `cubara-server` runs a world, it does not yet serve one. The next steps
+remain §8.2's client-side replica world, and then a socket.
