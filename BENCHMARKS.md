@@ -110,7 +110,7 @@ frames after 200 warmup.
 | 2026-08-31 | Caves at level 0 only [#175], radius 64, **old 3-layer slab**³⁸ | 1,600 | **675,962** | **~1,553** | **0.447 ms** | ~0.78 ms | *(this PR)* |
 | 2026-08-31 | **World with no height limit** [#175], radius 64, band ±2³⁸ | **3,138** | 912,964 | ~1,115 | 0.613 ms | ~1.08 ms | `4da25da` |
 | 2026-08-31 | Fixed-point positions, radius 64, band ±2³⁹ | 3,138 | 912,964 | ~1,109 | 0.622 ms | ~1.04 ms | `24e4789` |
-| 2026-09-01 | Client-side replica world, radius 64, band ±2⁴⁰ | 3,138 | 912,964 | ~1,101 | 0.628 ms | ~1.22 ms | *(this PR)* |
+| 2026-09-01 | Client-side replica world, radius 64, band ±2⁴⁰ | 3,138 | 912,964 | ~1,101 | 0.628 ms | ~1.22 ms | `a9f238e` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
