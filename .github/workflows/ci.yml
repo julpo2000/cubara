@@ -72,9 +72,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --workspace --all-targets --all-features
       - name: Build
-        run: cargo build --all-targets
+        run: cargo build --workspace --all-targets
       # `--skip`: the radius-64 smoke test gets its own step below, which runs it
       # with output shown. Without the skip it ran *twice* per job -- once here
       # silently, once there -- doubling both its cost (the slowest single test

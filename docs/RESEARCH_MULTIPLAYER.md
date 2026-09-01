@@ -531,3 +531,70 @@ file that may means a second one is a CI failure rather than a precedent.
 **Still not built: the transport.** Nothing listens on a port; no client can
 connect. `cubara-server` runs a world, it does not yet serve one. The next steps
 remain §8.2's client-side replica world, and then a socket.
+
+
+### §8.7 The replica, and what it caught
+
+**Landed.** The client holds its own `World`. §8.2's rule — *both sides have a
+`World`, and that is the point* — is now a fact about the types rather than an
+intention: `Game::world()` returns the client's, and nothing in the client reads
+the server's at all.
+
+**Terrain is generated, never sent.** The client is given a seed and builds the
+same world from it. What crosses the seam is the edit overlay and the block
+entities, which is already how a `World` is built and already what the save
+format persists. Measured at radius 64: CPU/frame 0.622 → 0.628 ms, inside this
+scene's run-to-run scatter (`BENCHMARKS.md`). Two worlds cost about one, because
+the second one is a seeded noise function and an empty `BTreeMap`.
+
+**`Dirty(chunk)` is gone, and its absence is the interesting part.** It only ever
+worked because both sides shared one world — the client had nothing of its own to
+mark dirty. Now the server reports `Edit { pos, block }`, the client applies it to
+its own world, and the stale chunk is whatever its own `set_block` hands back. A
+remote client would have to derive it exactly that way, because the server has no
+idea how its chunks are laid out on screen.
+
+**The furnace screen is the block-entity message doing real work.** A furnace
+smelting away updates the panel because the server journals a `BlockEntity`
+effect on every tick it changes and the client applies it — not because the
+client is looking at the server's furnace. Whole values, not deltas: a furnace is
+three slots and two counters, so sending what it *is* costs less than describing
+what happened to it and cannot desynchronise the way a missed delta can.
+
+**`Action::ClickFurnace`, and the slot vocabulary.** Moving items between a hand
+and a block entity is world state, however much it looks like UI. The client
+translates `PanelSlotKind` (where a slot is drawn) into `FurnaceSlot` (what it
+is), because a server that spoke in panel layouts would be a server that knew
+what a screen looks like. It is the one action that names its target, for a
+reason the raycast rule does not cover — the player is not *looking* at the slot
+— and the server validates the position rather than believing it.
+
+**The snapshot.** A replica that has seen nothing cannot be patched with a delta,
+because there is no delta from a world it has never seen. `Server::snapshot`
+emits every edit and every block entity as ordinary effects; a load uses it,
+and it is the shape the join handshake will take.
+
+#### What the split caught
+
+Thirteen existing tests failed the moment the replica landed, and **every one of
+them for the same reason**: they set the world up by writing straight into
+`server.world`, then asserted through the client. That is precisely the
+in-process shortcut §8.2 says the exercise exists to remove — invisible while one
+`World` was serving both sides.
+
+The fix was to make the setup go through the server (`set_block`, `add_furnace`,
+`set_furnace`), which journals. **No assertion changed.** Two moved which object
+they read: the chunk-lifecycle tests now ask the server, because which chunks
+simulate is authority (§8.1) and a replica has no lifecycle — it is told about
+edits, not about what is ticking.
+
+That is the split doing the job it was built for, one step before there is a
+socket to find it over.
+
+#### Still not split
+
+Inventory and crafting clicks still mutate `sim.player` directly. They are
+authority too, and they are `ClickSlot` in §8.3's list — but they touch no world
+state, so they cannot desynchronise a replica. They travel with the transport.
+
+**And there is still no transport.** Nothing listens on a port.

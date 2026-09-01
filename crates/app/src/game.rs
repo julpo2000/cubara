@@ -22,7 +22,7 @@ use cubara_sim::{SlotRef, HOTBAR_WIDTH};
 use cubara_voxel::{BlockRegistry, ChunkCoord, ItemRegistry, RecipeBook};
 use cubara_world::{Furnace, TerrainBlocks, World};
 
-use cubara_server::{Action, Effect, Screen, Server};
+use cubara_server::{Action, Effect, FurnaceSlot, Screen, Server};
 
 use winit::keyboard::KeyCode;
 
@@ -74,6 +74,21 @@ pub struct Game {
     /// in-process for singleplayer (§3.3). Everything left on `Game` itself is
     /// input, screen state or presentation — the §8.1 table is the sorting.
     pub server: Server,
+    /// The client's own world (`RESEARCH_MULTIPLAYER.md` §8.2).
+    ///
+    /// **A replica, not a cache, and not the server's.** The instinct is to
+    /// share one `World` in singleplayer; that defeats the exercise, because the
+    /// seam only tells you something if the client cannot reach into the
+    /// server's state, and an in-process shortcut is exactly what will not exist
+    /// over a socket.
+    ///
+    /// Affordable only because terrain is a pure function of the seed (§3.4), so
+    /// this copy is **generated, never received**. What crosses is the edit
+    /// overlay and the block entities, which is already how a `World` is built
+    /// and already what the save format persists.
+    ///
+    /// It may be wrong, briefly, and nothing may treat it as authority.
+    world: Arc<World>,
     /// The player's pose as of the *previous* completed tick -- together with
     /// `sim.player` (the current tick), what [`Game::camera_pose`] interpolates
     /// between for smooth rendering of a 60 Hz sim at any frame rate (§9).
@@ -147,6 +162,11 @@ impl Game {
         let server = Server::new();
         let player = server.sim.player;
         Self {
+            // Same seed, so the same terrain -- generated here rather than
+            // copied from the server, which is the whole point of §8.2. Over a
+            // socket the seed arrives in the join handshake; in-process it is
+            // read off the world that already exists.
+            world: Arc::new(World::with_seed(server.world.seed())),
             server,
             prev_player: player,
             inventory_open: false,
@@ -167,8 +187,10 @@ impl Game {
         }
     }
 
+    /// The client's replica (§8.2) -- what the renderer meshes and what the
+    /// crosshair raycasts against. Never the server's world.
     pub fn world(&self) -> &Arc<World> {
-        &self.server.world
+        &self.world
     }
 
     /// The camera pose to render from: the sim's player pose, interpolated
@@ -313,7 +335,6 @@ impl Game {
         self.fly_toggle_pending = false;
 
         let mut ticks = 0;
-        let mut dirty = Vec::new();
         while self.accumulator >= TICK_DT as f64 {
             self.prev_player = self.server.sim.player;
             self.server.tick_sim(&input);
@@ -323,9 +344,7 @@ impl Game {
             //
             // Between the server's two halves, which is where it has always
             // run: moving it would reorder the tick, and tick order is Rule 1.
-            if let Some(cc) = self.tick_mining(input.breaking) {
-                dirty.push(cc);
-            }
+            self.tick_mining(input.breaking);
             self.server.tick_world();
             input.jump = false;
             input.toggle_fly = false;
@@ -340,7 +359,10 @@ impl Game {
                 break;
             }
         }
-        dirty
+        // Once, after the whole burst: the replica catches up with everything
+        // the server did, and reports what needs re-meshing. A catch-up of five
+        // ticks that broke the same chunk five times is one re-mesh.
+        self.sync()
     }
 
     /// Write the world to disk (#179). The server owns the world, so it owns
@@ -358,6 +380,11 @@ impl Game {
     pub fn load_from(&mut self, dir: &std::path::Path) -> bool {
         let loaded = self.server.load_from(dir);
         if loaded {
+            // A load replaces the server's world wholesale, so the replica is
+            // rebuilt rather than patched: there is no edit stream that turns
+            // one world into another. Over a socket this is a fresh join.
+            self.world = Arc::new(World::with_seed(self.server.world.seed()));
+            self.resync();
             // A load replaces the player wholesale, so the previous pose the
             // client interpolates from is now a pose from a different world.
             self.prev_player = self.server.sim.player;
@@ -448,12 +475,8 @@ impl Game {
     /// Reached only through [`apply`](Self::apply) -- the raycast is the
     /// server's, which is what stops a client naming its own target (§8.3).
     pub fn break_block(&mut self) -> Option<ChunkCoord> {
-        let effects = self.server.apply(Action::Break);
-        self.absorb(&effects);
-        effects.iter().find_map(|e| match e {
-            Effect::Dirty(cc) => Some(*cc),
-            _ => None,
-        })
+        self.server.apply(Action::Break);
+        self.sync().into_iter().next()
     }
 
     /// One tick of mining (`PHASE2_ARCHITECTURE.md` §4.3). Returns the chunk to
@@ -463,34 +486,35 @@ impl Game {
     /// released, when the player looks at a different block, or when the held
     /// tool changes -- each of those makes the stored `Mining` stop matching,
     /// and a non-match restarts from zero rather than resuming.
-    fn tick_mining(&mut self, breaking: bool) -> Option<ChunkCoord> {
+    fn tick_mining(&mut self, breaking: bool) {
         if !breaking {
             self.mining = None;
-            return None;
+            return;
         }
+        // Predicted on the *replica* (§8.1: "client predicts, server decides").
+        // How far along a break is is display -- the break itself is an edit,
+        // and that goes through the server below.
         let origin = self.server.sim.player.pos.to_f32();
         let dir = self.server.sim.player.look_dir().to_array();
-        let Some(hit) = self
-            .server
-            .world
-            .raycast(origin, dir, REACH, self.terrain())
-        else {
+        let Some(hit) = self.world.raycast(origin, dir, REACH, self.terrain()) else {
             // Looking at nothing in reach: whatever was in progress is gone.
             self.mining = None;
-            return None;
+            return;
         };
-        let (registry, terrain) = (
-            self.server.blocks_registry.as_deref()?,
-            self.server.terrain?,
-        );
+        let (Some(registry), Some(terrain)) =
+            (self.server.blocks_registry.as_deref(), self.server.terrain)
+        else {
+            return;
+        };
         let target = self
-            .server
             .world
             .block_at(hit.block[0], hit.block[1], hit.block[2], terrain);
 
         // Absent hardness means unbreakable -- no progress accrues and no
         // amount of holding the button changes that.
-        let hardness = registry.hardness(target)?;
+        let Some(hardness) = registry.hardness(target) else {
+            return;
+        };
 
         let held = self
             .server
@@ -517,10 +541,13 @@ impl Game {
         let progress = m.progress + speed;
         if progress < hardness {
             self.mining = Some(Mining { progress, ..m });
-            return None;
+            return;
         }
         self.mining = None;
-        Some(self.break_at(hit.block))
+        // The break is an `Action`, so the *server* raycasts to decide what was
+        // hit -- the client's own hit above chose when to ask, not what to
+        // destroy (§8.3).
+        self.server.apply(Action::Break);
     }
 
     /// How far along the current break is, `0.0..1.0`, for the renderer to draw
@@ -539,7 +566,6 @@ impl Game {
         let registry = self.server.blocks_registry.as_deref()?;
         let terrain = self.server.terrain?;
         let target = self
-            .server
             .world
             .block_at(m.block[0], m.block[1], m.block[2], terrain);
         let hardness = registry.hardness(target)?;
@@ -551,12 +577,8 @@ impl Game {
 
     /// Place the held block, or use an interactive block under the crosshair.
     pub fn place_block(&mut self) -> Option<ChunkCoord> {
-        let effects = self.server.apply(Action::Place);
-        self.absorb(&effects);
-        effects.iter().find_map(|e| match e {
-            Effect::Dirty(cc) => Some(*cc),
-            _ => None,
-        })
+        self.server.apply(Action::Place);
+        self.sync().into_iter().next()
     }
 
     /// Use whatever the player is looking at, reporting whether a screen
@@ -568,46 +590,88 @@ impl Game {
     /// tests drive, and the shape a second input binding would use.
     #[allow(dead_code)]
     fn interact(&mut self) -> bool {
-        let effects = self.server.apply(Action::Interact);
-        let opened = effects.iter().any(|e| matches!(e, Effect::Open(_)));
-        self.absorb(&effects);
-        opened
+        self.server.apply(Action::Interact);
+        self.sync();
+        self.open_furnace.is_some() || self.inventory_open
     }
 
     /// Break a specific block, bypassing the raycast.
     ///
     /// The direct entry point the drop and tier tests drive, rather than
     /// holding a button for eight ticks to assert one drop. Play goes through
-    /// [`Action::Break`], where the server chooses the target.
+    /// [`Action::Break`], where the server chooses the target -- including
+    /// [`tick_mining`](Self::tick_mining), which since §8.3 asks for a break
+    /// rather than naming one, so nothing on the game's own path reaches here.
+    #[allow(dead_code)]
     fn break_at(&mut self, block: [i32; 3]) -> ChunkCoord {
         let cc = self.server.break_at(block);
-        self.absorb(&[Effect::CloseIfAt(block)]);
+        // The server does not journal a screen-close for a targeted break --
+        // `CloseIfAt` is `Action::Break`'s doing, and this bypasses it.
+        self.server.close_if_at(block);
+        self.sync();
         cc
     }
 
-    /// Apply the server's [`Effect`]s to client-side state: which screen is
-    /// open, and nothing else. Geometry invalidation is returned to the caller
-    /// instead, because the streamer owns that.
-    fn absorb(&mut self, effects: &[Effect]) {
+    /// Take everything the server has done and apply it to this client:
+    /// world edits onto the replica, block entities onto the replica, screens
+    /// onto the screen state. Returns the chunks whose geometry is now stale.
+    ///
+    /// **The dirty chunks are derived, not received.** Each edit is applied to
+    /// the client's own `World`, and the [`ChunkCoord`] its own `set_block`
+    /// hands back is what needs re-meshing. A remote client would have to work
+    /// it out exactly this way, because the server has no idea how its chunks
+    /// are laid out on screen.
+    fn sync(&mut self) -> Vec<ChunkCoord> {
+        let effects = self.server.drain_effects();
+        self.apply_effects(effects)
+    }
+
+    /// Rebuild the replica from the server's full state (§8.3's join
+    /// handshake), rather than from a delta there is no way to compute.
+    fn resync(&mut self) {
+        let snapshot = self.server.snapshot();
+        self.apply_effects(snapshot);
+    }
+
+    /// The one place effects are applied, whether they arrived as a stream or
+    /// as a snapshot.
+    fn apply_effects(&mut self, effects: Vec<Effect>) -> Vec<ChunkCoord> {
+        let mut dirty = Vec::new();
         for e in effects {
             match e {
+                Effect::Edit { pos, block } => {
+                    let cc =
+                        Arc::make_mut(&mut self.world).set_block(pos[0], pos[1], pos[2], block);
+                    if !dirty.contains(&cc) {
+                        dirty.push(cc);
+                    }
+                }
+                Effect::BlockEntity { pos, furnace } => {
+                    let world = Arc::make_mut(&mut self.world);
+                    match furnace {
+                        Some(f) => world.put_furnace(pos, f),
+                        None => {
+                            world.remove_block_entity(pos);
+                        }
+                    }
+                }
                 Effect::Open(Screen::Bench) => {
                     self.open_furnace = None;
                     self.inventory_open = true;
                 }
                 Effect::Open(Screen::Furnace(pos)) => {
-                    self.open_furnace = Some(*pos);
+                    self.open_furnace = Some(pos);
                     self.inventory_open = true;
                 }
                 Effect::CloseIfAt(pos) => {
-                    if self.open_furnace == Some(*pos) {
+                    if self.open_furnace == Some(pos) {
                         self.open_furnace = None;
                         self.inventory_open = false;
                     }
                 }
-                Effect::Dirty(_) => {}
             }
         }
+        dirty
     }
 
     /// The hotbar reduced to what drawing needs: a swatch colour and a count
@@ -639,10 +703,15 @@ impl Game {
         Some(out)
     }
 
-    /// The furnace screen currently open, if any.
+    /// The furnace screen currently open, if any -- read from the **replica**.
+    ///
+    /// Which is the interesting part: a furnace smelting away updates the screen
+    /// because the server journals a `BlockEntity` effect every tick it changes
+    /// and the client applies it, not because the client is looking at the
+    /// server's furnace. That is the same path a remote client would use.
     pub fn open_furnace(&self) -> Option<Furnace> {
         let pos = self.open_furnace?;
-        self.server.world.furnace_at(pos).copied()
+        self.world.furnace_at(pos).copied()
     }
 
     /// Which ids the terrain is made of — delegated to the server, which owns
@@ -733,17 +802,14 @@ impl Game {
             .click(slot, right, &mut player.inventory, items, book);
     }
 
-    /// A click on the open furnace's screen.
+    /// Route a click on the open furnace's screen.
     ///
-    /// Swap-on-click, matching the crafting cursor's feel: clicking a furnace
-    /// slot with something held puts it in, clicking with an empty hand takes
-    /// what is there. The output slot is take-only -- putting an ingot back
-    /// into the output would be a way to duplicate work when the next smelt
-    /// completes and stacks onto it.
-    ///
-    /// Uses the crafting cursor (`player.crafting.held()`) rather than a second
-    /// one, so a player never has two things in hand at once and closing either
-    /// screen has one rule for what happens to it.
+    /// The inventory half is the player's own and stays here; the three furnace
+    /// slots are world state, so they go to the server as an
+    /// [`Action::ClickFurnace`] and come back as a `BlockEntity` effect. That
+    /// translation -- `PanelSlotKind` (where it is drawn) to [`FurnaceSlot`]
+    /// (what it is) -- is the client's job, because a server that spoke in panel
+    /// layouts would be a server that knew what a screen looks like.
     fn click_furnace(&mut self, pos: [i32; 3], kind: PanelSlotKind, index: usize) {
         let Some(items) = self.server.items.as_ref() else {
             return;
@@ -755,38 +821,17 @@ impl Game {
                 .click_inventory_only(index, &mut player.inventory, items);
             return;
         }
-        let held = self.server.sim.player.crafting.held();
-        let world = Arc::make_mut(&mut self.server.world);
-        let Some(f) = world.furnace_at_mut(pos) else {
-            return;
-        };
         let slot = match kind {
-            PanelSlotKind::Grid => &mut f.input,
-            PanelSlotKind::Fuel => &mut f.fuel,
-            PanelSlotKind::Result => {
-                // Take-only.
-                if held.is_none() {
-                    if let Some((id, count)) = f.output.take() {
-                        if let Ok(stack) = items.new_stack(id, count) {
-                            self.server.sim.player.crafting.set_held(Some(stack));
-                        }
-                    }
-                }
-                return;
-            }
+            PanelSlotKind::Grid => FurnaceSlot::Input,
+            PanelSlotKind::Fuel => FurnaceSlot::Fuel,
+            PanelSlotKind::Result => FurnaceSlot::Output,
             PanelSlotKind::Inventory => return,
         };
-        match held {
-            Some(stack) => {
-                let previous = slot.replace((stack.item(), stack.count()));
-                let give_back = previous.and_then(|(id, c)| items.new_stack(id, c).ok());
-                self.server.sim.player.crafting.set_held(give_back);
-            }
-            None => {
-                let taken = slot.take().and_then(|(id, c)| items.new_stack(id, c).ok());
-                self.server.sim.player.crafting.set_held(taken);
-            }
-        }
+        self.server.apply(Action::ClickFurnace { pos, slot });
+        // The furnace's new contents come back as a `BlockEntity` effect, and
+        // the screen is drawn from the replica -- so without this the click
+        // would appear to do nothing until the next tick.
+        self.sync();
     }
 
     /// The screen's layout and contents, or `None` when it is closed.
@@ -1097,8 +1142,8 @@ mod tests {
             .unwrap()
             .id_of("cubara:crafting_bench")
             .expect("assets/blocks defines the bench");
-        std::sync::Arc::make_mut(&mut game.server.world)
-            .set_block(ground[0], ground[1], ground[2], bench);
+        game.server.set_block(ground, bench);
+        game.sync();
         (game, ground)
     }
 
@@ -1452,8 +1497,30 @@ mod tests {
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
         let b = ground.block;
-        Arc::make_mut(&mut game.server.world).set_block(b[0], b[1], b[2], id);
+        game.server.set_block(b, id);
+        // Drain it, so the setup's own edit is not mistaken for the first thing
+        // the test does. A client only ever learns about a world through these.
+        game.sync();
         b
+    }
+
+    /// Put the furnace at `pos` into a known state **through the server**, so
+    /// the client's replica is told about it.
+    ///
+    /// Reaching into `game.server.world` directly is the shortcut a real client
+    /// does not have (§8.2), so a test does not get it either -- a test that
+    /// took it would be setting up a world the client never sees, and would
+    /// then fail for a reason unrelated to what it asserts.
+    fn edit_furnace(game: &mut Game, pos: [i32; 3], f: impl FnOnce(&mut cubara_world::Furnace)) {
+        let mut furnace = game
+            .server
+            .world
+            .furnace_at(pos)
+            .copied()
+            .unwrap_or_default();
+        f(&mut furnace);
+        game.server.set_furnace(pos, furnace);
+        game.sync();
     }
 
     /// Give the player `item` in the selected hotbar slot.
@@ -1843,7 +1910,8 @@ mod tests {
     /// Place a furnace at the block the player is looking at and open it.
     fn open_a_furnace(game: &mut Game) -> [i32; 3] {
         let pos = stand_over(game, "cubara:furnace");
-        Arc::make_mut(&mut game.server.world).add_furnace(pos);
+        game.server.add_furnace(pos);
+        game.sync();
         game.open_furnace = Some(pos);
         game.inventory_open = true;
         pos
@@ -1891,13 +1959,10 @@ mod tests {
         let pos = open_a_furnace(&mut game);
         let raw = item(&game, "cubara:raw_iron");
         let log = item(&game, "cubara:oak_log");
-        {
-            let f = Arc::make_mut(&mut game.server.world)
-                .furnace_at_mut(pos)
-                .unwrap();
+        edit_furnace(&mut game, pos, |f| {
             f.input = Some((raw, 1));
             f.fuel = Some((log, 4));
-        }
+        });
 
         for _ in 0..210 {
             game.advance(TICK_DT);
@@ -1917,10 +1982,7 @@ mod tests {
         let (mut game, _) = game_looking_at_ground();
         let pos = open_a_furnace(&mut game);
         let raw = item(&game, "cubara:raw_iron");
-        Arc::make_mut(&mut game.server.world)
-            .furnace_at_mut(pos)
-            .unwrap()
-            .input = Some((raw, 1));
+        edit_furnace(&mut game, pos, |f| f.input = Some((raw, 1)));
 
         for _ in 0..400 {
             game.advance(TICK_DT);
@@ -1996,10 +2058,7 @@ mod tests {
         let (mut game, _) = game_looking_at_ground();
         let pos = open_a_furnace(&mut game);
         let raw = item(&game, "cubara:raw_iron");
-        Arc::make_mut(&mut game.server.world)
-            .furnace_at_mut(pos)
-            .unwrap()
-            .input = Some((raw, 5));
+        edit_furnace(&mut game, pos, |f| f.input = Some((raw, 5)));
 
         game.break_at(pos);
 
@@ -2041,10 +2100,7 @@ mod tests {
         let (mut game, _) = game_looking_at_ground();
         let pos = open_a_furnace(&mut game);
         let raw = item(&game, "cubara:raw_iron");
-        Arc::make_mut(&mut game.server.world)
-            .furnace_at_mut(pos)
-            .unwrap()
-            .input = Some((raw, 2));
+        edit_furnace(&mut game, pos, |f| f.input = Some((raw, 2)));
 
         game.toggle_inventory();
 
@@ -2095,13 +2151,10 @@ mod tests {
         let pos = open_a_furnace(&mut game);
         let raw = item(&game, "cubara:raw_iron");
         let log = item(&game, "cubara:oak_log");
-        {
-            let f = Arc::make_mut(&mut game.server.world)
-                .furnace_at_mut(pos)
-                .unwrap();
+        edit_furnace(&mut game, pos, |f| {
             f.input = Some((raw, 4));
             f.fuel = Some((log, 2));
-        }
+        });
 
         game.break_at(pos);
 
@@ -2188,11 +2241,10 @@ mod tests {
     fn load_furnace(game: &mut Game, pos: [i32; 3]) {
         let raw = item(game, "cubara:raw_iron");
         let log = item(game, "cubara:oak_log");
-        let f = Arc::make_mut(&mut game.server.world)
-            .furnace_at_mut(pos)
-            .unwrap();
-        f.input = Some((raw, 8));
-        f.fuel = Some((log, 32));
+        edit_furnace(game, pos, |f| {
+            f.input = Some((raw, 8));
+            f.fuel = Some((log, 32));
+        });
     }
 
     #[test]
@@ -2203,8 +2255,11 @@ mod tests {
         game.advance(TICK_DT);
 
         let coord = ChunkCoord::from_block(pos[0], pos[1], pos[2]);
+        // Read from the *server*: which chunks simulate is authority (§8.1),
+        // and the client's replica has no lifecycle at all -- it is told about
+        // edits, not about what is ticking.
         assert_eq!(
-            game.world().chunk_states().get(coord),
+            game.server.world.chunk_states().get(coord),
             cubara_world::ChunkState::Active,
             "active while the player is here"
         );
@@ -2214,7 +2269,7 @@ mod tests {
 
         assert!(
             matches!(
-                game.world().chunk_states().get(coord),
+                game.server.world.chunk_states().get(coord),
                 cubara_world::ChunkState::Dormant { .. }
             ),
             "dormant once they leave"
@@ -2472,12 +2527,8 @@ mod tests {
         let terrain = game.server.terrain.expect("assets are set");
         let deep = [3, -2_000, 7];
 
-        let cc = Arc::make_mut(&mut game.server.world).set_block(
-            deep[0],
-            deep[1],
-            deep[2],
-            BlockId::AIR,
-        );
+        let cc = game.server.set_block(deep, BlockId::AIR);
+        game.sync();
         assert_eq!(cc, ChunkCoord::from_block(deep[0], deep[1], deep[2]));
         assert!(
             !game.world().is_solid_at(deep[0], deep[1], deep[2], terrain),
@@ -2516,16 +2567,13 @@ mod tests {
         // player is next to it -- the simulated band moves with them now.
         let (mut game, _) = game_looking_at_ground();
         let deep = [0, -1_000, 0];
-        Arc::make_mut(&mut game.server.world).add_furnace(deep);
+        game.server.add_furnace(deep);
         let raw = item(&game, "cubara:raw_iron");
         let log = item(&game, "cubara:oak_log");
-        {
-            let f = Arc::make_mut(&mut game.server.world)
-                .furnace_at_mut(deep)
-                .unwrap();
+        edit_furnace(&mut game, deep, |f| {
             f.input = Some((raw, 2));
             f.fuel = Some((log, 4));
-        }
+        });
         // Stand next to it.
         game.server.sim.player.pos = cubara_voxel::FixedVec3::from_f32([0.5, -1_000.0, 0.5]);
         game.server.sim.player.spawn = game.server.sim.player.pos;
@@ -2613,6 +2661,192 @@ mod tests {
         assert!(
             !game.load_from(&empty),
             "reported a load that did not happen"
+        );
+    }
+
+    // ── The client's replica world (RESEARCH_MULTIPLAYER §8.2) ──────────────
+
+    /// The claim the whole section rests on: **terrain is generated, never
+    /// sent.** Two worlds built from one seed agree everywhere, and nothing
+    /// crossed the seam to make that true.
+    ///
+    /// If this ever stops holding, the replica stops being affordable and the
+    /// design changes -- so it is worth a test of its own rather than being
+    /// implied by the ones below.
+    #[test]
+    fn the_replica_generates_the_same_terrain_as_the_server_with_nothing_sent() {
+        let (game, _) = game_looking_at_ground();
+        let terrain = game.server.terrain.expect("assets are set");
+        assert_eq!(
+            game.world().seed(),
+            game.server.world.seed(),
+            "same seed, which is all the client is given"
+        );
+        for y in -40..80 {
+            assert_eq!(
+                game.world().is_solid_at(3, y, 7, terrain),
+                game.server.world.is_solid_at(3, y, 7, terrain),
+                "the two worlds disagree about (3, {y}, 7)"
+            );
+        }
+    }
+
+    /// They are genuinely two worlds, not one behind an accessor.
+    ///
+    /// An edit written straight into the server's world -- bypassing the
+    /// journal, which is the one thing production code may never do -- must
+    /// **not** appear on the client. That is what proves there is no in-process
+    /// shortcut left: if this test fails, `Game::world()` is the server's world
+    /// again and the seam is decorative.
+    #[test]
+    fn an_edit_that_skips_the_journal_never_reaches_the_client() {
+        let (mut game, _) = game_looking_at_ground();
+        let terrain = game.server.terrain.expect("assets are set");
+        let at = [11, 30, 11];
+        let stone = game
+            .server
+            .blocks_registry
+            .as_ref()
+            .unwrap()
+            .id_of("cubara:stone")
+            .unwrap();
+
+        Arc::make_mut(&mut game.server.world).set_block(at[0], at[1], at[2], stone);
+        game.sync();
+
+        assert!(
+            game.server.world.is_solid_at(at[0], at[1], at[2], terrain),
+            "the server has it"
+        );
+        assert!(
+            !game.world().is_solid_at(at[0], at[1], at[2], terrain),
+            "and the client was never told, because nothing told it"
+        );
+    }
+
+    /// The ordinary path: an edit made through the server reaches the replica,
+    /// and the chunk the client must re-mesh is the one it worked out itself.
+    #[test]
+    fn an_edit_reaches_the_replica_and_names_its_own_dirty_chunk() {
+        let (mut game, ground) = game_looking_at_ground();
+        let terrain = game.server.terrain.expect("assets are set");
+
+        game.server.set_block(ground, BlockId::AIR);
+        let dirty = game.sync();
+
+        assert!(
+            !game
+                .world()
+                .is_solid_at(ground[0], ground[1], ground[2], terrain),
+            "the replica applied the edit"
+        );
+        assert_eq!(
+            dirty,
+            vec![ChunkCoord::from_block(ground[0], ground[1], ground[2])],
+            "and derived the stale chunk from its own world, not from the server"
+        );
+    }
+
+    /// A catch-up burst that edits one chunk repeatedly is one re-mesh, not
+    /// five. `sync` runs once after the whole burst, which is where that
+    /// falls out.
+    #[test]
+    fn a_burst_of_edits_in_one_chunk_is_one_dirty_chunk() {
+        let (mut game, ground) = game_looking_at_ground();
+        for dy in 0..4 {
+            game.server
+                .set_block([ground[0], ground[1] - dy, ground[2]], BlockId::AIR);
+        }
+        assert_eq!(game.sync().len(), 1, "four edits, one chunk, one re-mesh");
+    }
+
+    /// The furnace screen is drawn from the **replica**, so a furnace smelting
+    /// away has to be replicated every tick it changes -- otherwise the panel
+    /// would freeze the moment it opened.
+    ///
+    /// This is the block-entity half of §8.3 doing real work rather than being
+    /// a message type nobody sends.
+    #[test]
+    fn a_smelting_furnace_updates_the_clients_screen_through_block_entity_effects() {
+        let (mut game, _) = game_looking_at_ground();
+        let pos = open_a_furnace(&mut game);
+        let raw = item(&game, "cubara:raw_iron");
+        let log = item(&game, "cubara:oak_log");
+        edit_furnace(&mut game, pos, |f| {
+            f.input = Some((raw, 1));
+            f.fuel = Some((log, 4));
+        });
+
+        let before = game.open_furnace().expect("open");
+        for _ in 0..210 {
+            game.advance(TICK_DT);
+        }
+        let after = game.open_furnace().expect("still open");
+
+        assert_ne!(
+            before, after,
+            "the client's copy of the furnace moved with the server's"
+        );
+        assert_eq!(
+            after,
+            game.server.world.furnace_at(pos).copied().unwrap(),
+            "and matches it exactly"
+        );
+    }
+
+    /// The join handshake (§8.3): a replica with nothing in it is brought up to
+    /// date from a snapshot, not from a delta -- because there is no delta from
+    /// a world it has never seen.
+    ///
+    /// Driven the way a load does it, since that is the one thing today that
+    /// replaces a world wholesale.
+    #[test]
+    fn a_snapshot_rebuilds_a_replica_that_has_seen_nothing() {
+        let (mut game, ground) = game_looking_at_ground();
+        let terrain = game.server.terrain.expect("assets are set");
+        let pos = open_a_furnace(&mut game);
+        let raw = item(&game, "cubara:raw_iron");
+        edit_furnace(&mut game, pos, |f| f.input = Some((raw, 2)));
+        game.server.set_block(ground, BlockId::AIR);
+        game.sync();
+
+        // Throw the replica away, exactly as a load does, and rejoin.
+        game.world = Arc::new(World::with_seed(game.server.world.seed()));
+        assert!(
+            game.world()
+                .is_solid_at(ground[0], ground[1], ground[2], terrain),
+            "the fresh replica has the untouched terrain"
+        );
+        game.resync();
+
+        assert!(
+            !game
+                .world()
+                .is_solid_at(ground[0], ground[1], ground[2], terrain),
+            "the snapshot carried the edit"
+        );
+        assert_eq!(
+            game.world().furnace_at(pos).copied(),
+            game.server.world.furnace_at(pos).copied(),
+            "and the block entity"
+        );
+    }
+
+    /// Playing must keep the two worlds in step. Mine a block by holding the
+    /// button, the way the game does, and the replica ends up agreeing with the
+    /// server about every edit in the chunk.
+    #[test]
+    fn mining_through_the_action_path_keeps_the_two_worlds_in_step() {
+        let (mut game, _) = game_looking_at_ground();
+        stand_over(&mut game, "cubara:stone");
+        hold(&mut game, "cubara:stone_pick");
+        mine_for(&mut game, 20).expect("it broke");
+
+        let server_edits: Vec<_> = game.server.world.edits().collect();
+        let client_edits: Vec<_> = game.world().edits().collect();
+        assert_eq!(
+            server_edits, client_edits,
+            "the replica saw every edit the server made, and no others"
         );
     }
 }

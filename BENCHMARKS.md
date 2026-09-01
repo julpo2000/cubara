@@ -109,7 +109,8 @@ frames after 200 warmup.
 | 2026-08-31 | Health, fall damage, regeneration [#172], radius 64³⁷ | 1,600 | 822,420 | ~1,379 | 0.496 ms | ~0.93 ms | `3df7b28` |
 | 2026-08-31 | Caves at level 0 only [#175], radius 64, **old 3-layer slab**³⁸ | 1,600 | **675,962** | **~1,553** | **0.447 ms** | ~0.78 ms | *(this PR)* |
 | 2026-08-31 | **World with no height limit** [#175], radius 64, band ±2³⁸ | **3,138** | 912,964 | ~1,115 | 0.613 ms | ~1.08 ms | `4da25da` |
-| 2026-08-31 | Fixed-point positions, radius 64, band ±2³⁹ | 3,138 | 912,964 | ~1,109 | 0.622 ms | ~1.04 ms | *(this PR)* |
+| 2026-08-31 | Fixed-point positions, radius 64, band ±2³⁹ | 3,138 | 912,964 | ~1,109 | 0.622 ms | ~1.04 ms | `24e4789` |
+| 2026-09-01 | Client-side replica world, radius 64, band ±2⁴⁰ | 3,138 | 912,964 | ~1,101 | 0.628 ms | ~1.22 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -1205,3 +1206,20 @@ mostly the CPU frustum cull writing the indirect list — the work **#28** hands
 compute shader. The `--caps` spike (#26) confirmed both target backends support
 `MULTI_DRAW_INDIRECT`; Metal lacks only `MULTI_DRAW_INDIRECT_COUNT`, which Step 2
 will need a fallback for.
+
+⁴⁰ **The replica costs nothing measurable, and that was the thing to check.**
+The client now holds its own `World` (`RESEARCH_MULTIPLAYER.md` §8.2), so the
+worry was two of them: twice the terrain generation, twice the memory.
+
+CPU/frame moved 0.622 → 0.628 ms, which is inside this scene's run-to-run
+scatter. The reason it is free is the design's own argument made concrete:
+**terrain is a pure function of the seed, so nothing is copied.** The replica's
+`WorldGen` is the same cheap seeded noise, and it is only ever evaluated for
+chunks the client actually meshes — which is exactly the set it was already
+meshing. What the replica adds is an edit `BTreeMap` and a block-entity map,
+both of which are empty on a fresh world and small on any world.
+
+p99 moved 1.04 → 1.22 ms, and the honest reading is that this scene's p99 is
+noisy rather than that a regression is hiding in it: the avg is what carries
+signal at this scale (see ¹), and the per-frame work added is one drain of an
+empty `Vec`.

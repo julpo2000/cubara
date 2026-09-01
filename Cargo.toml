@@ -1,6 +1,14 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# `cargo run --release` means *the game*. Without this it became ambiguous the
+# moment `cubara-server` added a second binary, which would have broken the
+# documented commands and the double-click launchers (`run.command`/`run.bat`).
+#
+# This narrows the default scope of bare `cargo build`/`test`/`clippy` too, so
+# CI passes `--workspace` explicitly rather than relying on the default -- the
+# point is to choose a binary, not to stop linting a crate.
+default-members = ["crates/app"]
 
 [workspace.package]
 version = "0.0.1"
