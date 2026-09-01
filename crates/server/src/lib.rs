@@ -1,28 +1,37 @@
 //! The authoritative half: the world, the simulation, and everything that
 //! decides what is true.
 //!
-//! # Why this is a separate type
+//! # Why this is its own crate
 //!
-//! `docs/RESEARCH_MULTIPLAYER.md` §8. Multiplayer here is an authoritative
-//! server (§3), and *"privé en public"* is one architecture in two deployments
-//! (§3.3): private play runs the server in-process, public runs it standalone.
-//! That means the client cannot own the world and edit it directly — which is
-//! exactly what `Game` did, with twenty-four fields spanning both sides of a
-//! seam that did not exist.
+//! `docs/RESEARCH_MULTIPLAYER.md` §3.3: multiplayer here is one architecture in
+//! two deployments — private play runs the server **in-process**, public runs it
+//! **standalone**. A crate is what makes the second one real. While `Server`
+//! lived in `crates/app` it was correct by *content* (it imports no `wgpu`) and
+//! wrong by *construction*: anything that linked it also linked a windowing
+//! library and a graphics API, so a headless host had to install a GPU stack for
+//! a process that will never draw a pixel.
 //!
-//! This is that seam, drawn where §8.1 says it goes. It is deliberately drawn
-//! **before** there is any networking: at one player and no netcode the seam
-//! moves by changing which struct owns a field, and after netcode exists it does
-//! not (§8.5).
+//! This is `ARCHITECTURE.md` Rule 4 collecting its debt. "The simulation runs
+//! with no GPU" was written so a dedicated server would be possible without a
+//! rewrite; the rewrite it saved is this file staying exactly as it was and only
+//! its `Cargo.toml` changing.
 //!
 //! # What is not here yet
 //!
-//! Messages (§8.3) and a client-side replica world (§8.2). This step establishes
-//! *ownership*; the client still calls the server directly rather than sending
-//! it an `Action`. That is the next step, and it is much cheaper once the fields
-//! are already on the right side.
+//! **Networking.** No sockets, no protocol, no players connecting. `Action` and
+//! `Effect` (§8.3) are the messages that will cross a socket, and
+//! [`headless::run`] is the loop that will service one — but today the only
+//! client is in the same process. `cubara-server` runs a world; it does not yet
+//! run a *shared* one. Saying otherwise would be the kind of plausible-sounding
+//! invention that looks decided.
+//!
+//! Also missing: the client-side replica world (§8.2).
 
-use cubara_sim::Sim;
+pub mod assets;
+pub mod clock;
+pub mod headless;
+
+use cubara_sim::{InputFrame, Player, Sim};
 use cubara_voxel::{BlockRegistry, ChunkCoord, ItemRegistry, RecipeBook, SmeltBook};
 use std::sync::Arc;
 
@@ -91,6 +100,239 @@ pub enum Effect {
     Open(Screen),
     /// Whatever screen is open should close -- the block behind it is gone.
     CloseIfAt([i32; 3]),
+}
+
+impl Server {
+    /// An empty world with no assets — what `Game::new()` builds before a
+    /// window exists, and what a test that does not care about content wants.
+    ///
+    /// The player starts at y = 48 because terrain does not exist yet at this
+    /// point; [`set_assets`](Self::set_assets) is what stands them on the
+    /// ground once it does.
+    pub fn new() -> Self {
+        Self {
+            world: Arc::new(World::new()),
+            sim: Sim::new(0, Player::new(FixedVec3::from_blocks(0, 48, 0), 0.6, -0.3)),
+            blocks_registry: None,
+            terrain: None,
+            items: None,
+            recipes: None,
+            smelting: None,
+            sim_centre: None,
+        }
+    }
+
+    /// A server with every definition loaded and the save at `dir` restored, if
+    /// there is one.
+    ///
+    /// This is the whole of "start a world" — what the dedicated server does at
+    /// boot and what the window does once its registry exists. Returns whether
+    /// a save was loaded; `false` is the normal first run, not an error.
+    pub fn open(&mut self, dir: &std::path::Path) -> bool {
+        let items = assets::load_item_registry();
+        let recipes = assets::load_recipe_book(&items);
+        self.set_assets(Arc::new(assets::load_block_registry()), items, recipes);
+        self.load_from(dir)
+    }
+
+    /// Give the server the assets it needs to turn blocks into items and back,
+    /// and stand the player on the ground.
+    pub fn set_assets(
+        &mut self,
+        registry: Arc<BlockRegistry>,
+        items: ItemRegistry,
+        recipes: RecipeBook,
+    ) {
+        self.terrain = Some(
+            TerrainBlocks::from_registry(&registry)
+                .with_oak(&assets::load_structure_registry(), &registry)
+                .with_ores(&assets::load_ore_registry(), &registry),
+        );
+        self.blocks_registry = Some(registry);
+        self.smelting = Some(assets::load_smelt_book(&items));
+        // Terrain is known for the first time here, so this is where the player
+        // can be put somewhere that exists.
+        self.place_player_on_ground();
+        self.items = Some(items);
+        self.recipes = Some(recipes);
+    }
+
+    /// Stand the player on the terrain under their column, and make that their
+    /// spawn point.
+    ///
+    /// **Without this the game is unplayable.** [`Server::new`] places the
+    /// player at y = 48 because terrain does not exist yet at that point -- but
+    /// the surface under that column is at y = 15, a 32-block drop. Once block
+    /// 2.9a made falling hurt, that is 29 damage against 20 health: the player
+    /// dies on the first landing, respawns at the same point in mid-air, and
+    /// dies again, forever.
+    ///
+    /// Every test missed it because they all reposition the player just above
+    /// the ground before doing anything. `the_game_does_not_start_by_killing_the_player`
+    /// is the one that starts the way the app does.
+    ///
+    /// Two blocks above the surface, not exactly on it: the eye is 1.62 above
+    /// the feet, so this leaves a fraction of a block to settle -- well inside
+    /// the 3-block safe fall, and it avoids having to reach for the private
+    /// eye-height constant from another crate.
+    pub fn place_player_on_ground(&mut self) {
+        let Some(terrain) = self.terrain else {
+            return;
+        };
+        let p = self.sim.player.pos;
+        let [px, _, pz] = p.to_f32();
+        let Some(hit) = self
+            .world
+            .raycast([px, 200.0, pz], [0.0, -1.0, 0.0], 400.0, terrain)
+        else {
+            return;
+        };
+        let standing = FixedVec3::new(p.x, cubara_voxel::Fixed::from_blocks(hit.block[1] + 2), p.z);
+        self.sim.player.pos = standing;
+        self.sim.player.velocity = FixedVec3::ZERO;
+        self.sim.player.fall_distance = cubara_voxel::Fixed::ZERO;
+        // Death returns here, not to wherever `Server::new` happened to start.
+        self.sim.player.spawn = standing;
+    }
+
+    /// Advance the player's simulation by one tick.
+    ///
+    /// Split from [`tick_world`](Self::tick_world) so the client can keep doing
+    /// its per-tick mining between the two, which is where it has always
+    /// happened. Merging them would reorder the tick, and tick order is Rule 1
+    /// — the pinned world hashes would move, and a moved hash with no reason is
+    /// indistinguishable from a determinism bug.
+    pub fn tick_sim(&mut self, input: &InputFrame) {
+        let terrain = self.terrain();
+        self.sim
+            .tick(Arc::make_mut(&mut self.world), input, terrain);
+    }
+
+    /// Advance everything that ticks whether or not a player is doing anything:
+    /// furnaces, and dropped items falling and ageing out.
+    ///
+    /// This is the half a dedicated server runs with no one connected. That it
+    /// *is* a half — that the world does not stop when the player does — is the
+    /// thing a headless server tests for free.
+    pub fn tick_world(&mut self) {
+        self.tick_furnaces();
+        // Dropped items fall, age out, and get picked up -- on the same fixed
+        // clock as everything else (§10.4, Rule 1).
+        if let Some(items) = self.items.as_ref() {
+            let terrain = self.terrain();
+            self.sim.tick_entities(&self.world, terrain, items);
+        }
+    }
+
+    /// The world's state reduced to one number (`cubara_sim::WorldHash`).
+    ///
+    /// **Over the simulation radius, not the whole world.** An infinite world
+    /// has no "whole" to hash, and the simulation radius is exactly the part
+    /// two machines running the same world have to agree about
+    /// (`RESEARCH_MULTIPLAYER.md` §3.2) — a chunk nobody is simulating cannot
+    /// have diverged, because nothing has happened in it.
+    ///
+    /// The region is derived from the player's position rather than read off
+    /// the chunk lifecycle: `chunk_states().active()` is empty on a world that
+    /// has been loaded but not yet ticked, so hashing that would make a
+    /// freshly-restored world hash differently from the one that was saved —
+    /// which is the one comparison this most needs to get right.
+    pub fn hash(&self) -> cubara_sim::WorldHash {
+        cubara_sim::WorldHash::compute(
+            &self.sim,
+            &self.world,
+            &self.hash_region(),
+            self.terrain(),
+            1,
+        )
+    }
+
+    /// The chunks [`hash`](Self::hash) covers, in ascending order.
+    ///
+    /// Separate so a test can check it against what the world actually
+    /// simulates -- see `the_hash_covers_every_chunk_that_is_simulating`.
+    pub fn hash_region(&self) -> Vec<ChunkCoord> {
+        let centre = ChunkCoord::from_world_pos(self.sim.player.pos.to_f32());
+        let mut region = Vec::new();
+        for x in (centre.x - SIM_RADIUS_CHUNKS)..=(centre.x + SIM_RADIUS_CHUNKS) {
+            for y in (centre.y - SIM_HASH_VERTICAL_CHUNKS)..=(centre.y + SIM_HASH_VERTICAL_CHUNKS) {
+                for z in (centre.z - SIM_RADIUS_CHUNKS)..=(centre.z + SIM_RADIUS_CHUNKS) {
+                    region.push(ChunkCoord::new(x, y, z));
+                }
+            }
+        }
+        // Ascending coordinate order, which is what `compute` folds in.
+        region.sort();
+        region
+    }
+
+    /// Write the world to disk (#179).
+    ///
+    /// Best-effort and non-fatal: a failed save is logged, not a crash. Losing
+    /// a session is bad; losing it *and* taking the process down with it is
+    /// worse, and it may be shutting down precisely because something is
+    /// already wrong.
+    pub fn save_to(&self, dir: &std::path::Path) {
+        let (Some(registry), Some(items), Some(blocks)) = (
+            self.blocks_registry.as_deref(),
+            self.items.as_ref(),
+            self.terrain,
+        ) else {
+            return;
+        };
+        match cubara_sim::save_world(dir, &self.sim, &self.world, registry, items, blocks) {
+            Ok(()) => log::info!("world saved to {}", dir.display()),
+            Err(e) => log::error!("could not save the world: {e}"),
+        }
+    }
+
+    /// Replace this server's world with the one on disk, if there is one (#179).
+    ///
+    /// Returns whether anything was loaded. A missing save is the normal first
+    /// run, not an error. A save that exists but *fails* to load is logged and
+    /// ignored rather than fatal -- most often it is a version mismatch after
+    /// the generator changed, and refusing to start over it would be worse than
+    /// starting a fresh world.
+    ///
+    /// **Called after `set_assets`**, which stands the player on the ground:
+    /// this overwrites that position with the saved one, so a player who quit
+    /// in a mineshaft comes back to the mineshaft.
+    pub fn load_from(&mut self, dir: &std::path::Path) -> bool {
+        let (Some(registry), Some(items), Some(blocks)) = (
+            self.blocks_registry.as_deref(),
+            self.items.as_ref(),
+            self.terrain,
+        ) else {
+            return false;
+        };
+        if !dir.join("level.ron").exists() {
+            return false;
+        }
+        match cubara_sim::load_world(dir, registry, items, blocks) {
+            Ok((sim, world)) => {
+                self.sim = sim;
+                self.world = Arc::new(world);
+                // The simulation radius is recomputed from scratch: the saved
+                // world has no chunk lifecycle (§11), by design.
+                self.sim_centre = None;
+                log::info!("world loaded from {}", dir.display());
+                true
+            }
+            Err(e) => {
+                log::error!(
+                    "could not load {}: {e} -- starting a fresh world",
+                    dir.display()
+                );
+                false
+            }
+        }
+    }
+}
+
+impl Default for Server {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Server {
@@ -435,8 +677,60 @@ fn advance_furnace(
 /// affordable; expected to grow once block 2.7 makes a dormant chunk nearly
 /// free.
 const SIM_RADIUS_CHUNKS: i32 = 4;
+
+/// The vertical half-height of [`Server::hash`]'s region, in chunks.
+///
+/// Matches the world's own simulated band. Its constant is private to
+/// `cubara-world` and this is a hash region rather than a lifecycle decision,
+/// so it is stated here rather than reached for.
+/// `the_hash_covers_every_chunk_that_is_simulating` is what stops the two
+/// drifting: if the world's band grows past this, that test fails.
+const SIM_HASH_VERTICAL_CHUNKS: i32 = 2;
 /// The middle of block `b`, where an item dropped by breaking it appears.
 fn drop_centre(b: [i32; 3]) -> FixedVec3 {
     let half = cubara_voxel::Fixed::from_raw(cubara_voxel::fixed::ONE / 2);
     FixedVec3::from_blocks(b[0], b[1], b[2]) + FixedVec3::new(half, half, half)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`Server::hash`] states its own vertical band because `cubara-world`'s
+    /// is private. That is a duplicated constant, so it needs a check: every
+    /// chunk the world is actually simulating must be inside the region the
+    /// hash covers.
+    ///
+    /// If the world's simulated band ever grows past the hash's, this fails —
+    /// which is what stops two servers agreeing on a hash that quietly stopped
+    /// covering the part of the world where they could disagree.
+    #[test]
+    fn the_hash_covers_every_chunk_that_is_simulating() {
+        let mut server = Server::new();
+        server.open(std::path::Path::new("/nonexistent-so-a-fresh-world"));
+        // One tick is enough to establish the simulation radius.
+        server.tick_sim(&InputFrame::default());
+        server.tick_world();
+
+        let region: std::collections::BTreeSet<_> = server.hash_region().into_iter().collect();
+        let active: Vec<_> = server.world.chunk_states().active().collect();
+        assert!(!active.is_empty(), "the radius was established");
+        for coord in active {
+            assert!(
+                region.contains(&coord),
+                "{coord:?} is simulating but is outside the hashed region"
+            );
+        }
+    }
+
+    /// A fresh server has no assets, and must still be usable — `Game::new()`
+    /// builds one before a window exists, and a headless test that never loads
+    /// anything should still be able to walk around.
+    #[test]
+    fn a_server_with_no_assets_still_ticks() {
+        let mut server = Server::new();
+        server.tick_sim(&InputFrame::default());
+        server.tick_world();
+        assert_eq!(server.sim.tick, 1);
+    }
 }

@@ -17,12 +17,12 @@ use std::sync::Arc;
 
 use cubara_render::CameraPose;
 use cubara_render::{swatch_color, HotbarSlot, InventoryPanel, PanelSlotKind};
-use cubara_sim::{InputFrame, Player, Sim, REACH, TICK_DT};
+use cubara_sim::{InputFrame, Player, REACH, TICK_DT};
 use cubara_sim::{SlotRef, HOTBAR_WIDTH};
-use cubara_voxel::{BlockRegistry, ChunkCoord, FixedVec3, ItemRegistry, RecipeBook, SmeltBook};
+use cubara_voxel::{BlockRegistry, ChunkCoord, ItemRegistry, RecipeBook};
 use cubara_world::{Furnace, TerrainBlocks, World};
 
-use crate::server::{Action, Effect, Screen, Server};
+use cubara_server::{Action, Effect, Screen, Server};
 
 use winit::keyboard::KeyCode;
 
@@ -37,55 +37,17 @@ const MAX_TICKS_PER_FRAME: u32 = 5;
 
 /// Everything the player *is* and *does*: the world they're in and the simulation
 /// running against it.
-/// Load `assets/items/*.ron`.
+/// The asset loaders and the world directory, re-exported from the crate that
+/// now owns them.
 ///
-/// In the app rather than in `cubara-render` alongside `load_registry`: items
-/// are not a render concern (`ARCHITECTURE.md` Rule 3), and nothing about them
-/// needs a GPU. `CARGO_MANIFEST_DIR` is `crates/app`, so `../..` reaches the
-/// repo root regardless of the caller's working directory -- the same trick
-/// `load_registry` uses from `crates/render`.
-pub fn load_item_registry() -> ItemRegistry {
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    ItemRegistry::load(&repo_root.join("assets/items")).expect("assets/items must load")
-}
-
-/// Load `assets/structures/*.ron` -- the shapes worldgen grows.
-pub fn load_structure_registry() -> cubara_voxel::StructureRegistry {
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    cubara_voxel::StructureRegistry::load(&repo_root.join("assets/structures"))
-        .expect("assets/structures must load")
-}
-
-/// Where the world lives on disk.
-///
-/// One world, in a fixed place next to the executable's project root. Named
-/// worlds and a world-picker are a gameplay/UI decision nobody has made
-/// (#179), and inventing one would be inventing a menu; this is the smallest
-/// thing that makes "still there after you close it" true, which is what
-/// `ROADMAP.md` says phase 1 delivers.
-pub fn world_dir() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("saves/world")
-}
-
-/// Load `assets/smelting/*.ron`, resolving item names through `items`.
-pub fn load_smelt_book(items: &ItemRegistry) -> SmeltBook {
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    SmeltBook::load(&repo_root.join("assets/smelting"), items).expect("assets/smelting must load")
-}
-
-/// Load `assets/ores/*.ron` -- which ores exist, and how common they are.
-pub fn load_ore_registry() -> cubara_voxel::OreRegistry {
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    cubara_voxel::OreRegistry::load(&repo_root.join("assets/ores")).expect("assets/ores must load")
-}
-
-/// Load `assets/recipes/*.ron`, resolving ingredient names through `items`.
-pub fn load_recipe_book(items: &ItemRegistry) -> RecipeBook {
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    RecipeBook::load(&repo_root.join("assets/recipes"), items).expect("assets/recipes must load")
-}
+/// They moved to `cubara-server` because the *server* decides what a block
+/// means (`RESEARCH_MULTIPLAYER.md` §3.4) and because a dedicated server has to
+/// be able to load them with no window. The client still needs the names — it
+/// draws items and builds the same registries — so it says where they went
+/// rather than keeping a second copy.
+pub use cubara_server::assets::{
+    load_item_registry, load_ore_registry, load_recipe_book, load_structure_registry, world_dir,
+};
 
 /// A break part-way through (`PHASE2_ARCHITECTURE.md` §4.3).
 ///
@@ -182,18 +144,10 @@ impl Game {
     /// you land in and walk, not one you start already flying over) -- gravity
     /// carries the player down onto the terrain below.
     pub fn new() -> Self {
-        let player = Player::new(FixedVec3::from_blocks(0, 48, 0), 0.6, -0.3);
+        let server = Server::new();
+        let player = server.sim.player;
         Self {
-            server: Server {
-                world: Arc::new(World::new()),
-                sim: Sim::new(0, player),
-                blocks_registry: None,
-                terrain: None,
-                items: None,
-                recipes: None,
-                smelting: None,
-                sim_centre: None,
-            },
+            server,
             prev_player: player,
             inventory_open: false,
             open_furnace: None,
@@ -362,25 +316,17 @@ impl Game {
         let mut dirty = Vec::new();
         while self.accumulator >= TICK_DT as f64 {
             self.prev_player = self.server.sim.player;
-            // Read before the mutable borrow of `world`.
-            let terrain = self.terrain();
-            self.server
-                .sim
-                .tick(Arc::make_mut(&mut self.server.world), &input, terrain);
+            self.server.tick_sim(&input);
             // Mining advances *per tick*, not per frame -- §4.3, and the same
             // reason the tick loop exists. A catch-up burst of N ticks is N
             // ticks of progress, which is correct: that time really did pass.
+            //
+            // Between the server's two halves, which is where it has always
+            // run: moving it would reorder the tick, and tick order is Rule 1.
             if let Some(cc) = self.tick_mining(input.breaking) {
                 dirty.push(cc);
             }
-            self.server.tick_furnaces();
-            // Dropped items fall, age out, and get picked up -- on the same
-            // fixed clock as everything else (§10.4, Rule 1).
-            if let Some(items) = self.server.items.as_ref() {
-                self.server
-                    .sim
-                    .tick_entities(&self.server.world, terrain, items);
-            }
+            self.server.tick_world();
             input.jump = false;
             input.toggle_fly = false;
             input.look_delta = [0.0, 0.0];
@@ -397,126 +343,26 @@ impl Game {
         dirty
     }
 
-    /// Stand the player on the terrain under their column, and make that their
-    /// spawn point.
-    ///
-    /// **Without this the game is unplayable.** `Game::new` places the player at
-    /// y = 48 because terrain does not exist yet at that point -- but the
-    /// surface under that column is at y = 15, a 32-block drop. Once block 2.9a
-    /// made falling hurt, that is 29 damage against 20 health: the player dies
-    /// on the first landing, respawns at the same point in mid-air, and dies
-    /// again, forever.
-    ///
-    /// Every test missed it because they all reposition the player just above
-    /// the ground before doing anything. `the_game_does_not_start_by_killing_the_player`
-    /// is the one that starts the way the app does.
-    ///
-    /// Two blocks above the surface, not exactly on it: the eye is 1.62 above
-    /// the feet, so this leaves a fraction of a block to settle -- well inside
-    /// the 3-block safe fall, and it avoids having to reach for the private
-    /// eye-height constant from another crate.
-    fn place_player_on_ground(&mut self) {
-        let Some(terrain) = self.server.terrain else {
-            return;
-        };
-        let p = self.server.sim.player.pos;
-        let [px, _, pz] = p.to_f32();
-        let Some(hit) =
-            self.server
-                .world
-                .raycast([px, 200.0, pz], [0.0, -1.0, 0.0], 400.0, terrain)
-        else {
-            return;
-        };
-        let standing = FixedVec3::new(p.x, cubara_voxel::Fixed::from_blocks(hit.block[1] + 2), p.z);
-        self.server.sim.player.pos = standing;
-        self.server.sim.player.velocity = FixedVec3::ZERO;
-        self.server.sim.player.fall_distance = cubara_voxel::Fixed::ZERO;
-        // Death returns here, not to wherever `Game::new` happened to start.
-        self.server.sim.player.spawn = standing;
-        self.prev_player = self.server.sim.player;
-    }
-
-    /// Write the world to disk (#179).
-    ///
-    /// Best-effort and non-fatal: a failed save is logged, not a crash. Losing
-    /// a session is bad; losing it *and* taking the window down with it is
-    /// worse, and the player may be quitting precisely because something is
-    /// already wrong.
+    /// Write the world to disk (#179). The server owns the world, so it owns
+    /// the save; this is the client's shutdown reaching for it.
     pub fn save(&self) {
-        self.save_to(&world_dir());
-    }
-
-    /// [`save`](Self::save) into a specific directory -- what the tests drive,
-    /// so they never touch the real world folder.
-    pub fn save_to(&self, dir: &std::path::Path) {
-        let (Some(registry), Some(items), Some(blocks)) = (
-            self.server.blocks_registry.as_deref(),
-            self.server.items.as_ref(),
-            self.server.terrain,
-        ) else {
-            return;
-        };
-        match cubara_sim::save_world(
-            dir,
-            &self.server.sim,
-            &self.server.world,
-            registry,
-            items,
-            blocks,
-        ) {
-            Ok(()) => log::info!("world saved to {}", dir.display()),
-            Err(e) => log::error!("could not save the world: {e}"),
-        }
+        self.server.save_to(&world_dir());
     }
 
     /// Replace this game's world with the one on disk, if there is one (#179).
-    ///
-    /// Returns whether anything was loaded. A missing save is the normal first
-    /// run, not an error. A save that exists but *fails* to load is logged and
-    /// ignored rather than fatal -- most often it is a version mismatch after
-    /// the generator changed, and refusing to start the game over it would be
-    /// worse than starting a fresh world.
-    ///
-    /// **Called after `set_assets`**, which stands the player on the ground:
-    /// this overwrites that position with the saved one, so a player who
-    /// quit in a mineshaft comes back to the mineshaft.
     pub fn load(&mut self) -> bool {
-        let dir = world_dir();
-        self.load_from(&dir)
+        self.load_from(&world_dir())
     }
 
     /// [`load`](Self::load) from a specific directory.
     pub fn load_from(&mut self, dir: &std::path::Path) -> bool {
-        let (Some(registry), Some(items), Some(blocks)) = (
-            self.server.blocks_registry.as_deref(),
-            self.server.items.as_ref(),
-            self.server.terrain,
-        ) else {
-            return false;
-        };
-        if !dir.join("level.ron").exists() {
-            return false;
+        let loaded = self.server.load_from(dir);
+        if loaded {
+            // A load replaces the player wholesale, so the previous pose the
+            // client interpolates from is now a pose from a different world.
+            self.prev_player = self.server.sim.player;
         }
-        match cubara_sim::load_world(dir, registry, items, blocks) {
-            Ok((sim, world)) => {
-                self.server.sim = sim;
-                self.server.world = Arc::new(world);
-                self.prev_player = self.server.sim.player;
-                // The simulation radius is recomputed from scratch: the saved
-                // world has no chunk lifecycle (§11), by design.
-                self.server.sim_centre = None;
-                log::info!("world loaded from {}", dir.display());
-                true
-            }
-            Err(e) => {
-                log::error!(
-                    "could not load {}: {e} -- starting a fresh world",
-                    dir.display()
-                );
-                false
-            }
-        }
+        loaded
     }
 
     /// The player's health, reduced to what the renderer draws
@@ -560,18 +406,10 @@ impl Game {
         items: ItemRegistry,
         recipes: RecipeBook,
     ) {
-        self.server.terrain = Some(
-            TerrainBlocks::from_registry(&registry)
-                .with_oak(&load_structure_registry(), &registry)
-                .with_ores(&load_ore_registry(), &registry),
-        );
-        self.server.blocks_registry = Some(registry);
-        self.server.smelting = Some(load_smelt_book(&items));
-        // Terrain is known for the first time here, so this is where the player
-        // can be put somewhere that exists.
-        self.place_player_on_ground();
-        self.server.items = Some(items);
-        self.server.recipes = Some(recipes);
+        self.server.set_assets(registry, items, recipes);
+        // The server just moved the player onto the ground; the client's
+        // interpolation would otherwise smear them there from y = 48.
+        self.prev_player = self.server.sim.player;
     }
 
     /// Break the targeted block and put its drop in the inventory.
@@ -1036,6 +874,7 @@ impl Default for Game {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cubara_voxel::FixedVec3;
     use cubara_voxel::{BlockId, ItemStack, ItemState};
 
     #[test]
@@ -2747,7 +2586,7 @@ mod tests {
             game.break_at(mined);
             carried = game.server.sim.player.inventory;
 
-            game.save_to(&dir);
+            game.server.save_to(&dir);
         }
 
         let mut reopened = game_with_assets();

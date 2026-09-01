@@ -10,7 +10,6 @@ mod bench;
 mod caps;
 mod game;
 mod screenshot;
-mod server;
 mod streaming;
 
 use std::sync::Arc;
@@ -218,6 +217,27 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args: Vec<String> = std::env::args().collect();
+
+    // The dedicated server: `cubara server [options]`.
+    //
+    // A subcommand rather than a separate download, because a machine that has
+    // the game can host a world without fetching anything. It is *also* its own
+    // binary (`cubara-server`), because this one links wgpu and winit even
+    // here, where it will never open a window -- and a headless host should not
+    // need a GPU stack installed to run a world.
+    //
+    // Both call the same `headless::run` and the same parser, so there is one
+    // server rather than two that drift (Rule 5).
+    if args.get(1).map(String::as_str) == Some("server") {
+        match cubara_server::headless::parse_args(&args[2..]) {
+            Ok(cfg) => cubara_server::headless::run(&cfg),
+            Err(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
 
     // GPU capability report: `cargo run --release -- --caps`.
     if args.iter().any(|a| a == "--caps") {

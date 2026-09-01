@@ -57,7 +57,30 @@ cargo run --release -- --screenshot world.png
 
 # Print GPU adapter capabilities (feature support for GPU-driven rendering)
 cargo run --release -- --caps
+
+# Run a world headlessly — no window, no GPU. `--help` lists the options.
+cargo run --release --bin cubara-server -- --help
+cargo run --release -- server --ticks 600      # the same thing, from the game binary
 ```
+
+### The dedicated server
+
+`cubara-server` runs a world with no window and no GPU: it loads the save, ticks
+the simulation, autosaves, and shuts down cleanly. Furnaces smelt and dropped
+items age out whether or not anyone is playing.
+
+It is a **separate binary** as well as a `cubara server` subcommand, and the
+difference matters on a host without a graphics stack — the subcommand still
+links `wgpu` and `winit` even where it never opens a window:
+
+| | Links | Size (release, macOS) |
+|---|---|---|
+| `cubara` | Metal, AppKit, QuartzCore, CoreVideo | 6.8 MB |
+| `cubara-server` | `libSystem` only | 2.1 MB |
+
+**There is no network transport yet.** This runs a world; it does not yet serve
+one to anybody. See [`docs/RESEARCH_MULTIPLAYER.md`](docs/RESEARCH_MULTIPLAYER.md)
+for the design it is being built towards.
 
 Stack: Rust + [`wgpu`](https://wgpu.rs) (Metal on macOS, DX12/Vulkan on Windows) +
 `winit`. See `PLAN.md` for architecture and the milestone roadmap.

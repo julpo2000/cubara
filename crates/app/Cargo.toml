@@ -19,6 +19,9 @@ cubara-voxel = { path = "../voxel" }
 cubara-render = { path = "../render" }
 cubara-world = { path = "../world" }
 cubara-sim = { path = "../sim" }
+# The authoritative half. The app is the *client*; this is what it talks to,
+# in-process today and over a socket later (RESEARCH_MULTIPLAYER §3.3).
+cubara-server = { path = "../server" }
 winit.workspace = true
 wgpu.workspace = true
 pollster.workspace = true

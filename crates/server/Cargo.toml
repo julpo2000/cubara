@@ -1,0 +1,28 @@
+[package]
+name = "cubara-server"
+description = "Cubara — the authoritative half: the world, the simulation, and the dedicated server that runs them without a GPU."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# The dedicated server. Deliberately its own binary rather than only a
+# subcommand of `cubara`: a subcommand still *links* wgpu and winit even when it
+# never initialises them, which on a headless host means the GPU libraries must
+# be installed for a process that will never draw a pixel. `cubara server`
+# exists too, for convenience on a machine that has the game anyway — both call
+# the same `run`, so there is one implementation (Rule 5).
+[[bin]]
+name = "cubara-server"
+path = "src/bin/cubara-server.rs"
+
+# No wgpu, no winit, no pollster — and `scripts/check-architecture.sh` enforces
+# that, the same way it does for voxel/world/sim. That is Rule 4 collecting its
+# debt: "the simulation runs with no GPU" was written so a dedicated server
+# would be possible without a rewrite, and this crate is the proof.
+[dependencies]
+cubara-voxel = { path = "../voxel" }
+cubara-world = { path = "../world" }
+cubara-sim = { path = "../sim" }
+log.workspace = true
+env_logger.workspace = true
