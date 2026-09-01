@@ -8,17 +8,26 @@
 
 use crate::crafting::Crafting;
 use crate::inventory::Inventory;
-use cubara_voxel::{Fixed, FixedVec3};
+use cubara_voxel::{Angle, Fixed, FixedVec3};
 use glam::Vec3;
 
 use crate::input::InputFrame;
 
-/// Look sensitivity, radians of turn per pixel of mouse motion.
-const SENSITIVITY: f32 = 0.0022;
+/// Look sensitivity, as a binary angle per pixel of mouse motion.
+///
+/// **Public, because it now belongs to the client.** `InputFrame::look_delta`
+/// is an [`Angle`] rather than pixels (`docs/RESEARCH_MULTIPLAYER.md` §3.5:
+/// nothing that crosses the wire is a float), so the pixels-to-angle
+/// conversion happens before the input is sent -- which is also where it
+/// belongs, since sensitivity is a setting on the machine holding the mouse.
+///
+/// 0.0022 radians per pixel, as a binary angle: `0.0022 / τ × 2³²`.
+pub const SENSITIVITY_PER_PIXEL: i32 = 1_503_844;
 /// Movement speed through the world, in blocks per second.
 const SPEED: f32 = 24.0;
 /// Pitch is clamped just short of straight up/down to avoid the view flipping.
-const PITCH_LIMIT: f32 = 1.54; // ~88°
+/// ~88°, as a binary angle.
+const PITCH_LIMIT: Angle = Angle::from_raw(1_052_690_524);
 
 /// Where the player is, which way they're looking, and (block 1.7a) their
 /// walking-physics state. Free-fly and walking are two *modes* of this one
@@ -45,14 +54,18 @@ pub struct Player {
     /// a replay (block 1.8) needs to reproduce -- not a side channel outside
     /// it.
     pub(crate) free_fly: bool,
-    /// Heading around +Y, radians. 0 looks toward −Z. `pub(crate)`, not
-    /// private: `crate::hash::WorldHash` needs the raw angle (`look_dir()`
-    /// only exposes the derived unit vector) to include orientation in the
-    /// world-state hash (issue #90).
-    pub(crate) yaw: f32,
-    /// Up/down angle, radians, clamped to [`PITCH_LIMIT`]. Same reason as
-    /// [`Self::yaw`].
-    pub(crate) pitch: f32,
+    /// Heading around +Y. 0 looks toward −Z. `pub(crate)`, not private:
+    /// `crate::hash::WorldHash` needs the raw angle (`look_dir()` only exposes
+    /// the derived unit vector) to include orientation in the world-state hash
+    /// (issue #90).
+    ///
+    /// An [`Angle`], not radians: this feeds the ray that decides which block
+    /// gets broken, so it is authority, and `docs/RESEARCH_MULTIPLAYER.md` §3.5
+    /// requires authority to be integers. Wrapping is exact, so turning for an
+    /// hour does not drift.
+    pub(crate) yaw: Angle,
+    /// Up/down angle, clamped to [`PITCH_LIMIT`]. Same reason as [`Self::yaw`].
+    pub(crate) pitch: Angle,
     /// What the player is carrying. Part of world state, so it is hashed with
     /// everything else (`crate::hash`) -- block 2.9's survival replay test
     /// asserts on the result.
@@ -105,14 +118,14 @@ pub const SAFE_FALL: Fixed = Fixed::from_raw(3 * cubara_voxel::fixed::ONE);
 pub const FALL_DAMAGE_PER_BLOCK: u8 = 1;
 
 impl Player {
-    pub fn new(pos: FixedVec3, yaw: f32, pitch: f32) -> Self {
+    pub fn new(pos: FixedVec3, yaw: Angle, pitch: Angle) -> Self {
         Self {
             pos,
             velocity: FixedVec3::ZERO,
             on_ground: false,
             free_fly: false,
             yaw,
-            pitch: pitch.clamp(-PITCH_LIMIT, PITCH_LIMIT),
+            pitch: pitch.clamp(PITCH_LIMIT),
             inventory: Inventory::new(),
             crafting: Crafting::default(),
             health: MAX_HEALTH,
@@ -196,19 +209,45 @@ impl Player {
         self.free_fly
     }
 
-    /// Unit view direction from the current yaw/pitch.
-    pub fn look_dir(&self) -> Vec3 {
-        let (sp, cp) = self.pitch.sin_cos();
-        let (sy, cy) = self.yaw.sin_cos();
-        Vec3::new(cp * sy, sp, -cp * cy)
+    /// Unit view direction from the current yaw/pitch, in [`Fixed`].
+    ///
+    /// Computed by [`cubara_voxel::angle::look_dir`]'s own integer
+    /// trigonometry, not by the platform's `sin`/`cos`. That is the whole point
+    /// of the migration: this vector decides which block a click breaks, and
+    /// `sin` and `cos` are among the least portable functions in any standard
+    /// library (§3.5).
+    pub fn look_dir(&self) -> [Fixed; 3] {
+        cubara_voxel::angle::look_dir(self.yaw, self.pitch)
     }
 
-    /// Turn by `input.look_delta`, scaled by [`SENSITIVITY`] -- the one piece
-    /// of input handling shared by every movement mode.
+    /// [`look_dir`](Self::look_dir) as floats, for the raycast and the camera.
+    ///
+    /// A conversion *out* of the exact representation, at the point of use.
+    /// Integer-to-float is exact and deterministic; what was not deterministic
+    /// was the trigonometry, and that has already happened by the time this is
+    /// called.
+    pub fn look_dir_f32(&self) -> Vec3 {
+        let d = self.look_dir();
+        Vec3::new(d[0].to_f32(), d[1].to_f32(), d[2].to_f32())
+    }
+
+    /// Turn by `input.look_delta` -- the one piece of input handling shared by
+    /// every movement mode.
+    ///
+    /// The delta arrives already scaled by [`SENSITIVITY_PER_PIXEL`], on the
+    /// client. Yaw wraps, which is exact; pitch is subtracted (screen y grows
+    /// downward) and clamped, so looking up cannot go over the top and invert
+    /// the view.
+    ///
+    /// The clamp holds for **any** delta, including one far larger than a mouse
+    /// can produce -- which matters because this value will arrive from a
+    /// client, and §3.4 says a client may never be believed.
     pub(crate) fn apply_look(&mut self, input: &InputFrame) {
-        self.yaw += input.look_delta[0] * SENSITIVITY;
-        self.pitch =
-            (self.pitch - input.look_delta[1] * SENSITIVITY).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+        self.yaw = self.yaw.wrapping_add(input.look_delta[0]);
+        self.pitch = self
+            .pitch
+            .wrapping_sub(input.look_delta[1])
+            .clamp(PITCH_LIMIT);
     }
 
     /// Horizontal (pitch-ignored) `(forward, right)` unit vectors from the
@@ -216,8 +255,9 @@ impl Player {
     /// not tilt you into the ground or the sky. `right` is also what
     /// [`Self::apply_free_fly`] strafes along.
     pub(crate) fn horizontal_axes(&self) -> (Vec3, Vec3) {
-        let (sy, cy) = self.yaw.sin_cos();
-        (Vec3::new(sy, 0.0, -cy), Vec3::new(cy, 0.0, sy))
+        let (f, r) = cubara_voxel::angle::horizontal_axes(self.yaw);
+        let v = |a: [Fixed; 3]| Vec3::new(a[0].to_f32(), a[1].to_f32(), a[2].to_f32());
+        (v(f), v(r))
     }
 
     /// Apply one fixed tick's worth of free-fly movement: turn (see
@@ -230,7 +270,7 @@ impl Player {
     pub fn apply_free_fly(&mut self, input: &InputFrame, dt: f32) {
         self.apply_look(input);
 
-        let look = self.look_dir();
+        let look = self.look_dir_f32();
         let (_, right) = self.horizontal_axes();
 
         let delta =
@@ -256,8 +296,10 @@ impl Player {
             velocity: other.velocity,
             on_ground: other.on_ground,
             free_fly: other.free_fly,
-            yaw: self.yaw + (other.yaw - self.yaw) * t,
-            pitch: self.pitch + (other.pitch - self.pitch) * t,
+            // The short way round, which wrapping gives for free -- and the one
+            // place a float belongs, because this is the render camera (§9).
+            yaw: self.yaw.lerp(other.yaw, t),
+            pitch: self.pitch.lerp(other.pitch, t),
             // Not interpolatable and not rendered from here: the current
             // tick's inventory passes through, like velocity above.
             inventory: other.inventory,
@@ -285,37 +327,40 @@ mod tests {
 
     #[test]
     fn default_orientation_looks_along_negative_z() {
-        let player = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
-        let d = player.look_dir();
-        assert!((d - Vec3::new(0.0, 0.0, -1.0)).length() < 1e-5, "{d:?}");
+        let player = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
+        let d = player.look_dir_f32();
+        assert!((d - Vec3::new(0.0, 0.0, -1.0)).length() < 1e-4, "{d:?}");
     }
 
     #[test]
     fn yaw_ninety_degrees_looks_along_positive_x() {
         let player = Player::new(
             cubara_voxel::FixedVec3::ZERO,
-            std::f32::consts::FRAC_PI_2,
-            0.0,
+            Angle::QUARTER_TURN,
+            Angle::ZERO,
         );
-        let d = player.look_dir();
-        assert!((d - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-5, "{d:?}");
+        let d = player.look_dir_f32();
+        assert!((d - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-4, "{d:?}");
     }
 
     #[test]
     fn pitch_is_clamped() {
-        let mut player = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
+        let mut player = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
         let look_up = InputFrame {
-            look_delta: [0.0, -100_000.0],
+            // Far more than a quarter turn in one tick, which no mouse can
+            // produce -- and which a lying client could send, so the clamp has
+            // to hold regardless of how big the delta is.
+            look_delta: [Angle::ZERO, Angle::from_raw(-Angle::QUARTER_TURN.raw())],
             ..InputFrame::default()
         };
         player.apply_free_fly(&look_up, 1.0);
-        assert!(player.pitch <= PITCH_LIMIT && player.pitch >= -PITCH_LIMIT);
-        assert!(player.look_dir().y < 1.0, "never fully vertical");
+        assert!(player.pitch <= PITCH_LIMIT && player.pitch >= Angle::from_raw(-PITCH_LIMIT.raw()));
+        assert!(player.look_dir()[1] < Fixed::ONE, "never fully vertical");
     }
 
     #[test]
     fn forward_axis_moves_along_look_dir() {
-        let mut player = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
+        let mut player = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
         player.apply_free_fly(&moving([0.0, 0.0, 1.0]), 1.0);
         // One second of SPEED along −Z.
         assert!(
@@ -333,22 +378,26 @@ mod tests {
         // A caller building InputFrame from held keys already cancels W+S
         // etc. into a zero axis -- this pins that a zero axis truly means no
         // movement on that axis, not that it happens to net out via floats.
-        let mut player = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
+        let mut player = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
         player.apply_free_fly(&moving([0.0, 0.0, 0.0]), 1.0);
         assert_eq!(player.pos, FixedVec3::ZERO);
     }
 
     #[test]
     fn zero_dt_does_not_move_even_with_input_held() {
-        let mut player = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
+        let mut player = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
         player.apply_free_fly(&moving([1.0, 1.0, 1.0]), 0.0);
         assert_eq!(player.pos, FixedVec3::ZERO);
     }
 
     #[test]
     fn lerp_at_zero_and_one_returns_the_endpoints() {
-        let a = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
-        let b = Player::new(FixedVec3::from_blocks(10, 0, 0), 1.0, 0.2);
+        let a = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
+        let b = Player::new(
+            FixedVec3::from_blocks(10, 0, 0),
+            Angle::from_radians(1.0),
+            Angle::from_radians(0.2),
+        );
 
         // The *interpolated* fields hit the endpoints. Whole-struct equality is
         // deliberately not asserted: `lerp` documents that fields which are not
@@ -372,16 +421,20 @@ mod tests {
 
     #[test]
     fn lerp_at_half_is_halfway_between() {
-        let a = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
-        let b = Player::new(FixedVec3::from_blocks(10, 0, 0), 1.0, 0.2);
+        let a = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
+        let b = Player::new(
+            FixedVec3::from_blocks(10, 0, 0),
+            Angle::from_radians(1.0),
+            Angle::from_radians(0.2),
+        );
         let mid = a.lerp(&b, 0.5);
         assert_eq!(
             mid.pos,
             FixedVec3::from_blocks(5, 0, 0),
             "halfway between two whole-block positions is exact in integers"
         );
-        assert!((mid.yaw - 0.5).abs() < 1e-5);
-        assert!((mid.pitch - 0.1).abs() < 1e-5);
+        assert!((mid.yaw.to_radians() - 0.5).abs() < 1e-5);
+        assert!((mid.pitch.to_radians() - 0.1).abs() < 1e-5);
     }
 
     #[test]
@@ -397,7 +450,7 @@ mod tests {
 
     #[test]
     fn a_long_enough_fall_kills_and_respawns() {
-        let mut p = Player::new(FixedVec3::from_blocks(5, 70, 5), 0.0, 0.0);
+        let mut p = Player::new(FixedVec3::from_blocks(5, 70, 5), Angle::ZERO, Angle::ZERO);
         p.pos = FixedVec3::from_blocks(5, 2, 5);
 
         // 23 blocks: 20 points beyond the safe distance, which is exactly full
@@ -414,7 +467,7 @@ mod tests {
         // The owner's decision (§13.4). Worth its own test because the obvious
         // alternative -- dropping everything -- is what the genre usually does,
         // and a future change here should have to say so out loud.
-        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
+        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
         let before = p.inventory;
         p.take_damage(MAX_HEALTH);
         assert_eq!(p.health, MAX_HEALTH);
@@ -423,7 +476,7 @@ mod tests {
 
     #[test]
     fn a_heart_comes_back_every_interval_without_damage() {
-        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
+        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
         p.take_damage(6);
         assert_eq!(p.health, 14);
 
@@ -446,7 +499,7 @@ mod tests {
     #[test]
     fn damage_restarts_the_regeneration_clock() {
         // Sustained damage means no healing at all, rather than slow healing.
-        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
+        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
         p.take_damage(10);
         for _ in 0..REGEN_INTERVAL - 1 {
             p.tick_regeneration();
@@ -462,7 +515,7 @@ mod tests {
     fn a_harmless_fall_does_not_interrupt_healing() {
         // Zero damage is not damage: landing inside the safe distance must not
         // reset the counter, or a player hopping around would never heal.
-        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
+        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
         p.take_damage(4);
         for _ in 0..REGEN_INTERVAL - 1 {
             p.tick_regeneration();
@@ -474,7 +527,7 @@ mod tests {
 
     #[test]
     fn regeneration_stops_at_full_health() {
-        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
+        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
         for _ in 0..REGEN_INTERVAL * 3 {
             p.tick_regeneration();
         }
@@ -483,9 +536,86 @@ mod tests {
 
     #[test]
     fn health_never_wraps_past_zero() {
-        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0);
+        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
         // Far more than full health in one hit: saturating, then a respawn.
         p.take_damage(u8::MAX);
         assert_eq!(p.health, MAX_HEALTH);
+    }
+
+    /// The property the whole migration is for: turning for an hour and coming
+    /// back lands *exactly* where it started.
+    ///
+    /// With radians in `f32` this is false — every `+=` rounds, and the error
+    /// accumulates for as long as the session lasts. With binary angles the
+    /// wrap is the integer's own, so there is nothing to accumulate.
+    #[test]
+    fn a_session_of_turning_returns_exactly_to_where_it_started() {
+        let mut player = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
+        let start = player.yaw;
+
+        // Roughly an hour of continuous mouse movement at 60 Hz, then the same
+        // again in the other direction.
+        let right = InputFrame {
+            look_delta: [Angle::from_raw(37 * SENSITIVITY_PER_PIXEL), Angle::ZERO],
+            ..InputFrame::default()
+        };
+        let left = InputFrame {
+            look_delta: [Angle::from_raw(-37 * SENSITIVITY_PER_PIXEL), Angle::ZERO],
+            ..InputFrame::default()
+        };
+        for _ in 0..216_000 {
+            player.apply_look(&right);
+        }
+        for _ in 0..216_000 {
+            player.apply_look(&left);
+        }
+
+        assert_eq!(player.yaw, start, "yaw drifted over a session of turning");
+    }
+
+    /// Two players given the same look input reach the same direction, bit for
+    /// bit -- which is the claim the netcode needs and the one `f32` angles
+    /// could not make across compilers.
+    ///
+    /// Asserted on the raw integers rather than on the float view: the floats
+    /// are derived, and derived values agreeing is weaker than the state
+    /// agreeing.
+    #[test]
+    fn the_same_look_input_reaches_the_same_direction_exactly() {
+        let script: Vec<i32> = (0..500).map(|i| (i * 37) % 211 - 105).collect();
+        let run = || {
+            let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
+            for &px in &script {
+                p.apply_look(&InputFrame {
+                    look_delta: [
+                        Angle::from_raw(px * SENSITIVITY_PER_PIXEL),
+                        Angle::from_raw(-px * SENSITIVITY_PER_PIXEL),
+                    ],
+                    ..InputFrame::default()
+                });
+            }
+            (p.yaw, p.pitch, p.look_dir())
+        };
+        assert_eq!(run(), run());
+    }
+
+    /// Pitch cannot be pushed over the top, however large the delta -- a client
+    /// sends this value, and §3.4 says a client may never be believed.
+    #[test]
+    fn no_look_delta_can_push_pitch_past_the_limit() {
+        for raw in [i32::MAX, i32::MIN, 1 << 30, -(1 << 30), 12_345_678] {
+            let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
+            for _ in 0..8 {
+                p.apply_look(&InputFrame {
+                    look_delta: [Angle::ZERO, Angle::from_raw(raw)],
+                    ..InputFrame::default()
+                });
+                assert!(
+                    p.pitch <= PITCH_LIMIT && p.pitch >= Angle::from_raw(-PITCH_LIMIT.raw()),
+                    "delta {raw} escaped the clamp: {:?}",
+                    p.pitch
+                );
+            }
+        }
     }
 }

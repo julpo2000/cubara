@@ -42,6 +42,16 @@ for d in $SIM_CRATES; do [ -d "$d" ] || continue
     grep -rn --include='*.rs' -E "thread_rng|random\(\)" "$d"
 done | report "Rule 1" "unseeded RNG in a simulation crate — RNG state belongs to the world"
 
+# Transcendental functions are the least portable part of any standard library,
+# and a simulation that calls one is a simulation two machines can disagree
+# about -- `docs/RESEARCH_MULTIPLAYER.md` §3.5, which named this before the
+# netcode block rather than during it. `crates/voxel/src/angle.rs` is the one
+# file allowed them, and only in its tests, where it checks its own integer
+# trigonometry against the platform's.
+for d in $SIM_CRATES; do [ -d "$d" ] || continue
+    grep -rn --include='*.rs' --exclude='angle.rs' -E "\.(sin|cos|tan|sin_cos|atan2|asin|acos)\(\)" "$d"
+done | report "Rule 1" "floating-point trigonometry in a simulation crate — use cubara_voxel::Angle"
+
 # ── Rule 2 — no ambient state ────────────────────────────────────────────────
 # A system that cannot be instantiated twice cannot be tested in isolation.
 grep -rn --include='*.rs' -E "static +[A-Z_]+ *: *(OnceLock|Mutex|RwLock|LazyLock)|static mut |lazy_static" crates \

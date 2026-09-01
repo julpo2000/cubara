@@ -23,7 +23,10 @@ pub use entity::{despawn_ticks, DroppedItem, Entities, EntityKey, PICKUP_RADIUS_
 pub use hash::{hash_region, WorldHash};
 pub use input::InputFrame;
 pub use inventory::{Inventory, HOTBAR_WIDTH, SLOT_COUNT};
-pub use player::{Player, FALL_DAMAGE_PER_BLOCK, HEART, MAX_HEALTH, REGEN_INTERVAL, SAFE_FALL};
+pub use player::{
+    Player, FALL_DAMAGE_PER_BLOCK, HEART, MAX_HEALTH, REGEN_INTERVAL, SAFE_FALL,
+    SENSITIVITY_PER_PIXEL,
+};
 pub use rng::WorldRng;
 pub use save::{load_world, save_world, LoadError, SaveError, FORMAT_VERSION};
 
@@ -139,7 +142,7 @@ impl Sim {
                 // comes from `yaw`/`pitch` through trig; angles are the other
                 // half of this migration (RESEARCH_MULTIPLAYER §3.5).
                 self.player.pos.to_f32(),
-                self.player.look_dir().to_array(),
+                self.player.look_dir_f32().to_array(),
                 REACH,
                 blocks,
             )
@@ -150,7 +153,19 @@ impl Sim {
 
 #[cfg(test)]
 mod tests {
+    /// The mouse motion these scripts used to be written in.
+    ///
+    /// `InputFrame::look_delta` is an `Angle` now (§3.5: nothing that crosses the
+    /// wire is a float), and the pixels-to-angle conversion moved to the client.
+    /// These scripts predate that and are written in pixels, so this is the same
+    /// conversion the client does -- which is what keeps them meaning what they
+    /// meant, rather than quietly turning 454 times as far.
+    fn pixels(px: f32) -> Angle {
+        Angle::from_raw((px * crate::SENSITIVITY_PER_PIXEL as f32) as i32)
+    }
+
     use super::*;
+    use cubara_voxel::Angle;
 
     /// A treeless terrain palette: these tests are about the tick, not about
     /// what the world is made of.
@@ -171,7 +186,10 @@ mod tests {
     #[test]
     fn tick_counter_advances_by_exactly_one_per_call() {
         let mut world = World::new();
-        let mut sim = Sim::new(0, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
+        let mut sim = Sim::new(
+            0,
+            Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO),
+        );
         for expected in 1..=100u64 {
             sim.tick(&mut world, &no_input(), blocks());
             assert_eq!(sim.tick, expected);
@@ -186,7 +204,14 @@ mod tests {
             .expect("ground below");
         // Hover just above the surface, looking straight down at it.
         let eye = cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 3.5, 0.5]);
-        let mut sim = Sim::new(0, Player::new(eye, 0.0, -std::f32::consts::FRAC_PI_2));
+        let mut sim = Sim::new(
+            0,
+            Player::new(
+                eye,
+                Angle::ZERO,
+                Angle::from_radians(-std::f32::consts::FRAC_PI_2),
+            ),
+        );
         sim.player.free_fly = true; // hold position -- only the raycast matters here
         sim.tick(&mut world, &no_input(), blocks());
         assert_eq!(sim.target, Some(ground.block));
@@ -201,8 +226,8 @@ mod tests {
             0,
             Player::new(
                 cubara_voxel::FixedVec3::from_f32([0.5, 500.0, 0.5]),
-                0.0,
-                0.0,
+                Angle::ZERO,
+                Angle::ZERO,
             ),
         );
         sim.player.free_fly = true;
@@ -213,8 +238,14 @@ mod tests {
     #[test]
     fn roll_draws_from_the_seeded_stream_not_a_global() {
         let mut world = World::new();
-        let mut a = Sim::new(1, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
-        let mut b = Sim::new(1, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
+        let mut a = Sim::new(
+            1,
+            Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO),
+        );
+        let mut b = Sim::new(
+            1,
+            Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO),
+        );
         a.tick(&mut world, &no_input(), blocks());
         b.tick(&mut world, &no_input(), blocks());
         assert_eq!(a.roll(), b.roll(), "same seed, same tick, same roll");
@@ -233,10 +264,10 @@ mod tests {
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, blocks())
             .expect("ground below");
         let spawn = cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 10.0, 0.5]);
-        let mut sim = Sim::new(7, Player::new(spawn, 0.0, 0.0));
+        let mut sim = Sim::new(7, Player::new(spawn, Angle::ZERO, Angle::ZERO));
         let wander = InputFrame {
             move_axes: [0.0, 0.0, 1.0],
-            look_delta: [2.0, 0.0],
+            look_delta: [pixels(2.0), Angle::ZERO],
             ..InputFrame::default()
         };
 

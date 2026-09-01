@@ -1,5 +1,5 @@
 (
-    format_version: 3,
+    format_version: 4,
     worldgen_version: 2,
     seed: 71755617007496449,
     tick: 120,
@@ -8,10 +8,10 @@
         inc: 1,
     ),
     player: (
-        pos: (267414, 2268856, -578672),
+        pos: (267412, 2268856, -578672),
         vel: (137195, 0, -297576),
-        yaw: 0.43200046,
-        pitch: -0.1,
+        yaw: 295300224,
+        pitch: -68356528,
         on_ground: true,
         free_fly: false,
         inventory: [

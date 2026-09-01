@@ -17,9 +17,9 @@ use std::sync::Arc;
 
 use cubara_render::CameraPose;
 use cubara_render::{swatch_color, HotbarSlot, InventoryPanel, PanelSlotKind};
-use cubara_sim::{InputFrame, Player, REACH, TICK_DT};
+use cubara_sim::{InputFrame, Player, REACH, SENSITIVITY_PER_PIXEL, TICK_DT};
 use cubara_sim::{SlotRef, HOTBAR_WIDTH};
-use cubara_voxel::{BlockRegistry, ChunkCoord, ItemRegistry, RecipeBook};
+use cubara_voxel::{Angle, BlockRegistry, ChunkCoord, ItemRegistry, RecipeBook};
 use cubara_world::{Furnace, TerrainBlocks, World};
 
 use cubara_server::{Action, Effect, FurnaceSlot, Screen, Server};
@@ -149,7 +149,14 @@ pub struct Game {
     jump_pending: bool,
     fly_toggle_pending: bool,
     /// Mouse motion (pixels) accumulated since the last `advance` call.
-    look_delta: (f32, f32),
+    /// Mouse motion accumulated since the last tick, already converted to
+    /// [`Angle`]s.
+    ///
+    /// **Converted here, not in the simulation.** `InputFrame::look_delta` is
+    /// what will cross a socket, and §3.5 requires that nothing crossing the
+    /// wire is a float. Sensitivity is a setting on the machine holding the
+    /// mouse, so this is also where it belongs.
+    look_delta: (Angle, Angle),
 }
 
 impl Game {
@@ -183,7 +190,7 @@ impl Game {
             fly_toggle_held: false,
             jump_pending: false,
             fly_toggle_pending: false,
-            look_delta: (0.0, 0.0),
+            look_delta: (Angle::ZERO, Angle::ZERO),
         }
     }
 
@@ -204,7 +211,7 @@ impl Game {
             // seam for it: a wrong last bit in a camera matrix is a sub-pixel
             // difference (§3.5, presentation may be float).
             eye: glam::Vec3::from_array(player.pos.to_f32()),
-            look_dir: player.look_dir(),
+            look_dir: player.look_dir_f32(),
         }
     }
 
@@ -277,8 +284,9 @@ impl Game {
 
     /// Feed a raw mouse-motion delta (pixels) toward the next tick's look input.
     pub fn mouse_look(&mut self, dx: f32, dy: f32) {
-        self.look_delta.0 += dx;
-        self.look_delta.1 += dy;
+        let scale = |px: f32| Angle::from_raw((px * SENSITIVITY_PER_PIXEL as f32) as i32);
+        self.look_delta.0 = self.look_delta.0.wrapping_add(scale(dx));
+        self.look_delta.1 = self.look_delta.1.wrapping_add(scale(dy));
     }
 
     /// Advance the simulation by `dt` wall-clock seconds: zero or more fixed
@@ -330,7 +338,7 @@ impl Game {
             breaking: self.breaking,
         };
         // A tick below will consume these, so it's safe to clear them now.
-        self.look_delta = (0.0, 0.0);
+        self.look_delta = (Angle::ZERO, Angle::ZERO);
         self.jump_pending = false;
         self.fly_toggle_pending = false;
 
@@ -348,7 +356,7 @@ impl Game {
             self.server.tick_world();
             input.jump = false;
             input.toggle_fly = false;
-            input.look_delta = [0.0, 0.0];
+            input.look_delta = [Angle::ZERO, Angle::ZERO];
             self.accumulator -= TICK_DT as f64;
             ticks += 1;
             if ticks >= MAX_TICKS_PER_FRAME {
@@ -495,7 +503,7 @@ impl Game {
         // How far along a break is is display -- the break itself is an edit,
         // and that goes through the server below.
         let origin = self.server.sim.player.pos.to_f32();
-        let dir = self.server.sim.player.look_dir().to_array();
+        let dir = self.server.sim.player.look_dir_f32().to_array();
         let Some(hit) = self.world.raycast(origin, dir, REACH, self.terrain()) else {
             // Looking at nothing in reach: whatever was in progress is gone.
             self.mining = None;
@@ -929,8 +937,8 @@ mod tests {
         // Look straight down from above the terrain.
         game.server.sim.player = Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, 60.0, 0.5]),
-            0.0,
-            -1.5,
+            Angle::ZERO,
+            Angle::from_radians(-1.5),
         );
         let hit = game
             .world()
@@ -953,7 +961,7 @@ mod tests {
             .expect("ground below");
         // Stand just above the surface, looking down — now it is within reach.
         let eye = cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 3.5, 0.5]);
-        game.server.sim.player = Player::new(eye, 0.0, -1.5);
+        game.server.sim.player = Player::new(eye, Angle::ZERO, Angle::from_radians(-1.5));
 
         let dirty = game.break_block().expect("a block was in reach");
         assert!(
@@ -992,7 +1000,7 @@ mod tests {
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
         let eye = cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 3.5, 0.5]);
-        game.server.sim.player = Player::new(eye, 0.0, -1.5);
+        game.server.sim.player = Player::new(eye, Angle::ZERO, Angle::from_radians(-1.5));
         (game, ground.block)
     }
 
@@ -2315,8 +2323,8 @@ mod tests {
         // has its own test below, asserting the respawn instead.
         game.server.sim.player = Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 11.0, 0.5]),
-            0.0,
-            0.0,
+            Angle::ZERO,
+            Angle::ZERO,
         );
         let full = game.server.sim.player.health;
 
@@ -2344,7 +2352,7 @@ mod tests {
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
         let spawn = cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 3.0, 0.5]);
-        game.server.sim.player = Player::new(spawn, 0.0, 0.0);
+        game.server.sim.player = Player::new(spawn, Angle::ZERO, Angle::ZERO);
         // Give them something to lose, then drop them from lethal height.
         hold(&mut game, "cubara:iron_pick");
         let carried = game.server.sim.player.inventory;
@@ -2388,8 +2396,8 @@ mod tests {
             .expect("ground below");
         game.server.sim.player = Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 2.5, 0.5]),
-            0.0,
-            0.0,
+            Angle::ZERO,
+            Angle::ZERO,
         );
         let full = game.server.sim.player.health;
 
@@ -2411,8 +2419,8 @@ mod tests {
             .expect("ground below");
         game.server.sim.player = Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 80.0, 0.5]),
-            0.0,
-            -1.5,
+            Angle::ZERO,
+            Angle::from_radians(-1.5),
         );
         // Toggle free-fly on, then descend through the whole drop.
         game.fly_toggle_pending = true;

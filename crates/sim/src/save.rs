@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use cubara_voxel::{
-    BlockId, BlockRegistry, ChunkCoord, ItemId, ItemRegistry, ItemStack, ItemState,
+    Angle, BlockId, BlockRegistry, ChunkCoord, ItemId, ItemRegistry, ItemStack, ItemState,
 };
 use cubara_world::{region, TerrainBlocks, World, WORLDGEN_VERSION};
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,13 @@ use crate::Sim;
 /// [`cubara_world::region::REGION_FORMAT_VERSION`] and of
 /// [`cubara_world::WORLDGEN_VERSION`]; each names a different thing that
 /// can change on its own schedule.
-pub const FORMAT_VERSION: u16 = 3;
+///
+/// **4:** `yaw` and `pitch` are raw binary angles (`i32`) rather than radians
+/// (`f32`). A save is world state, and world state is integers
+/// (`docs/RESEARCH_MULTIPLAYER.md` §3.5). A version-3 save cannot be read as a
+/// version-4 one -- the fields have the same names and different meanings,
+/// which is exactly the case a version number exists for.
+pub const FORMAT_VERSION: u16 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SavedRng {
@@ -80,8 +86,10 @@ struct SavedEntity {
 struct SavedPlayer {
     pos: (i64, i64, i64),
     vel: (i64, i64, i64),
-    yaw: f32,
-    pitch: f32,
+    /// Raw binary angles (`cubara_voxel::Angle`), not radians -- a save is
+    /// world state, and world state is integers (§3.5).
+    yaw: i32,
+    pitch: i32,
     on_ground: bool,
     free_fly: bool,
     /// 36 entries, `None` for an empty slot. Block 2.8.
@@ -317,8 +325,8 @@ pub fn save_world(
         player: SavedPlayer {
             pos: to_xyz(sim.player.pos),
             vel: to_xyz(sim.player.velocity),
-            yaw: sim.player.yaw,
-            pitch: sim.player.pitch,
+            yaw: sim.player.yaw.raw(),
+            pitch: sim.player.pitch.raw(),
             on_ground: sim.player.on_ground,
             free_fly: sim.player.free_fly,
             inventory: (0..crate::inventory::SLOT_COUNT)
@@ -436,8 +444,8 @@ pub fn load_world(
         velocity: from_xyz(header.player.vel),
         on_ground: header.player.on_ground,
         free_fly: header.player.free_fly,
-        yaw: header.player.yaw,
-        pitch: header.player.pitch,
+        yaw: Angle::from_raw(header.player.yaw),
+        pitch: Angle::from_raw(header.player.pitch),
         // Block 2.8: restored by name, so a registry that assigns different ids
         // this run still lands the right items in the right slots (§8.1).
         inventory: {

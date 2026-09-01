@@ -8,7 +8,7 @@ use cubara_sim::{
     load_world, save_world, InputFrame, LoadError, Player, Sim, WorldHash, FORMAT_VERSION,
 };
 use cubara_voxel::{
-    BlockId, BlockRegistry, ChunkCoord, DropRule, Faces, Interact, Material, Shape,
+    Angle, BlockId, BlockRegistry, ChunkCoord, DropRule, Faces, Interact, Material, Shape,
 };
 use cubara_world::{TerrainBlocks, World, WORLDGEN_VERSION};
 
@@ -123,8 +123,8 @@ fn round_trip_edit_hash_save_load_hash_is_equal() {
         seed,
         Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, 40.0, 0.5]),
-            0.6,
-            -0.2,
+            Angle::from_radians(0.6),
+            Angle::from_radians(-0.2),
         ),
     );
 
@@ -134,7 +134,7 @@ fn round_trip_edit_hash_save_load_hash_is_equal() {
     world.set_block(2, 1, -1, blocks.stone);
     let walking = InputFrame {
         move_axes: [0.0, 0.0, 1.0],
-        look_delta: [0.3, 0.0],
+        look_delta: [pixels(0.3), Angle::ZERO],
         ..InputFrame::default()
     };
     for _ in 0..30 {
@@ -171,7 +171,10 @@ fn an_unedited_chunk_is_bit_identical_after_a_save_load_round_trip() {
     let unedited = ChunkCoord::new(6, 1, -6); // far from the edit below
 
     let mut world = World::with_seed(seed);
-    let sim = Sim::new(seed, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
+    let sim = Sim::new(
+        seed,
+        Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO),
+    );
     world.set_block(0, 0, 0, BlockId::AIR); // an edit elsewhere, so save/load has real work
 
     let original = world
@@ -219,8 +222,8 @@ fn a_placed_block_keeps_its_own_material_across_a_round_trip() {
         seed,
         Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, 40.0, 0.5]),
-            0.0,
-            0.0,
+            Angle::ZERO,
+            Angle::ZERO,
         ),
     );
 
@@ -254,8 +257,8 @@ fn saving_the_same_world_twice_produces_byte_identical_files() {
         seed,
         Player::new(
             cubara_voxel::FixedVec3::from_f32([1.0, 2.0, 3.0]),
-            0.5,
-            -0.1,
+            Angle::from_radians(0.5),
+            Angle::from_radians(-0.1),
         ),
     );
 
@@ -330,13 +333,35 @@ fn saving_the_same_world_twice_produces_byte_identical_files() {
 /// change at all, which is the evidence that the world itself is untouched and
 /// only the header moved.
 ///
+/// The sixth move is the same kind as the fifth, and finishes it: yaw and pitch
+/// are binary angles now, so `level.ron` holds **no floating-point value at
+/// all**. That is a schema change with the same field names and different
+/// meanings, which is exactly what `FORMAT_VERSION` exists for — hence 3 → 4,
+/// and hence the committed fixture was re-blessed rather than migrated.
+///
+/// The re-blessed fixture is worth reading, because it is small enough to check
+/// by eye:
+///
+/// - `format_version: 3 → 4`
+/// - `yaw: 0.43200046 → 295300224` — the same angle: 295300224 / 2³² of a turn
+///   is 0.4320004 radians
+/// - `pitch: -0.1 → -68356528` — likewise −0.1 radians
+/// - `pos.x: 267414 → 267412` — **two units of 1/65536 of a block**, or 0.00003
+///   blocks, which is the integer trigonometry differing from the platform's
+///   `sin`/`cos` in the last place and the player having walked on it for 120
+///   ticks
+///
+/// `vel`, `pitch`'s sign, the inventory, and every file under `region/` are
+/// unchanged. Nothing about the world moved; the way two numbers are written
+/// did.
+///
 /// It is worth saying plainly that this will keep happening: hunger and mobs
 /// will each add player state and each move both pinned hashes again. That is
 /// the cost of pinning a digest of everything at one number, and it is a cost
 /// worth paying while the alternative -- pinning per subsystem -- would let a
 /// real divergence hide in a subsystem nobody re-pinned. Revisit if the two
 /// values ever move *apart*.
-const FIXTURE_HASH: u64 = 0xfdea_8337_8a61_7fcc;
+const FIXTURE_HASH: u64 = 0x29f8_32dd_1c6a_97cb;
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/save_fixture")
@@ -352,8 +377,8 @@ fn fixture_state() -> (Sim, World) {
         SEED,
         Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, 40.0, 0.5]),
-            0.3,
-            -0.1,
+            Angle::from_radians(0.3),
+            Angle::from_radians(-0.1),
         ),
     );
 
@@ -368,7 +393,7 @@ fn fixture_state() -> (Sim, World) {
 
     let walking = InputFrame {
         move_axes: [0.0, 0.0, 1.0],
-        look_delta: [0.5, 0.0],
+        look_delta: [pixels(0.5), Angle::ZERO],
         ..InputFrame::default()
     };
     for _ in 0..120 {
@@ -417,7 +442,10 @@ fn loading_with_a_registry_missing_a_saved_block_name_is_a_named_error() {
     let blocks = TerrainBlocks::from_registry(&full_registry);
     let seed = 0x0066_6677_7788_8899;
     let world = World::with_seed(seed);
-    let sim = Sim::new(seed, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
+    let sim = Sim::new(
+        seed,
+        Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO),
+    );
 
     let dir = scratch_dir("missing-name");
     save_world(&dir, &sim, &world, &full_registry, &test_items(), blocks).expect("save");
@@ -472,7 +500,10 @@ fn loading_a_worldgen_version_mismatch_is_a_named_error() {
     let blocks = TerrainBlocks::from_registry(&registry);
     let seed = 0x0088_8899_99AA_AABB;
     let world = World::with_seed(seed);
-    let sim = Sim::new(seed, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
+    let sim = Sim::new(
+        seed,
+        Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO),
+    );
 
     let dir = scratch_dir("version-mismatch");
     save_world(&dir, &sim, &world, &registry, &test_items(), blocks).expect("save");
@@ -506,7 +537,10 @@ fn loading_an_unsupported_format_version_is_a_named_error() {
     let blocks = TerrainBlocks::from_registry(&registry);
     let seed = 0x00CC_CCDD_DDEE_EEFF;
     let world = World::with_seed(seed);
-    let sim = Sim::new(seed, Player::new(cubara_voxel::FixedVec3::ZERO, 0.0, 0.0));
+    let sim = Sim::new(
+        seed,
+        Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO),
+    );
 
     let dir = scratch_dir("format-version-mismatch");
     save_world(&dir, &sim, &world, &registry, &test_items(), blocks).expect("save");
@@ -599,8 +633,8 @@ fn a_world_saved_mid_script_finishes_where_an_uninterrupted_one_does() {
         seed,
         Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, 50.0, 0.5]),
-            0.0,
-            0.0,
+            Angle::ZERO,
+            Angle::ZERO,
         ),
     );
     setup(&mut sim_a, &mut world_a);
@@ -612,8 +646,8 @@ fn a_world_saved_mid_script_finishes_where_an_uninterrupted_one_does() {
         seed,
         Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, 50.0, 0.5]),
-            0.0,
-            0.0,
+            Angle::ZERO,
+            Angle::ZERO,
         ),
     );
     setup(&mut sim_b, &mut world_b);
@@ -674,4 +708,15 @@ fn hash_region_coords() -> Vec<ChunkCoord> {
         }
     }
     out
+}
+
+/// The mouse motion these scripts used to be written in.
+///
+/// `InputFrame::look_delta` is an `Angle` now (§3.5: nothing that crosses the
+/// wire is a float), and the pixels-to-angle conversion moved to the client.
+/// These scripts predate that and are written in pixels, so this is the same
+/// conversion the client does -- which is what keeps them meaning what they
+/// meant, rather than quietly turning 454 times as far.
+fn pixels(px: f32) -> Angle {
+    Angle::from_raw((px * cubara_sim::SENSITIVITY_PER_PIXEL as f32) as i32)
 }
