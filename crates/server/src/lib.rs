@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use cubara_sim::REACH;
 use cubara_voxel::{BlockId, DropRule, FixedVec3, Interact, ItemStack, ItemState};
-use cubara_world::{ChunkState, SmeltCtx, TerrainBlocks, TimedProcess, World};
+use cubara_world::{ChunkState, Furnace, SmeltCtx, TerrainBlocks, TimedProcess, World};
 
 /// Everything the simulation is authoritative about.
 ///
@@ -58,6 +58,13 @@ pub struct Server {
     /// The chunk the simulation radius was last updated around (§11). Which
     /// chunks tick is an authority question, so it lives here.
     pub sim_centre: Option<ChunkCoord>,
+    /// What has changed and not yet been handed to a client (§8.3,
+    /// server -> client).
+    ///
+    /// Private, and drained rather than read: a client that could *look* at the
+    /// journal without taking it could read the same change twice, or read a
+    /// change it has not applied yet. Over a socket this is the send queue.
+    journal: Vec<Effect>,
 }
 
 /// What a client asks the world to do (`docs/RESEARCH_MULTIPLAYER.md` §8.3).
@@ -78,6 +85,30 @@ pub enum Action {
     Place,
     /// Use whatever the player is looking at.
     Interact,
+    /// Click a slot on the open furnace's screen.
+    ///
+    /// The one action that names its target, and for a reason the raycast rule
+    /// does not cover: the player is not *looking* at the slot, they are looking
+    /// at a screen. The position is still checked against the world — a furnace
+    /// that is not there cannot be clicked — so this is a lookup the server
+    /// validates, not a claim it believes.
+    ClickFurnace { pos: [i32; 3], slot: FurnaceSlot },
+}
+
+/// Which slot of a furnace a click landed on.
+///
+/// The server's own vocabulary, deliberately not `cubara_render`'s
+/// `PanelSlotKind`: where a slot is *drawn* is presentation, and a server that
+/// spoke in panel layouts would be a server that knew what a screen looks like
+/// (Rule 3). The client translates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FurnaceSlot {
+    /// What is waiting to be smelted.
+    Input,
+    /// What is waiting to be burned.
+    Fuel,
+    /// What has been smelted. Take-only.
+    Output,
 }
 
 /// A screen the server says should open. The *screen* is client state (§8.1);
@@ -88,14 +119,30 @@ pub enum Screen {
     Furnace([i32; 3]),
 }
 
-/// What changed, for the client to react to.
+/// What changed, for the client to apply to its replica (§8.3).
 ///
 /// This is what will cross a socket. It is a *result*, never a request: the
 /// client cannot ask for an effect, only be told about one.
+///
+/// **Note what is not here: a chunk id.** The old `Dirty(chunk)` told the client
+/// which chunk to re-mesh, which only works when both sides share one `World` —
+/// the client had nothing of its own to make dirty. Now the server reports the
+/// *edit*, the client applies it to its own world, and the dirty chunk is what
+/// its own `set_block` hands back. A remote client would derive it the same way,
+/// because there is no other way for it to derive it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effect {
-    /// This chunk's geometry is stale and wants re-meshing.
-    Dirty(ChunkCoord),
+    /// A block changed. The client applies it to its replica.
+    Edit { pos: [i32; 3], block: BlockId },
+    /// A block entity appeared, changed, or (`None`) was removed.
+    ///
+    /// The whole value, not a delta. A furnace is three item slots and two
+    /// counters; sending what it *is* costs less than describing what happened
+    /// to it, and cannot desynchronise the way a missed delta can.
+    BlockEntity {
+        pos: [i32; 3],
+        furnace: Option<Furnace>,
+    },
     /// Open this screen.
     Open(Screen),
     /// Whatever screen is open should close -- the block behind it is gone.
@@ -119,6 +166,7 @@ impl Server {
             recipes: None,
             smelting: None,
             sim_centre: None,
+            journal: Vec::new(),
         }
     }
 
@@ -336,32 +384,122 @@ impl Default for Server {
 }
 
 impl Server {
-    /// Apply one action and report what changed (§8.3).
+    /// Take everything that has changed since this was last called.
+    ///
+    /// Drained, not borrowed: an effect applied twice is a desynchronised
+    /// replica, and taking the queue is what makes that impossible rather than
+    /// merely discouraged.
+    pub fn drain_effects(&mut self) -> Vec<Effect> {
+        std::mem::take(&mut self.journal)
+    }
+
+    /// Apply one action (§8.3). What changed comes back through
+    /// [`drain_effects`](Self::drain_effects), not from here — the same way it
+    /// will when the action arrived over a socket and the reply is a separate
+    /// message rather than a return value.
     ///
     /// **The server raycasts here, not the client.** That is the point of the
     /// action being `Break` rather than `Break(block)`.
-    pub fn apply(&mut self, action: Action) -> Vec<Effect> {
+    pub fn apply(&mut self, action: Action) {
         match action {
-            Action::Break => match self.break_looked_at() {
-                Some((cc, block)) => vec![Effect::Dirty(cc), Effect::CloseIfAt(block)],
-                None => Vec::new(),
-            },
-            Action::Interact => self
-                .interact()
-                .map(|s| vec![Effect::Open(s)])
-                .unwrap_or_default(),
+            Action::Break => {
+                if let Some(block) = self.break_looked_at() {
+                    self.journal.push(Effect::CloseIfAt(block));
+                }
+            }
+            Action::Interact => {
+                if let Some(screen) = self.interact() {
+                    self.journal.push(Effect::Open(screen));
+                }
+            }
             Action::Place => {
                 // An interactive block under the crosshair takes precedence
                 // over placing -- otherwise a bench is unusable the moment you
                 // are holding anything, which is most of the time.
                 if let Some(screen) = self.interact() {
-                    return vec![Effect::Open(screen)];
+                    self.journal.push(Effect::Open(screen));
+                    return;
                 }
-                self.place_held()
-                    .map(|cc| vec![Effect::Dirty(cc)])
-                    .unwrap_or_default()
+                self.place_held();
             }
+            Action::ClickFurnace { pos, slot } => self.click_furnace(pos, slot),
         }
+    }
+
+    /// Everything a client needs to bring an empty replica up to date: every
+    /// edit and every block entity, as ordinary [`Effect`]s.
+    ///
+    /// **The join handshake** (§8.3). A client that has just connected — or one
+    /// whose world was replaced by a load — cannot be patched with a delta,
+    /// because there is no delta from "a world it has never seen". The terrain
+    /// is not in here and never will be: it is a pure function of the seed
+    /// (§3.4), so the client generates it.
+    ///
+    /// The edits come out in position order and so are applied in position
+    /// order, which is what makes a replica built from a snapshot identical to
+    /// one built from the stream of edits that produced it (Rule 1).
+    pub fn snapshot(&self) -> Vec<Effect> {
+        let edits = self
+            .world
+            .edits()
+            .map(|(pos, block)| Effect::Edit { pos, block });
+        let entities = self
+            .world
+            .block_entities()
+            .map(|(pos, f)| Effect::BlockEntity {
+                pos: *pos,
+                furnace: Some(*f),
+            });
+        edits.chain(entities).collect()
+    }
+
+    /// Tell the client to close whatever screen is showing the block at `pos`.
+    ///
+    /// `Action::Break` does this for itself; this exists for
+    /// [`break_at`](Self::break_at), which is the entry point that bypasses the
+    /// raycast and so bypasses the action.
+    pub fn close_if_at(&mut self, pos: [i32; 3]) {
+        self.journal.push(Effect::CloseIfAt(pos));
+    }
+
+    /// Edit a block and record it for the client's replica.
+    ///
+    /// **Every authoritative block change goes through here.** One that did not
+    /// would leave the client's world quietly wrong -- and quietly wrong in a
+    /// replica is the failure mode with no symptom until someone walks into a
+    /// wall that is not there.
+    ///
+    /// Public because that rule applies to tests too: a test that reaches past
+    /// this into `server.world` is setting up a world the client will never be
+    /// told about, and will then fail for a reason that has nothing to do with
+    /// what it was testing.
+    pub fn set_block(&mut self, pos: [i32; 3], block: BlockId) -> ChunkCoord {
+        let cc = Arc::make_mut(&mut self.world).set_block(pos[0], pos[1], pos[2], block);
+        self.journal.push(Effect::Edit { pos, block });
+        cc
+    }
+
+    /// Give the block at `pos` a furnace, and tell the client.
+    pub fn add_furnace(&mut self, pos: [i32; 3]) {
+        Arc::make_mut(&mut self.world).add_furnace(pos);
+        self.note_block_entity(pos);
+    }
+
+    /// Set the furnace at `pos` to exactly `furnace`, and tell the client.
+    ///
+    /// The wholesale setter, for putting a world into a known state. Ordinary
+    /// play does not use it -- smelting goes through [`tick_furnaces`](Self::tick_furnaces)
+    /// and clicks through [`Action::ClickFurnace`], both of which journal for
+    /// themselves.
+    pub fn set_furnace(&mut self, pos: [i32; 3], furnace: Furnace) {
+        Arc::make_mut(&mut self.world).put_furnace(pos, furnace);
+        self.note_block_entity(pos);
+    }
+
+    /// Record the block entity at `pos` as it now stands, for the same reason.
+    fn note_block_entity(&mut self, pos: [i32; 3]) {
+        let furnace = self.world.furnace_at(pos).copied();
+        self.journal.push(Effect::BlockEntity { pos, furnace });
     }
 
     /// Which ids the terrain is made of, or a treeless default before assets
@@ -392,6 +530,10 @@ impl Server {
         // now spill onto the floor rather than being destroyed (block 2.5,
         // §10.4). This is one of the five sites that used to lose items.
         if let Some(f) = Arc::make_mut(&mut self.world).remove_block_entity(block) {
+            self.journal.push(Effect::BlockEntity {
+                pos: block,
+                furnace: None,
+            });
             let contents: Vec<_> = [f.input, f.fuel, f.output].into_iter().flatten().collect();
             if let Some(items) = self.items.as_ref() {
                 let spawned: Vec<_> = contents
@@ -461,7 +603,7 @@ impl Server {
             }
         }
 
-        Arc::make_mut(&mut self.world).set_block(x, y, z, BlockId::AIR)
+        self.set_block(block, BlockId::AIR)
     }
 
     /// Spend one point of the held tool's durability, removing the stack when
@@ -531,9 +673,68 @@ impl Server {
                 // older save) has no entity yet; give it one on first use rather
                 // than refusing to open.
                 Arc::make_mut(&mut self.world).add_furnace([x, y, z]);
+                self.note_block_entity([x, y, z]);
                 Some(Screen::Furnace([x, y, z]))
             }
         }
+    }
+
+    /// A click on the open furnace's screen.
+    ///
+    /// Swap-on-click, matching the crafting cursor's feel: clicking a furnace
+    /// slot with something held puts it in, clicking with an empty hand takes
+    /// what is there. The output slot is take-only -- putting an ingot back
+    /// into the output would be a way to duplicate work when the next smelt
+    /// completes and stacks onto it.
+    ///
+    /// Uses the crafting cursor (`player.crafting.held()`) rather than a second
+    /// one, so a player never has two things in hand at once and closing either
+    /// screen has one rule for what happens to it.
+    ///
+    /// **Authority, despite looking like UI.** It moves items between a player's
+    /// hand and a block entity, which is world state -- so it happens here and
+    /// comes back as a `BlockEntity` effect, rather than the client editing a
+    /// furnace it does not own.
+    fn click_furnace(&mut self, pos: [i32; 3], slot: FurnaceSlot) {
+        let Some(items) = self.items.as_ref() else {
+            return;
+        };
+        let held = self.sim.player.crafting.held();
+        let world = Arc::make_mut(&mut self.world);
+        let Some(f) = world.furnace_at_mut(pos) else {
+            // A furnace that is not there cannot be clicked. This is the
+            // validation that makes `ClickFurnace`'s named position a lookup
+            // rather than something the server took on trust.
+            return;
+        };
+        let slot = match slot {
+            FurnaceSlot::Input => &mut f.input,
+            FurnaceSlot::Fuel => &mut f.fuel,
+            FurnaceSlot::Output => {
+                // Take-only.
+                if held.is_none() {
+                    if let Some((id, count)) = f.output.take() {
+                        if let Ok(stack) = items.new_stack(id, count) {
+                            self.sim.player.crafting.set_held(Some(stack));
+                        }
+                    }
+                }
+                self.note_block_entity(pos);
+                return;
+            }
+        };
+        match held {
+            Some(stack) => {
+                let previous = slot.replace((stack.item(), stack.count()));
+                let give_back = previous.and_then(|(id, c)| items.new_stack(id, c).ok());
+                self.sim.player.crafting.set_held(give_back);
+            }
+            None => {
+                let taken = slot.take().and_then(|(id, c)| items.new_stack(id, c).ok());
+                self.sim.player.crafting.set_held(taken);
+            }
+        }
+        self.note_block_entity(pos);
     }
 
     /// One tick of every furnace in the world (`PHASE2_ARCHITECTURE.md` §7).
@@ -578,6 +779,11 @@ impl Server {
         // obvious shape -- for each active chunk, find the entities in it --
         // is O(chunks x entities) and allocates a vector of every block entity
         // in the world for each of the 243 chunks in range. This is O(entities).
+        // Which ones actually changed, so the client is told about those and
+        // not about the hundred furnaces sitting idle with no fuel. Collected
+        // rather than journalled in the loop because `world` is borrowed from
+        // `self` for the whole of it.
+        let mut changed = Vec::new();
         for pos in positions {
             let coord = ChunkCoord::from_block(pos[0], pos[1], pos[2]);
             if world.chunk_states().get(coord) != ChunkState::Active {
@@ -587,15 +793,21 @@ impl Server {
             // this one -- the same total the two-pass version produced, which is
             // what keeps the dormancy gate test passing.
             let ticks = caught_up.get(&coord).copied().unwrap_or(0) + 1;
-            advance_furnace(world, pos, ticks, items, smelting);
+            if advance_furnace(world, pos, ticks, items, smelting) {
+                changed.push(pos);
+            }
+        }
+        for pos in changed {
+            self.note_block_entity(pos);
         }
     }
 
-    fn break_looked_at(&mut self) -> Option<(ChunkCoord, [i32; 3])> {
+    fn break_looked_at(&mut self) -> Option<[i32; 3]> {
         let origin = self.sim.player.pos.to_f32();
         let dir = self.sim.player.look_dir().to_array();
         let hit = self.world.raycast(origin, dir, REACH, self.terrain())?;
-        Some((self.break_at(hit.block), hit.block))
+        self.break_at(hit.block);
+        Some(hit.block)
     }
     /// Place the held hotbar item's block against the targeted face, consuming
     /// one of it.
@@ -634,26 +846,28 @@ impl Server {
             .as_deref()
             .map(|r| r.interact(block) == Interact::Furnace)
             .unwrap_or(false);
-        let world = Arc::make_mut(&mut self.world);
-        let cc = world.set_block(target[0], target[1], target[2], block);
+        let cc = self.set_block(target, block);
         if interactive {
-            world.add_furnace(target);
+            Arc::make_mut(&mut self.world).add_furnace(target);
+            self.note_block_entity(target);
         }
         Some(cc)
     }
 }
 
 /// Advance one furnace by `ticks`, whether that is one ordinary tick or a
-/// dormant chunk's whole backlog.
+/// dormant chunk's whole backlog. Reports whether anything about it changed, so
+/// the caller can tell a client about the ones that did (§8.3) and stay quiet
+/// about the ones idling with no fuel.
 fn advance_furnace(
     world: &mut World,
     pos: [i32; 3],
     ticks: u64,
     items: &ItemRegistry,
     smelting: &SmeltBook,
-) {
+) -> bool {
     let Some(f) = world.furnace_at_mut(pos) else {
-        return;
+        return false;
     };
     // Resolved to plain numbers once, here: a furnace only ever asks about the
     // one item in its fuel slot and the one its recipe outputs, so nothing in
@@ -666,7 +880,7 @@ fn advance_furnace(
     };
     // Bounded catch-up (§12.1): one ordinary tick and a million-tick backlog go
     // through the same call, and cost the same.
-    f.advance(ticks, &ctx);
+    f.advance(ticks, &ctx).changed
 }
 /// How far from the player, in chunks, the simulation keeps running
 /// (`PHASE2_ARCHITECTURE.md` §11.4).

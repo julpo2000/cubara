@@ -145,6 +145,20 @@ impl World {
         self.block_entities.entry(pos).or_default();
     }
 
+    /// Set the block entity at `pos` to exactly `furnace`, creating it if it is
+    /// not there.
+    ///
+    /// **This is replication, not gameplay.** A client applying a
+    /// `BlockEntity` message from the server (`RESEARCH_MULTIPLAYER.md` §8.3)
+    /// is told what the furnace *is*, not what happened to it — it has no
+    /// recipe book, no fuel table and no business deriving it. Nothing on the
+    /// authoritative side should call this; that side goes through
+    /// [`add_furnace`](Self::add_furnace) and [`furnace_at_mut`](Self::furnace_at_mut),
+    /// which is where the rules live.
+    pub fn put_furnace(&mut self, pos: [i32; 3], furnace: Furnace) {
+        self.block_entities.insert(pos, furnace);
+    }
+
     /// Drop the block entity at `pos`, if any. Called when the block is broken.
     ///
     /// **Its contents go with it.** Spilling them would need dropped-item
@@ -325,6 +339,17 @@ impl World {
     /// itself rather than tracked separately, so there is nothing to keep
     /// in sync: a chunk is dirty exactly when [`set_block`](Self::set_block)
     /// has ever touched a voxel inside it.
+    /// Every block edited away from what the terrain generates, in position
+    /// order.
+    ///
+    /// What a client's opening snapshot is made of
+    /// (`RESEARCH_MULTIPLAYER.md` §8.3): terrain is a pure function of the seed
+    /// and does not travel, so the whole difference between a freshly generated
+    /// world and this one is right here.
+    pub fn edits(&self) -> impl Iterator<Item = ([i32; 3], BlockId)> + '_ {
+        self.edits.iter().map(|(pos, block)| (*pos, *block))
+    }
+
     pub fn dirty_chunks(&self) -> Vec<ChunkCoord> {
         let mut coords: Vec<ChunkCoord> = self
             .edits
