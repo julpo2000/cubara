@@ -88,6 +88,19 @@ awk '
 ' crates/render/Cargo.toml | sed 's|^|crates/render/Cargo.toml:|' \
     | report "Rule 3" "cubara-render depends on cubara-world — its inputs must stay meshes, origins and a camera"
 
+# ── Rule 8 — no code assumes one `World` owns everything ────────────────
+# A process may host several `Server`s, each owning its own `World`, and a shard
+# may run in another process or on another machine entirely. Region sharding is
+# the item docs/RESEARCH_MULTIPLAYER.md §3.2 says must be *designed for* early
+# even if built late, and this is what makes that true rather than claimed: the
+# day one machine's tick budget runs out, a global world turns sharding into a
+# rewrite instead of a deployment change.
+#
+# Rule 2's check already catches `static WORLD: Mutex<..>`. These catch the two
+# shapes that hide a single world behind something Rule 2 does not name.
+grep -rn --include='*.rs' -E "static +[A-Za-z_]+ *: *[^=]*World|thread_local!.*World" crates | report "Rule 8" "a process-wide World — a process may host several, each owning its own"
+grep -rn --include='*.rs' -E "fn +(the_world|current_world|global_world|world_instance)" crates | report "Rule 8" "an implicit 'the world' accessor — pass the World in"
+
 if [ -s "$failures" ]; then
     echo
     echo "$(wc -l <"$failures" | tr -d ' ') architecture rule(s) violated."

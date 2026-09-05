@@ -191,6 +191,12 @@ before touching items, inventory, crafting, drops, trees or the furnace. Blocks
 2.5 – 2.9 are designed when they are reached, against what 2.1 – 2.4 actually
 produced.
 
+Blocks **2.10 – 2.17 are multiplayer**, and they have their own binding design in
+[`docs/PHASE2_MULTIPLAYER.md`](docs/PHASE2_MULTIPLAYER.md) — read that before
+touching players, the transport, interest management or persistence.
+[`docs/RESEARCH_MULTIPLAYER.md`](docs/RESEARCH_MULTIPLAYER.md) is the *research*
+behind it and is not binding; the design doc is.
+
 ### Ordered blocks
 
 | # | Block | Note |
@@ -205,6 +211,14 @@ produced.
 | **2.8** | Extend the save format: block entities, entity state, inventory | Phase 1 ships the format (design §7); phase 2 adds the state phase 2 invented. A format version bump, not a new format. |
 | **2.9a** | Health, fall damage, and regeneration | Shipped. [#172](../../issues/172) |
 | **2.9b** | Hunger, food, and the first hostile mobs | **Deferred to phase 3 by the project owner, 2026-09-05.** It was put to them as a design question — what hunger *is*, where food comes from, which mobs exist — and the answer was "not yet". Phase 2's threat model is therefore fall damage alone. |
+| **2.10** | **The world holds many players.** `PlayerId`, players in id order, `target` moves onto `Player`, hash and save format carry all of them | Multiplayer joined phase 2 on the owner’s call, 2026-09-05. This is the one structural piece the client/server split did *not* already do — `Sim` models exactly one player — and the piece that gets expensive the moment netcode sits on it. No networking needed to land it. |
+| **2.11** | **The per-client view, and interest management** — a client is sent only what it can perceive | The single largest determinant of whether the player-count target is reachable. Built and tested **in-process, before any socket**, because a headless loop is testable to the tick and a networked one to the flake. |
+| **2.12** | **The transport** — a `Transport` trait, in-process and socket implementations; two machines on a LAN | Only now, and behind a trait, so private play and public play stay one code path. |
+| **2.13** | **Prediction and reconciliation** | Deliberately not earlier: building latency compensation against a round trip that is always zero cannot show whether it works (research §8.4). |
+| **2.14** | **Untrusted clients** — reach, speed, inventory and rate validated server-side | What “public” actually costs. |
+| **2.15** | **Persistence that is not one `level.ron`** — per-player state, a chunk store a live server can write concurrently | One RON file is right for one player and wrong for a live server. |
+| **2.16** | **Sharding, in one process** — Rule 8’s check, two `Server`s owning disjoint worlds, a region moving between them | Built late, designed for from 2.10. This is where “designed for” is made true rather than claimed. |
+| **2.17** | **Distributed simulation across machines** — a peer claims a region and keeps it active; boundary handoff, reclaim on disconnect, audit by replay | Added on the owner’s call 2026-09-05: *two PCs running a world should not both do everything.* Designed in [`PHASE2_MULTIPLAYER.md`](docs/PHASE2_MULTIPLAYER.md) §7. Last, because it stands on 2.11 and 2.12 already working. |
 
 Note that the tick loop is *not* in this list — it lands in phase 1 (block 1.6).
 Trees growing and furnaces smelting are what make the tick *interesting*, but a
@@ -236,6 +250,33 @@ tick, not the tick itself.
   same hash as the uninterrupted run.
 - **The dormant test:** a chunk left dormant for N ticks and then activated ends
   in the same state as one simulated continuously for N ticks.
+
+**Multiplayer, added 2026-09-05** when the owner moved it into phase 2. These go
+red on landing, exactly as block 2.7a’s criterion did — a gate’s job is to say
+what is missing before the work is done.
+
+- **Two clients, one world, one hash:** two clients join one server in-process,
+  run a fixed scripted input sequence, and both replicas *and* the server agree
+  on the world-state hash. The multiplayer sibling of the survival replay.
+- **The server never sends terrain:** the join handshake carries the seed and the
+  edit overlay, and is asserted to contain no terrain. Terrain is a pure function
+  of the seed, already proven bit-identical on both platforms, and *not* sending
+  it is what makes the player-count target arithmetically possible — so it is
+  checked, not trusted.
+- **Bandwidth per client does not grow with player count:** with players spread
+  across the world, bytes sent to *one* client per tick must not grow as others
+  are added. Measured at two counts an order of magnitude apart, on simulated
+  clients. This is the honest, testable form of “the structure must carry 5,000
+  in one world” — the scaling *shape*, which is what decides feasibility. A live
+  5,000-client demonstration is not something a CI runner can give, and claiming
+  otherwise would be the kind of invention this document exists to prevent.
+- **A real socket, two processes:** not only the in-process transport — a server
+  process and a client process on localhost completing a scripted exchange.
+- **A region simulated elsewhere lands where it would have locally:** a region
+  handed to a second `Server` and ticked there reaches the same world hash as
+  one ticked in place. This is §7’s whole claim — that work can move without
+  changing the answer — and it is the same shape as block 2.6’s dormancy test,
+  which is not a coincidence: both are “the world does not care who ticked it”.
 
 That third test is the real gate. If a scripted agent can survive in the world
 without a human, the world is playable; if it cannot, no screenshot proves it is.

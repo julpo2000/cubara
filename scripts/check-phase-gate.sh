@@ -112,6 +112,16 @@ if [ "$phase" = "2" ]; then
     run "round-trip covering phase 2 state (block entities, entities, inventory)" \
         cargo test -p cubara-sim --test save_load a_world_saved_mid_script_finishes_where_an_uninterrupted_one_does
 
+    # Multiplayer, moved into phase 2 by the owner on 2026-09-05 (ROADMAP.md).
+    # Red on landing, exactly as this file's survival criterion was: a gate says
+    # what is missing before the work is done. Blocks 2.10-2.17, designed in
+    # docs/PHASE2_MULTIPLAYER.md.
+    not_implemented "two clients, one world, one hash (block 2.11)"
+    not_implemented "the server never sends terrain (block 2.11)"
+    not_implemented "bandwidth per client does not grow with player count (block 2.11)"
+    not_implemented "a real socket, two processes (block 2.12)"
+    not_implemented "a region simulated elsewhere lands where it would have locally (block 2.16)"
+
     echo
     echo "$pass passed, $fail failed."
     if [ "$fail" -gt 0 ]; then
