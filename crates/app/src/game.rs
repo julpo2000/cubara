@@ -684,6 +684,17 @@ impl Game {
                         self.inventory_open = false;
                     }
                 }
+                // Block 2.11 replicates where other players are; this client has
+                // nowhere to put them yet. **Deliberately a no-op, and
+                // deliberately written out** rather than caught by a wildcard:
+                // a `_ =>` arm here would mean the next effect anyone adds is
+                // silently dropped by the replica, which is the kind of bug that
+                // shows up as a desync weeks later.
+                //
+                // Drawing another player needs a model and an interpolator, and
+                // interpolating a remote pose is exactly what design §8.4 says
+                // not to build before there is real latency to build it against.
+                Effect::PlayerMoved { .. } | Effect::PlayerGone(_) => {}
             }
         }
         dirty
@@ -2714,15 +2725,65 @@ mod tests {
         let cc = game.server.set_block(deep, BlockId::AIR);
         game.sync();
         assert_eq!(cc, ChunkCoord::from_block(deep[0], deep[1], deep[2]));
+
+        // Asserted against the **server's** world, not the replica. It used to
+        // be the replica, and block 2.11 is why it moved: this test is about the
+        // edit overlay having no floor -- its own comment says so -- and the
+        // overlay is the server's. Two thousand blocks down is far outside any
+        // client's replication radius, so the replica *correctly* never hears
+        // about it now; `a_deep_edit_is_not_replicated_to_a_client_who_cannot_see_it`
+        // pins that as the deliberate behaviour it is.
         assert!(
-            !game.world().is_solid_at(deep[0], deep[1], deep[2], terrain),
+            !game
+                .server
+                .world
+                .is_solid_at(deep[0], deep[1], deep[2], terrain),
             "the deep block was mined out"
         );
 
         // And its neighbours are still stone, so the edit is local.
         assert!(game
-            .world()
+            .server
+            .world
             .is_solid_at(deep[0] + 1, deep[1], deep[2], terrain));
+    }
+
+    /// Interest management, stated as the behaviour it is (block 2.11).
+    ///
+    /// An edit nobody can perceive is not queued for them. This is the property
+    /// that stops a client's byte count depending on how much of the world other
+    /// people are digging up, and it is worth a test of its own precisely
+    /// because it looks like a bug when you meet it in the test above.
+    #[test]
+    fn a_deep_edit_is_not_replicated_to_a_client_who_cannot_see_it() {
+        let (mut game, _) = game_looking_at_ground();
+        let deep = [3, -2_000, 7];
+
+        game.server.set_block(deep, BlockId::AIR);
+        let effects = game.server.drain_effects();
+        assert!(
+            !effects.iter().any(|e| matches!(
+                e,
+                cubara_server::Effect::Edit { pos, .. } if *pos == deep
+            )),
+            "an edit two thousand blocks below the player was sent to them anyway"
+        );
+
+        // The same edit, made where the player is standing, *is* sent -- so the
+        // assertion above is about distance and not about `set_block` being mute.
+        let near = {
+            let p = game.server.sim.player(game.server.local).pos.to_f32();
+            [p[0] as i32, p[1] as i32 - 3, p[2] as i32]
+        };
+        game.server.set_block(near, BlockId::AIR);
+        let effects = game.server.drain_effects();
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                cubara_server::Effect::Edit { pos, .. } if *pos == near
+            )),
+            "an edit at the player's feet did not reach them"
+        );
     }
 
     #[test]

@@ -105,6 +105,35 @@ The rest of the table, restated as the rule underneath it:
 > never be **believed** about any of it. Prediction is for latency, never for
 > truth.
 
+### §3.1 Two radii, and a decision that was wrong for a week
+
+Block 2.11's issue (#200) said interest should reuse `SIM_RADIUS_CHUNKS`, and
+argued that a second radius is "a bug with a delay fuse". **That was wrong, and
+the existing tests caught it within the hour.**
+
+The client renders to a horizon 64 chunks away. An edit thirty chunks off has to
+reach it, or the hole somebody dug is simply not drawn — while nothing out there
+is simulated, and nothing out there *should* be. **What a client can see and what
+the world ticks are different questions**, and every game in this genre carries
+both numbers for that reason.
+
+So:
+
+| | constant | what it means |
+|---|---|---|
+| replication | `view::VIEW_RADIUS` = 64 | how far a client is *told* about changes |
+| simulation | `SIM_RADIUS_CHUNKS` = 4 | how far the world *ticks* |
+
+They are allowed to disagree. The combination that would genuinely be a bug is
+replicating **less** than is simulated — a client simulated at without being told
+— and `the_view_covers_everything_that_simulates` asserts against exactly that,
+which is the check the original argument was reaching for and missed.
+
+One consequence worth stating, because it looks like a regression when met in a
+test: **an edit nobody can perceive is dropped, not queued.** That is the whole
+mechanism. `a_deep_edit_is_not_replicated_to_a_client_who_cannot_see_it` pins it
+as deliberate.
+
 ## §4 Rule 8 — no code assumes one `World` owns everything
 
 `RESEARCH_MULTIPLAYER.md` §3.2 item 5 is the only item on its list that must be

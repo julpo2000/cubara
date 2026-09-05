@@ -246,6 +246,20 @@ impl Player {
     /// of the migration: this vector decides which block a click breaks, and
     /// `sin` and `cos` are among the least portable functions in any standard
     /// library (§3.5).
+    /// Where this player is looking, as the two angles themselves.
+    ///
+    /// The fields stay `pub(crate)` -- they are only ever *changed* through
+    /// `apply_look`, so that the pitch clamp cannot be bypassed -- but reading
+    /// them is another matter: block 2.11 replicates other players' poses, and
+    /// `cubara-server` cannot send what it cannot see.
+    pub fn yaw(&self) -> Angle {
+        self.yaw
+    }
+
+    pub fn pitch(&self) -> Angle {
+        self.pitch
+    }
+
     pub fn look_dir(&self) -> [Fixed; 3] {
         cubara_voxel::angle::look_dir(self.yaw, self.pitch)
     }
