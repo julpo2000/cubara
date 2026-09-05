@@ -84,6 +84,15 @@ pub struct Server {
     /// without taking could apply the same change twice, or miss one. Over a
     /// socket each of these is a send queue.
     views: BTreeMap<PlayerId, ClientView>,
+    /// The pose each player was last told about, so an unchanged one is not
+    /// sent again.
+    ///
+    /// Keyed by player rather than by (viewer, player): a pose that has not
+    /// changed has not changed for anybody, and a per-pair table would be
+    /// O(players squared) memory to save O(players squared) bytes. Viewers who
+    /// arrive late are handled by `refresh_view`'s backfill instead, which is
+    /// where "new to *you*" belongs.
+    last_pose: BTreeMap<PlayerId, (FixedVec3, Angle, Angle)>,
 }
 
 /// What a client asks the world to do (`docs/RESEARCH_MULTIPLAYER.md` §8.3).
@@ -233,6 +242,7 @@ impl Server {
             smelting: None,
             sim_centre: None,
             views: BTreeMap::new(),
+            last_pose: BTreeMap::new(),
             local: PlayerId::LOCAL,
         };
         // The local client is watching from the start. A `Server` with no view
@@ -547,6 +557,10 @@ impl Server {
     /// watching costs nine bytes and no confusion; *not* sending it to someone
     /// who was leaves a person standing in their world forever.
     pub fn announce_departure(&mut self, who: PlayerId) {
+        // Ids are never reused, so a stale entry could not be mistaken for
+        // somebody else -- but a table that only grows is still a leak on a
+        // server that stays up.
+        self.last_pose.remove(&who);
         for view in self.views.values_mut() {
             view.push(Effect::PlayerGone(who));
         }
@@ -591,9 +605,35 @@ impl Server {
             }
         }
 
+        // **And the people.** Sending only what changed (see
+        // `publish_player_states`) has a trap in it: somebody who has been
+        // standing still since before this viewer arrived never "changed", so
+        // without this they are invisible. Walking towards a motionless person
+        // would mean walking towards empty world -- a worse bug than the
+        // bandwidth one, and the obvious fix for that bug is what introduces it.
+        let arrivals: Vec<(PlayerId, FixedVec3, Angle, Angle)> = self
+            .sim
+            .players()
+            .filter(|(id, _)| *id != who)
+            .filter(|(_, p)| {
+                self.views
+                    .get(&who)
+                    .is_some_and(|v| v.newly_visible(previous, block_of(p.pos)))
+            })
+            .map(|(id, p)| (id, p.pos, p.yaw(), p.pitch()))
+            .collect();
+
         if let Some(view) = self.views.get_mut(&who) {
             for e in owed {
                 view.push(e);
+            }
+            for (id, pos, yaw, pitch) in arrivals {
+                view.push(Effect::PlayerMoved {
+                    who: id,
+                    pos,
+                    yaw,
+                    pitch,
+                });
             }
         }
     }
@@ -644,23 +684,34 @@ impl Server {
     /// Iterated in `PlayerId` order on both sides, so what a client is told, and
     /// in what order, does not depend on a hash seed (Rule 1).
     fn publish_player_states(&mut self) {
-        let others: Vec<(PlayerId, FixedVec3, Angle, Angle)> = self
+        // **Only what changed.** This used to send every player's pose to every
+        // viewer every tick, which a LAN test caught as 299 byte-identical
+        // messages in 299 ticks for somebody standing still. The bandwidth
+        // criterion did not notice, because it measures bytes against *player
+        // count* and that stayed perfectly flat -- flat in player count and
+        // wasteful per player are different properties, and only one of them was
+        // being checked. `a_player_who_does_not_move_costs_nothing_to_watch` is
+        // the other one.
+        //
+        // For a world meant to hold five thousand people, most of whom are
+        // standing still at any instant, this is most of the bandwidth.
+        let moved: Vec<(PlayerId, FixedVec3, Angle, Angle)> = self
             .sim
             .players()
+            .filter(|(id, p)| self.last_pose.get(id) != Some(&(p.pos, p.yaw(), p.pitch())))
             .map(|(id, p)| (id, p.pos, p.yaw(), p.pitch()))
             .collect();
 
+        for &(who, pos, yaw, pitch) in &moved {
+            self.last_pose.insert(who, (pos, yaw, pitch));
+        }
+
         for (&watcher, view) in self.views.iter_mut() {
-            for &(who, pos, yaw, pitch) in &others {
+            for &(who, pos, yaw, pitch) in &moved {
                 if who == watcher {
                     continue; // you are not news to yourself
                 }
-                let block = [
-                    pos.x.floor_block(),
-                    pos.y.floor_block(),
-                    pos.z.floor_block(),
-                ];
-                if view.perceives(block) {
+                if view.perceives(block_of(pos)) {
                     view.push(Effect::PlayerMoved {
                         who,
                         pos,
@@ -1228,6 +1279,15 @@ pub(crate) const SIM_RADIUS_CHUNKS: i32 = 4;
 /// `the_hash_covers_every_chunk_that_is_simulating` is what stops the two
 /// drifting: if the world's band grows past this, that test fails.
 pub(crate) const SIM_HASH_VERTICAL_CHUNKS: i32 = 2;
+/// Which block a position stands in.
+fn block_of(pos: FixedVec3) -> [i32; 3] {
+    [
+        pos.x.floor_block(),
+        pos.y.floor_block(),
+        pos.z.floor_block(),
+    ]
+}
+
 /// The middle of block `b`, where an item dropped by breaking it appears.
 fn drop_centre(b: [i32; 3]) -> FixedVec3 {
     let half = cubara_voxel::Fixed::from_raw(cubara_voxel::fixed::ONE / 2);
