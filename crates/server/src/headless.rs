@@ -344,6 +344,10 @@ impl Session {
             self.accept_new_clients();
             let inputs = self.collect_input();
             self.server.tick_sim_all(&inputs);
+            // Between the two halves: mining raycasts from the pose this tick
+            // produced, and the break it completes is an edit the world half
+            // then publishes. Reordering these would reorder the tick (Rule 1).
+            self.server.tick_mining_all(&inputs);
             self.server.tick_world();
             self.flush_effects();
             self.ticks += 1;

@@ -58,6 +58,29 @@ use cubara_world::{ChunkState, Furnace, SmeltCtx, TerrainBlocks, TimedProcess, W
 /// what it drops, what tier it needs, how long it takes to break. A client
 /// needs the same definitions to draw and to predict, and will be given them;
 /// it does not get to disagree about them.
+/// A break part-way through (`PHASE2_ARCHITECTURE.md` §4.3).
+///
+/// Keyed by the block position *and* the tool: change either and the progress
+/// is dropped rather than carried over, which is what "abandoned, not banked"
+/// means in practice.
+///
+/// **On the server since block 2.14.** It lived on `Game` until then, which
+/// meant the ~30 ticks stone takes were counted only by the client — and
+/// `Action::Break` broke a block the instant it arrived. A client that sent the
+/// action itself skipped mining entirely. Time spent is authority like any
+/// other rule about what the world does, so it is counted where the world is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Mining {
+    block: [i32; 3],
+    /// The item id held when this break started, so switching tools restarts.
+    /// `None` for a bare hand.
+    tool: Option<cubara_voxel::ItemId>,
+    /// Work done so far, in the same units as the block's `hardness`. One tick
+    /// adds the tool's `speed`, so reaching `hardness` takes exactly
+    /// `ceil(hardness / speed)` ticks — §4.3's formula, without a division.
+    progress: u32,
+}
+
 pub struct Server {
     /// The world being simulated. Behind an [`Arc`] so meshing jobs can carry
     /// the exact snapshot they were queued against; an edit publishes a new one.
@@ -99,6 +122,12 @@ pub struct Server {
     /// arrive late are handled by `refresh_view`'s backfill instead, which is
     /// where "new to *you*" belongs.
     last_pose: BTreeMap<PlayerId, (FixedVec3, Angle, Angle)>,
+    /// Each player's break in progress (block 2.14).
+    ///
+    /// Not in the save format and not in the world hash, for the reason §4.3
+    /// gives: progress is transient, belongs to one player, and is abandoned
+    /// rather than banked. A world reloaded mid-swing starts the swing again.
+    mining: BTreeMap<PlayerId, Mining>,
 }
 
 /// What a client asks the world to do (`docs/RESEARCH_MULTIPLAYER.md` §8.3).
@@ -113,8 +142,6 @@ pub struct Server {
 /// than checked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
-    /// Break whatever the player is looking at.
-    Break,
     /// Place the held block against whatever the player is looking at.
     Place,
     /// Use whatever the player is looking at.
@@ -248,6 +275,7 @@ impl Server {
             smelting: None,
             sim_centre: None,
             views: BTreeMap::new(),
+            mining: BTreeMap::new(),
             last_pose: BTreeMap::new(),
             local: PlayerId::LOCAL,
         };
@@ -356,6 +384,116 @@ impl Server {
         let terrain = self.terrain();
         self.sim
             .tick(Arc::make_mut(&mut self.world), inputs, terrain);
+    }
+
+    /// One tick of every player's break-in-progress (block 2.14).
+    ///
+    /// Runs **between** [`tick_sim_all`](Self::tick_sim_all) and
+    /// [`tick_world`](Self::tick_world), which is where it has always run: it
+    /// raycasts from the pose this tick produced, and moving it would reorder
+    /// the tick, which is Rule 1.
+    ///
+    /// Driven by [`InputFrame::breaking`] rather than by an action, and that is
+    /// the whole point of the block. Holding the button is a *duration*, and a
+    /// server can only know a duration it measured. The field already crossed
+    /// the wire every tick for exactly this reason — its own documentation says
+    /// it is in the input value so a replay can reproduce a mining session.
+    pub fn tick_mining_all(&mut self, inputs: &PlayerInputs) {
+        // A player who left takes their half-finished swing with them.
+        let present: Vec<PlayerId> = self.sim.player_ids();
+        self.mining.retain(|who, _| present.contains(who));
+
+        for who in present {
+            self.tick_mining_for(who, inputs.get(who).breaking);
+        }
+    }
+
+    /// The one-player case, expressed in terms of the many-player one rather
+    /// than as a second path (Rule 5).
+    pub fn tick_mining(&mut self, input: &InputFrame) {
+        self.tick_mining_all(&PlayerInputs::one(self.local, *input));
+    }
+
+    /// How far along `who`'s break is, `0.0..1.0`, for a crack overlay to draw.
+    ///
+    /// A fraction rather than the raw counters, so drawing it needs no access to
+    /// the registries — the renderer does not own gameplay (Rule 3).
+    pub fn mining_progress(&self, who: PlayerId) -> Option<f32> {
+        let m = self.mining.get(&who)?;
+        let registry = self.blocks_registry.as_deref()?;
+        let terrain = self.terrain?;
+        let target = self
+            .world
+            .block_at(m.block[0], m.block[1], m.block[2], terrain);
+        let hardness = registry.hardness(target)?;
+        if hardness == 0 {
+            return Some(1.0);
+        }
+        Some((m.progress as f32 / hardness as f32).clamp(0.0, 1.0))
+    }
+
+    /// One player's break.
+    ///
+    /// **Progress is abandoned, not banked** (§4.3): it is dropped when the
+    /// button is released, when the player looks at a different block, or when
+    /// the held tool changes. Each of those makes the stored `Mining` stop
+    /// matching, and a non-match restarts from zero rather than resuming.
+    fn tick_mining_for(&mut self, who: PlayerId, breaking: bool) {
+        if !breaking {
+            self.mining.remove(&who);
+            return;
+        }
+        let Some(p) = self.sim.get(who) else {
+            self.mining.remove(&who);
+            return;
+        };
+        let (origin, dir) = (p.pos.to_f32(), p.look_dir_f32().to_array());
+        let held = p.inventory.selected_stack().map(|s| s.item());
+
+        let Some(hit) = self.world.raycast(origin, dir, REACH, self.terrain()) else {
+            // Looking at nothing in reach: whatever was in progress is gone.
+            self.mining.remove(&who);
+            return;
+        };
+        let (Some(registry), Some(terrain)) = (self.blocks_registry.as_deref(), self.terrain)
+        else {
+            return;
+        };
+        let target = self
+            .world
+            .block_at(hit.block[0], hit.block[1], hit.block[2], terrain);
+
+        // Absent hardness means unbreakable -- no progress accrues, and no
+        // amount of holding the button changes that.
+        let Some(hardness) = registry.hardness(target) else {
+            return;
+        };
+        let speed = match (held, self.items.as_ref()) {
+            (Some(item), Some(items)) => items.speed(item),
+            // An empty hand, or assets not yet wired: speed 1, §4.3's floor.
+            _ => 1,
+        };
+
+        let fresh = Mining {
+            block: hit.block,
+            tool: held,
+            progress: 0,
+        };
+        let m = match self.mining.get(&who) {
+            Some(&m) if m.block == fresh.block && m.tool == fresh.tool => m,
+            _ => fresh,
+        };
+        let progress = m.progress + speed;
+        if progress < hardness {
+            self.mining.insert(who, Mining { progress, ..m });
+            return;
+        }
+        self.mining.remove(&who);
+        // The server raycast to decide what was hit, and counted the ticks that
+        // earned it. Nothing the client said is taken on trust here beyond
+        // "the button is down", which is the only thing it can know.
+        self.break_at_as(who, hit.block);
+        self.publish_at(hit.block, Effect::CloseIfAt(hit.block));
     }
 
     /// Advance everything that ticks whether or not a player is doing anything:
@@ -749,11 +887,6 @@ impl Server {
     /// are, never theirs, which is what makes section 3.4's rule structural.
     pub fn apply_as(&mut self, who: PlayerId, action: Action) {
         match action {
-            Action::Break => {
-                if let Some(block) = self.break_looked_at_as(who) {
-                    self.publish_at(block, Effect::CloseIfAt(block));
-                }
-            }
             Action::Interact => {
                 if let Some(screen) = self.interact_as(who) {
                     self.publish_to(who, Effect::Open(screen));
@@ -1235,7 +1368,26 @@ impl Server {
         d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= limit * limit
     }
 
-    fn break_looked_at_as(&mut self, who: PlayerId) -> Option<[i32; 3]> {
+    /// Break whatever `who` is looking at, right now, and report which block
+    /// it was.
+    ///
+    /// **Not reachable from a client.** There is no `Action` for it since block
+    /// 2.14: an instant break is exactly the thing mining time exists to
+    /// prevent, and a message that asks for one cannot be validated, because the
+    /// server has no way to check a duration it did not measure. Play reaches
+    /// breaking through [`tick_mining_all`](Self::tick_mining_all), which counts
+    /// the ticks itself.
+    ///
+    /// What remains is a server-side entry point: tests that want a block gone
+    /// without holding a button for thirty ticks, and anything the server
+    /// decides to break for its own reasons.
+    pub fn break_looked_at_as(&mut self, who: PlayerId) -> Option<[i32; 3]> {
+        let block = self.break_looked_at_inner(who)?;
+        self.publish_at(block, Effect::CloseIfAt(block));
+        Some(block)
+    }
+
+    fn break_looked_at_inner(&mut self, who: PlayerId) -> Option<[i32; 3]> {
         let origin = self.sim.player_mut(who).pos.to_f32();
         let dir = self.sim.player_mut(who).look_dir_f32().to_array();
         let hit = self.world.raycast(origin, dir, REACH, self.terrain())?;

@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use cubara_render::CameraPose;
 use cubara_render::{swatch_color, HotbarSlot, InventoryPanel, PanelSlotKind};
-use cubara_sim::{InputFrame, Player, REACH, SENSITIVITY_PER_PIXEL, TICK_DT};
+use cubara_sim::{InputFrame, Player, SENSITIVITY_PER_PIXEL, TICK_DT};
 use cubara_sim::{SlotRef, HOTBAR_WIDTH};
 use cubara_voxel::{Angle, BlockRegistry, ChunkCoord, ItemRegistry, RecipeBook};
 use cubara_world::{Furnace, TerrainBlocks, World};
@@ -48,23 +48,6 @@ const MAX_TICKS_PER_FRAME: u32 = 5;
 pub use cubara_server::assets::{
     load_item_registry, load_ore_registry, load_recipe_book, load_structure_registry, world_dir,
 };
-
-/// A break part-way through (`PHASE2_ARCHITECTURE.md` §4.3).
-///
-/// Keyed by the block position *and* the tool being used: change either and the
-/// progress is dropped rather than carried over, which is what "abandoned, not
-/// banked" means in practice.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Mining {
-    block: [i32; 3],
-    /// The item id held when this break started, so switching tools restarts.
-    /// `None` for a bare hand.
-    tool: Option<cubara_voxel::ItemId>,
-    /// Work done so far, in the same units as the block's `hardness`. One tick
-    /// adds the tool's `speed`, so this reaching `hardness` is exactly
-    /// `ceil(hardness / speed)` ticks -- the §4.3 formula, without a division.
-    progress: u32,
-}
 
 pub struct Game {
     /// The authoritative half (`docs/RESEARCH_MULTIPLAYER.md` §8): the world,
@@ -113,14 +96,6 @@ pub struct Game {
     /// Whether the break button is currently held. Read once per `advance`
     /// into [`InputFrame::breaking`].
     breaking: bool,
-    /// The break in progress, if any (`PHASE2_ARCHITECTURE.md` §4.3).
-    ///
-    /// **Not on the chunk, and not in the save format.** It is transient, it
-    /// belongs to one player, and §4.3 decided progress is abandoned rather
-    /// than banked -- so there is nothing here worth persisting, and putting it
-    /// on the chunk would make it block-entity-shaped (§7) for something the
-    /// player cannot even see.
-    mining: Option<Mining>,
     /// Wall-clock seconds not yet consumed by a fixed tick. `f64`, not `f32`
     /// like everything else here -- this is the one value that keeps being
     /// added to across a whole play session (thousands of frames), and
@@ -179,7 +154,6 @@ impl Game {
             inventory_open: false,
             open_furnace: None,
             breaking: false,
-            mining: None,
             accumulator: 0.0,
             forward: false,
             back: false,
@@ -354,7 +328,13 @@ impl Game {
             //
             // Between the server's two halves, which is where it has always
             // run: moving it would reorder the tick, and tick order is Rule 1.
-            self.tick_mining(input.breaking);
+            //
+            // On the **server** since block 2.14. It used to be counted here,
+            // which meant the client decided when a block had been mined long
+            // enough -- and a client that skipped the counting broke blocks
+            // instantly. `InputFrame::breaking` already carries the only thing
+            // a client can honestly know, which is that the button is down.
+            self.server.tick_mining(&input);
             self.server.tick_world();
             input.jump = false;
             input.toggle_fly = false;
@@ -485,109 +465,22 @@ impl Game {
     /// Reached only through [`apply`](Self::apply) -- the raycast is the
     /// server's, which is what stops a client naming its own target (§8.3).
     pub fn break_block(&mut self) -> Option<ChunkCoord> {
-        self.server.apply(Action::Break);
+        self.server.break_looked_at_as(self.server.local);
         self.sync().into_iter().next()
-    }
-
-    /// One tick of mining (`PHASE2_ARCHITECTURE.md` §4.3). Returns the chunk to
-    /// re-mesh on the tick the block finally gives way.
-    ///
-    /// **Progress is abandoned, not banked.** It is dropped when the button is
-    /// released, when the player looks at a different block, or when the held
-    /// tool changes -- each of those makes the stored `Mining` stop matching,
-    /// and a non-match restarts from zero rather than resuming.
-    fn tick_mining(&mut self, breaking: bool) {
-        if !breaking {
-            self.mining = None;
-            return;
-        }
-        // Predicted on the *replica* (§8.1: "client predicts, server decides").
-        // How far along a break is is display -- the break itself is an edit,
-        // and that goes through the server below.
-        let origin = self.server.sim.player_mut(self.server.local).pos.to_f32();
-        let dir = self
-            .server
-            .sim
-            .player_mut(self.server.local)
-            .look_dir_f32()
-            .to_array();
-        let Some(hit) = self.world.raycast(origin, dir, REACH, self.terrain()) else {
-            // Looking at nothing in reach: whatever was in progress is gone.
-            self.mining = None;
-            return;
-        };
-        let (Some(registry), Some(terrain)) =
-            (self.server.blocks_registry.as_deref(), self.server.terrain)
-        else {
-            return;
-        };
-        let target = self
-            .world
-            .block_at(hit.block[0], hit.block[1], hit.block[2], terrain);
-
-        // Absent hardness means unbreakable -- no progress accrues and no
-        // amount of holding the button changes that.
-        let Some(hardness) = registry.hardness(target) else {
-            return;
-        };
-
-        let held = self
-            .server
-            .sim
-            .player(self.server.local)
-            .inventory
-            .selected_stack()
-            .map(|s| s.item());
-        let speed = match (held, self.server.items.as_ref()) {
-            (Some(item), Some(items)) => items.speed(item),
-            // An empty hand, or assets not yet wired: speed 1, §4.3's floor.
-            _ => 1,
-        };
-
-        let fresh = Mining {
-            block: hit.block,
-            tool: held,
-            progress: 0,
-        };
-        let m = match self.mining {
-            Some(m) if m.block == fresh.block && m.tool == fresh.tool => m,
-            _ => fresh,
-        };
-        let progress = m.progress + speed;
-        if progress < hardness {
-            self.mining = Some(Mining { progress, ..m });
-            return;
-        }
-        self.mining = None;
-        // The break is an `Action`, so the *server* raycasts to decide what was
-        // hit -- the client's own hit above chose when to ask, not what to
-        // destroy (§8.3).
-        self.server.apply(Action::Break);
     }
 
     /// How far along the current break is, `0.0..1.0`, for the renderer to draw
     /// a crack overlay with. `None` when nothing is being mined.
     ///
-    /// Exposed as a fraction rather than as the raw counters so that drawing it
-    /// needs no access to the registries -- the renderer does not own gameplay
-    /// (Rule 3).
-    ///
-    /// Nothing draws this yet -- the crack overlay is 2.4d, deliberately out of
-    /// 2.4b's scope (#159). This is the fraction it will consume, and it is
-    /// pinned by a test so the hook cannot rot before then.
+    /// Read from the server, which has counted the ticks since block 2.14.
+    /// In-process that is a field access; over a socket a client will have to
+    /// predict it the way block 2.13 predicts a pose, because progress is not
+    /// something the server sends. Nothing draws this yet -- the crack overlay
+    /// is 2.4d -- so the prediction is not built: it would be machinery with no
+    /// caller, and the shape it should take depends on what the overlay needs.
     #[allow(dead_code)]
     pub fn mining_progress(&self) -> Option<f32> {
-        let m = self.mining?;
-        let registry = self.server.blocks_registry.as_deref()?;
-        let terrain = self.server.terrain?;
-        let target = self
-            .world
-            .block_at(m.block[0], m.block[1], m.block[2], terrain);
-        let hardness = registry.hardness(target)?;
-        if hardness == 0 {
-            return Some(1.0);
-        }
-        Some((m.progress as f32 / hardness as f32).clamp(0.0, 1.0))
+        self.server.mining_progress(self.server.local)
     }
 
     /// Place the held block, or use an interactive block under the crosshair.
@@ -753,6 +646,12 @@ impl Game {
 
     /// Which ids the terrain is made of — delegated to the server, which owns
     /// the registries (§8.1).
+    ///
+    /// Only the tests below reach for it since block 2.14 moved mining to the
+    /// server; kept rather than inlined into each of them because "which ids is
+    /// the terrain made of" is a question about this client, and the tests
+    /// asking it should not each have to know it is the server's to answer.
+    #[allow(dead_code)]
     fn terrain(&self) -> TerrainBlocks {
         self.server.terrain()
     }

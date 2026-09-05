@@ -102,7 +102,7 @@ fn block_at(s: &Server, at: [i32; 3]) -> BlockId {
 fn a_break_destroys_what_its_sender_was_looking_at() {
     let (mut s, _a, b, block_a, block_b, stone) = pair();
 
-    s.apply_as(b, Action::Break);
+    s.break_looked_at_as(b);
 
     assert_eq!(
         block_at(&s, block_b),
@@ -143,7 +143,7 @@ fn a_break_fills_its_senders_inventory() {
     };
     assert_eq!((cobble_held(&s, a), cobble_held(&s, b)), (0, 0));
 
-    s.apply_as(b, Action::Break);
+    s.break_looked_at_as(b);
 
     assert_eq!(
         cobble_held(&s, b),
