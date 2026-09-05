@@ -31,6 +31,7 @@ pub mod assets;
 pub mod clock;
 pub mod headless;
 pub mod net;
+pub mod predict;
 pub mod view;
 pub mod wire;
 
