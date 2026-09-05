@@ -301,12 +301,16 @@ mod tests {
         server.send(ServerMessage::Welcome {
             seed: 7,
             you: PlayerId(0),
+            blocks: 1,
+            items: 2,
         });
         assert_eq!(
             client.poll(),
             vec![ServerMessage::Welcome {
                 seed: 7,
-                you: PlayerId(0)
+                you: PlayerId(0),
+                blocks: 1,
+                items: 2,
             }]
         );
     }

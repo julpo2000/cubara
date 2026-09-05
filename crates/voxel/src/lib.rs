@@ -9,6 +9,7 @@ pub mod angle;
 pub mod block;
 pub mod bounds;
 pub mod coord;
+pub mod fingerprint;
 pub mod fixed;
 pub mod item;
 pub mod mesh;

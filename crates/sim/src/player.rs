@@ -50,6 +50,41 @@ impl PlayerId {
     pub const LOCAL: PlayerId = PlayerId(0);
 }
 
+/// Everything one tick of physics reads and writes about a player, as a value.
+///
+/// Block 2.12b: the payload of the server's correction to a client, and the
+/// state a client rewinds to before replaying its unacknowledged input (block
+/// 2.13). Those two uses decide the field list, and they decide it strictly:
+/// **anything `Sim::tick` touches has to be in here.**
+///
+/// Leave `velocity` out and a falling player resumes from a standstill, so the
+/// replay lands somewhere the server never went and the next correction yanks
+/// them back -- a permanent twitch, which is worse than no prediction at all.
+/// `fall_distance` and `ticks_since_damage` are in for the same reason: without
+/// them a client mispredicts fall damage and regeneration.
+///
+/// It lives in this crate rather than in `cubara-server` deliberately. Partly
+/// because `yaw`, `pitch` and `free_fly` are `pub(crate)` and a pose cannot be
+/// rebuilt from outside. Mostly because *which fields a tick changes* is
+/// knowledge belonging to the crate that owns the tick: whoever adds a physics
+/// field later should be made to decide, in this file, whether it is authority.
+///
+/// `spawn`, `inventory` and `crafting` are **not** here. They change through
+/// deliberate acts rather than through physics, so they are not part of what a
+/// replay reconstructs; they reach a client by other means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlayerState {
+    pub pos: FixedVec3,
+    pub velocity: FixedVec3,
+    pub yaw: Angle,
+    pub pitch: Angle,
+    pub on_ground: bool,
+    pub free_fly: bool,
+    pub fall_distance: Fixed,
+    pub health: u8,
+    pub ticks_since_damage: u32,
+}
+
 /// Where the player is, which way they're looking, and (block 1.7a) their
 /// walking-physics state. Free-fly and walking are two *modes* of this one
 /// type, not two competing implementations (Rule 5) -- [`Self::free_fly`]
@@ -246,6 +281,39 @@ impl Player {
     /// of the migration: this vector decides which block a click breaks, and
     /// `sin` and `cos` are among the least portable functions in any standard
     /// library (§3.5).
+    /// This player's physics state, as a value (block 2.12b).
+    pub fn state(&self) -> PlayerState {
+        PlayerState {
+            pos: self.pos,
+            velocity: self.velocity,
+            yaw: self.yaw,
+            pitch: self.pitch,
+            on_ground: self.on_ground,
+            free_fly: self.free_fly,
+            fall_distance: self.fall_distance,
+            health: self.health,
+            ticks_since_damage: self.ticks_since_damage,
+        }
+    }
+
+    /// Put this player back into `state`, leaving everything else alone.
+    ///
+    /// What a client does before replaying its unacknowledged input. Inventory,
+    /// crafting and spawn survive untouched, because they are not physics and a
+    /// replay must not rewind them -- an item picked up between the correction
+    /// being sent and it arriving is still picked up.
+    pub fn restore(&mut self, state: PlayerState) {
+        self.pos = state.pos;
+        self.velocity = state.velocity;
+        self.yaw = state.yaw;
+        self.pitch = state.pitch;
+        self.on_ground = state.on_ground;
+        self.free_fly = state.free_fly;
+        self.fall_distance = state.fall_distance;
+        self.health = state.health;
+        self.ticks_since_damage = state.ticks_since_damage;
+    }
+
     /// Where this player is looking, as the two angles themselves.
     ///
     /// The fields stay `pub(crate)` -- they are only ever *changed* through

@@ -34,7 +34,7 @@ pub mod net;
 pub mod view;
 pub mod wire;
 
-use cubara_sim::{InputFrame, Player, PlayerId, PlayerInputs, Sim};
+use cubara_sim::{InputFrame, Player, PlayerId, PlayerInputs, PlayerState, Sim};
 use cubara_voxel::{Angle, BlockRegistry, ChunkCoord, ItemRegistry, RecipeBook, SmeltBook};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -184,6 +184,27 @@ pub enum Effect {
     /// A player left the world, or walked out of sight. The client stops
     /// drawing them.
     PlayerGone(PlayerId),
+    /// **The server's correction to the client this is addressed to** (block
+    /// 2.12b).
+    ///
+    /// Deliberately not `PlayerMoved` with the owner's own id. Those are
+    /// different messages because they exist for different reasons: another
+    /// player's pose is *interpolated*, because their input is unknown; your own
+    /// is *reconciled*, because your input is known and has already been acted
+    /// on locally. Collapsing them would delete the distinction reconciliation
+    /// is built on.
+    ///
+    /// `seq` is **which of this client's inputs the server had applied** when it
+    /// produced `state` -- not a tick number. The client's clock and the
+    /// server's are different clocks, and mixing them is how a reconnect rewinds
+    /// the world.
+    ///
+    /// Block 2.12b sends `seq` and never reads it: a client that does not
+    /// predict has nothing to reconcile. It is here anyway because changing a
+    /// *wire format* is the expensive part, not carrying a field -- landing
+    /// without it would make block 2.13's first commit a breaking change to a
+    /// message a day old. Do not remove it as dead code.
+    SelfState { seq: u64, state: PlayerState },
 }
 
 impl Server {
@@ -501,6 +522,19 @@ impl Server {
     /// Drop a client's view. Their player may well still exist.
     pub fn close_view(&mut self, who: PlayerId) {
         self.views.remove(&who);
+    }
+
+    /// Send `who` the server's view of their own player (block 2.12b).
+    ///
+    /// `seq` is the last input from that client the server had applied when this
+    /// state was produced. The caller owns the counting, because it owns the
+    /// connection the inputs arrived on -- a `Server` has no idea how many
+    /// messages a link has carried, and should not.
+    pub fn publish_self_state(&mut self, who: PlayerId, seq: u64) {
+        let Some(state) = self.sim.get(who).map(|p| p.state()) else {
+            return;
+        };
+        self.publish_to(who, Effect::SelfState { seq, state });
     }
 
     /// Tell everyone still watching that `who` has gone.

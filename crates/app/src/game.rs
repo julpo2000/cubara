@@ -695,6 +695,17 @@ impl Game {
                 // interpolating a remote pose is exactly what design §8.4 says
                 // not to build before there is real latency to build it against.
                 Effect::PlayerMoved { .. } | Effect::PlayerGone(_) => {}
+                // The server's correction to this client's own player (block
+                // 2.12b). Ignored here **only because this client is the server**
+                // -- `Game` still owns an in-process `Server` and reads the
+                // authoritative player straight out of it, so a correction is
+                // the state it already has.
+                //
+                // The next block, where `Game` talks over a `net::Link` and can
+                // no longer reach into a `Sim`, is where this becomes the *only*
+                // way a client learns where it is. Written out rather than
+                // wildcarded for that reason: this arm is about to matter.
+                Effect::SelfState { .. } => {}
             }
         }
         dirty

@@ -438,6 +438,15 @@ impl ItemRegistry {
             .unwrap_or(1)
     }
 
+    /// A number that changes exactly when the id table does (block 2.12b).
+    ///
+    /// Over the ids' own order, which `from_defs` already sorted by name -- so
+    /// this hashes precisely what decides an id, and nothing that does not. See
+    /// `crate::fingerprint` for why it is not the files.
+    pub fn fingerprint(&self) -> u64 {
+        crate::fingerprint::of_names(self.ids().filter_map(|id| self.name_of(id)))
+    }
+
     pub fn ids(&self) -> impl Iterator<Item = ItemId> + '_ {
         (0..self.entries.len()).map(|i| ItemId(i as u16))
     }

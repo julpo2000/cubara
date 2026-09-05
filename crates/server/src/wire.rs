@@ -48,7 +48,7 @@
 use cubara_voxel::{Angle, BlockId, Fixed, FixedVec3, ItemId};
 use cubara_world::Furnace;
 
-use cubara_sim::{InputFrame, PlayerId};
+use cubara_sim::{InputFrame, PlayerId, PlayerState};
 
 use crate::{Action, Effect, FurnaceSlot, Screen};
 
@@ -198,6 +198,37 @@ fn put_item_slot(out: &mut Vec<u8>, slot: Option<(ItemId, u8)>) {
     }
 }
 
+/// A player's whole physics state (block 2.12b).
+///
+/// Every field `Sim::tick` reads, because a client replaying its input has to
+/// start from all of it -- see `PlayerState`'s own docs for what dropping one
+/// costs.
+fn put_player_state(out: &mut Vec<u8>, s: &PlayerState) {
+    put_fixed_vec3(out, s.pos);
+    put_fixed_vec3(out, s.velocity);
+    out.extend_from_slice(&s.yaw.raw().to_le_bytes());
+    out.extend_from_slice(&s.pitch.raw().to_le_bytes());
+    out.push(s.on_ground as u8);
+    out.push(s.free_fly as u8);
+    out.extend_from_slice(&s.fall_distance.raw().to_le_bytes());
+    out.push(s.health);
+    out.extend_from_slice(&s.ticks_since_damage.to_le_bytes());
+}
+
+fn get_player_state(c: &mut Cursor<'_>) -> Result<PlayerState, WireError> {
+    Ok(PlayerState {
+        pos: c.fixed_vec3()?,
+        velocity: c.fixed_vec3()?,
+        yaw: c.angle()?,
+        pitch: c.angle()?,
+        on_ground: c.bool()?,
+        free_fly: c.bool()?,
+        fall_distance: Fixed::from_raw(c.i64()?),
+        health: c.u8()?,
+        ticks_since_damage: c.u32()?,
+    })
+}
+
 fn put_furnace(out: &mut Vec<u8>, f: &Furnace) {
     put_item_slot(out, f.input);
     put_item_slot(out, f.fuel);
@@ -288,6 +319,11 @@ impl Effect {
                 out.push(5);
                 out.extend_from_slice(&who.0.to_le_bytes());
             }
+            Effect::SelfState { seq, state } => {
+                out.push(6);
+                out.extend_from_slice(&seq.to_le_bytes());
+                put_player_state(out, state);
+            }
         }
     }
 
@@ -315,6 +351,10 @@ impl Effect {
                 pitch: c.angle()?,
             },
             5 => Effect::PlayerGone(PlayerId(c.u64()?)),
+            6 => Effect::SelfState {
+                seq: c.u64()?,
+                state: get_player_state(c)?,
+            },
             t => return Err(WireError::BadTag(t)),
         })
     }
@@ -406,8 +446,17 @@ pub enum ClientMessage {
     /// Asking to join. Carries nothing: a client does not get to say who it is
     /// (§3.4), so the server names it in [`ServerMessage::Welcome`].
     Hello,
-    /// One tick's controls.
-    Input(InputFrame),
+    /// One tick's controls, and which input this is.
+    ///
+    /// `seq` counts this client's inputs, starting at 0 and never reset. The
+    /// server echoes the last one it applied in [`Effect::SelfState`], which is
+    /// what lets a predicting client (block 2.13) know which of its outstanding
+    /// inputs to discard and which to replay.
+    ///
+    /// A `u64` rather than a `u32` because at 60 Hz a `u32` wraps after about
+    /// two and a bit years of uptime, and wrap-aware comparison is a bug factory
+    /// bought for nothing.
+    Input { seq: u64, frame: InputFrame },
     /// One thing the client is asking the world to do.
     Act(Action),
 }
@@ -420,7 +469,43 @@ pub enum ServerMessage {
     ///
     /// **The seed, not the terrain** (§3). This one `u64` replaces everything a
     /// naive protocol would send about the shape of the world.
-    Welcome { seed: u64, you: PlayerId },
+    Welcome {
+        seed: u64,
+        you: PlayerId,
+        /// Fingerprints of the two registries whose ids cross this wire.
+        ///
+        /// Ids cross this wire **raw**, and they are assigned from sorted names
+        /// (`ItemRegistry::from_defs`), so two machines with identical assets
+        /// agree exactly -- and two machines whose assets differ by one file
+        /// disagree about the whole table from that name onward. Stone becomes
+        /// iron, silently.
+        ///
+        /// The save format solved this by storing names and remapping on load
+        /// (design §8.1). The wire refuses instead: remapping is more work and
+        /// it *hides* that two people are running different versions, which is
+        /// the thing they most need to be told. It also cannot fix it -- a
+        /// renamed id can be translated, an item one side lacks cannot be
+        /// invented.
+        ///
+        /// **Why these two and not recipes or smelting.** The rule is: hash
+        /// every *id space* whose ids cross this wire, and those are blocks and
+        /// items. (Smelting ids do cross, inside a `Furnace`'s three
+        /// `Option<(ItemId, u8)>` slots -- but they are `ItemId`s, so the item
+        /// fingerprint already covers them.)
+        ///
+        /// Recipes and smelting are rule tables, not id spaces. A difference
+        /// there gives a wrong *prediction* -- the client previews a craft the
+        /// server will not make -- rather than a wrong *identity*, which is
+        /// stone silently becoming iron. The first is annoying and visible; the
+        /// second is quiet corruption, and only the second earns a refusal to
+        /// connect at all.
+        ///
+        /// Worth revisiting when crafting becomes an `Action`: a mismatch turns
+        /// into a rejected action rather than a misleading preview, and that is
+        /// a different trade.
+        blocks: u64,
+        items: u64,
+    },
     /// Everything owed since the last message.
     Effects(Vec<Effect>),
     /// The tick this batch belongs to.
@@ -431,9 +516,10 @@ impl ClientMessage {
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
             ClientMessage::Hello => out.push(0),
-            ClientMessage::Input(i) => {
+            ClientMessage::Input { seq, frame } => {
                 out.push(1);
-                put_input(out, i);
+                out.extend_from_slice(&seq.to_le_bytes());
+                put_input(out, frame);
             }
             ClientMessage::Act(a) => {
                 out.push(2);
@@ -446,7 +532,10 @@ impl ClientMessage {
         let c = &mut Cursor::new(buf);
         Ok(match c.u8()? {
             0 => ClientMessage::Hello,
-            1 => ClientMessage::Input(get_input(c)?),
+            1 => ClientMessage::Input {
+                seq: c.u64()?,
+                frame: get_input(c)?,
+            },
             2 => ClientMessage::Act(Action::decode(c)?),
             t => return Err(WireError::BadTag(t)),
         })
@@ -456,10 +545,17 @@ impl ClientMessage {
 impl ServerMessage {
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
-            ServerMessage::Welcome { seed, you } => {
+            ServerMessage::Welcome {
+                seed,
+                you,
+                blocks,
+                items,
+            } => {
                 out.push(0);
                 out.extend_from_slice(&seed.to_le_bytes());
                 out.extend_from_slice(&you.0.to_le_bytes());
+                out.extend_from_slice(&blocks.to_le_bytes());
+                out.extend_from_slice(&items.to_le_bytes());
             }
             ServerMessage::Effects(effects) => {
                 out.push(1);
@@ -483,6 +579,8 @@ impl ServerMessage {
             0 => ServerMessage::Welcome {
                 seed: c.u64()?,
                 you: PlayerId(c.u64()?),
+                blocks: c.u64()?,
+                items: c.u64()?,
             },
             1 => {
                 let n = c.u32()?;
@@ -590,19 +688,72 @@ mod tests {
             pitch: Angle::from_raw(-7_654),
         });
         round_trip_effect(Effect::PlayerGone(PlayerId(u64::MAX)));
+        round_trip_effect(Effect::SelfState {
+            seq: u64::MAX,
+            state: a_player_state(),
+        });
+    }
+
+    /// Every field of a correction survives, checked one at a time.
+    ///
+    /// A round trip of a struct where every field happens to be zero passes
+    /// whether or not the encoder wrote them, so each field is given a value
+    /// nothing else has. Dropping `velocity` here is the failure block 2.13
+    /// would meet as a permanent twitch rather than as a test.
+    #[test]
+    fn a_correction_carries_every_field_physics_reads() {
+        let s = a_player_state();
+        let mut buf = Vec::new();
+        Effect::SelfState { seq: 7, state: s }.encode(&mut buf);
+        let back = Effect::decode(&mut Cursor::new(&buf)).expect("decodes");
+        let Effect::SelfState { seq, state } = back else {
+            panic!("wrong variant");
+        };
+        assert_eq!(seq, 7);
+        assert_eq!(state.pos, s.pos, "pos");
+        assert_eq!(state.velocity, s.velocity, "velocity");
+        assert_eq!(state.yaw, s.yaw, "yaw");
+        assert_eq!(state.pitch, s.pitch, "pitch");
+        assert_eq!(state.on_ground, s.on_ground, "on_ground");
+        assert_eq!(state.free_fly, s.free_fly, "free_fly");
+        assert_eq!(state.fall_distance, s.fall_distance, "fall_distance");
+        assert_eq!(state.health, s.health, "health");
+        assert_eq!(
+            state.ticks_since_damage, s.ticks_since_damage,
+            "ticks_since_damage"
+        );
+    }
+
+    /// Distinct, non-default values throughout, so a field the encoder forgot
+    /// cannot pass by coincidence.
+    fn a_player_state() -> PlayerState {
+        PlayerState {
+            pos: FixedVec3::from_f32([1.5, -20.25, 3.75]),
+            velocity: FixedVec3::from_f32([-0.5, 9.0, 0.125]),
+            yaw: Angle::from_raw(123_456),
+            pitch: Angle::from_raw(-7_654),
+            on_ground: true,
+            free_fly: false,
+            fall_distance: Fixed::from_f32(12.5),
+            health: 13,
+            ticks_since_damage: 4_242,
+        }
     }
 
     #[test]
     fn every_client_message_survives_a_round_trip() {
         let messages = [
             ClientMessage::Hello,
-            ClientMessage::Input(InputFrame {
-                move_axes: [-1.0, 0.25, 1.0],
-                look_delta: [Angle::from_raw(9), Angle::from_raw(-9)],
-                jump: true,
-                toggle_fly: false,
-                breaking: true,
-            }),
+            ClientMessage::Input {
+                seq: u64::MAX,
+                frame: InputFrame {
+                    move_axes: [-1.0, 0.25, 1.0],
+                    look_delta: [Angle::from_raw(9), Angle::from_raw(-9)],
+                    jump: true,
+                    toggle_fly: false,
+                    breaking: true,
+                },
+            },
             ClientMessage::Act(Action::Break),
             ClientMessage::Act(Action::ClickFurnace {
                 pos: [1, 2, 3],
@@ -622,6 +773,8 @@ mod tests {
             ServerMessage::Welcome {
                 seed: 0x00C0_FFEE_D0D0,
                 you: PlayerId(2),
+                blocks: 0xABCD,
+                items: 0x1234,
             },
             ServerMessage::Tick(1_234_567),
             ServerMessage::Effects(vec![
@@ -645,13 +798,18 @@ mod tests {
     #[test]
     fn move_axes_cross_exactly() {
         for axis in [0.1_f32, -0.1, 1.0 / 3.0, f32::MIN_POSITIVE, -0.0] {
-            let m = ClientMessage::Input(InputFrame {
-                move_axes: [axis, 0.0, 0.0],
-                ..InputFrame::default()
-            });
+            let m = ClientMessage::Input {
+                seq: 0,
+                frame: InputFrame {
+                    move_axes: [axis, 0.0, 0.0],
+                    ..InputFrame::default()
+                },
+            };
             let mut buf = Vec::new();
             m.encode(&mut buf);
-            let ClientMessage::Input(back) = ClientMessage::decode(&buf).expect("decodes") else {
+            let ClientMessage::Input { frame: back, .. } =
+                ClientMessage::decode(&buf).expect("decodes")
+            else {
                 panic!("wrong variant");
             };
             assert_eq!(

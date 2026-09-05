@@ -24,8 +24,8 @@ pub use hash::{hash_region, WorldHash};
 pub use input::InputFrame;
 pub use inventory::{Inventory, HOTBAR_WIDTH, SLOT_COUNT};
 pub use player::{
-    Player, PlayerId, FALL_DAMAGE_PER_BLOCK, HEART, MAX_HEALTH, REGEN_INTERVAL, SAFE_FALL,
-    SENSITIVITY_PER_PIXEL,
+    Player, PlayerId, PlayerState, FALL_DAMAGE_PER_BLOCK, HEART, MAX_HEALTH, REGEN_INTERVAL,
+    SAFE_FALL, SENSITIVITY_PER_PIXEL,
 };
 pub use rng::WorldRng;
 pub use save::{load_world, save_world, LoadError, SaveError, FORMAT_VERSION};
