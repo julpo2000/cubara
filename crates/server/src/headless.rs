@@ -26,8 +26,11 @@
 
 use crate::assets;
 use crate::clock::Pacer;
-use crate::Server;
-use cubara_sim::InputFrame;
+use crate::net::{Acceptor, Link};
+use crate::wire::{ClientMessage, ServerMessage};
+use crate::{Action, Server};
+use cubara_sim::{PlayerId, PlayerInputs};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// How the server was asked to run.
@@ -43,6 +46,12 @@ pub struct Config {
     /// Stop after this many ticks instead of running until interrupted. What
     /// makes the loop testable, and what a smoke test in CI uses.
     pub run_ticks: Option<u64>,
+    /// Where to listen for clients, if anywhere (block 2.12).
+    ///
+    /// `None` is a world that runs with nobody able to join -- which is what
+    /// this binary did before there was a protocol, and still the right default:
+    /// opening a port should be something someone asked for.
+    pub listen: Option<String>,
 }
 
 impl Default for Config {
@@ -55,6 +64,7 @@ impl Default for Config {
             // serialising itself constantly.
             autosave_ticks: 60 * 60 * 5,
             run_ticks: None,
+            listen: None,
         }
     }
 }
@@ -70,6 +80,14 @@ pub struct Session {
     pub ticks: u64,
     /// The tick at which the world was last written to disk.
     last_save: u64,
+    /// Where new clients arrive, when this world is listening (block 2.12).
+    acceptor: Option<Acceptor>,
+    /// One link per connected client, keyed by the player it drives.
+    ///
+    /// A `BTreeMap` for the reason everything else in this project is: the order
+    /// clients are serviced must be a property of the id, not of whose packet
+    /// landed first (Rule 1).
+    clients: BTreeMap<PlayerId, Link<ServerMessage, ClientMessage>>,
 }
 
 impl Session {
@@ -91,6 +109,124 @@ impl Session {
             server,
             ticks: 0,
             last_save: 0,
+            acceptor: None,
+            clients: BTreeMap::new(),
+        }
+    }
+
+    /// Start listening, and report the address actually bound.
+    ///
+    /// Returned rather than only logged because a caller that asked for port 0
+    /// -- every test does -- has no other way to find out which port it got.
+    pub fn listen(&mut self, addr: &str) -> std::io::Result<std::net::SocketAddr> {
+        let acceptor = Acceptor::bind(addr)?;
+        let bound = acceptor.addr();
+        self.acceptor = Some(acceptor);
+        Ok(bound)
+    }
+
+    /// How many clients are connected.
+    pub fn client_count(&self) -> usize {
+        self.clients.len()
+    }
+
+    /// Take in whoever has connected, and give each of them a player.
+    ///
+    /// The server assigns the `PlayerId`; the client is told which one it got in
+    /// [`ServerMessage::Welcome`]. Section 3.4 -- a client may never be believed
+    /// -- made structural: there is no message a client could send that names
+    /// itself.
+    ///
+    /// The welcome carries the **seed**, not the world. Terrain is a pure
+    /// function of it, so a joining client generates its own; what follows is
+    /// the edit overlay for what that client can actually see, which is
+    /// `snapshot_for` and therefore already interest-filtered (block 2.11).
+    fn accept_new_clients(&mut self) {
+        let Some(acceptor) = self.acceptor.as_mut() else {
+            return;
+        };
+        for mut link in acceptor.accepted() {
+            let spawn = self.server.sim.player(self.server.local).spawn;
+            let player = cubara_sim::Player::new(
+                spawn,
+                cubara_voxel::Angle::ZERO,
+                cubara_voxel::Angle::ZERO,
+            );
+            let id = self.server.sim.join(player);
+            self.server.open_view(id);
+
+            link.send(ServerMessage::Welcome {
+                seed: self.server.world.seed(),
+                you: id,
+            });
+            let handshake = self.server.snapshot_for(id);
+            log::info!(
+                "player {id:?} joined; handshake is {} effects",
+                handshake.len()
+            );
+            link.send(ServerMessage::Effects(handshake));
+            // The view has already been charged for the handshake, so whatever
+            // `open_view` queued must not be sent again.
+            let _ = self.server.drain_effects_for(id);
+            self.clients.insert(id, link);
+        }
+    }
+
+    /// Read whatever every client sent, and turn it into this tick's input.
+    ///
+    /// Several inputs from one client in one tick collapse to the last: a client
+    /// that sends faster than the world ticks does not get to move faster than
+    /// it. Actions are applied in the order they arrived, per client, and
+    /// clients are visited in id order.
+    fn collect_input(&mut self) -> PlayerInputs {
+        let mut inputs = PlayerInputs::default();
+        let mut actions: Vec<(PlayerId, Action)> = Vec::new();
+        let mut gone: Vec<PlayerId> = Vec::new();
+
+        for (&who, link) in self.clients.iter_mut() {
+            for msg in link.poll() {
+                match msg {
+                    ClientMessage::Hello => {} // already welcomed on accept
+                    ClientMessage::Input(i) => inputs.set(who, i),
+                    ClientMessage::Act(a) => actions.push((who, a)),
+                }
+            }
+            if link.is_closed() {
+                gone.push(who);
+            }
+        }
+
+        for (who, action) in actions {
+            self.server.apply_as(who, action);
+        }
+        for who in gone {
+            self.drop_client(who);
+        }
+        inputs
+    }
+
+    /// A client has hung up: forget its link, its view, and its player.
+    ///
+    /// Everyone still watching is told, so nobody is left drawing a person who
+    /// left. What happens to their *things* is a gameplay question nobody has
+    /// answered, so their inventory goes with them rather than being invented
+    /// onto the floor.
+    fn drop_client(&mut self, who: PlayerId) {
+        log::info!("player {who:?} disconnected");
+        self.clients.remove(&who);
+        self.server.close_view(who);
+        self.server.sim.leave(who);
+        self.server.announce_departure(who);
+    }
+
+    /// Hand each client what it is owed.
+    fn flush_effects(&mut self) {
+        for (&who, link) in self.clients.iter_mut() {
+            let owed = self.server.drain_effects_for(who);
+            if !owed.is_empty() {
+                link.send(ServerMessage::Effects(owed));
+            }
+            link.send(ServerMessage::Tick(self.server.sim.tick));
         }
     }
 
@@ -101,10 +237,12 @@ impl Session {
     /// anything" means — not a special no-player code path, which would be a
     /// second implementation of the tick (Rule 5) and would drift.
     pub fn advance(&mut self, ticks: u64, cfg: &Config) {
-        let input = InputFrame::default();
         for _ in 0..ticks {
-            self.server.tick_sim(&input);
+            self.accept_new_clients();
+            let inputs = self.collect_input();
+            self.server.tick_sim_all(&inputs);
             self.server.tick_world();
+            self.flush_effects();
             self.ticks += 1;
         }
         if cfg.autosave_ticks > 0 && self.ticks - self.last_save >= cfg.autosave_ticks {
@@ -150,7 +288,20 @@ pub fn run(cfg: &Config) {
         cfg.autosave_ticks,
         cfg.world.display()
     );
-    log::warn!("no network transport yet — nothing is listening, and no client can connect");
+    match cfg.listen.as_deref() {
+        Some(addr) => match session.listen(addr) {
+            // **Printed, not only logged.** A caller that asked for port 0 --
+            // every test does -- has to be told which port it got, and stdout is
+            // the one channel a spawned process always has. The prefix is part
+            // of the contract: `tests/two_processes.rs` parses this line.
+            Ok(bound) => println!("cubara-server listening on {bound}"),
+            Err(e) => {
+                eprintln!("could not listen on {addr}: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => log::info!("not listening — pass --listen <addr> to let clients connect"),
+    }
     log::info!("{}", session.status());
 
     // A status line a minute: enough to see the world is alive, quiet enough to
@@ -229,6 +380,7 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
                         .map_err(|_| "--ticks needs a number".to_string())?,
                 )
             }
+            "--listen" => cfg.listen = Some(value("--listen")?),
             "--help" | "-h" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown option {other}\n\n{USAGE}")),
         }
@@ -251,10 +403,14 @@ Run a Cubara world with no window and no GPU.
                     different game, since block timings are counted in ticks)
   --autosave <n>    save every n ticks, 0 to disable (default: 18000, 5 min)
   --ticks <n>       run n ticks and exit, instead of running until interrupted
+  --listen <addr>   accept clients on <addr>, e.g. 0.0.0.0:25650 or
+                    127.0.0.1:0 to be given a free port. Without it the world
+                    runs but nobody can join.
   -h, --help        this
 
-Note: there is no network transport yet. This runs a world; it does not yet
-serve one.";
+Note: connections are neither authenticated nor encrypted. Anyone who can reach
+the port can join and can edit the world. Do not expose this to the internet
+yet -- untrusted clients are block 2.14.";
 
 #[cfg(test)]
 mod tests {

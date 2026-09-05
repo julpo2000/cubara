@@ -57,7 +57,7 @@ if [ "$phase" = "2" ]; then
     # "Everything phase 1's gate checks, still passing -- a perf regression
     # blocks the phase (Rule 7), it is not noted and forgotten."
     run "cargo test --all" cargo test --all
-    run "cargo clippy --all-targets --all-features" cargo clippy --all-targets --all-features
+    run "cargo clippy --workspace --all-targets --all-features" cargo clippy --workspace --all-targets --all-features
     run "cargo fmt --all --check" cargo fmt --all --check
     run "architecture rules (check-architecture.sh)" ./scripts/check-architecture.sh
     run "single render path (check-single-render-path.sh)" ./scripts/check-single-render-path.sh
@@ -119,7 +119,7 @@ if [ "$phase" = "2" ]; then
     run "two clients, one world, one hash (block 2.11)"         cargo test -p cubara-server --test client_view two_clients_in_one_world_leave_one_authoritative_state
     run "the server never sends terrain (block 2.11)"         cargo test -p cubara-server --test client_view the_join_handshake_carries_no_terrain
     run "bandwidth per client does not grow with player count (block 2.11)"         cargo test -p cubara-server --test client_view bytes_to_one_client_do_not_grow_with_the_player_count
-    not_implemented "a real socket, two processes (block 2.12)"
+    run "a real socket, two processes (block 2.12)"         cargo test -p cubara-server --test two_processes
     not_implemented "a region simulated elsewhere lands where it would have locally (block 2.16)"
 
     echo
@@ -137,7 +137,12 @@ echo "Phase 1 exit gate (ROADMAP.md) ------------------------------------------"
 echo
 
 run "cargo test --all" cargo test --all
-run "cargo clippy --all-targets --all-features" cargo clippy --all-targets --all-features
+# `--workspace`, matching .github/workflows exactly. It did not, until a PR
+# went red on a lint the gate had just called clean: the toolchain pin makes
+# local and CI agree about which lints *exist*, and it cannot help when the two
+# are not running the same command. A gate that checks less than CI is a gate
+# that lies.
+run "cargo clippy --workspace --all-targets --all-features" cargo clippy --workspace --all-targets --all-features
 run "cargo fmt --all --check" cargo fmt --all --check
 run "architecture rules (check-architecture.sh)" ./scripts/check-architecture.sh
 run "single render path (check-single-render-path.sh)" ./scripts/check-single-render-path.sh

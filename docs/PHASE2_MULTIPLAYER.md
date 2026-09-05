@@ -174,7 +174,7 @@ testable to the tick where a networked one is testable to the flake.
 |---|---|---|
 | **2.10** | **The world holds many players.** `PlayerId`, `Sim.players` in id order, `target` moves onto `Player`, the hash and the save format carry all of them. Singleplayer becomes one player with one id. | The structural change §1 identifies. Must land before netcode, and needs no netcode to land. |
 | **2.11** | **The per-client view.** What one client has been told, and the delta owed to it. Interest management lives here: a client is sent only what it can perceive. Built and tested **in-process**, with no socket. | §3.2 items 2–3, the single largest determinant of whether the player-count target is reachable. Testable headlessly, so it is built where it is testable. |
-| **2.12** | **The transport.** A `Transport` trait with two implementations — in-process and a socket — carrying `InputFrame`/`Action` up and `Effect`/state down. Two machines on a LAN: the Mac and the Windows laptop. | Only now, and behind a trait, so §2's rule holds. |
+| **2.12** | **The transport.** One `Link` type, wired either to a channel or to a socket, carrying `InputFrame`/`Action` up and `Effect`/state down. Two machines on a LAN: the Mac and the Windows laptop. | Only now, and behind **one type rather than a trait** (§5.1), so §2's rule holds without two code paths to keep in step. |
 | **2.13** | **Prediction and reconciliation.** The client predicts its own player and its own edits, and reconciles against the server. | §8.4: *not* before there is latency, because a round trip that is always zero cannot show whether it works. |
 | **2.14** | **Untrusted clients.** Every action validated server-side: reach, speed, inventory, rate. | What "public" actually costs (§3.2 item 6). |
 | **2.15** | **Persistence that is not one `level.ron`.** Per-player state, and a chunk store a live server can write concurrently. | §3.2 item 4. One RON file is right for one player and wrong for a live server. |
@@ -185,6 +185,24 @@ Prediction is at 2.13 rather than earlier for the reason §8.4 gives, and intere
 management is at 2.11 rather than after the transport because it is the part the
 player-count answer depends on and the part that is cheapest to test with no
 network in the way.
+
+### §5.1 One type, not a trait — what block 2.12 changed
+
+The row above originally said "a `Transport` trait with two implementations",
+and that is not what landed. There is one type, `net::Link<S, R>`, holding a pair
+of channel ends: a **local** link joins two halves of one process, a **TCP** link
+joins two machines, and neither side can tell which it has, because both are the
+same type.
+
+That is stronger than the trait it replaced. A trait leaves two code paths that
+have to be kept in step, and §2's rule — *anything true only because client and
+server share a process is a bug waiting for the socket* — is exactly what rots
+between two such paths. Here the difference lives in how the ends are wired up,
+and nothing above that seam has a second case to get wrong. **Singleplayer is not
+a special case of multiplayer; it is multiplayer with a very short wire.**
+
+UDP or QUIC, if measurement ever asks for them, become another way of wiring a
+`Link` rather than another implementation of anything.
 
 ## §6 The exit gate, and the honest reading of "5000"
 
