@@ -380,7 +380,6 @@ impl Effect {
 impl Action {
     fn encode(&self, out: &mut Vec<u8>) {
         match self {
-            Action::Break => out.push(0),
             Action::Place => out.push(1),
             Action::Interact => out.push(2),
             Action::ClickFurnace { pos, slot } => {
@@ -397,7 +396,10 @@ impl Action {
 
     fn decode(c: &mut Cursor<'_>) -> Result<Self, WireError> {
         Ok(match c.u8()? {
-            0 => Action::Break,
+            // Tag 0 was `Action::Break` until block 2.14 removed it. The
+            // remaining tags keep their numbers rather than closing the gap:
+            // renumbering would silently turn an old client's `Place` into a
+            // new server's `Interact`, which is worse than a clean rejection.
             1 => Action::Place,
             2 => Action::Interact,
             3 => {
@@ -754,7 +756,7 @@ mod tests {
                     breaking: true,
                 },
             },
-            ClientMessage::Act(Action::Break),
+            ClientMessage::Act(Action::Interact),
             ClientMessage::Act(Action::ClickFurnace {
                 pos: [1, 2, 3],
                 slot: FurnaceSlot::Output,

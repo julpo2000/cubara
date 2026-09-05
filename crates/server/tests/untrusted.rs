@@ -29,7 +29,7 @@
 
 use cubara_server::headless::MAX_ACTIONS_PER_TICK;
 use cubara_server::{Action, FurnaceSlot, Server};
-use cubara_sim::{InputFrame, Player, PlayerId};
+use cubara_sim::{InputFrame, Player, PlayerId, PlayerInputs};
 use cubara_voxel::{Angle, FixedVec3};
 
 const SKY: i32 = 400;
@@ -296,7 +296,10 @@ fn a_flood_of_actions_is_capped_at_the_limit() {
 
     const SENT: usize = 50;
     for _ in 0..SENT {
-        link.send(ClientMessage::Act(Action::Break));
+        // Any action will do: what is being measured is how many of them the
+        // server lets through in one tick, not what they were. `Interact` is
+        // the cheapest -- it raycasts and finds nothing.
+        link.send(ClientMessage::Act(Action::Interact));
     }
 
     // A generous number of ticks: the actions cross a real socket, so how many
@@ -322,5 +325,131 @@ fn a_flood_of_actions_is_capped_at_the_limit() {
         "one client had {} actions applied in a single tick, cap is {}",
         session.most_actions_in_one_tick(),
         MAX_ACTIONS_PER_TICK
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Mining time
+// ---------------------------------------------------------------------------
+
+/// Holding the button for less than a block's hardness does not break it.
+fn mine_for(ticks: u32) -> (Server, [i32; 3], bool) {
+    let mut s = Server::new();
+    s.open(std::path::Path::new("cubara-nonexistent-untrusted-fixture"));
+    let who = s.sim.join(Player::new(
+        FixedVec3::from_blocks(0, SKY, 0),
+        Angle::ZERO,
+        Angle::ZERO,
+    ));
+    s.open_view(who);
+    let stone = s
+        .blocks_registry
+        .as_deref()
+        .and_then(|r| r.id_of("cubara:stone"))
+        .expect("stone is a block");
+    let target = [0, SKY, -3];
+    s.set_block(target, stone);
+
+    let holding = InputFrame {
+        breaking: true,
+        ..InputFrame::default()
+    };
+    // Only the mining half. Ticking the simulation too would let gravity pull
+    // the player away from the block they are aiming at -- they are standing in
+    // empty sky -- and the block would survive because the ray stopped hitting
+    // it, not because the time had not been paid. The first version of this
+    // test did exactly that and reported "stone never gave way".
+    for _ in 0..ticks {
+        s.tick_mining_all(&PlayerInputs::one(who, holding));
+    }
+    let gone = s
+        .world
+        .block_at(target[0], target[1], target[2], s.terrain())
+        == cubara_voxel::BlockId::AIR;
+    (s, target, gone)
+}
+
+/// Stone declares `hardness: 30`, so a bare hand at speed 1 needs thirty ticks.
+///
+/// Both halves matter. That it breaks eventually says the mechanism works; that
+/// it does *not* break early says the time is being counted rather than
+/// nodded at.
+#[test]
+fn a_block_is_not_broken_before_its_hardness_is_paid() {
+    let (_s, _t, early) = mine_for(20);
+    assert!(
+        !early,
+        "stone gave way after 20 ticks of a 30-tick hardness"
+    );
+
+    let (_s, _t, late) = mine_for(30);
+    assert!(
+        late,
+        "stone never gave way after 30 ticks of holding the button"
+    );
+}
+
+/// There is no message a client can send that asks for an instant break.
+///
+/// The structural half of this block, and the reason `Action::Break` was
+/// removed rather than validated: the server cannot check a duration it did not
+/// measure, so a message that asks for a completed break is one it would have
+/// to take on trust. Tag 0 is what that action encoded as; it is now refused.
+#[test]
+fn the_wire_has_no_instant_break() {
+    use cubara_server::wire::ClientMessage;
+    // `Act` is client tag 2; 0 was `Break`'s action tag.
+    assert!(
+        ClientMessage::decode(&[2, 0]).is_err(),
+        "the wire still accepts the instant-break action"
+    );
+    // The neighbouring tags still decode, so this is a rejection of one message
+    // rather than the decoder failing on everything.
+    assert!(
+        ClientMessage::decode(&[2, 1]).is_ok(),
+        "Place stopped decoding, so the test above proves nothing"
+    );
+}
+
+/// Progress is abandoned when the button comes up, not banked (§4.3).
+///
+/// Otherwise a client could pay for a break twenty ticks at a time across a
+/// minute of tapping, which is the rate limit defeated by patience.
+#[test]
+fn released_progress_is_not_banked() {
+    let mut s = Server::new();
+    s.open(std::path::Path::new("cubara-nonexistent-untrusted-fixture"));
+    let who = s.sim.join(Player::new(
+        FixedVec3::from_blocks(0, SKY, 0),
+        Angle::ZERO,
+        Angle::ZERO,
+    ));
+    s.open_view(who);
+    let stone = s
+        .blocks_registry
+        .as_deref()
+        .and_then(|r| r.id_of("cubara:stone"))
+        .expect("stone is a block");
+    let target = [0, SKY, -3];
+    s.set_block(target, stone);
+
+    let holding = InputFrame {
+        breaking: true,
+        ..InputFrame::default()
+    };
+    // Three bursts of twenty, released in between: sixty ticks of holding in
+    // total, none of them consecutive enough to finish a thirty-tick block.
+    for _ in 0..3 {
+        for _ in 0..20 {
+            s.tick_mining_all(&PlayerInputs::one(who, holding));
+        }
+        s.tick_mining_all(&PlayerInputs::one(who, InputFrame::default()));
+    }
+
+    assert_ne!(
+        s.world
+            .block_at(target[0], target[1], target[2], s.terrain()),
+        cubara_voxel::BlockId::AIR,
+        "sixty ticks of tapping broke a block that needs thirty consecutive"
     );
 }

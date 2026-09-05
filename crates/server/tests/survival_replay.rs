@@ -310,7 +310,13 @@ impl Fixture {
         if !self.face(target) {
             return false;
         }
-        self.server.apply(Action::Break);
+        // Block 2.14 removed `Action::Break`: an instant break is what mining
+        // time exists to prevent, and a message asking for one cannot be
+        // validated. This is the server's own entry point, which does exactly
+        // what that action did -- same raycast, same reach, same drop -- so the
+        // hash this fixture pins is unchanged.
+        let who = self.server.local;
+        self.server.break_looked_at_as(who);
         self.raycast_breaks += 1;
         true
     }
