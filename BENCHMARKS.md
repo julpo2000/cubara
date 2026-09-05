@@ -112,6 +112,7 @@ frames after 200 warmup.
 | 2026-08-31 | Fixed-point positions, radius 64, band ±2³⁹ | 3,138 | 912,964 | ~1,109 | 0.622 ms | ~1.04 ms | `24e4789` |
 | 2026-09-01 | Client-side replica world, radius 64, band ±2⁴⁰ | 3,138 | 912,964 | ~1,101 | 0.628 ms | ~1.22 ms | `a9f238e` |
 | 2026-09-01 | Fixed-point angles, radius 64, band ±2⁴¹ | 3,138 | 912,964 | ~1,096 | 0.630 ms | ~1.38 ms | `bbb09c2` |
+| 2026-09-05 | macOS caught up to `main` — many players, per-client views, the transport [#199, #201, #203], radius 64, band ±2⁴² | 3,138 | 912,964 | ~1,108 | 0.628 ms | ~0.98 ms | `01aa32e` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -1224,6 +1225,29 @@ p99 moved 1.04 → 1.22 ms, and the honest reading is that this scene's p99 is
 noisy rather than that a regression is hiding in it: the avg is what carries
 signal at this scale (see ¹), and the per-frame work added is one drain of an
 empty `Vec`.
+
+⁴² **Three multiplayer blocks, and the scene is untouched — which is the whole
+claim being checked.** Blocks 2.10 (the world holds many players), 2.11 (the
+per-client view and interest management) and 2.12 (the transport) landed on
+Windows; this is the first macOS measurement since `bbb09c2`, so it covers all
+three at once.
+
+3,138 nodes and 912,964 triangles, identical to the four rows above it. That is
+the expected answer and it is worth having on the record anyway: none of these
+blocks touch worldgen, meshing or the render path, so a change in either column
+would have meant something had leaked across a seam it should not have.
+
+CPU/frame 0.630 → 0.628 ms and 1,096 → 1,108 FPS are both inside this scene's
+run-to-run scatter (see ¹ on why FPS ramps here). p99 reads 0.98 ms against the
+previous row's 1.38, and that is scatter too rather than an improvement to claim
+— this scene's p99 has swung between 0.86 and 1.38 ms across rows that changed
+nothing about rendering.
+
+What none of this measures is the cost of *many* clients. There is one player in
+the benchmark, and per-client views only start costing something when there are
+clients to have them. The scaling question has its own test
+(`bytes_to_one_client_do_not_grow_with_the_player_count`), and it measures bytes
+rather than frames, because bandwidth is the thing block 2.11 was built to bound.
 
 ⁴¹ **Replacing the platform's `sin`/`cos` with a polynomial costs nothing
 measurable.** CPU/frame 0.628 → 0.630 ms, which is scatter.
