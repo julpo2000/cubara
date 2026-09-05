@@ -73,6 +73,12 @@ impl Default for Config {
 ///
 /// The clock is [`run`]'s business, not this type's — which is what makes the
 /// loop testable, and what keeps this file inside Rule 1.
+/// How many actions one client may have applied in a single tick (block 2.14).
+///
+/// See [`Session::collect_input`] for why the excess is dropped rather than
+/// held over, and why the number is deliberately loose.
+pub const MAX_ACTIONS_PER_TICK: usize = 8;
+
 pub struct Session {
     pub server: Server,
     /// Ticks run since this session started. Not the world's tick count, which
@@ -95,6 +101,23 @@ pub struct Session {
     /// rather than in `Server` because it is a property of the *connection*, and
     /// a world has no opinion about how many messages a link has carried.
     last_seq: BTreeMap<PlayerId, u64>,
+    /// Actions refused this session for exceeding [`MAX_ACTIONS_PER_TICK`].
+    ///
+    /// Counted rather than only logged, for two reasons. A server operator
+    /// wants to know that a client is being throttled — a number climbing
+    /// steadily is a script, and a log line lost among thousands is not. And a
+    /// limit whose effect cannot be observed cannot be tested: the first
+    /// version of this block's test asserted that the *constant* was a
+    /// plausible size, which is a test that passes whether or not the code
+    /// enforcing it exists.
+    dropped_actions: u64,
+    /// The most actions any one client has had applied in a single tick.
+    ///
+    /// The cap's actual invariant, and therefore what a test can assert without
+    /// depending on timing: *how* a burst splits across ticks is a property of
+    /// the socket, not of the limit, so counting refusals alone makes a test
+    /// that fails on a slow runner and passes on a fast one.
+    most_in_one_tick: usize,
 }
 
 impl Session {
@@ -119,6 +142,8 @@ impl Session {
             acceptor: None,
             clients: BTreeMap::new(),
             last_seq: BTreeMap::new(),
+            dropped_actions: 0,
+            most_in_one_tick: 0,
         }
     }
 
@@ -131,6 +156,18 @@ impl Session {
         let bound = acceptor.addr();
         self.acceptor = Some(acceptor);
         Ok(bound)
+    }
+
+    /// How many actions have been refused for exceeding
+    /// [`MAX_ACTIONS_PER_TICK`] since this session started.
+    pub fn dropped_actions(&self) -> u64 {
+        self.dropped_actions
+    }
+
+    /// The most actions one client has had applied in a single tick. Never
+    /// above [`MAX_ACTIONS_PER_TICK`], which is the whole claim.
+    pub fn most_actions_in_one_tick(&self) -> usize {
+        self.most_in_one_tick
     }
 
     /// How many clients are connected.
@@ -201,6 +238,7 @@ impl Session {
     fn collect_input(&mut self) -> PlayerInputs {
         let mut inputs = PlayerInputs::default();
         let last_seq = &mut self.last_seq;
+        let dropped = &mut self.dropped_actions;
         let mut actions: Vec<(PlayerId, Action)> = Vec::new();
         let mut gone: Vec<PlayerId> = Vec::new();
 
@@ -209,7 +247,9 @@ impl Session {
                 match msg {
                     ClientMessage::Hello => {} // already welcomed on accept
                     ClientMessage::Input { seq, frame } => {
-                        inputs.set(who, frame);
+                        // Block 2.14: the one place untrusted input enters the
+                        // simulation, so the one place it is cleaned.
+                        inputs.set(who, frame.sanitized());
                         // Highest wins rather than latest: messages arrive in
                         // order over TCP today, and acknowledging a *lower*
                         // number after a higher one would tell a client to
@@ -217,7 +257,30 @@ impl Session {
                         let slot = last_seq.entry(who).or_insert(0);
                         *slot = (*slot).max(seq);
                     }
-                    ClientMessage::Act(a) => actions.push((who, a)),
+                    ClientMessage::Act(a) => {
+                        // Block 2.14. A client that sends a thousand actions in
+                        // one tick gets `MAX_ACTIONS_PER_TICK` of them and the
+                        // rest are **dropped, not queued**: queueing turns a
+                        // burst into the same burst arriving slightly later,
+                        // which is the cheat with a delay on it rather than a
+                        // cheat prevented.
+                        //
+                        // The number is generous on purpose. Ordinary play
+                        // sends at most a click or two per tick, so this is far
+                        // above anything a person produces and far below what a
+                        // script would want -- a limit tight enough to argue
+                        // about is a limit that eventually rejects a laggy
+                        // client's legitimate catch-up.
+                        let n = actions.iter().filter(|(p, _)| *p == who).count();
+                        if n < MAX_ACTIONS_PER_TICK {
+                            actions.push((who, a));
+                        } else {
+                            *dropped += 1;
+                            log::debug!(
+                                "{who:?} exceeded {MAX_ACTIONS_PER_TICK} actions in one tick"
+                            );
+                        }
+                    }
                 }
             }
             if link.is_closed() {
@@ -225,6 +288,10 @@ impl Session {
             }
         }
 
+        for &who in self.clients.keys() {
+            let n = actions.iter().filter(|(p, _)| *p == who).count();
+            self.most_in_one_tick = self.most_in_one_tick.max(n);
+        }
         for (who, action) in actions {
             self.server.apply_as(who, action);
         }

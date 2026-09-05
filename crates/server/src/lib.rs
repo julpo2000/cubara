@@ -43,6 +43,11 @@ use std::sync::Arc;
 use crate::view::ClientView;
 
 use cubara_sim::REACH;
+
+/// Half the space diagonal of a unit cube: how much further than `REACH` the
+/// *centre* of a legitimately reachable block can be. See
+/// [`Server::within_reach`].
+const HALF_DIAGONAL: f32 = 0.866_025_4;
 use cubara_voxel::{BlockId, DropRule, FixedVec3, Interact, ItemStack, ItemState};
 use cubara_world::{ChunkState, Furnace, SmeltCtx, TerrainBlocks, TimedProcess, World};
 
@@ -1082,6 +1087,19 @@ impl Server {
         let Some(items) = self.items.as_ref() else {
             return;
         };
+        // Block 2.14. Every other action is reach-limited for free, because the
+        // server raycasts from the player and a raycast stops at `REACH`. This
+        // one names its target, so nothing stops it reaching across the world
+        // unless something here does.
+        //
+        // Without it a client could empty every furnace on the map without
+        // moving -- and it would look like ordinary play in the log, because
+        // each click is individually well-formed. The furnace-exists check
+        // above cannot catch it: the furnace does exist, just not near them.
+        if !self.within_reach(who, pos) {
+            log::debug!("{who:?} clicked a furnace at {pos:?}, out of reach");
+            return;
+        }
         let held = self.sim.player_mut(who).crafting.held();
         let world = Arc::make_mut(&mut self.world);
         let Some(f) = world.furnace_at_mut(pos) else {
@@ -1183,6 +1201,37 @@ impl Server {
         for pos in changed {
             self.note_block_entity(pos);
         }
+    }
+
+    /// Whether `who` could actually touch the block at `pos` (block 2.14).
+    ///
+    /// Measured from the eye to the **centre** of the block, and compared
+    /// against `REACH` plus the half-diagonal of a unit cube. That slack is not
+    /// generosity: a raycast — which is what every other action is limited by —
+    /// stops when it *enters* a block, so it can legitimately hit a block whose
+    /// centre is further away than `REACH`. Comparing centre-to-eye against a
+    /// bare `REACH` would reject clicks the player can plainly make, and a
+    /// check that rejects legitimate play is a check that gets loosened until
+    /// it does nothing.
+    ///
+    /// Float arithmetic, deliberately: this is a *rejection test* rather than
+    /// world state. It never decides where anything ends up, so it is not
+    /// authority in §3.5's sense, and a last-bit disagreement between two
+    /// machines cannot desynchronise anything -- the server that owns the world
+    /// is the only one that runs it.
+    fn within_reach(&self, who: PlayerId, pos: [i32; 3]) -> bool {
+        let Some(p) = self.sim.get(who) else {
+            return false;
+        };
+        let eye = p.pos.to_f32();
+        let centre = [
+            pos[0] as f32 + 0.5,
+            pos[1] as f32 + 0.5,
+            pos[2] as f32 + 0.5,
+        ];
+        let d = [centre[0] - eye[0], centre[1] - eye[1], centre[2] - eye[2]];
+        let limit = REACH + HALF_DIAGONAL;
+        d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= limit * limit
     }
 
     fn break_looked_at_as(&mut self, who: PlayerId) -> Option<[i32; 3]> {

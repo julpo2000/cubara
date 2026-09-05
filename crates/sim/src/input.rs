@@ -54,3 +54,52 @@ pub struct InputFrame {
     /// recorded input.
     pub breaking: bool,
 }
+
+impl InputFrame {
+    /// This frame with its axes forced back inside the range the field's
+    /// documentation has always claimed for them (block 2.14).
+    ///
+    /// `move_axes` is the only float that crosses the wire into the simulation,
+    /// and it arrives from a machine that may be lying. Three things it can say
+    /// that a keyboard cannot:
+    ///
+    /// - **NaN.** `f32::NAN != 0.0`, so it reaches `normalize()`, comes out NaN,
+    ///   and casts to zero -- harmless today, entirely by luck, and one
+    ///   refactor away from poisoning a position that is folded into the world
+    ///   hash. A world whose hash depends on a client's NaN is a world that
+    ///   cannot be replayed.
+    /// - **Infinity.** Same path, same luck.
+    /// - **A large magnitude.** Walking normalises, so this is capped today --
+    ///   but by an implementation detail two crates away, not by anything that
+    ///   says so. Clamping here makes the bound a property of the input rather
+    ///   than a side effect of how movement happens to be computed.
+    ///
+    /// Non-finite values become zero rather than being clamped: there is no
+    /// "nearest valid direction" to a NaN, and inventing one would be guessing
+    /// what a client meant when the honest answer is that it said nothing.
+    ///
+    /// **Applied at the boundary, not inside [`crate::Sim::tick`].** The tick is
+    /// the hot path and runs for every player every step; input arrives once per
+    /// client per tick, at exactly one place, and validating where the untrusted
+    /// thing enters is what makes the rest of the code able to assume it is
+    /// clean. `look_delta` needs nothing: an `Angle` is an integer that wraps,
+    /// so there is no value it cannot legitimately hold.
+    #[must_use]
+    pub fn sanitized(self) -> Self {
+        let axis = |v: f32| {
+            if v.is_finite() {
+                v.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            }
+        };
+        Self {
+            move_axes: [
+                axis(self.move_axes[0]),
+                axis(self.move_axes[1]),
+                axis(self.move_axes[2]),
+            ],
+            ..self
+        }
+    }
+}
