@@ -116,9 +116,9 @@ if [ "$phase" = "2" ]; then
     # Red on landing, exactly as this file's survival criterion was: a gate says
     # what is missing before the work is done. Blocks 2.10-2.17, designed in
     # docs/PHASE2_MULTIPLAYER.md.
-    not_implemented "two clients, one world, one hash (block 2.11)"
-    not_implemented "the server never sends terrain (block 2.11)"
-    not_implemented "bandwidth per client does not grow with player count (block 2.11)"
+    run "two clients, one world, one hash (block 2.11)"         cargo test -p cubara-server --test client_view two_clients_in_one_world_leave_one_authoritative_state
+    run "the server never sends terrain (block 2.11)"         cargo test -p cubara-server --test client_view the_join_handshake_carries_no_terrain
+    run "bandwidth per client does not grow with player count (block 2.11)"         cargo test -p cubara-server --test client_view bytes_to_one_client_do_not_grow_with_the_player_count
     not_implemented "a real socket, two processes (block 2.12)"
     not_implemented "a region simulated elsewhere lands where it would have locally (block 2.16)"
 

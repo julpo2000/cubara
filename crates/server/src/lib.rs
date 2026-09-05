@@ -30,10 +30,14 @@
 pub mod assets;
 pub mod clock;
 pub mod headless;
+pub mod view;
 
 use cubara_sim::{InputFrame, Player, PlayerId, PlayerInputs, Sim};
 use cubara_voxel::{Angle, BlockRegistry, ChunkCoord, ItemRegistry, RecipeBook, SmeltBook};
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+use crate::view::ClientView;
 
 use cubara_sim::REACH;
 use cubara_voxel::{BlockId, DropRule, FixedVec3, Interact, ItemStack, ItemState};
@@ -66,13 +70,17 @@ pub struct Server {
     /// The chunk the simulation radius was last updated around (§11). Which
     /// chunks tick is an authority question, so it lives here.
     pub sim_centre: Option<ChunkCoord>,
-    /// What has changed and not yet been handed to a client (§8.3,
-    /// server -> client).
+    /// What each client can perceive, and what it is owed (block 2.11).
     ///
-    /// Private, and drained rather than read: a client that could *look* at the
-    /// journal without taking it could read the same change twice, or read a
-    /// change it has not applied yet. Over a socket this is the send queue.
-    journal: Vec<Effect>,
+    /// This replaced a single `journal: Vec<Effect>`. One queue was right while
+    /// there was one client; with many it is the O(players²) shape
+    /// `docs/RESEARCH_MULTIPLAYER.md` §3.2 names as the thing that decides
+    /// whether the player-count target is reachable at all.
+    ///
+    /// Private, and drained rather than read: a client that could *look*
+    /// without taking could apply the same change twice, or miss one. Over a
+    /// socket each of these is a send queue.
+    views: BTreeMap<PlayerId, ClientView>,
 }
 
 /// What a client asks the world to do (`docs/RESEARCH_MULTIPLAYER.md` §8.3).
@@ -155,6 +163,54 @@ pub enum Effect {
     Open(Screen),
     /// Whatever screen is open should close -- the block behind it is gone.
     CloseIfAt([i32; 3]),
+    /// Where another player is now (block 2.11).
+    ///
+    /// **Never the receiving client's own player.** Section 3.4 splits those:
+    /// a client predicts itself and is corrected, and interpolates everyone
+    /// else, because it does not know their inputs. Sending someone their own
+    /// position back every tick would be both useless and, once there is
+    /// latency, actively wrong -- it would fight the prediction.
+    ///
+    /// Fixed-point and binary angles, like everything else that crosses this
+    /// seam: nothing here is a float (section 3.5).
+    PlayerMoved {
+        who: PlayerId,
+        pos: FixedVec3,
+        yaw: Angle,
+        pitch: Angle,
+    },
+    /// A player left the world, or walked out of sight. The client stops
+    /// drawing them.
+    PlayerGone(PlayerId),
+}
+
+impl Effect {
+    /// Roughly how many bytes this costs to send.
+    ///
+    /// **An accounting of the fields, not a codec.** Block 2.12 chooses the wire
+    /// format and this becomes its `encoded_len`; until then, what the scaling
+    /// criterion needs is the *shape* of the curve -- flat or growing as players
+    /// are added -- and for that an honest field count is as good as an encoder
+    /// and does not require picking a serialisation format early to get it.
+    ///
+    /// A discriminant byte plus the payload, which is what any compact binary
+    /// format would produce within a small constant.
+    pub fn wire_size(&self) -> usize {
+        const TAG: usize = 1;
+        const POS: usize = 3 * 4; // three i32 block coordinates
+        const FIXED_VEC3: usize = 3 * 8; // three i64 sub-unit coordinates
+        const ANGLE: usize = 4;
+        const PLAYER_ID: usize = 8;
+        TAG + match self {
+            Effect::Edit { .. } => POS + 2,
+            // A furnace is three optional (id, count) slots and two counters.
+            Effect::BlockEntity { furnace, .. } => POS + 1 + furnace.map_or(0, |_| 3 * 4 + 2 * 4),
+            Effect::Open(_) => 1 + POS,
+            Effect::CloseIfAt(_) => POS,
+            Effect::PlayerMoved { .. } => PLAYER_ID + FIXED_VEC3 + 2 * ANGLE,
+            Effect::PlayerGone(_) => PLAYER_ID,
+        }
+    }
 }
 
 impl Server {
@@ -165,7 +221,7 @@ impl Server {
     /// point; [`set_assets`](Self::set_assets) is what stands them on the
     /// ground once it does.
     pub fn new() -> Self {
-        Self {
+        let mut server = Self {
             world: Arc::new(World::new()),
             sim: Sim::new(
                 0,
@@ -181,9 +237,14 @@ impl Server {
             recipes: None,
             smelting: None,
             sim_centre: None,
-            journal: Vec::new(),
+            views: BTreeMap::new(),
             local: PlayerId::LOCAL,
-        }
+        };
+        // The local client is watching from the start. A `Server` with no view
+        // would queue every effect into nothing, which is not a smaller server
+        // -- it is one whose edits never reach the screen.
+        server.open_view(PlayerId::LOCAL);
+        server
     }
 
     /// A server with every definition loaded and the save at `dir` restored, if
@@ -196,7 +257,14 @@ impl Server {
         let items = assets::load_item_registry();
         let recipes = assets::load_recipe_book(&items);
         self.set_assets(Arc::new(assets::load_block_registry()), items, recipes);
-        self.load_from(dir)
+        let loaded = self.load_from(dir);
+        // The local client is watching from the moment the world opens. Loading
+        // replaces the `Sim` -- and with it every player -- so this comes after,
+        // or the view would be centred on a player who no longer exists.
+        for who in self.sim.player_ids() {
+            self.open_view(who);
+        }
+        loaded
     }
 
     /// Give the server the assets it needs to turn blocks into items and back,
@@ -286,6 +354,11 @@ impl Server {
     /// *is* a half — that the world does not stop when the player does — is the
     /// thing a headless server tests for free.
     pub fn tick_world(&mut self) {
+        // Before the furnaces, so a client that walked into a chunk this tick is
+        // owed that chunk's contents *and then* whatever changed in it -- rather
+        // than a change to a block it has not been told exists.
+        self.refresh_views();
+        self.publish_player_states();
         self.tick_furnaces();
         // Dropped items fall, age out, and get picked up -- on the same fixed
         // clock as everything else (§10.4, Rule 1).
@@ -419,13 +492,162 @@ impl Default for Server {
 }
 
 impl Server {
-    /// Take everything that has changed since this was last called.
+    /// Take everything the local client has not been told yet.
     ///
     /// Drained, not borrowed: an effect applied twice is a desynchronised
     /// replica, and taking the queue is what makes that impossible rather than
     /// merely discouraged.
     pub fn drain_effects(&mut self) -> Vec<Effect> {
-        std::mem::take(&mut self.journal)
+        self.drain_effects_for(self.local)
+    }
+
+    /// The same, for a named client (block 2.11).
+    pub fn drain_effects_for(&mut self, who: PlayerId) -> Vec<Effect> {
+        self.views
+            .get_mut(&who)
+            .map(ClientView::drain)
+            .unwrap_or_default()
+    }
+
+    /// A client's view, if it has one.
+    pub fn view(&self, who: PlayerId) -> Option<&ClientView> {
+        self.views.get(&who)
+    }
+
+    /// Give `who` a view, and owe them everything already in sight.
+    ///
+    /// Separate from `Sim::join` because a *player* existing and a *client*
+    /// watching are different things: a dedicated server may hold a player
+    /// whose connection dropped, and it should keep simulating them without
+    /// queueing effects nobody will ever collect.
+    pub fn open_view(&mut self, who: PlayerId) {
+        self.views.entry(who).or_default();
+        self.refresh_view(who);
+    }
+
+    /// Drop a client's view. Their player may well still exist.
+    pub fn close_view(&mut self, who: PlayerId) {
+        self.views.remove(&who);
+    }
+
+    /// Bring one client's interest set up to date with where its player is, and
+    /// backfill any chunk that has just come into view.
+    ///
+    /// A no-op when the player has not changed chunk, which is most ticks.
+    fn refresh_view(&mut self, who: PlayerId) {
+        let Some(player) = self.sim.get(who) else {
+            return;
+        };
+        let centre = ChunkCoord::from_world_pos(player.pos.to_f32());
+        let Some(view) = self.views.get_mut(&who) else {
+            return;
+        };
+        let Some(previous) = view.recentre(centre) else {
+            return;
+        };
+        let view = view.clone();
+
+        // **Walk the edits, not the chunks.** At the replication radius the view
+        // holds tens of thousands of chunks and the world holds a handful of
+        // edits; iterating the sparse side is the difference between a scan that
+        // costs nothing and one that costs more than the tick.
+        //
+        // Edits before block entities, so a client applies the block before
+        // whatever state hangs off it -- the same order `snapshot` uses.
+        let mut owed: Vec<Effect> = Vec::new();
+        for (pos, block) in self.world.edits() {
+            if view.newly_visible(previous, pos) {
+                owed.push(Effect::Edit { pos, block });
+            }
+        }
+        for (pos, f) in self.world.block_entities() {
+            if view.newly_visible(previous, *pos) {
+                owed.push(Effect::BlockEntity {
+                    pos: *pos,
+                    furnace: Some(*f),
+                });
+            }
+        }
+
+        if let Some(view) = self.views.get_mut(&who) {
+            for e in owed {
+                view.push(e);
+            }
+        }
+    }
+
+    /// Bring every client's interest set up to date. Once per tick.
+    pub fn refresh_views(&mut self) {
+        let watchers: Vec<PlayerId> = self.views.keys().copied().collect();
+        for who in watchers {
+            self.refresh_view(who);
+        }
+    }
+
+    /// Queue an effect for every client that can perceive `pos`.
+    ///
+    /// This is the whole of interest management on the outbound side: an effect
+    /// nobody is near is **dropped**, not stored. That is what stops bytes
+    /// growing with the number of players -- the alternative, keeping it in case
+    /// someone walks past later, is how a per-client queue becomes a second copy
+    /// of the world.
+    fn publish_at(&mut self, pos: [i32; 3], effect: Effect) {
+        for view in self.views.values_mut() {
+            if view.perceives(pos) {
+                view.push(effect);
+            }
+        }
+    }
+
+    /// Queue an effect for one named client -- for effects that are about a
+    /// *client* rather than about a place. Opening a screen is the only one.
+    fn publish_to(&mut self, who: PlayerId, effect: Effect) {
+        if let Some(view) = self.views.get_mut(&who) {
+            view.push(effect);
+        }
+    }
+
+    /// Tell each client where the *other* players near them are (block 2.11).
+    ///
+    /// This is the traffic interest management exists to bound, and the reason
+    /// the scaling criterion is not vacuous: without it there is nothing in the
+    /// per-client queue that could grow with the player count, and a test
+    /// claiming the shape is flat would be measuring an empty room.
+    ///
+    /// Cost is O(watchers x players) when everyone is standing on the same
+    /// spot, and that is correct -- a thousand people in one square genuinely do
+    /// all have to see each other. The claim interest management makes is about
+    /// the *spread-out* case, which is the one a world of five thousand is in.
+    ///
+    /// Iterated in `PlayerId` order on both sides, so what a client is told, and
+    /// in what order, does not depend on a hash seed (Rule 1).
+    fn publish_player_states(&mut self) {
+        let others: Vec<(PlayerId, FixedVec3, Angle, Angle)> = self
+            .sim
+            .players()
+            .map(|(id, p)| (id, p.pos, p.yaw(), p.pitch()))
+            .collect();
+
+        for (&watcher, view) in self.views.iter_mut() {
+            for &(who, pos, yaw, pitch) in &others {
+                if who == watcher {
+                    continue; // you are not news to yourself
+                }
+                let block = [
+                    pos.x.floor_block(),
+                    pos.y.floor_block(),
+                    pos.z.floor_block(),
+                ];
+                if view.perceives(block) {
+                    view.push(Effect::PlayerMoved {
+                        who,
+                        pos,
+                        yaw,
+                        pitch,
+                    });
+                }
+            }
+        }
     }
 
     /// Apply one action (§8.3). What changed comes back through
@@ -436,15 +658,26 @@ impl Server {
     /// **The server raycasts here, not the client.** That is the point of the
     /// action being `Break` rather than `Break(block)`.
     pub fn apply(&mut self, action: Action) {
+        self.apply_as(self.local, action);
+    }
+
+    /// The same, on behalf of a named client (block 2.11).
+    ///
+    /// Which client acted matters now, and not only for bookkeeping: `Open` is
+    /// addressed to the person who clicked, where an edit is addressed to a
+    /// *place* and reaches everyone standing near it. Over a socket this
+    /// argument is "which connection sent this" -- the server's idea of who they
+    /// are, never theirs, which is what makes section 3.4's rule structural.
+    pub fn apply_as(&mut self, who: PlayerId, action: Action) {
         match action {
             Action::Break => {
                 if let Some(block) = self.break_looked_at() {
-                    self.journal.push(Effect::CloseIfAt(block));
+                    self.publish_at(block, Effect::CloseIfAt(block));
                 }
             }
             Action::Interact => {
                 if let Some(screen) = self.interact() {
-                    self.journal.push(Effect::Open(screen));
+                    self.publish_to(who, Effect::Open(screen));
                 }
             }
             Action::Place => {
@@ -452,7 +685,7 @@ impl Server {
                 // over placing -- otherwise a bench is unusable the moment you
                 // are holding anything, which is most of the time.
                 if let Some(screen) = self.interact() {
-                    self.journal.push(Effect::Open(screen));
+                    self.publish_to(who, Effect::Open(screen));
                     return;
                 }
                 self.place_held();
@@ -474,13 +707,41 @@ impl Server {
     /// order, which is what makes a replica built from a snapshot identical to
     /// one built from the stream of edits that produced it (Rule 1).
     pub fn snapshot(&self) -> Vec<Effect> {
+        self.snapshot_for(self.local)
+    }
+
+    /// The join handshake for one named client (block 2.11).
+    ///
+    /// **Filtered to what that client can perceive**, which is the difference
+    /// between a handshake whose size depends on how long the world has been
+    /// played and one whose size depends on how much has been built *near the
+    /// joiner*. On a server that has been up for a month those are not the same
+    /// number.
+    ///
+    /// A client with no view yet gets everything -- that is the singleplayer and
+    /// early-test path, where "everything" is what it can perceive anyway, and
+    /// silently sending nothing would be the worse failure.
+    ///
+    /// **No terrain, ever** (design §3). Terrain is a pure function of the seed,
+    /// proven bit-identical on both CI platforms, so the client generates it.
+    /// That is what makes the byte count scale with how much players have
+    /// *changed* the world rather than with how much of it they can see, and
+    /// `the_join_handshake_carries_no_terrain` is what keeps it true.
+    pub fn snapshot_for(&self, who: PlayerId) -> Vec<Effect> {
+        let view = self.views.get(&who);
+        let visible = |pos: [i32; 3]| match view {
+            Some(v) => v.perceives(pos),
+            None => true,
+        };
         let edits = self
             .world
             .edits()
+            .filter(|(pos, _)| visible(*pos))
             .map(|(pos, block)| Effect::Edit { pos, block });
         let entities = self
             .world
             .block_entities()
+            .filter(|(pos, _)| visible(**pos))
             .map(|(pos, f)| Effect::BlockEntity {
                 pos: *pos,
                 furnace: Some(*f),
@@ -494,7 +755,7 @@ impl Server {
     /// [`break_at`](Self::break_at), which is the entry point that bypasses the
     /// raycast and so bypasses the action.
     pub fn close_if_at(&mut self, pos: [i32; 3]) {
-        self.journal.push(Effect::CloseIfAt(pos));
+        self.publish_at(pos, Effect::CloseIfAt(pos));
     }
 
     /// Edit a block and record it for the client's replica.
@@ -510,7 +771,7 @@ impl Server {
     /// what it was testing.
     pub fn set_block(&mut self, pos: [i32; 3], block: BlockId) -> ChunkCoord {
         let cc = Arc::make_mut(&mut self.world).set_block(pos[0], pos[1], pos[2], block);
-        self.journal.push(Effect::Edit { pos, block });
+        self.publish_at(pos, Effect::Edit { pos, block });
         cc
     }
 
@@ -534,7 +795,7 @@ impl Server {
     /// Record the block entity at `pos` as it now stands, for the same reason.
     fn note_block_entity(&mut self, pos: [i32; 3]) {
         let furnace = self.world.furnace_at(pos).copied();
-        self.journal.push(Effect::BlockEntity { pos, furnace });
+        self.publish_at(pos, Effect::BlockEntity { pos, furnace });
     }
 
     /// Which ids the terrain is made of, or a treeless default before assets
@@ -565,10 +826,13 @@ impl Server {
         // now spill onto the floor rather than being destroyed (block 2.5,
         // §10.4). This is one of the five sites that used to lose items.
         if let Some(f) = Arc::make_mut(&mut self.world).remove_block_entity(block) {
-            self.journal.push(Effect::BlockEntity {
-                pos: block,
-                furnace: None,
-            });
+            self.publish_at(
+                block,
+                Effect::BlockEntity {
+                    pos: block,
+                    furnace: None,
+                },
+            );
             let contents: Vec<_> = [f.input, f.fuel, f.output].into_iter().flatten().collect();
             if let Some(items) = self.items.as_ref() {
                 let spawned: Vec<_> = contents
@@ -932,7 +1196,7 @@ fn advance_furnace(
 /// simulation is the expensive part and dormancy is what makes a big world
 /// affordable; expected to grow once block 2.7 makes a dormant chunk nearly
 /// free.
-const SIM_RADIUS_CHUNKS: i32 = 4;
+pub(crate) const SIM_RADIUS_CHUNKS: i32 = 4;
 
 /// The vertical half-height of [`Server::hash`]'s region, in chunks.
 ///
@@ -941,7 +1205,7 @@ const SIM_RADIUS_CHUNKS: i32 = 4;
 /// so it is stated here rather than reached for.
 /// `the_hash_covers_every_chunk_that_is_simulating` is what stops the two
 /// drifting: if the world's band grows past this, that test fails.
-const SIM_HASH_VERTICAL_CHUNKS: i32 = 2;
+pub(crate) const SIM_HASH_VERTICAL_CHUNKS: i32 = 2;
 /// The middle of block `b`, where an item dropped by breaking it appears.
 fn drop_centre(b: [i32; 3]) -> FixedVec3 {
     let half = cubara_voxel::Fixed::from_raw(cubara_voxel::fixed::ONE / 2);
