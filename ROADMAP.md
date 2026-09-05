@@ -203,7 +203,8 @@ produced.
 | **2.6** | Chunk state machine: `Active ⇄ Dormant` | [#47](../../issues/47) |
 | **2.7** | Dormant-chunk catch-up (the Factorio timers) + a worked process | The founding chunk idea, and only now is there a process (a growing tree, a running furnace) real enough to test it against. [#58](../../issues/58), [#59](../../issues/59) |
 | **2.8** | Extend the save format: block entities, entity state, inventory | Phase 1 ships the format (design §7); phase 2 adds the state phase 2 invented. A format version bump, not a new format. |
-| **2.9** | Health, hunger, damage, and the first hostile mobs | The largest block, and last: it is the one that needs every system before it. |
+| **2.9a** | Health, fall damage, and regeneration | Shipped. [#172](../../issues/172) |
+| **2.9b** | Hunger, food, and the first hostile mobs | **Deferred to phase 3 by the project owner, 2026-09-05.** It was put to them as a design question — what hunger *is*, where food comes from, which mobs exist — and the answer was "not yet". Phase 2's threat model is therefore fall damage alone. |
 
 Note that the tick loop is *not* in this list — it lands in phase 1 (block 1.6).
 Trees growing and furnaces smelting are what make the tick *interesting*, but a
@@ -221,8 +222,15 @@ tick, not the tick itself.
   phase (Rule 7), it is not noted and forgotten.
 - **The survival replay test:** a fixed, scripted input sequence runs headlessly
   and completes the loop — chop a tree, craft a tool, mine iron ore, smelt it,
-  eat, take damage — then asserts a world-state hash. It runs single-threaded and
+  take damage — then asserts a world-state hash. It runs single-threaded and
   multi-threaded and must agree.
+
+  *Amended 2026-09-05.* This used to read "… smelt it, **eat**, take damage …".
+  Eating left the list along with hunger, food and mobs when the owner deferred
+  block 2.9b; damage is now a scripted fall, which since 2.9a is the only thing
+  in this world that hurts. Recorded here rather than quietly edited, because a
+  gate that moves without a note is a gate that does not hold. Changing one is
+  the owner’s call, and this is the record of them making it.
 - **The round-trip test**, extended from phase 1 to cover phase 2's state: save
   the world mid-script, reload it, run the rest of the script, and land on the
   same hash as the uninterrupted run.

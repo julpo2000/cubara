@@ -293,12 +293,24 @@ impl Server {
     /// freshly-restored world hash differently from the one that was saved —
     /// which is the one comparison this most needs to get right.
     pub fn hash(&self) -> cubara_sim::WorldHash {
+        self.hash_with_workers(1)
+    }
+
+    /// [`hash`](Self::hash), computed across `workers` threads.
+    ///
+    /// The result must not depend on `workers` — that is Rule 1, and it is what
+    /// the phase 2 gate's survival replay checks by running the same finished
+    /// world through this at one thread and at several. `hash` fixes the count
+    /// at 1 because a server hashing itself wants the answer, not the
+    /// parallelism; a test that wants to prove the two agree needs to be able
+    /// to ask for both.
+    pub fn hash_with_workers(&self, workers: usize) -> cubara_sim::WorldHash {
         cubara_sim::WorldHash::compute(
             &self.sim,
             &self.world,
             &self.hash_region(),
             self.terrain(),
-            1,
+            workers,
         )
     }
 
