@@ -31,7 +31,7 @@ pub mod assets;
 pub mod clock;
 pub mod headless;
 
-use cubara_sim::{InputFrame, Player, Sim};
+use cubara_sim::{InputFrame, Player, PlayerId, PlayerInputs, Sim};
 use cubara_voxel::{Angle, BlockRegistry, ChunkCoord, ItemRegistry, RecipeBook, SmeltBook};
 use std::sync::Arc;
 
@@ -50,6 +50,14 @@ pub struct Server {
     /// the exact snapshot they were queued against; an edit publishes a new one.
     pub world: Arc<World>,
     pub sim: Sim,
+    /// Which player this server's *local* client drives (block 2.10).
+    ///
+    /// Named rather than assumed. A dedicated server has many players and no
+    /// local one, and this field is the seam where that becomes true: today it
+    /// is always [`PlayerId::LOCAL`] because there is one client and it is in
+    /// this process, and every site that means "the player at this keyboard"
+    /// says so instead of writing `0`.
+    pub local: PlayerId,
     pub blocks_registry: Option<Arc<BlockRegistry>>,
     pub terrain: Option<TerrainBlocks>,
     pub items: Option<ItemRegistry>,
@@ -174,6 +182,7 @@ impl Server {
             smelting: None,
             sim_centre: None,
             journal: Vec::new(),
+            local: PlayerId::LOCAL,
         }
     }
 
@@ -234,7 +243,7 @@ impl Server {
         let Some(terrain) = self.terrain else {
             return;
         };
-        let p = self.sim.player.pos;
+        let p = self.sim.player_mut(self.local).pos;
         let [px, _, pz] = p.to_f32();
         let Some(hit) = self
             .world
@@ -243,11 +252,11 @@ impl Server {
             return;
         };
         let standing = FixedVec3::new(p.x, cubara_voxel::Fixed::from_blocks(hit.block[1] + 2), p.z);
-        self.sim.player.pos = standing;
-        self.sim.player.velocity = FixedVec3::ZERO;
-        self.sim.player.fall_distance = cubara_voxel::Fixed::ZERO;
+        self.sim.player_mut(self.local).pos = standing;
+        self.sim.player_mut(self.local).velocity = FixedVec3::ZERO;
+        self.sim.player_mut(self.local).fall_distance = cubara_voxel::Fixed::ZERO;
         // Death returns here, not to wherever `Server::new` happened to start.
-        self.sim.player.spawn = standing;
+        self.sim.player_mut(self.local).spawn = standing;
     }
 
     /// Advance the player's simulation by one tick.
@@ -258,9 +267,16 @@ impl Server {
     /// — the pinned world hashes would move, and a moved hash with no reason is
     /// indistinguishable from a determinism bug.
     pub fn tick_sim(&mut self, input: &InputFrame) {
+        self.tick_sim_all(&PlayerInputs::one(self.local, *input));
+    }
+
+    /// The same tick, with an input per player -- what a server with more than
+    /// one client will call. [`tick_sim`](Self::tick_sim) is the one-client case
+    /// expressed in terms of it, rather than a second path (Rule 5).
+    pub fn tick_sim_all(&mut self, inputs: &PlayerInputs) {
         let terrain = self.terrain();
         self.sim
-            .tick(Arc::make_mut(&mut self.world), input, terrain);
+            .tick(Arc::make_mut(&mut self.world), inputs, terrain);
     }
 
     /// Advance everything that ticks whether or not a player is doing anything:
@@ -319,7 +335,7 @@ impl Server {
     /// Separate so a test can check it against what the world actually
     /// simulates -- see `the_hash_covers_every_chunk_that_is_simulating`.
     pub fn hash_region(&self) -> Vec<ChunkCoord> {
-        let centre = ChunkCoord::from_world_pos(self.sim.player.pos.to_f32());
+        let centre = ChunkCoord::from_world_pos(self.sim.player(self.local).pos.to_f32());
         let mut region = Vec::new();
         for x in (centre.x - SIM_RADIUS_CHUNKS)..=(centre.x + SIM_RADIUS_CHUNKS) {
             for y in (centre.y - SIM_HASH_VERTICAL_CHUNKS)..=(centre.y + SIM_HASH_VERTICAL_CHUNKS) {
@@ -574,7 +590,7 @@ impl Server {
         //
         // Read the three as separate fields rather than through a helper: the
         // borrow checker tracks disjoint field borrows, so `items` can stay
-        // borrowed while `self.sim.player.inventory` is mutated. A helper
+        // borrowed while `self.sim.player_mut(self.local).inventory` is mutated. A helper
         // returning them all borrows the whole of `self`.
         if let (Some(registry), Some(terrain), Some(items)) = (
             self.blocks_registry.as_deref(),
@@ -582,7 +598,7 @@ impl Server {
             self.items.as_ref(),
         ) {
             let broken = self.world.block_at(x, y, z, terrain);
-            let held = self.sim.player.inventory.selected_stack();
+            let held = self.sim.player_mut(self.local).inventory.selected_stack();
             let held_tier = held.map(|s| items.tier(s.item())).unwrap_or(0);
 
             let drop = if held_tier < registry.requires_tier(broken) {
@@ -607,7 +623,8 @@ impl Server {
                 Some(stack) => {
                     // Block 2.5: what does not fit falls on the floor rather
                     // than being destroyed (§10.4).
-                    if let Some(rest) = self.sim.player.inventory.add(stack, items) {
+                    if let Some(rest) = self.sim.player_mut(self.local).inventory.add(stack, items)
+                    {
                         self.sim
                             .entities
                             .spawn_item(rest, drop_centre(block), FixedVec3::ZERO);
@@ -640,7 +657,7 @@ impl Server {
         let Some(items) = self.items.as_ref() else {
             return;
         };
-        let inv = &mut self.sim.player.inventory;
+        let inv = &mut self.sim.player_mut(self.local).inventory;
         let slot = inv.selected_slot() as usize;
         let Some(stack) = inv.slot(slot) else {
             return;
@@ -674,8 +691,8 @@ impl Server {
         else {
             return None;
         };
-        let origin = self.sim.player.pos.to_f32();
-        let dir = self.sim.player.look_dir_f32().to_array();
+        let origin = self.sim.player_mut(self.local).pos.to_f32();
+        let dir = self.sim.player_mut(self.local).look_dir_f32().to_array();
         let hit = self.world.raycast(origin, dir, REACH, self.terrain())?;
         let [x, y, z] = hit.block;
         match registry.interact(self.world.block_at(x, y, z, terrain)) {
@@ -684,7 +701,7 @@ impl Server {
                 // Width lives on `Crafting` (world state), not on the screen: a
                 // 3x3 grid holding items in its outer cells is a different world
                 // from a 2x2 one, and the hash already covers it.
-                self.sim.player.crafting.set_width(3);
+                self.sim.player_mut(self.local).crafting.set_width(3);
                 Some(Screen::Bench)
             }
             Interact::Furnace => {
@@ -718,7 +735,7 @@ impl Server {
         let Some(items) = self.items.as_ref() else {
             return;
         };
-        let held = self.sim.player.crafting.held();
+        let held = self.sim.player_mut(self.local).crafting.held();
         let world = Arc::make_mut(&mut self.world);
         let Some(f) = world.furnace_at_mut(pos) else {
             // A furnace that is not there cannot be clicked. This is the
@@ -734,7 +751,10 @@ impl Server {
                 if held.is_none() {
                     if let Some((id, count)) = f.output.take() {
                         if let Ok(stack) = items.new_stack(id, count) {
-                            self.sim.player.crafting.set_held(Some(stack));
+                            self.sim
+                                .player_mut(self.local)
+                                .crafting
+                                .set_held(Some(stack));
                         }
                     }
                 }
@@ -746,11 +766,11 @@ impl Server {
             Some(stack) => {
                 let previous = slot.replace((stack.item(), stack.count()));
                 let give_back = previous.and_then(|(id, c)| items.new_stack(id, c).ok());
-                self.sim.player.crafting.set_held(give_back);
+                self.sim.player_mut(self.local).crafting.set_held(give_back);
             }
             None => {
                 let taken = slot.take().and_then(|(id, c)| items.new_stack(id, c).ok());
-                self.sim.player.crafting.set_held(taken);
+                self.sim.player_mut(self.local).crafting.set_held(taken);
             }
         }
         self.note_block_entity(pos);
@@ -777,7 +797,7 @@ impl Server {
         // change no chunk's state, and this walks a (2r+1)²x3 box -- 243
         // lookups at radius 4 -- which is pure waste every tick the player is
         // not moving, which is most of them.
-        let centre = ChunkCoord::from_world_pos(self.sim.player.pos.to_f32());
+        let centre = ChunkCoord::from_world_pos(self.sim.player_mut(self.local).pos.to_f32());
         let now = self.sim.tick;
         let woken = if self.sim_centre == Some(centre) {
             Vec::new()
@@ -822,8 +842,8 @@ impl Server {
     }
 
     fn break_looked_at(&mut self) -> Option<[i32; 3]> {
-        let origin = self.sim.player.pos.to_f32();
-        let dir = self.sim.player.look_dir_f32().to_array();
+        let origin = self.sim.player_mut(self.local).pos.to_f32();
+        let dir = self.sim.player_mut(self.local).look_dir_f32().to_array();
         let hit = self.world.raycast(origin, dir, REACH, self.terrain())?;
         self.break_at(hit.block);
         Some(hit.block)
@@ -841,11 +861,11 @@ impl Server {
         // holding anything -- which is most of the time.
         let registry = self.blocks_registry.as_deref()?;
         let items = self.items.as_ref()?;
-        let held = self.sim.player.inventory.selected_stack()?;
+        let held = self.sim.player_mut(self.local).inventory.selected_stack()?;
         let block = registry.id_of(items.name_of(held.item())?)?;
 
-        let origin = self.sim.player.pos.to_f32();
-        let dir = self.sim.player.look_dir_f32().to_array();
+        let origin = self.sim.player_mut(self.local).pos.to_f32();
+        let dir = self.sim.player_mut(self.local).look_dir_f32().to_array();
         let hit = self.world.raycast(origin, dir, REACH, self.terrain())?;
         let target = [
             hit.block[0] + hit.normal[0],
@@ -854,8 +874,11 @@ impl Server {
         ];
 
         // Only now that the placement is certain to happen.
-        let slot = self.sim.player.inventory.selected_slot() as usize;
-        self.sim.player.inventory.take_one(slot, items)?;
+        let slot = self.sim.player_mut(self.local).inventory.selected_slot() as usize;
+        self.sim
+            .player_mut(self.local)
+            .inventory
+            .take_one(slot, items)?;
 
         // A block that owns state gets it the moment it is placed, rather than
         // on first use -- so a furnace someone never opens still ticks, and the

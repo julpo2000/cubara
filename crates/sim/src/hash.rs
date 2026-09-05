@@ -23,6 +23,7 @@ use cubara_world::{TerrainBlocks, World};
 
 use crate::crafting::Crafting;
 use crate::inventory::Inventory;
+use crate::player::Player;
 use crate::Sim;
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -93,7 +94,23 @@ impl WorldHash {
         self.write_u64(sim.tick);
         self.write_u64(sim.rng.state);
         self.write_u64(sim.rng.inc);
-        let p = &sim.player;
+        // Every player, in `PlayerId` order (block 2.10). The count goes first
+        // so that a world of two players cannot hash like a world of one whose
+        // fields happen to concatenate the same way -- the same
+        // present-or-not discipline `write_inventory` uses on slots.
+        //
+        // The id is folded with each player, not only their state: two worlds
+        // where the same two people swapped bodies are different worlds, and
+        // without the id they would hash alike.
+        self.write_u64(sim.player_count() as u64);
+        self.write_u64(sim.next_player_id());
+        for (id, p) in sim.players() {
+            self.write_u64(id.0);
+            self.write_player(p);
+        }
+    }
+
+    fn write_player(&mut self, p: &Player) {
         // **All integers.** A hash folding raw f32 bits is a hash that can
         // differ between compilers, which would make the toolchain pin
         // load-bearing for correctness rather than for lints

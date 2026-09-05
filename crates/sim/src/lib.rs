@@ -24,11 +24,13 @@ pub use hash::{hash_region, WorldHash};
 pub use input::InputFrame;
 pub use inventory::{Inventory, HOTBAR_WIDTH, SLOT_COUNT};
 pub use player::{
-    Player, FALL_DAMAGE_PER_BLOCK, HEART, MAX_HEALTH, REGEN_INTERVAL, SAFE_FALL,
+    Player, PlayerId, FALL_DAMAGE_PER_BLOCK, HEART, MAX_HEALTH, REGEN_INTERVAL, SAFE_FALL,
     SENSITIVITY_PER_PIXEL,
 };
 pub use rng::WorldRng;
 pub use save::{load_world, save_world, LoadError, SaveError, FORMAT_VERSION};
+
+use std::collections::BTreeMap;
 
 use cubara_world::{TerrainBlocks, World};
 
@@ -41,24 +43,59 @@ pub const TICK_DT: f32 = 1.0 / 60.0;
 /// apart into two different reach distances.
 pub const REACH: f32 = 6.0;
 
-/// Everything the player *is* and *does*, plus the world's own randomness --
-/// the whole of what phase 1 considers "the game state" outside `World`
-/// itself. `tick`/`player`/`target` are `pub`: read freely (rendering
-/// interpolates against `player` and draws the outline at `target`, a save
-/// file will want `tick`), but the only way to *change* any of this is
-/// [`Sim::tick`].
+/// One tick's input, per player (block 2.10).
+///
+/// A map rather than a single frame because a server ticking several players
+/// has several inputs, and rather than a `Vec` because iteration order is Rule
+/// 1: which player steps first must be a property of the id, not of arrival
+/// order over a socket.
+///
+/// A player with no entry this tick gets [`InputFrame::default`] -- which is
+/// what a connected client that sent nothing means, and what an idle one means
+/// too. Those are the same thing to the simulation, and treating them
+/// differently would make the world depend on packet timing.
+#[derive(Debug, Default, Clone)]
+pub struct PlayerInputs(BTreeMap<PlayerId, InputFrame>);
+
+impl PlayerInputs {
+    /// The one-player case: singleplayer, and most tests.
+    pub fn one(id: PlayerId, input: InputFrame) -> Self {
+        let mut m = BTreeMap::new();
+        m.insert(id, input);
+        Self(m)
+    }
+
+    pub fn set(&mut self, id: PlayerId, input: InputFrame) {
+        self.0.insert(id, input);
+    }
+
+    pub fn get(&self, id: PlayerId) -> InputFrame {
+        self.0.get(&id).copied().unwrap_or_default()
+    }
+}
+
+/// Everything the players *are* and *do*, plus the world's own randomness --
+/// the whole of what phase 1 considers "the game state" outside `World` itself.
+///
+/// `tick` and `entities` are `pub`: read freely. Players are behind accessors
+/// rather than a public field, because the map's invariant -- ids are assigned
+/// by [`Sim::join`] and never reused -- is not something a caller should be able
+/// to break by inserting into it (Rule 1).
 #[derive(Debug)]
 pub struct Sim {
     /// How many fixed steps have run since this `Sim` was created.
     pub tick: u64,
     rng: WorldRng,
-    pub player: Player,
-    /// The block the player is currently looking at, within [`REACH`] --
-    /// recomputed every tick from the player's own raycast. `None` when
-    /// nothing solid is in reach. The renderer draws the outline; it does
-    /// not decide what's selected (issue #52's Rule 3 boundary) -- this
-    /// field is the seam.
-    pub target: Option<[i32; 3]>,
+    /// Everyone in this world, in `PlayerId` order.
+    ///
+    /// A `BTreeMap`, not a `HashMap` and not a `Vec`: ordered iteration is what
+    /// lets the hash fold players in a fixed order and the tick step them in
+    /// one, and `EntityKey` set the same precedent in `entity.rs` for the same
+    /// reason.
+    players: BTreeMap<PlayerId, Player>,
+    /// The next id [`join`](Sim::join) will hand out. World state, so it
+    /// survives a save and ids stay unique across a restart.
+    next_player: u64,
     /// Everything on the floor (`PHASE2_ARCHITECTURE.md` §10). Ticked here,
     /// so dropped items fall and despawn on the same fixed clock the player
     /// walks on -- Rule 1.
@@ -66,14 +103,73 @@ pub struct Sim {
 }
 
 impl Sim {
+    /// A world with one player, [`PlayerId::LOCAL`]. What singleplayer builds,
+    /// and what every test that does not care about multiplayer wants.
     pub fn new(seed: u64, player: Player) -> Self {
-        Self {
+        let mut sim = Self {
             tick: 0,
             rng: WorldRng::new(seed, 0),
-            player,
-            target: None,
+            players: BTreeMap::new(),
+            next_player: 0,
             entities: Entities::default(),
-        }
+        };
+        let id = sim.join(player);
+        debug_assert_eq!(id, PlayerId::LOCAL);
+        sim
+    }
+
+    /// Add a player, and hand back the id it will answer to forever.
+    pub fn join(&mut self, player: Player) -> PlayerId {
+        let id = PlayerId(self.next_player);
+        self.next_player += 1;
+        self.players.insert(id, player);
+        id
+    }
+
+    /// Remove a player, returning what they were carrying so the caller can
+    /// decide where it goes. Ids are never reused, so the slot does not come
+    /// back.
+    pub fn leave(&mut self, id: PlayerId) -> Option<Player> {
+        self.players.remove(&id)
+    }
+
+    /// The next id that would be handed out. Save/load carries it so a restart
+    /// cannot re-issue an id the world has already used.
+    pub fn next_player_id(&self) -> u64 {
+        self.next_player
+    }
+
+    /// One player, by id. Panics when the id is unknown, deliberately: ids come
+    /// from [`join`](Sim::join) and disappear only at [`leave`](Sim::leave), so
+    /// asking for one that is not there is a bug in the caller rather than a
+    /// condition to handle. Use [`get`](Sim::get) where absence is expected.
+    pub fn player(&self, id: PlayerId) -> &Player {
+        self.get(id)
+            .unwrap_or_else(|| panic!("no player {id:?} in this world"))
+    }
+
+    pub fn player_mut(&mut self, id: PlayerId) -> &mut Player {
+        self.players
+            .get_mut(&id)
+            .unwrap_or_else(|| panic!("no player {id:?} in this world"))
+    }
+
+    pub fn get(&self, id: PlayerId) -> Option<&Player> {
+        self.players.get(&id)
+    }
+
+    /// Every player, in `PlayerId` order -- the only iteration order anything
+    /// outside this module may depend on.
+    pub fn players(&self) -> impl Iterator<Item = (PlayerId, &Player)> + '_ {
+        self.players.iter().map(|(id, p)| (*id, p))
+    }
+
+    pub fn player_ids(&self) -> Vec<PlayerId> {
+        self.players.keys().copied().collect()
+    }
+
+    pub fn player_count(&self) -> usize {
+        self.players.len()
     }
 
     /// A pseudo-random `f32` in `[0, 1)` from the world's own RNG stream --
@@ -111,43 +207,69 @@ impl Sim {
         }
         self.entities
             .tick(items, |x, y, z| world.is_solid_at(x, y, z, blocks));
-        self.entities
-            .collect_nearby(self.player.pos, &mut self.player.inventory, items);
+        // Pickup is per player, in id order (Rule 1): two players reaching the
+        // same stack in a different order would empty the floor differently.
+        for id in self.player_ids() {
+            let p = self.players.get_mut(&id).expect("id came from the map");
+            self.entities.collect_nearby(p.pos, &mut p.inventory, items);
+        }
     }
 
-    pub fn tick(&mut self, world: &mut World, input: &InputFrame, blocks: TerrainBlocks) {
-        if input.toggle_fly {
-            self.player.free_fly = !self.player.free_fly;
+    /// Advance the whole simulation by one fixed step of [`TICK_DT`] seconds.
+    ///
+    /// Every player steps, **in `PlayerId` order**, and only then does the tick
+    /// counter move. Order matters even though the per-player step is mostly
+    /// independent, because it will not stay independent -- and a tick whose
+    /// result depends on which client's packet arrived first is not a tick this
+    /// project is allowed to have (Rule 1).
+    pub fn tick(&mut self, world: &mut World, inputs: &PlayerInputs, blocks: TerrainBlocks) {
+        for id in self.player_ids() {
+            let input = inputs.get(id);
+            self.step_player(id, world, &input, blocks);
         }
-        if self.player.free_fly {
-            self.player.velocity = cubara_voxel::FixedVec3::ZERO;
-            self.player.on_ground = false;
+        self.tick += 1;
+    }
+
+    /// One player's half of a tick. Private: the tick counter is the world's,
+    /// not a player's, and letting a caller step one player without advancing
+    /// the world would be a way to desynchronise them.
+    fn step_player(
+        &mut self,
+        id: PlayerId,
+        world: &mut World,
+        input: &InputFrame,
+        blocks: TerrainBlocks,
+    ) {
+        let player = self.players.get_mut(&id).expect("id came from the map");
+        if input.toggle_fly {
+            player.free_fly = !player.free_fly;
+        }
+        if player.free_fly {
+            player.velocity = cubara_voxel::FixedVec3::ZERO;
+            player.on_ground = false;
             // Free-fly is a debug mode and must never hurt: dropping out of it
             // should not kill you (§13.3), so the accumulated fall goes with it.
-            self.player.fall_distance = cubara_voxel::Fixed::ZERO;
-            self.player.apply_free_fly(input, TICK_DT);
+            player.fall_distance = cubara_voxel::Fixed::ZERO;
+            player.apply_free_fly(input, TICK_DT);
         } else {
-            physics::step(&mut self.player, input, |x, y, z| {
-                world.is_solid_at(x, y, z, blocks)
-            });
+            physics::step(player, input, |x, y, z| world.is_solid_at(x, y, z, blocks));
         }
         // After physics, so damage taken this tick resets the counter before it
         // is incremented -- a tick you were hurt on is not a damage-free tick.
-        self.player.tick_regeneration();
-        self.target = world
+        player.tick_regeneration();
+        player.target = world
             .raycast(
                 // Raycasting takes floats, and its answer is a *block* -- the
                 // conversion cannot move which block is hit by more than a
                 // sub-unit. The ray direction is float regardless, since it
                 // comes from `yaw`/`pitch` through trig; angles are the other
                 // half of this migration (RESEARCH_MULTIPLAYER §3.5).
-                self.player.pos.to_f32(),
-                self.player.look_dir_f32().to_array(),
+                player.pos.to_f32(),
+                player.look_dir_f32().to_array(),
                 REACH,
                 blocks,
             )
             .map(|hit| hit.block);
-        self.tick += 1;
     }
 }
 
@@ -179,9 +301,17 @@ mod tests {
         }
     }
 
-    fn no_input() -> InputFrame {
-        InputFrame::default()
+    fn no_input() -> PlayerInputs {
+        PlayerInputs::default()
     }
+
+    /// One frame, for the one player these tests have.
+    fn only(input: InputFrame) -> PlayerInputs {
+        PlayerInputs::one(PlayerId::LOCAL, input)
+    }
+
+    /// The player every test in this module drives.
+    const P: PlayerId = PlayerId::LOCAL;
 
     #[test]
     fn tick_counter_advances_by_exactly_one_per_call() {
@@ -212,9 +342,9 @@ mod tests {
                 Angle::from_radians(-std::f32::consts::FRAC_PI_2),
             ),
         );
-        sim.player.free_fly = true; // hold position -- only the raycast matters here
+        sim.player_mut(P).free_fly = true; // hold position -- only the raycast matters here
         sim.tick(&mut world, &no_input(), blocks());
-        assert_eq!(sim.target, Some(ground.block));
+        assert_eq!(sim.player(P).target, Some(ground.block));
     }
 
     #[test]
@@ -230,9 +360,9 @@ mod tests {
                 Angle::ZERO,
             ),
         );
-        sim.player.free_fly = true;
+        sim.player_mut(P).free_fly = true;
         sim.tick(&mut world, &no_input(), blocks());
-        assert_eq!(sim.target, None);
+        assert_eq!(sim.player(P).target, None);
     }
 
     #[test]
@@ -272,9 +402,9 @@ mod tests {
         };
 
         for i in 0..10_000u64 {
-            sim.tick(&mut world, &wander, blocks());
+            sim.tick(&mut world, &only(wander), blocks());
             assert!(
-                !physics::player_intersects_solid(&sim.player, &|x, y, z| world.is_solid_at(
+                !physics::player_intersects_solid(sim.player(P), &|x, y, z| world.is_solid_at(
                     x,
                     y,
                     z,
@@ -283,9 +413,9 @@ mod tests {
                 "tick {i}: player collision box intersects a solid voxel"
             );
             assert!(
-                sim.player.pos.y > cubara_voxel::Fixed::from_blocks(-1000),
+                sim.player_mut(P).pos.y > cubara_voxel::Fixed::from_blocks(-1000),
                 "tick {i}: fell through the world, y = {:?}",
-                sim.player.pos.y
+                sim.player_mut(P).pos.y
             );
         }
     }
