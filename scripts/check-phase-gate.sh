@@ -57,7 +57,7 @@ if [ "$phase" = "2" ]; then
     # "Everything phase 1's gate checks, still passing -- a perf regression
     # blocks the phase (Rule 7), it is not noted and forgotten."
     run "cargo test --all" cargo test --all
-    run "cargo clippy --all-targets --all-features" cargo clippy --all-targets --all-features
+    run "cargo clippy --workspace --all-targets --all-features" cargo clippy --workspace --all-targets --all-features
     run "cargo fmt --all --check" cargo fmt --all --check
     run "architecture rules (check-architecture.sh)" ./scripts/check-architecture.sh
     run "single render path (check-single-render-path.sh)" ./scripts/check-single-render-path.sh
@@ -137,7 +137,12 @@ echo "Phase 1 exit gate (ROADMAP.md) ------------------------------------------"
 echo
 
 run "cargo test --all" cargo test --all
-run "cargo clippy --all-targets --all-features" cargo clippy --all-targets --all-features
+# `--workspace`, matching .github/workflows exactly. It did not, until a PR
+# went red on a lint the gate had just called clean: the toolchain pin makes
+# local and CI agree about which lints *exist*, and it cannot help when the two
+# are not running the same command. A gate that checks less than CI is a gate
+# that lies.
+run "cargo clippy --workspace --all-targets --all-features" cargo clippy --workspace --all-targets --all-features
 run "cargo fmt --all --check" cargo fmt --all --check
 run "architecture rules (check-architecture.sh)" ./scripts/check-architecture.sh
 run "single render path (check-single-render-path.sh)" ./scripts/check-single-render-path.sh
