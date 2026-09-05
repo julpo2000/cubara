@@ -131,7 +131,7 @@ fn a_client_process_joins_a_server_process_over_a_real_socket() {
     let welcome = messages
         .iter()
         .find_map(|m| match m {
-            ServerMessage::Welcome { seed, you } => Some((*seed, *you)),
+            ServerMessage::Welcome { seed, you, .. } => Some((*seed, *you)),
             _ => None,
         })
         .unwrap_or_else(|| panic!("no welcome arrived; got {messages:?}"));
@@ -150,7 +150,10 @@ fn a_client_process_joins_a_server_process_over_a_real_socket() {
     // 2. The world keeps turning, and says so. A `Tick` after the welcome is
     //    what proves the loop is servicing this client every tick rather than
     //    only at the handshake.
-    link.send(ClientMessage::Input(InputFrame::default()));
+    link.send(ClientMessage::Input {
+        seq: 0,
+        frame: InputFrame::default(),
+    });
     let messages = collect_until(&mut link, Duration::from_secs(20), |all| {
         all.iter().any(|m| matches!(m, ServerMessage::Tick(_)))
     });

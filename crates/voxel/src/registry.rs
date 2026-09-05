@@ -456,6 +456,12 @@ impl BlockRegistry {
     }
 
     /// Every `BlockId` this registry assigned, air included, in ascending order.
+    /// A number that changes exactly when the id table does (block 2.12b).
+    /// The block half of the same check `ItemRegistry::fingerprint` makes.
+    pub fn fingerprint(&self) -> u64 {
+        crate::fingerprint::of_names(self.ids().filter_map(|id| self.name_of(id)))
+    }
+
     pub fn ids(&self) -> impl Iterator<Item = BlockId> + '_ {
         (0..self.entries.len() as u16).map(BlockId)
     }

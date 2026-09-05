@@ -88,6 +88,13 @@ pub struct Session {
     /// clients are serviced must be a property of the id, not of whose packet
     /// landed first (Rule 1).
     clients: BTreeMap<PlayerId, Link<ServerMessage, ClientMessage>>,
+    /// The last input sequence number applied, per client (block 2.12b).
+    ///
+    /// Echoed back in `Effect::SelfState` so a predicting client (block 2.13)
+    /// knows which of its outstanding inputs the server has seen. Counted here
+    /// rather than in `Server` because it is a property of the *connection*, and
+    /// a world has no opinion about how many messages a link has carried.
+    last_seq: BTreeMap<PlayerId, u64>,
 }
 
 impl Session {
@@ -111,6 +118,7 @@ impl Session {
             last_save: 0,
             acceptor: None,
             clients: BTreeMap::new(),
+            last_seq: BTreeMap::new(),
         }
     }
 
@@ -158,6 +166,18 @@ impl Session {
             link.send(ServerMessage::Welcome {
                 seed: self.server.world.seed(),
                 you: id,
+                blocks: self
+                    .server
+                    .blocks_registry
+                    .as_ref()
+                    .map(|r| r.fingerprint())
+                    .unwrap_or(0),
+                items: self
+                    .server
+                    .items
+                    .as_ref()
+                    .map(|r| r.fingerprint())
+                    .unwrap_or(0),
             });
             let handshake = self.server.snapshot_for(id);
             log::info!(
@@ -180,6 +200,7 @@ impl Session {
     /// clients are visited in id order.
     fn collect_input(&mut self) -> PlayerInputs {
         let mut inputs = PlayerInputs::default();
+        let last_seq = &mut self.last_seq;
         let mut actions: Vec<(PlayerId, Action)> = Vec::new();
         let mut gone: Vec<PlayerId> = Vec::new();
 
@@ -187,7 +208,15 @@ impl Session {
             for msg in link.poll() {
                 match msg {
                     ClientMessage::Hello => {} // already welcomed on accept
-                    ClientMessage::Input(i) => inputs.set(who, i),
+                    ClientMessage::Input { seq, frame } => {
+                        inputs.set(who, frame);
+                        // Highest wins rather than latest: messages arrive in
+                        // order over TCP today, and acknowledging a *lower*
+                        // number after a higher one would tell a client to
+                        // replay input the server had already applied.
+                        let slot = last_seq.entry(who).or_insert(0);
+                        *slot = (*slot).max(seq);
+                    }
                     ClientMessage::Act(a) => actions.push((who, a)),
                 }
             }
@@ -214,6 +243,7 @@ impl Session {
     fn drop_client(&mut self, who: PlayerId) {
         log::info!("player {who:?} disconnected");
         self.clients.remove(&who);
+        self.last_seq.remove(&who);
         self.server.close_view(who);
         self.server.sim.leave(who);
         self.server.announce_departure(who);
@@ -221,6 +251,12 @@ impl Session {
 
     /// Hand each client what it is owed.
     fn flush_effects(&mut self) {
+        // The correction first, so it is in the same batch as whatever else this
+        // tick produced rather than trailing a tick behind it.
+        for &who in self.clients.keys() {
+            let seq = self.last_seq.get(&who).copied().unwrap_or(0);
+            self.server.publish_self_state(who, seq);
+        }
         for (&who, link) in self.clients.iter_mut() {
             let owed = self.server.drain_effects_for(who);
             if !owed.is_empty() {
