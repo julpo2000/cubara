@@ -134,6 +134,24 @@ Already project practice: every performance-relevant change records a
 re-validated as the engine grows; a regression blocks the milestone rather than
 being noted and forgotten.
 
+## Rule 8 — No code assumes one `World` owns everything
+
+A process may own several `Server`s, each with its own `World`, and nothing may
+be written as though there is *the* world. No global or process-wide `World` (Rule
+2 already forbids globals; this is the case that matters most, so the check names
+it), and no API that takes "the world" implicitly.
+
+Added 2026-09-05, when multiplayer moved into phase 2 and the owner asked for a
+structure that can carry 5,000 players in one shared world.
+[`docs/RESEARCH_MULTIPLAYER.md`](docs/RESEARCH_MULTIPLAYER.md) §3.2 names region
+sharding as the one item that must be **designed for early even if built late**,
+for exactly this reason.
+
+**What fails when someone breaks it:** the day one machine's tick budget runs
+out, sharding is a rewrite instead of a deployment change — which is precisely the
+demolition this was moved into phase 2 to avoid. Enforced by
+`scripts/check-architecture.sh`.
+
 ---
 
 ## Why these are enforced mechanically

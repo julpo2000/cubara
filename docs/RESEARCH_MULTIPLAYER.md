@@ -261,7 +261,25 @@ with a compiler version, and the pin returns to being about lints.
 **Worth stating because it is easy to get backwards:** the goal is not "avoid
 floats". It is that *authority* is integer and *presentation* may be float.
 
-### §3.6 The one question this leaves open
+### §3.6 The one question this leaves open — **answered 2026-09-05**
+
+> **Owner, 2026-09-05:** *"Ik wil dat de structuur er is om 5000 spelers in 1
+> wereld aan te kunnen."*
+
+**One shared world.** Note what was asked for precisely: that the **structure**
+can carry it — a requirement about architecture, not a promise to demonstrate
+five thousand live clients. The distinction is load-bearing and
+[`PHASE2_MULTIPLAYER.md`](PHASE2_MULTIPLAYER.md) §6 keeps it: what the exit gate
+checks is the scaling *shape*, bandwidth per client flat as player count grows,
+because that is what decides feasibility and a live 5,000 test is not something
+CI can give.
+
+This is the harder of the two answers — "genuinely hard", as the original
+question below says — and it was given knowingly. It makes item 5 of §3.2
+(region sharding) binding rather than optional, which is why it became
+`ARCHITECTURE.md` **Rule 8** in the same change.
+
+The question as it originally stood:
 
 **5,000 in a single shared world, or 5,000 across servers?** They are different
 projects: the second is items 1–4 and is a normal (large) netcode effort; the
