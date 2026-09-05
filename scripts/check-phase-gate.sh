@@ -87,13 +87,20 @@ if [ "$phase" = "2" ]; then
 
     # "The survival replay test: a fixed, scripted input sequence runs headlessly
     # and completes the loop -- chop a tree, craft a tool, mine iron ore, smelt
-    # it, eat, take damage -- then asserts a world-state hash. It runs
-    # single-threaded and multi-threaded and must agree."
+    # it, take damage -- then asserts a world-state hash. It runs single-threaded
+    # and multi-threaded and must agree."
     #
-    # Needs eating and damage, which are block 2.9. There is no harness that
-    # drives a scripted InputFrame sequence headlessly either. This is the gate's
-    # own "real gate" criterion and it is the furthest from done.
-    not_implemented "survival replay test (scripted headless loop, asserts a world-state hash)"
+    # "Eat" is not in that list any more: on 2026-09-05 the project owner deferred
+    # hunger, food and hostile mobs (block 2.9b) out of phase 2, and ROADMAP.md's
+    # gate was amended in the open in the same change -- moving a gate is the
+    # owner's call, and this is the record of them making it. See
+    # docs/PHASE2_ARCHITECTURE.md section 9. Damage is a scripted fall, which
+    # since block 2.9a is the one thing in this world that hurts.
+    #
+    # Three tests rather than one: the loop and its pinned hash at one worker and
+    # at six, the same script run twice, and the register of stations that stops
+    # an empty run passing by hashing a world in which nothing happened.
+    run "survival replay test (scripted headless loop, asserts a world-state hash)"         cargo test -p cubara-server --test survival_replay
 
     # "The round-trip test, extended from phase 1 to cover phase 2's state: save
     # the world mid-script, reload it, run the rest of the script, and land on
@@ -109,8 +116,7 @@ if [ "$phase" = "2" ]; then
     echo "$pass passed, $fail failed."
     if [ "$fail" -gt 0 ]; then
         echo
-        echo "Phase 2 is NOT finished. Remaining: block 2.9 (health, hunger,"
-        echo "damage, mobs) and the survival replay harness it makes possible."
+        echo "Phase 2 is NOT finished. See the FAIL lines above."
         exit 1
     fi
     echo "OK: phase 2 exit gate met."

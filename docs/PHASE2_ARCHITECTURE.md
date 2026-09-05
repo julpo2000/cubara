@@ -793,7 +793,26 @@ so the trail from question to decision is readable):
 - *What hurts you first, and what does death cost?* → **fall damage**; death
   returns you to spawn **with your items**, §13.3–§13.4.
 
-Still open, and still the owner's: hunger and food, and what mobs exist (2.9b).
+Answered on **2026-09-05**, and the answer was *not yet*: **hunger, food and
+hostile mobs (block 2.9b) are deferred to phase 3.** The owner was asked all
+three as design questions — what hunger *is* (a bar that gates regeneration, or
+food that simply heals), where food comes from (mobs, apples, farming), and
+which mobs exist — and chose to answer none of them yet rather than have one
+invented. So:
+
+- There is **no hunger stat and no food item**. `Player::tick_regeneration` stays
+  ungated, exactly as §13.2 left it, and the note in its doc comment saying it
+  would be gated "when hunger arrives" stands as written — hunger has not
+  arrived, and this is what that looks like.
+- Phase 2’s **threat model is fall damage alone** (§13.3). Nothing in the world
+  attacks the player, and nothing should be written as though something does.
+- `ROADMAP.md`’s exit gate was **amended in the same change**, in the open: its
+  survival replay no longer asks the script to eat. Moving a gate is the
+  owner’s call and never the agent’s, so it carries a dated note saying who
+  moved it and why.
+
+What this does *not* change: the ladder to iron, which was always the point of
+phase 2, and which the survival replay now runs end to end.
 
 None of these block the ladder to iron. Each is listed so that it gets asked
 rather than invented — a plausible-sounding invention is worse than a question,
