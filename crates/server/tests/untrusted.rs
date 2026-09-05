@@ -280,7 +280,7 @@ fn a_flood_of_actions_is_capped_at_the_limit() {
         .listen("127.0.0.1:0")
         .expect("bind an ephemeral port");
 
-    let mut link = connect(&addr.to_string()).expect("connect to the session");
+    let mut link = connect(addr.to_string()).expect("connect to the session");
     link.send(ClientMessage::Hello);
 
     // Wait for the accept rather than assuming one tick is enough. The

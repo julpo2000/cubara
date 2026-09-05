@@ -12,6 +12,11 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# What CI sets for the entire workflow (.github/workflows/ci.yml). Exported
+# rather than passed per-command so that every cargo invocation below is the one
+# CI runs -- including the ones added later by someone not reading this comment.
+export RUSTFLAGS="${RUSTFLAGS:--D warnings}"
+
 phase="${1:-1}"
 
 pass=0
@@ -142,6 +147,12 @@ run "cargo test --all" cargo test --all
 # local and CI agree about which lints *exist*, and it cannot help when the two
 # are not running the same command. A gate that checks less than CI is a gate
 # that lies.
+#
+# And it went on lying, because matching the *command* is not enough: CI sets
+# `RUSTFLAGS: -D warnings` for the whole workflow, so a lint that is a warning
+# here is an error there. A second PR went red on `needless_borrows_for_generic_args`
+# that this script had just called clean. `RUSTFLAGS` is exported at the top of
+# this file now, so local and CI disagree about nothing.
 run "cargo clippy --workspace --all-targets --all-features" cargo clippy --workspace --all-targets --all-features
 run "cargo fmt --all --check" cargo fmt --all --check
 run "architecture rules (check-architecture.sh)" ./scripts/check-architecture.sh
