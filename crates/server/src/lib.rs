@@ -744,12 +744,12 @@ impl Server {
     pub fn apply_as(&mut self, who: PlayerId, action: Action) {
         match action {
             Action::Break => {
-                if let Some(block) = self.break_looked_at() {
+                if let Some(block) = self.break_looked_at_as(who) {
                     self.publish_at(block, Effect::CloseIfAt(block));
                 }
             }
             Action::Interact => {
-                if let Some(screen) = self.interact() {
+                if let Some(screen) = self.interact_as(who) {
                     self.publish_to(who, Effect::Open(screen));
                 }
             }
@@ -757,13 +757,13 @@ impl Server {
                 // An interactive block under the crosshair takes precedence
                 // over placing -- otherwise a bench is unusable the moment you
                 // are holding anything, which is most of the time.
-                if let Some(screen) = self.interact() {
+                if let Some(screen) = self.interact_as(who) {
                     self.publish_to(who, Effect::Open(screen));
                     return;
                 }
-                self.place_held();
+                self.place_held_as(who);
             }
-            Action::ClickFurnace { pos, slot } => self.click_furnace(pos, slot),
+            Action::ClickFurnace { pos, slot } => self.click_furnace_as(who, pos, slot),
         }
     }
 
@@ -894,6 +894,17 @@ impl Server {
     /// [`tick_mining`](Self::tick_mining) (timed, what the game actually does),
     /// so the two cannot drift apart on what a break *yields*.
     pub fn break_at(&mut self, block: [i32; 3]) -> ChunkCoord {
+        self.break_at_as(self.local, block)
+    }
+
+    /// The same, on behalf of a named player: **their** tool decides what the
+    /// block yields, and **their** inventory receives it.
+    ///
+    /// Split out from [`break_at`](Self::break_at) because it was not split
+    /// before, and the whole of this block is what that cost: every action ran
+    /// as `self.local` whoever had sent it, so a second player mining put ore
+    /// into the first player's pockets.
+    pub fn break_at_as(&mut self, who: PlayerId, block: [i32; 3]) -> ChunkCoord {
         let [x, y, z] = block;
         // Whatever state the block owned goes with it (§7) -- but its contents
         // now spill onto the floor rather than being destroyed (block 2.5,
@@ -927,7 +938,7 @@ impl Server {
         //
         // Read the three as separate fields rather than through a helper: the
         // borrow checker tracks disjoint field borrows, so `items` can stay
-        // borrowed while `self.sim.player_mut(self.local).inventory` is mutated. A helper
+        // borrowed while `self.sim.player_mut(who).inventory` is mutated. A helper
         // returning them all borrows the whole of `self`.
         if let (Some(registry), Some(terrain), Some(items)) = (
             self.blocks_registry.as_deref(),
@@ -935,7 +946,7 @@ impl Server {
             self.items.as_ref(),
         ) {
             let broken = self.world.block_at(x, y, z, terrain);
-            let held = self.sim.player_mut(self.local).inventory.selected_stack();
+            let held = self.sim.player_mut(who).inventory.selected_stack();
             let held_tier = held.map(|s| items.tier(s.item())).unwrap_or(0);
 
             let drop = if held_tier < registry.requires_tier(broken) {
@@ -960,14 +971,13 @@ impl Server {
                 Some(stack) => {
                     // Block 2.5: what does not fit falls on the floor rather
                     // than being destroyed (§10.4).
-                    if let Some(rest) = self.sim.player_mut(self.local).inventory.add(stack, items)
-                    {
+                    if let Some(rest) = self.sim.player_mut(who).inventory.add(stack, items) {
                         self.sim
                             .entities
                             .spawn_item(rest, drop_centre(block), FixedVec3::ZERO);
                     }
                     // Only a break that yielded something wears the tool.
-                    self.wear_held_tool();
+                    self.wear_held_tool(who);
                 }
                 None => log::debug!(
                     "{} yielded nothing",
@@ -990,11 +1000,11 @@ impl Server {
     /// enforces its own invariant (a stack with state is a stack of one), and
     /// going through `ItemStack::new` is what keeps that enforcement in one
     /// place.
-    fn wear_held_tool(&mut self) {
+    fn wear_held_tool(&mut self, who: PlayerId) {
         let Some(items) = self.items.as_ref() else {
             return;
         };
-        let inv = &mut self.sim.player_mut(self.local).inventory;
+        let inv = &mut self.sim.player_mut(who).inventory;
         let slot = inv.selected_slot() as usize;
         let Some(stack) = inv.slot(slot) else {
             return;
@@ -1023,13 +1033,13 @@ impl Server {
     /// The name comparison this replaces carried a note saying block 2.4 was
     /// the point to generalise it, "with two real cases to design against" --
     /// the furnace is that second case.
-    fn interact(&mut self) -> Option<Screen> {
+    fn interact_as(&mut self, who: PlayerId) -> Option<Screen> {
         let (Some(registry), Some(terrain)) = (self.blocks_registry.as_deref(), self.terrain)
         else {
             return None;
         };
-        let origin = self.sim.player_mut(self.local).pos.to_f32();
-        let dir = self.sim.player_mut(self.local).look_dir_f32().to_array();
+        let origin = self.sim.player_mut(who).pos.to_f32();
+        let dir = self.sim.player_mut(who).look_dir_f32().to_array();
         let hit = self.world.raycast(origin, dir, REACH, self.terrain())?;
         let [x, y, z] = hit.block;
         match registry.interact(self.world.block_at(x, y, z, terrain)) {
@@ -1038,7 +1048,7 @@ impl Server {
                 // Width lives on `Crafting` (world state), not on the screen: a
                 // 3x3 grid holding items in its outer cells is a different world
                 // from a 2x2 one, and the hash already covers it.
-                self.sim.player_mut(self.local).crafting.set_width(3);
+                self.sim.player_mut(who).crafting.set_width(3);
                 Some(Screen::Bench)
             }
             Interact::Furnace => {
@@ -1068,11 +1078,11 @@ impl Server {
     /// hand and a block entity, which is world state -- so it happens here and
     /// comes back as a `BlockEntity` effect, rather than the client editing a
     /// furnace it does not own.
-    fn click_furnace(&mut self, pos: [i32; 3], slot: FurnaceSlot) {
+    fn click_furnace_as(&mut self, who: PlayerId, pos: [i32; 3], slot: FurnaceSlot) {
         let Some(items) = self.items.as_ref() else {
             return;
         };
-        let held = self.sim.player_mut(self.local).crafting.held();
+        let held = self.sim.player_mut(who).crafting.held();
         let world = Arc::make_mut(&mut self.world);
         let Some(f) = world.furnace_at_mut(pos) else {
             // A furnace that is not there cannot be clicked. This is the
@@ -1088,10 +1098,7 @@ impl Server {
                 if held.is_none() {
                     if let Some((id, count)) = f.output.take() {
                         if let Ok(stack) = items.new_stack(id, count) {
-                            self.sim
-                                .player_mut(self.local)
-                                .crafting
-                                .set_held(Some(stack));
+                            self.sim.player_mut(who).crafting.set_held(Some(stack));
                         }
                     }
                 }
@@ -1103,11 +1110,11 @@ impl Server {
             Some(stack) => {
                 let previous = slot.replace((stack.item(), stack.count()));
                 let give_back = previous.and_then(|(id, c)| items.new_stack(id, c).ok());
-                self.sim.player_mut(self.local).crafting.set_held(give_back);
+                self.sim.player_mut(who).crafting.set_held(give_back);
             }
             None => {
                 let taken = slot.take().and_then(|(id, c)| items.new_stack(id, c).ok());
-                self.sim.player_mut(self.local).crafting.set_held(taken);
+                self.sim.player_mut(who).crafting.set_held(taken);
             }
         }
         self.note_block_entity(pos);
@@ -1178,11 +1185,11 @@ impl Server {
         }
     }
 
-    fn break_looked_at(&mut self) -> Option<[i32; 3]> {
-        let origin = self.sim.player_mut(self.local).pos.to_f32();
-        let dir = self.sim.player_mut(self.local).look_dir_f32().to_array();
+    fn break_looked_at_as(&mut self, who: PlayerId) -> Option<[i32; 3]> {
+        let origin = self.sim.player_mut(who).pos.to_f32();
+        let dir = self.sim.player_mut(who).look_dir_f32().to_array();
         let hit = self.world.raycast(origin, dir, REACH, self.terrain())?;
-        self.break_at(hit.block);
+        self.break_at_as(who, hit.block);
         Some(hit.block)
     }
     /// Place the held hotbar item's block against the targeted face, consuming
@@ -1192,17 +1199,17 @@ impl Server {
     /// An item with no matching block -- a stick, an ingot -- places nothing
     /// **and consumes nothing**: a click that does nothing must not quietly
     /// spend an item.
-    fn place_held(&mut self) -> Option<ChunkCoord> {
+    fn place_held_as(&mut self, who: PlayerId) -> Option<ChunkCoord> {
         // An interactive block under the crosshair takes precedence over
         // placing. Otherwise a bench would be unusable the moment you are
         // holding anything -- which is most of the time.
         let registry = self.blocks_registry.as_deref()?;
         let items = self.items.as_ref()?;
-        let held = self.sim.player_mut(self.local).inventory.selected_stack()?;
+        let held = self.sim.player_mut(who).inventory.selected_stack()?;
         let block = registry.id_of(items.name_of(held.item())?)?;
 
-        let origin = self.sim.player_mut(self.local).pos.to_f32();
-        let dir = self.sim.player_mut(self.local).look_dir_f32().to_array();
+        let origin = self.sim.player_mut(who).pos.to_f32();
+        let dir = self.sim.player_mut(who).look_dir_f32().to_array();
         let hit = self.world.raycast(origin, dir, REACH, self.terrain())?;
         let target = [
             hit.block[0] + hit.normal[0],
@@ -1211,11 +1218,8 @@ impl Server {
         ];
 
         // Only now that the placement is certain to happen.
-        let slot = self.sim.player_mut(self.local).inventory.selected_slot() as usize;
-        self.sim
-            .player_mut(self.local)
-            .inventory
-            .take_one(slot, items)?;
+        let slot = self.sim.player_mut(who).inventory.selected_slot() as usize;
+        self.sim.player_mut(who).inventory.take_one(slot, items)?;
 
         // A block that owns state gets it the moment it is placed, rather than
         // on first use -- so a furnace someone never opens still ticks, and the
