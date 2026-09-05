@@ -155,6 +155,11 @@ impl Session {
         let acceptor = Acceptor::bind(addr)?;
         let bound = acceptor.addr();
         self.acceptor = Some(acceptor);
+        // A world that is served is not also played here. Done at `listen`
+        // rather than at `open` so that `--ticks` without `--listen` -- the
+        // smoke test, and anyone running a world forward on purpose -- still has
+        // a player for the simulation to be about.
+        self.server.go_headless();
         Ok(bound)
     }
 
@@ -191,7 +196,13 @@ impl Session {
             return;
         };
         for mut link in acceptor.accepted() {
-            let spawn = self.server.sim.player(self.server.local).spawn;
+            // From the *world*, not from a player. This used to read the local
+            // player's spawn field, which is why a dedicated server needed a
+            // player nobody was driving.
+            let Some(spawn) = self.server.world_spawn() else {
+                log::warn!("no spawn point yet -- refusing a connection until assets are set");
+                continue;
+            };
             let player = cubara_sim::Player::new(
                 spawn,
                 cubara_voxel::Angle::ZERO,
@@ -216,15 +227,28 @@ impl Session {
                     .map(|r| r.fingerprint())
                     .unwrap_or(0),
             });
-            let handshake = self.server.snapshot_for(id);
+            // **The view's own backfill is the handshake.** `open_view` centres
+            // the view, and a first centring makes everything in range newly
+            // visible -- which is exactly what `snapshot_for` computes, plus the
+            // players standing in it.
+            //
+            // This used to send `snapshot_for` and then *discard* what the view
+            // had queued, on the grounds that the same edits must not go twice.
+            // That was true when the view only backfilled edits. Since players
+            // are backfilled too (and `snapshot_for` has never carried them),
+            // the discard threw those away: a joining client was never told
+            // about anybody already standing there, until they happened to move.
+            // Two changes that were each correct alone.
+            //
+            // Draining the view instead of computing a second, nearly-identical
+            // list also means there is one answer to "what can this client see"
+            // rather than two that can drift.
+            let handshake = self.server.drain_effects_for(id);
             log::info!(
                 "player {id:?} joined; handshake is {} effects",
                 handshake.len()
             );
             link.send(ServerMessage::Effects(handshake));
-            // The view has already been charged for the handshake, so whatever
-            // `open_view` queued must not be sent again.
-            let _ = self.server.drain_effects_for(id);
             self.clients.insert(id, link);
         }
     }
@@ -572,7 +596,12 @@ mod tests {
         let plank = items.id_of("cubara:plank").expect("plank exists");
 
         // Right next to the player, so it is inside the simulation radius.
-        let p = s.server.sim.player(s.server.local).pos.to_f32();
+        let p = s
+            .server
+            .sim
+            .player(s.server.local.expect("a local client"))
+            .pos
+            .to_f32();
         let pos = [p[0] as i32 + 1, p[1] as i32, p[2] as i32];
         {
             let world = Arc::make_mut(&mut s.server.world);
@@ -634,7 +663,12 @@ mod tests {
         let mut first = Session::open(&cfg);
         first.advance(120, &cfg);
         // An edit only a save can carry: dig out the block under the player.
-        let p = first.server.sim.player(first.server.local).pos.to_f32();
+        let p = first
+            .server
+            .sim
+            .player(first.server.local.expect("a local client"))
+            .pos
+            .to_f32();
         let block = [p[0] as i32, p[1] as i32 - 2, p[2] as i32];
         first.server.break_at(block);
         let hash = first.server.hash();

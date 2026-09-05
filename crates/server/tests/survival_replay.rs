@@ -164,8 +164,9 @@ impl Fixture {
         server.open(std::path::Path::new("cubara-nonexistent-survival-fixture"));
         // Known angles to count deltas from. `Server::new`'s default look is a
         // presentation choice; this test needs an arithmetic one.
-        let pos = server.sim.player(server.local).pos;
-        *server.sim.player_mut(server.local) = Player::new(pos, Angle::ZERO, Angle::ZERO);
+        let pos = server.sim.player(server.local.expect("a local client")).pos;
+        *server.sim.player_mut(server.local.expect("a local client")) =
+            Player::new(pos, Angle::ZERO, Angle::ZERO);
         server.place_player_on_ground();
         Self {
             server,
@@ -195,7 +196,7 @@ impl Fixture {
         };
         self.server
             .sim
-            .player(self.server.local)
+            .player(self.server.local.expect("a local client"))
             .inventory
             .slots()
             .flatten()
@@ -232,7 +233,10 @@ impl Fixture {
     /// made, and the damage station is supposed to earn its damage.
     fn stand_at(&mut self, b: [i32; 3]) {
         let half = Fixed::from_raw(cubara_voxel::fixed::ONE / 2);
-        let p = self.server.sim.player_mut(self.server.local);
+        let p = self
+            .server
+            .sim
+            .player_mut(self.server.local.expect("a local client"));
         p.pos = FixedVec3::from_blocks(b[0], b[1], b[2]) + FixedVec3::new(half, half, half);
         p.velocity = FixedVec3::ZERO;
         p.fall_distance = Fixed::ZERO;
@@ -256,11 +260,16 @@ impl Fixture {
     /// the block and the face, exactly as `Action::Break` and `Action::Place`
     /// will read them a moment later.
     fn looking_at(&self) -> Option<([i32; 3], [i32; 3])> {
-        let origin = self.server.sim.player(self.server.local).pos.to_f32();
+        let origin = self
+            .server
+            .sim
+            .player(self.server.local.expect("a local client"))
+            .pos
+            .to_f32();
         let dir = self
             .server
             .sim
-            .player(self.server.local)
+            .player(self.server.local.expect("a local client"))
             .look_dir_f32()
             .to_array();
         self.server
@@ -315,7 +324,7 @@ impl Fixture {
         // validated. This is the server's own entry point, which does exactly
         // what that action did -- same raycast, same reach, same drop -- so the
         // hash this fixture pins is unchanged.
-        let who = self.server.local;
+        let who = self.server.local.expect("a local client");
         self.server.break_looked_at_as(who);
         self.raycast_breaks += 1;
         true
@@ -331,7 +340,12 @@ impl Fixture {
     /// Sorted by `(distance, x, y, z)` — a total order, so *which* log the
     /// script fells is fixed rather than whatever the scan reached first.
     fn find(&self, name: &str, radius: i32) -> Vec<[i32; 3]> {
-        let p = self.server.sim.player(self.server.local).pos.to_f32();
+        let p = self
+            .server
+            .sim
+            .player(self.server.local.expect("a local client"))
+            .pos
+            .to_f32();
         let (cx, cy, cz) = (p[0] as i32, p[1] as i32, p[2] as i32);
         let mut found = Vec::new();
         for dx in -radius..=radius {
@@ -357,7 +371,7 @@ impl Fixture {
             if self
                 .server
                 .sim
-                .player_mut(self.server.local)
+                .player_mut(self.server.local.expect("a local client"))
                 .inventory
                 .slot(slot)
                 .map(|s| s.item())
@@ -368,7 +382,7 @@ impl Fixture {
             if self
                 .server
                 .sim
-                .player_mut(self.server.local)
+                .player_mut(self.server.local.expect("a local client"))
                 .inventory
                 .take_one(slot, items)
                 .is_some()
@@ -397,19 +411,19 @@ impl Fixture {
         let displaced = self
             .server
             .sim
-            .player_mut(self.server.local)
+            .player_mut(self.server.local.expect("a local client"))
             .inventory
             .take(0);
         let items = self.server.items.as_ref().expect("assets loaded");
         let stack = items.new_stack(id, 1).expect("one of anything is a stack");
         self.server
             .sim
-            .player_mut(self.server.local)
+            .player_mut(self.server.local.expect("a local client"))
             .inventory
             .set_slot(0, Some(stack));
         self.server
             .sim
-            .player_mut(self.server.local)
+            .player_mut(self.server.local.expect("a local client"))
             .inventory
             .select(0);
         if let Some(displaced) = displaced {
@@ -417,7 +431,7 @@ impl Fixture {
             let rest = self
                 .server
                 .sim
-                .player_mut(self.server.local)
+                .player_mut(self.server.local.expect("a local client"))
                 .inventory
                 .add(displaced, items);
             assert!(
@@ -441,7 +455,7 @@ impl Fixture {
                 let stack = items.new_stack(id, 1).expect("one is a stack");
                 self.server
                     .sim
-                    .player_mut(self.server.local)
+                    .player_mut(self.server.local.expect("a local client"))
                     .crafting
                     .set_cell(index, Some(stack));
             }
@@ -452,7 +466,7 @@ impl Fixture {
             let made = self
                 .server
                 .sim
-                .player_mut(self.server.local)
+                .player_mut(self.server.local.expect("a local client"))
                 .crafting
                 .take_result(book, items);
             assert!(made, "the grid did not match a recipe for {what}");
@@ -460,20 +474,20 @@ impl Fixture {
             let held = self
                 .server
                 .sim
-                .player_mut(self.server.local)
+                .player_mut(self.server.local.expect("a local client"))
                 .crafting
                 .held()
                 .expect("a result");
             self.server
                 .sim
-                .player_mut(self.server.local)
+                .player_mut(self.server.local.expect("a local client"))
                 .crafting
                 .set_held(None);
             let items = self.server.items.as_ref().expect("assets loaded");
             let rest = self
                 .server
                 .sim
-                .player_mut(self.server.local)
+                .player_mut(self.server.local.expect("a local client"))
                 .inventory
                 .add(held, items);
             assert!(rest.is_none(), "no room in the inventory to bank {what}");
@@ -588,7 +602,11 @@ fn run_survival_script() -> Fixture {
         "interacting with the bench did not open it: {opened:?}"
     );
     assert_eq!(
-        f.server.sim.player_mut(f.server.local).crafting.width(),
+        f.server
+            .sim
+            .player_mut(f.server.local.expect("a local client"))
+            .crafting
+            .width(),
         3,
         "the bench opened but the grid is still 2x2"
     );
@@ -681,7 +699,7 @@ fn run_survival_script() -> Fixture {
     let ore_stack = items.new_stack(raw, 1).expect("one is a stack");
     f.server
         .sim
-        .player_mut(f.server.local)
+        .player_mut(f.server.local.expect("a local client"))
         .crafting
         .set_held(Some(ore_stack));
     f.server.apply(Action::ClickFurnace {
@@ -699,7 +717,7 @@ fn run_survival_script() -> Fixture {
     let fuel_stack = items.new_stack(log_id, fuel).expect("a stack of logs");
     f.server
         .sim
-        .player_mut(f.server.local)
+        .player_mut(f.server.local.expect("a local client"))
         .crafting
         .set_held(Some(fuel_stack));
     f.server.apply(Action::ClickFurnace {
@@ -709,7 +727,7 @@ fn run_survival_script() -> Fixture {
     assert!(
         f.server
             .sim
-            .player_mut(f.server.local)
+            .player_mut(f.server.local.expect("a local client"))
             .crafting
             .held()
             .is_none(),
@@ -738,7 +756,7 @@ fn run_survival_script() -> Fixture {
     // Take it out, and bank it.
     f.server
         .sim
-        .player_mut(f.server.local)
+        .player_mut(f.server.local.expect("a local client"))
         .crafting
         .set_held(None);
     f.server.apply(Action::ClickFurnace {
@@ -748,20 +766,20 @@ fn run_survival_script() -> Fixture {
     let held = f
         .server
         .sim
-        .player_mut(f.server.local)
+        .player_mut(f.server.local.expect("a local client"))
         .crafting
         .held()
         .expect("the output slot handed the ingot over");
     f.server
         .sim
-        .player_mut(f.server.local)
+        .player_mut(f.server.local.expect("a local client"))
         .crafting
         .set_held(None);
     let items = f.server.items.as_ref().expect("assets loaded");
     let rest = f
         .server
         .sim
-        .player_mut(f.server.local)
+        .player_mut(f.server.local.expect("a local client"))
         .inventory
         .add(held, items);
     assert!(rest.is_none(), "no room to bank the ingot");
@@ -775,7 +793,10 @@ fn run_survival_script() -> Fixture {
     // --- Take damage ------------------------------------------------------
     // A fall, which since block 2.9a is the one thing in this world that hurts.
     assert_eq!(
-        f.server.sim.player_mut(f.server.local).health,
+        f.server
+            .sim
+            .player_mut(f.server.local.expect("a local client"))
+            .health,
         MAX_HEALTH,
         "the script hurt the player before the station that is supposed to"
     );
@@ -784,18 +805,30 @@ fn run_survival_script() -> Fixture {
     let mut landed = false;
     for _ in 0..200 {
         f.tick(&InputFrame::default());
-        if f.server.sim.player_mut(f.server.local).on_ground {
+        if f.server
+            .sim
+            .player_mut(f.server.local.expect("a local client"))
+            .on_ground
+        {
             landed = true;
             break;
         }
     }
     assert!(landed, "the player never landed");
     assert!(
-        f.server.sim.player_mut(f.server.local).health < MAX_HEALTH,
+        f.server
+            .sim
+            .player_mut(f.server.local.expect("a local client"))
+            .health
+            < MAX_HEALTH,
         "a {FALL_BLOCKS}-block fall cost nothing; SAFE_FALL is 3"
     );
     assert!(
-        f.server.sim.player_mut(f.server.local).health > 0,
+        f.server
+            .sim
+            .player_mut(f.server.local.expect("a local client"))
+            .health
+            > 0,
         "the fall was meant to hurt, not to kill"
     );
     f.log.push("took damage");
@@ -876,7 +909,11 @@ fn every_station_of_the_loop_actually_ran() {
     );
     assert_eq!(f.carrying("cubara:iron_ingot"), 1, "no ingot at the end");
     assert!(
-        f.server.sim.player(f.server.local).health < MAX_HEALTH,
+        f.server
+            .sim
+            .player(f.server.local.expect("a local client"))
+            .health
+            < MAX_HEALTH,
         "nothing hurt"
     );
 }

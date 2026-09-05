@@ -231,7 +231,7 @@ fn a_large_move_axis_does_not_move_a_player_further() {
         let mut s = Server::new();
         s.open(std::path::Path::new("cubara-nonexistent-untrusted-fixture"));
         s.place_player_on_ground();
-        let who = s.local;
+        let who = s.local.expect("a local client");
         let before = s.sim.player(who).pos;
         let input = InputFrame {
             move_axes: axes,

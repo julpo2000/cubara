@@ -86,14 +86,21 @@ pub struct Server {
     /// the exact snapshot they were queued against; an edit publishes a new one.
     pub world: Arc<World>,
     pub sim: Sim,
-    /// Which player this server's *local* client drives (block 2.10).
+    /// Which player this server's *local* client drives, if it has one.
     ///
-    /// Named rather than assumed. A dedicated server has many players and no
-    /// local one, and this field is the seam where that becomes true: today it
-    /// is always [`PlayerId::LOCAL`] because there is one client and it is in
-    /// this process, and every site that means "the player at this keyboard"
-    /// says so instead of writing `0`.
-    pub local: PlayerId,
+    /// **`None` on a dedicated server**, and that is the whole point of the
+    /// `Option`. Block 2.10 wrote "a dedicated server has many players and no
+    /// local one" in this comment and then made the field a bare `PlayerId`, so
+    /// the sentence was a promise rather than a fact: a listening server kept a
+    /// motionless `PlayerId(0)` standing on spawn, and told every client about
+    /// it every tick. Found over a real LAN, where it showed up as a ghost.
+    ///
+    /// The methods that say "the local client" — [`apply`](Self::apply),
+    /// [`snapshot`](Self::snapshot), [`break_at`](Self::break_at),
+    /// [`drain_effects`](Self::drain_effects) — now require one, loudly. A
+    /// dedicated server has no business calling them and should use the
+    /// `_as`/`_for` variants that name a player.
+    pub local: Option<PlayerId>,
     pub blocks_registry: Option<Arc<BlockRegistry>>,
     pub terrain: Option<TerrainBlocks>,
     pub items: Option<ItemRegistry>,
@@ -277,7 +284,7 @@ impl Server {
             views: BTreeMap::new(),
             mining: BTreeMap::new(),
             last_pose: BTreeMap::new(),
-            local: PlayerId::LOCAL,
+            local: Some(PlayerId::LOCAL),
         };
         // The local client is watching from the start. A `Server` with no view
         // would queue every effect into nothing, which is not a smaller server
@@ -347,23 +354,100 @@ impl Server {
     /// the 3-block safe fall, and it avoids having to reach for the private
     /// eye-height constant from another crate.
     pub fn place_player_on_ground(&mut self) {
-        let Some(terrain) = self.terrain else {
+        let (Some(who), Some(standing)) = (self.local, self.world_spawn()) else {
             return;
         };
-        let p = self.sim.player_mut(self.local).pos;
-        let [px, _, pz] = p.to_f32();
-        let Some(hit) = self
-            .world
-            .raycast([px, 200.0, pz], [0.0, -1.0, 0.0], 400.0, terrain)
-        else {
-            return;
-        };
-        let standing = FixedVec3::new(p.x, cubara_voxel::Fixed::from_blocks(hit.block[1] + 2), p.z);
-        self.sim.player_mut(self.local).pos = standing;
-        self.sim.player_mut(self.local).velocity = FixedVec3::ZERO;
-        self.sim.player_mut(self.local).fall_distance = cubara_voxel::Fixed::ZERO;
+        let p = self.sim.player_mut(who);
+        p.pos = standing;
+        p.velocity = FixedVec3::ZERO;
+        p.fall_distance = cubara_voxel::Fixed::ZERO;
         // Death returns here, not to wherever `Server::new` happened to start.
-        self.sim.player_mut(self.local).spawn = standing;
+        p.spawn = standing;
+    }
+
+    /// Where somebody entering this world stands.
+    ///
+    /// **A property of the world, not of a player.** It used to be read off the
+    /// local player's `spawn` field, which meant a dedicated server needed a
+    /// player nobody was driving in order to know where to put the people who
+    /// actually joined — the tail wagging the dog, and the reason the ghost
+    /// existed at all.
+    ///
+    /// Derived rather than stored: the surface of the origin column, and
+    /// worldgen is a pure function of the seed, so this is the same answer on
+    /// every machine and after every restart. No new state, no save format
+    /// change, and nothing that can drift out of agreement with itself.
+    ///
+    /// `None` before assets are set, because "solid" is a question about block
+    /// ids and there are none yet. Two blocks above the surface, not exactly on
+    /// it: the eye is 1.62 above the feet, so this leaves a fraction of a block
+    /// to settle — well inside the 3-block safe fall, and it avoids reaching for
+    /// a private eye-height constant in another crate.
+    ///
+    /// A world where players choose their own spawn (a bed) would make this
+    /// per-player state that has to be saved. That is a gameplay decision nobody
+    /// has made, and this is the smallest thing that is true until they do.
+    pub fn world_spawn(&self) -> Option<FixedVec3> {
+        let terrain = self.terrain?;
+        let hit = self
+            .world
+            .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, terrain)?;
+        Some(FixedVec3::new(
+            cubara_voxel::Fixed::from_f32(0.5),
+            cubara_voxel::Fixed::from_blocks(hit.block[1] + 2),
+            cubara_voxel::Fixed::from_f32(0.5),
+        ))
+    }
+
+    /// The local client's player, or a panic explaining why there isn't one.
+    ///
+    /// Deliberately loud rather than a silent no-op: a dedicated server calling
+    /// a "local client" method is a bug in the caller, and a method that quietly
+    /// did nothing would hide it until someone wondered why their edits never
+    /// arrived.
+    /// Give up the local client: this world is served, not played, here.
+    ///
+    /// Removes the player nobody is driving, along with their view. Without this
+    /// a dedicated server keeps a motionless figure standing on spawn and tells
+    /// every client about it — which is what a LAN test found, and what
+    /// `Server::local`'s own comment had been promising was not the case since
+    /// block 2.10.
+    ///
+    /// Called once, when a world starts listening. Idempotent, and a no-op on a
+    /// server that never had a local client.
+    pub fn go_headless(&mut self) {
+        let Some(who) = self.local.take() else {
+            return;
+        };
+        self.close_view(who);
+        self.sim.leave(who);
+        // Nobody has been told about them yet on a server that has just started,
+        // but this is also the honest thing to do if it is ever called later.
+        self.announce_departure(who);
+    }
+
+    /// The player the simulated region is centred on.
+    ///
+    /// The local client if there is one, otherwise the lowest-numbered player —
+    /// and on an empty world, nobody.
+    ///
+    /// **This is a placeholder and it is worth saying so.** "Which chunks tick"
+    /// is not one player's question once there are several: the honest answer is
+    /// a region per player, or the union of them, and choosing between those is
+    /// what block 2.16 (sharding) is for. Centring on one player keeps today's
+    /// single-player behaviour exactly as it was — the pinned hashes do not move
+    /// — while removing the *panic* that an `Option` would otherwise introduce
+    /// here. It is not the right answer to a question this block is not asking.
+    fn centre_player(&self) -> Option<PlayerId> {
+        self.local
+            .or_else(|| self.sim.players().next().map(|(id, _)| id))
+    }
+
+    fn local_or_panic(&self) -> PlayerId {
+        self.local.expect(
+            "this server has no local client — a dedicated server should use the \
+             _as/_for methods that name a player",
+        )
     }
 
     /// Advance the player's simulation by one tick.
@@ -374,7 +458,13 @@ impl Server {
     /// — the pinned world hashes would move, and a moved hash with no reason is
     /// indistinguishable from a determinism bug.
     pub fn tick_sim(&mut self, input: &InputFrame) {
-        self.tick_sim_all(&PlayerInputs::one(self.local, *input));
+        // No local client means nobody is pressing anything, not that the
+        // world stops: a dedicated server ticks its players with no input.
+        let inputs = match self.local {
+            Some(who) => PlayerInputs::one(who, *input),
+            None => PlayerInputs::default(),
+        };
+        self.tick_sim_all(&inputs);
     }
 
     /// The same tick, with an input per player -- what a server with more than
@@ -411,7 +501,11 @@ impl Server {
     /// The one-player case, expressed in terms of the many-player one rather
     /// than as a second path (Rule 5).
     pub fn tick_mining(&mut self, input: &InputFrame) {
-        self.tick_mining_all(&PlayerInputs::one(self.local, *input));
+        let inputs = match self.local {
+            Some(who) => PlayerInputs::one(who, *input),
+            None => PlayerInputs::default(),
+        };
+        self.tick_mining_all(&inputs);
     }
 
     /// How far along `who`'s break is, `0.0..1.0`, for a crack overlay to draw.
@@ -557,7 +651,13 @@ impl Server {
     /// Separate so a test can check it against what the world actually
     /// simulates -- see `the_hash_covers_every_chunk_that_is_simulating`.
     pub fn hash_region(&self) -> Vec<ChunkCoord> {
-        let centre = ChunkCoord::from_world_pos(self.sim.player(self.local).pos.to_f32());
+        let Some(who) = self.centre_player() else {
+            // No players at all: nothing is simulating, so there is nothing to
+            // hash. An empty region rather than a region around the origin,
+            // which would be a claim about a place nobody is.
+            return Vec::new();
+        };
+        let centre = ChunkCoord::from_world_pos(self.sim.player(who).pos.to_f32());
         let mut region = Vec::new();
         for x in (centre.x - SIM_RADIUS_CHUNKS)..=(centre.x + SIM_RADIUS_CHUNKS) {
             for y in (centre.y - SIM_HASH_VERTICAL_CHUNKS)..=(centre.y + SIM_HASH_VERTICAL_CHUNKS) {
@@ -647,7 +747,7 @@ impl Server {
     /// replica, and taking the queue is what makes that impossible rather than
     /// merely discouraged.
     pub fn drain_effects(&mut self) -> Vec<Effect> {
-        self.drain_effects_for(self.local)
+        self.drain_effects_for(self.local_or_panic())
     }
 
     /// The same, for a named client (block 2.11).
@@ -875,7 +975,7 @@ impl Server {
     /// **The server raycasts here, not the client.** That is the point of the
     /// action being `Break` rather than `Break(block)`.
     pub fn apply(&mut self, action: Action) {
-        self.apply_as(self.local, action);
+        self.apply_as(self.local_or_panic(), action);
     }
 
     /// The same, on behalf of a named client (block 2.11).
@@ -919,7 +1019,7 @@ impl Server {
     /// order, which is what makes a replica built from a snapshot identical to
     /// one built from the stream of edits that produced it (Rule 1).
     pub fn snapshot(&self) -> Vec<Effect> {
-        self.snapshot_for(self.local)
+        self.snapshot_for(self.local_or_panic())
     }
 
     /// The join handshake for one named client (block 2.11).
@@ -1033,7 +1133,7 @@ impl Server {
     /// [`tick_mining`](Self::tick_mining) (timed, what the game actually does),
     /// so the two cannot drift apart on what a break *yields*.
     pub fn break_at(&mut self, block: [i32; 3]) -> ChunkCoord {
-        self.break_at_as(self.local, block)
+        self.break_at_as(self.local_or_panic(), block)
     }
 
     /// The same, on behalf of a named player: **their** tool decides what the
@@ -1293,7 +1393,10 @@ impl Server {
         // change no chunk's state, and this walks a (2r+1)²x3 box -- 243
         // lookups at radius 4 -- which is pure waste every tick the player is
         // not moving, which is most of them.
-        let centre = ChunkCoord::from_world_pos(self.sim.player_mut(self.local).pos.to_f32());
+        let Some(who) = self.centre_player() else {
+            return;
+        };
+        let centre = ChunkCoord::from_world_pos(self.sim.player(who).pos.to_f32());
         let now = self.sim.tick;
         let woken = if self.sim_centre == Some(centre) {
             Vec::new()
