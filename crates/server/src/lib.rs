@@ -30,7 +30,9 @@
 pub mod assets;
 pub mod clock;
 pub mod headless;
+pub mod net;
 pub mod view;
+pub mod wire;
 
 use cubara_sim::{InputFrame, Player, PlayerId, PlayerInputs, Sim};
 use cubara_voxel::{Angle, BlockRegistry, ChunkCoord, ItemRegistry, RecipeBook, SmeltBook};
@@ -182,35 +184,6 @@ pub enum Effect {
     /// A player left the world, or walked out of sight. The client stops
     /// drawing them.
     PlayerGone(PlayerId),
-}
-
-impl Effect {
-    /// Roughly how many bytes this costs to send.
-    ///
-    /// **An accounting of the fields, not a codec.** Block 2.12 chooses the wire
-    /// format and this becomes its `encoded_len`; until then, what the scaling
-    /// criterion needs is the *shape* of the curve -- flat or growing as players
-    /// are added -- and for that an honest field count is as good as an encoder
-    /// and does not require picking a serialisation format early to get it.
-    ///
-    /// A discriminant byte plus the payload, which is what any compact binary
-    /// format would produce within a small constant.
-    pub fn wire_size(&self) -> usize {
-        const TAG: usize = 1;
-        const POS: usize = 3 * 4; // three i32 block coordinates
-        const FIXED_VEC3: usize = 3 * 8; // three i64 sub-unit coordinates
-        const ANGLE: usize = 4;
-        const PLAYER_ID: usize = 8;
-        TAG + match self {
-            Effect::Edit { .. } => POS + 2,
-            // A furnace is three optional (id, count) slots and two counters.
-            Effect::BlockEntity { furnace, .. } => POS + 1 + furnace.map_or(0, |_| 3 * 4 + 2 * 4),
-            Effect::Open(_) => 1 + POS,
-            Effect::CloseIfAt(_) => POS,
-            Effect::PlayerMoved { .. } => PLAYER_ID + FIXED_VEC3 + 2 * ANGLE,
-            Effect::PlayerGone(_) => PLAYER_ID,
-        }
-    }
 }
 
 impl Server {
@@ -528,6 +501,20 @@ impl Server {
     /// Drop a client's view. Their player may well still exist.
     pub fn close_view(&mut self, who: PlayerId) {
         self.views.remove(&who);
+    }
+
+    /// Tell everyone still watching that `who` has gone.
+    ///
+    /// Unfiltered by interest, deliberately, and it is the one place that is
+    /// right: a client that was drawing someone needs to stop, and by the time
+    /// this is called the departed player's position is no longer available to
+    /// decide who could see them. Sending a departure to someone who was not
+    /// watching costs nine bytes and no confusion; *not* sending it to someone
+    /// who was leaves a person standing in their world forever.
+    pub fn announce_departure(&mut self, who: PlayerId) {
+        for view in self.views.values_mut() {
+            view.push(Effect::PlayerGone(who));
+        }
     }
 
     /// Bring one client's interest set up to date with where its player is, and

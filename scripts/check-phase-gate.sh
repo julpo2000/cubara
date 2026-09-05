@@ -119,7 +119,7 @@ if [ "$phase" = "2" ]; then
     run "two clients, one world, one hash (block 2.11)"         cargo test -p cubara-server --test client_view two_clients_in_one_world_leave_one_authoritative_state
     run "the server never sends terrain (block 2.11)"         cargo test -p cubara-server --test client_view the_join_handshake_carries_no_terrain
     run "bandwidth per client does not grow with player count (block 2.11)"         cargo test -p cubara-server --test client_view bytes_to_one_client_do_not_grow_with_the_player_count
-    not_implemented "a real socket, two processes (block 2.12)"
+    run "a real socket, two processes (block 2.12)"         cargo test -p cubara-server --test two_processes
     not_implemented "a region simulated elsewhere lands where it would have locally (block 2.16)"
 
     echo
