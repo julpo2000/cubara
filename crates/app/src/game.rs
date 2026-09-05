@@ -167,7 +167,7 @@ impl Game {
     /// carries the player down onto the terrain below.
     pub fn new() -> Self {
         let server = Server::new();
-        let player = server.sim.player;
+        let player = *server.sim.player(server.local);
         Self {
             // Same seed, so the same terrain -- generated here rather than
             // copied from the server, which is the whole point of §8.2. Over a
@@ -205,7 +205,9 @@ impl Game {
     /// fraction. Render-side only (§9) -- never read back into the sim.
     pub fn camera_pose(&self) -> CameraPose {
         let alpha = (self.accumulator / TICK_DT as f64).clamp(0.0, 1.0) as f32;
-        let player = self.prev_player.lerp(&self.server.sim.player, alpha);
+        let player = self
+            .prev_player
+            .lerp(self.server.sim.player(self.server.local), alpha);
         CameraPose {
             // The renderer works in floats, and that is the correct side of the
             // seam for it: a wrong last bit in a camera matrix is a sub-pixel
@@ -220,7 +222,7 @@ impl Game {
     /// tick (`cubara_sim::Sim::tick`), not here. The renderer draws it; it
     /// does not decide it (`ARCHITECTURE.md` Rule 3, issue #52).
     pub fn selected_block(&self) -> Option<[i32; 3]> {
-        self.server.sim.target
+        self.server.sim.player(self.server.local).target
     }
 
     /// Record a movement key going down/up. Unmapped keys are ignored (returns
@@ -344,7 +346,7 @@ impl Game {
 
         let mut ticks = 0;
         while self.accumulator >= TICK_DT as f64 {
-            self.prev_player = self.server.sim.player;
+            self.prev_player = *self.server.sim.player(self.server.local);
             self.server.tick_sim(&input);
             // Mining advances *per tick*, not per frame -- §4.3, and the same
             // reason the tick loop exists. A catch-up burst of N ticks is N
@@ -395,7 +397,7 @@ impl Game {
             self.resync();
             // A load replaces the player wholesale, so the previous pose the
             // client interpolates from is now a pose from a different world.
-            self.prev_player = self.server.sim.player;
+            self.prev_player = *self.server.sim.player(self.server.local);
         }
         loaded
     }
@@ -407,7 +409,7 @@ impl Game {
     /// it is told the points and the maximum and works out the hearts (Rule 3).
     pub fn health_view(&self) -> cubara_render::HealthView {
         cubara_render::HealthView {
-            points: self.server.sim.player.health,
+            points: self.server.sim.player(self.server.local).health,
             max_points: cubara_sim::MAX_HEALTH,
         }
     }
@@ -444,7 +446,7 @@ impl Game {
         self.server.set_assets(registry, items, recipes);
         // The server just moved the player onto the ground; the client's
         // interpolation would otherwise smear them there from y = 48.
-        self.prev_player = self.server.sim.player;
+        self.prev_player = *self.server.sim.player(self.server.local);
     }
 
     /// Break the targeted block and put its drop in the inventory.
@@ -502,8 +504,13 @@ impl Game {
         // Predicted on the *replica* (§8.1: "client predicts, server decides").
         // How far along a break is is display -- the break itself is an edit,
         // and that goes through the server below.
-        let origin = self.server.sim.player.pos.to_f32();
-        let dir = self.server.sim.player.look_dir_f32().to_array();
+        let origin = self.server.sim.player_mut(self.server.local).pos.to_f32();
+        let dir = self
+            .server
+            .sim
+            .player_mut(self.server.local)
+            .look_dir_f32()
+            .to_array();
         let Some(hit) = self.world.raycast(origin, dir, REACH, self.terrain()) else {
             // Looking at nothing in reach: whatever was in progress is gone.
             self.mining = None;
@@ -527,7 +534,7 @@ impl Game {
         let held = self
             .server
             .sim
-            .player
+            .player(self.server.local)
             .inventory
             .selected_stack()
             .map(|s| s.item());
@@ -696,7 +703,7 @@ impl Game {
     /// are art that does not exist yet.
     pub fn hotbar_slots(&self) -> Option<[Option<HotbarSlot>; HOTBAR_WIDTH]> {
         let items = self.server.items.as_ref()?;
-        let inv = &self.server.sim.player.inventory;
+        let inv = &self.server.sim.player(self.server.local).inventory;
         let mut out = [None; HOTBAR_WIDTH];
         for (i, out_slot) in out.iter_mut().enumerate() {
             let Some(stack) = inv.slot(i) else { continue };
@@ -746,7 +753,7 @@ impl Game {
         if self.open_furnace.take().is_some() {
             self.inventory_open = false;
             if let Some(items) = self.server.items.as_ref() {
-                let player = &mut self.server.sim.player;
+                let player = self.server.sim.player_mut(self.server.local);
                 if let Some(held) = player.crafting.held() {
                     if let Some(lost) = player.inventory.add(held, items) {
                         log::debug!(
@@ -764,7 +771,7 @@ impl Game {
             self.inventory_open = false;
             return;
         };
-        let player = &mut self.server.sim.player;
+        let player = self.server.sim.player_mut(self.server.local);
         if player.crafting.close(&mut player.inventory, items) {
             self.inventory_open = false;
             // Back to the inventory's own grid. `close` emptied all nine cells
@@ -787,7 +794,15 @@ impl Game {
         };
         let panel = match self.open_furnace {
             Some(_) => InventoryPanel::layout_furnace(width, height),
-            None => InventoryPanel::layout(width, height, self.server.sim.player.crafting.width()),
+            None => InventoryPanel::layout(
+                width,
+                height,
+                self.server
+                    .sim
+                    .player_mut(self.server.local)
+                    .crafting
+                    .width(),
+            ),
         };
         let Some((kind, index)) = panel.hit(x, y) else {
             return;
@@ -804,7 +819,7 @@ impl Game {
             // is the safe branch rather than mapping it to a grid cell.
             PanelSlotKind::Fuel => return,
         };
-        let player = &mut self.server.sim.player;
+        let player = self.server.sim.player_mut(self.server.local);
         player
             .crafting
             .click(slot, right, &mut player.inventory, items, book);
@@ -823,7 +838,7 @@ impl Game {
             return;
         };
         if kind == PanelSlotKind::Inventory {
-            let player = &mut self.server.sim.player;
+            let player = self.server.sim.player_mut(self.server.local);
             player
                 .crafting
                 .click_inventory_only(index, &mut player.inventory, items);
@@ -856,7 +871,7 @@ impl Game {
             return None;
         }
         let items = self.server.items.as_ref()?;
-        let crafting = &self.server.sim.player.crafting;
+        let crafting = &self.server.sim.player(self.server.local).crafting;
         let book = self.server.recipes.as_ref();
         let furnace = self.open_furnace();
         let panel = match self.open_furnace {
@@ -888,7 +903,7 @@ impl Game {
                 (PanelSlotKind::Inventory, _) => self
                     .server
                     .sim
-                    .player
+                    .player(self.server.local)
                     .inventory
                     .slot(s.index)
                     .and_then(swatch),
@@ -909,12 +924,20 @@ impl Game {
 
     /// Which hotbar slot is held, for the renderer.
     pub fn selected_hotbar_slot(&self) -> u8 {
-        self.server.sim.player.inventory.selected_slot()
+        self.server
+            .sim
+            .player(self.server.local)
+            .inventory
+            .selected_slot()
     }
 
     /// Select a hotbar slot (number keys 1-9, passed as 0-8).
     pub fn select_hotbar(&mut self, index: u8) {
-        self.server.sim.player.inventory.select(index);
+        self.server
+            .sim
+            .player_mut(self.server.local)
+            .inventory
+            .select(index);
     }
 }
 
@@ -935,7 +958,7 @@ mod tests {
         // No GPU involved — this is why gameplay does not belong on the renderer.
         let mut game = Game::new();
         // Look straight down from above the terrain.
-        game.server.sim.player = Player::new(
+        *game.server.sim.player_mut(game.server.local) = Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, 60.0, 0.5]),
             Angle::ZERO,
             Angle::from_radians(-1.5),
@@ -961,7 +984,8 @@ mod tests {
             .expect("ground below");
         // Stand just above the surface, looking down — now it is within reach.
         let eye = cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 3.5, 0.5]);
-        game.server.sim.player = Player::new(eye, Angle::ZERO, Angle::from_radians(-1.5));
+        *game.server.sim.player_mut(game.server.local) =
+            Player::new(eye, Angle::ZERO, Angle::from_radians(-1.5));
 
         let dirty = game.break_block().expect("a block was in reach");
         assert!(
@@ -1000,7 +1024,8 @@ mod tests {
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
         let eye = cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 3.5, 0.5]);
-        game.server.sim.player = Player::new(eye, Angle::ZERO, Angle::from_radians(-1.5));
+        *game.server.sim.player_mut(game.server.local) =
+            Player::new(eye, Angle::ZERO, Angle::from_radians(-1.5));
         (game, ground.block)
     }
 
@@ -1024,7 +1049,7 @@ mod tests {
         let stack = game
             .server
             .sim
-            .player
+            .player_mut(game.server.local)
             .inventory
             .slot(0)
             .expect("slot 0 holds the drop");
@@ -1055,13 +1080,22 @@ mod tests {
             .id_of(&stone_name)
             .expect("every shipped block needs an item of the same name to be placeable");
         let stack = items.new_stack(held, 5).unwrap();
-        game.server.sim.player.inventory.add(stack, items);
+        game.server
+            .sim
+            .player_mut(game.server.local)
+            .inventory
+            .add(stack, items);
         game.select_hotbar(0);
 
         game.place_block().expect("a face was in reach");
 
         assert_eq!(
-            game.server.sim.player.inventory.slot(0).map(|s| s.count()),
+            game.server
+                .sim
+                .player_mut(game.server.local)
+                .inventory
+                .slot(0)
+                .map(|s| s.count()),
             Some(4),
             "placing spends exactly one"
         );
@@ -1087,7 +1121,7 @@ mod tests {
             .expect("assets/items has a stick");
         game.server
             .sim
-            .player
+            .player_mut(game.server.local)
             .inventory
             .add(items.new_stack(stick, 3).unwrap(), items);
         game.select_hotbar(0);
@@ -1096,7 +1130,12 @@ mod tests {
         assert_eq!(game.place_block(), None);
         assert_eq!(game.world().edit_count(), before, "nothing was placed");
         assert_eq!(
-            game.server.sim.player.inventory.slot(0).map(|s| s.count()),
+            game.server
+                .sim
+                .player_mut(game.server.local)
+                .inventory
+                .slot(0)
+                .map(|s| s.count()),
             Some(3),
             "and nothing was consumed"
         );
@@ -1113,7 +1152,7 @@ mod tests {
         for _ in 0..cubara_sim::SLOT_COUNT {
             game.server
                 .sim
-                .player
+                .player_mut(game.server.local)
                 .inventory
                 .add(items.new_stack(filler, 64).unwrap(), items);
         }
@@ -1131,13 +1170,27 @@ mod tests {
     fn number_keys_select_hotbar_slots_on_press_only() {
         let mut game = Game::new();
         assert!(game.key_input(KeyCode::Digit4, true));
-        assert_eq!(game.server.sim.player.inventory.selected_slot(), 3);
+        assert_eq!(
+            game.server
+                .sim
+                .player_mut(game.server.local)
+                .inventory
+                .selected_slot(),
+            3
+        );
 
         // Releasing must not reselect -- otherwise every key-up would snap the
         // selection back to whichever number was let go of last.
         game.key_input(KeyCode::Digit1, true);
         game.key_input(KeyCode::Digit4, false);
-        assert_eq!(game.server.sim.player.inventory.selected_slot(), 0);
+        assert_eq!(
+            game.server
+                .sim
+                .player_mut(game.server.local)
+                .inventory
+                .selected_slot(),
+            0
+        );
     }
 
     /// Place a bench right where the player is looking, and aim at it.
@@ -1160,7 +1213,7 @@ mod tests {
         let (mut game, _) = game_facing_a_bench();
         let items = game.server.items.as_ref().unwrap();
         // Holding something placeable, to prove interaction wins over placing.
-        game.server.sim.player.inventory.add(
+        game.server.sim.player_mut(game.server.local).inventory.add(
             items
                 .new_stack(items.id_of("cubara:stone").unwrap(), 5)
                 .unwrap(),
@@ -1172,14 +1225,22 @@ mod tests {
         assert_eq!(game.place_block(), None, "no block was placed");
         assert_eq!(game.world().edit_count(), before, "the world is unchanged");
         assert!(game.inventory_open(), "the screen opened");
-        assert_eq!(game.server.sim.player.crafting.width(), 3, "at bench size");
+        assert_eq!(
+            game.server
+                .sim
+                .player_mut(game.server.local)
+                .crafting
+                .width(),
+            3,
+            "at bench size"
+        );
     }
 
     #[test]
     fn right_clicking_anything_else_still_places() {
         let (mut game, _) = game_looking_at_ground();
         let items = game.server.items.as_ref().unwrap();
-        game.server.sim.player.inventory.add(
+        game.server.sim.player_mut(game.server.local).inventory.add(
             items
                 .new_stack(items.id_of("cubara:stone").unwrap(), 5)
                 .unwrap(),
@@ -1200,7 +1261,7 @@ mod tests {
         let book = game.server.recipes.as_ref().unwrap();
         let mut scratch = cubara_sim::Inventory::new();
         scratch.add(items.new_stack(item, count).unwrap(), items);
-        let mut c = game.server.sim.player.crafting;
+        let mut c = game.server.sim.player_mut(game.server.local).crafting;
         c.click(
             cubara_sim::SlotRef::Inventory(0),
             false,
@@ -1215,7 +1276,7 @@ mod tests {
             items,
             book,
         );
-        game.server.sim.player.crafting = c;
+        game.server.sim.player_mut(game.server.local).crafting = c;
     }
 
     #[test]
@@ -1226,7 +1287,14 @@ mod tests {
         // says why that mattered.
         let (mut game, _) = game_facing_a_bench();
         game.place_block();
-        assert_eq!(game.server.sim.player.crafting.width(), 3);
+        assert_eq!(
+            game.server
+                .sim
+                .player_mut(game.server.local)
+                .crafting
+                .width(),
+            3
+        );
 
         let stone = game
             .server
@@ -1237,21 +1305,39 @@ mod tests {
             .unwrap();
         load_cell(&mut game, 8, stone, 4);
         assert!(
-            game.server.sim.player.crafting.cell(8).is_some(),
+            game.server
+                .sim
+                .player_mut(game.server.local)
+                .crafting
+                .cell(8)
+                .is_some(),
             "cell 8 is loaded"
         );
 
         game.toggle_inventory();
         assert!(!game.inventory_open(), "it closed");
-        assert_eq!(game.server.sim.player.crafting.width(), 2, "and narrowed");
+        assert_eq!(
+            game.server
+                .sim
+                .player_mut(game.server.local)
+                .crafting
+                .width(),
+            2,
+            "and narrowed"
+        );
         assert!(
-            game.server.sim.player.crafting.cell(8).is_none(),
+            game.server
+                .sim
+                .player_mut(game.server.local)
+                .crafting
+                .cell(8)
+                .is_none(),
             "the outer cell was emptied, not stranded"
         );
         assert!(
             game.server
                 .sim
-                .player
+                .player_mut(game.server.local)
                 .inventory
                 .slots()
                 .flatten()
@@ -1283,7 +1369,7 @@ mod tests {
         let made = game
             .server
             .sim
-            .player
+            .player_mut(game.server.local)
             .crafting
             .result(game.server.recipes.as_ref().unwrap(), items)
             .expect("the grid makes something");
@@ -1333,12 +1419,12 @@ mod tests {
     fn fly_toggle_flips_the_mode_on_a_single_press() {
         let mut game = Game::new();
         assert!(
-            !game.server.sim.player.is_free_fly(),
+            !game.server.sim.player_mut(game.server.local).is_free_fly(),
             "walking is the default mode"
         );
         game.key_input(KeyCode::F4, true);
         game.advance(TICK_DT);
-        assert!(game.server.sim.player.is_free_fly());
+        assert!(game.server.sim.player_mut(game.server.local).is_free_fly());
     }
 
     #[test]
@@ -1355,7 +1441,7 @@ mod tests {
         game.advance(2.0 * TICK_DT);
         assert_eq!(game.server.sim.tick, 2);
         assert!(
-            game.server.sim.player.is_free_fly(),
+            game.server.sim.player_mut(game.server.local).is_free_fly(),
             "one press should flip the mode once (false -> true), not twice (-> false)"
         );
     }
@@ -1406,8 +1492,8 @@ mod tests {
         assert_eq!(once.server.sim.tick, 1);
 
         assert_eq!(
-            spread.server.sim.player.look_dir(),
-            once.server.sim.player.look_dir(),
+            spread.server.sim.player(spread.server.local).look_dir(),
+            once.server.sim.player(once.server.local).look_dir(),
             "mouse motion spread over sub-tick frames must turn the player by \
              the same total as the same motion in one frame -- none dropped"
         );
@@ -1430,8 +1516,8 @@ mod tests {
         assert_eq!(single.server.sim.tick, 1);
         assert_eq!(burst.server.sim.tick, 3);
         assert_eq!(
-            single.server.sim.player.look_dir(),
-            burst.server.sim.player.look_dir(),
+            single.server.sim.player(single.server.local).look_dir(),
+            burst.server.sim.player(burst.server.local).look_dir(),
             "the same single mouse-look delta must turn the player by the same \
              amount regardless of how many ticks ran in the same `advance` call"
         );
@@ -1486,7 +1572,10 @@ mod tests {
         }
 
         assert_eq!(steady.server.sim.tick, jittery.server.sim.tick);
-        assert_eq!(steady.server.sim.player, jittery.server.sim.player);
+        assert_eq!(
+            steady.server.sim.player(steady.server.local),
+            jittery.server.sim.player(jittery.server.local)
+        );
     }
 
     /// Put `block` directly in front of the player and aim at it, so a test can
@@ -1538,8 +1627,17 @@ mod tests {
             .id_of(item)
             .unwrap_or_else(|| panic!("no item {item}"));
         let stack = items.new_stack(id, 1).expect("a stack of one");
-        let slot = game.server.sim.player.inventory.selected_slot() as usize;
-        game.server.sim.player.inventory.set_slot(slot, Some(stack));
+        let slot = game
+            .server
+            .sim
+            .player_mut(game.server.local)
+            .inventory
+            .selected_slot() as usize;
+        game.server
+            .sim
+            .player_mut(game.server.local)
+            .inventory
+            .set_slot(slot, Some(stack));
     }
 
     fn count_of(game: &Game, item: &str) -> u8 {
@@ -1548,7 +1646,7 @@ mod tests {
             return 0;
         };
         (0..cubara_sim::SLOT_COUNT)
-            .filter_map(|i| game.server.sim.player.inventory.slot(i))
+            .filter_map(|i| game.server.sim.player(game.server.local).inventory.slot(i))
             .filter(|s| s.item() == id)
             .map(|s| s.count())
             .sum()
@@ -1631,7 +1729,7 @@ mod tests {
         let before = match game
             .server
             .sim
-            .player
+            .player_mut(game.server.local)
             .inventory
             .selected_stack()
             .unwrap()
@@ -1646,7 +1744,7 @@ mod tests {
         let after = match game
             .server
             .sim
-            .player
+            .player_mut(game.server.local)
             .inventory
             .selected_stack()
             .unwrap()
@@ -1667,7 +1765,7 @@ mod tests {
         let before = match game
             .server
             .sim
-            .player
+            .player_mut(game.server.local)
             .inventory
             .selected_stack()
             .unwrap()
@@ -1682,7 +1780,7 @@ mod tests {
         let after = match game
             .server
             .sim
-            .player
+            .player_mut(game.server.local)
             .inventory
             .selected_stack()
             .unwrap()
@@ -1706,10 +1804,15 @@ mod tests {
             items.max_stack(pick),
         )
         .expect("a worn pick");
-        let slot = game.server.sim.player.inventory.selected_slot() as usize;
+        let slot = game
+            .server
+            .sim
+            .player_mut(game.server.local)
+            .inventory
+            .selected_slot() as usize;
         game.server
             .sim
-            .player
+            .player_mut(game.server.local)
             .inventory
             .set_slot(slot, Some(nearly_dead));
         stand_over(&mut game, "cubara:stone");
@@ -1717,7 +1820,12 @@ mod tests {
         game.break_block().expect("a block was in reach");
 
         assert!(
-            game.server.sim.player.inventory.slot(slot).is_none(),
+            game.server
+                .sim
+                .player_mut(game.server.local)
+                .inventory
+                .slot(slot)
+                .is_none(),
             "the spent tool is gone"
         );
         assert_eq!(
@@ -1954,7 +2062,14 @@ mod tests {
         assert!(game.interact());
         assert!(game.inventory_open());
         assert!(game.open_furnace().is_none(), "a bench, not a furnace");
-        assert_eq!(game.server.sim.player.crafting.width(), 3);
+        assert_eq!(
+            game.server
+                .sim
+                .player_mut(game.server.local)
+                .crafting
+                .width(),
+            3
+        );
     }
 
     #[test]
@@ -2013,7 +2128,11 @@ mod tests {
             .unwrap()
             .new_stack(raw, 3)
             .unwrap();
-        game.server.sim.player.crafting.set_held(Some(stack));
+        game.server
+            .sim
+            .player_mut(game.server.local)
+            .crafting
+            .set_held(Some(stack));
 
         // Into the input slot.
         game.click_furnace(pos, PanelSlotKind::Grid, 0);
@@ -2023,7 +2142,12 @@ mod tests {
             "the held stack went in"
         );
         assert!(
-            game.server.sim.player.crafting.held().is_none(),
+            game.server
+                .sim
+                .player_mut(game.server.local)
+                .crafting
+                .held()
+                .is_none(),
             "hand is empty"
         );
 
@@ -2031,7 +2155,12 @@ mod tests {
         game.click_furnace(pos, PanelSlotKind::Grid, 0);
         assert_eq!(game.open_furnace().unwrap().input, None);
         assert_eq!(
-            game.server.sim.player.crafting.held().map(|s| s.count()),
+            game.server
+                .sim
+                .player_mut(game.server.local)
+                .crafting
+                .held()
+                .map(|s| s.count()),
             Some(3)
         );
     }
@@ -2050,13 +2179,22 @@ mod tests {
             .unwrap()
             .new_stack(raw, 1)
             .unwrap();
-        game.server.sim.player.crafting.set_held(Some(stack));
+        game.server
+            .sim
+            .player_mut(game.server.local)
+            .crafting
+            .set_held(Some(stack));
 
         game.click_furnace(pos, PanelSlotKind::Result, 0);
 
         assert_eq!(game.open_furnace().unwrap().output, None, "nothing went in");
         assert!(
-            game.server.sim.player.crafting.held().is_some(),
+            game.server
+                .sim
+                .player_mut(game.server.local)
+                .crafting
+                .held()
+                .is_some(),
             "still held"
         );
     }
@@ -2089,8 +2227,17 @@ mod tests {
         let items = game.server.items.as_ref().unwrap();
         let id = items.id_of("cubara:furnace").unwrap();
         let stack = items.new_stack(id, 1).unwrap();
-        let slot = game.server.sim.player.inventory.selected_slot() as usize;
-        game.server.sim.player.inventory.set_slot(slot, Some(stack));
+        let slot = game
+            .server
+            .sim
+            .player_mut(game.server.local)
+            .inventory
+            .selected_slot() as usize;
+        game.server
+            .sim
+            .player_mut(game.server.local)
+            .inventory
+            .set_slot(slot, Some(stack));
 
         let cc = game.place_block().expect("placed");
         let _ = (furnace, cc);
@@ -2136,7 +2283,11 @@ mod tests {
                 .unwrap()
                 .new_stack(raw, 64)
                 .unwrap();
-            game.server.sim.player.inventory.set_slot(i, Some(full));
+            game.server
+                .sim
+                .player_mut(game.server.local)
+                .inventory
+                .set_slot(i, Some(full));
         }
 
         game.break_at(b);
@@ -2184,7 +2335,7 @@ mod tests {
             items.new_stack(id, 7).unwrap()
         };
         // Right where the player is standing.
-        let at = game.server.sim.player.pos;
+        let at = game.server.sim.player_mut(game.server.local).pos;
         game.server
             .sim
             .entities
@@ -2222,14 +2373,15 @@ mod tests {
                 // Exactly `total` ticks here too, or the comparison is against
                 // a different amount of elapsed time rather than against
                 // dormancy: one nearby, the middle away, one back home.
-                let home = game.server.sim.player.pos;
+                let home = game.server.sim.player_mut(game.server.local).pos;
                 game.advance(TICK_DT);
-                game.server.sim.player.pos = home + FixedVec3::from_f32([4000.0, 0.0, 0.0]);
+                game.server.sim.player_mut(game.server.local).pos =
+                    home + FixedVec3::from_f32([4000.0, 0.0, 0.0]);
                 for _ in 0..total - 2 {
                     game.advance(TICK_DT);
                 }
                 // Come back: the chunk wakes and catches up.
-                game.server.sim.player.pos = home;
+                game.server.sim.player_mut(game.server.local).pos = home;
                 game.advance(TICK_DT);
                 game.world().furnace_at(pos).copied().expect("still there")
             };
@@ -2272,7 +2424,8 @@ mod tests {
             "active while the player is here"
         );
 
-        game.server.sim.player.pos += FixedVec3::from_f32([4000.0, 0.0, 0.0]);
+        game.server.sim.player_mut(game.server.local).pos +=
+            FixedVec3::from_f32([4000.0, 0.0, 0.0]);
         game.advance(TICK_DT);
 
         assert!(
@@ -2294,7 +2447,8 @@ mod tests {
         game.advance(TICK_DT);
         let after_one = game.world().furnace_at(pos).copied().unwrap();
 
-        game.server.sim.player.pos += FixedVec3::from_f32([4000.0, 0.0, 0.0]);
+        game.server.sim.player_mut(game.server.local).pos +=
+            FixedVec3::from_f32([4000.0, 0.0, 0.0]);
         for _ in 0..500 {
             game.advance(TICK_DT);
         }
@@ -2321,25 +2475,28 @@ mod tests {
         // it -- so a lethal fall reads as "no damage" here. That is what the
         // first version of this test measured, and it is why the lethal case
         // has its own test below, asserting the respawn instead.
-        game.server.sim.player = Player::new(
+        *game.server.sim.player_mut(game.server.local) = Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 11.0, 0.5]),
             Angle::ZERO,
             Angle::ZERO,
         );
-        let full = game.server.sim.player.health;
+        let full = game.server.sim.player_mut(game.server.local).health;
 
         for _ in 0..600 {
             game.advance(TICK_DT);
-            if game.server.sim.player.on_ground {
+            if game.server.sim.player_mut(game.server.local).on_ground {
                 break;
             }
         }
 
-        assert!(game.server.sim.player.on_ground, "it landed");
         assert!(
-            game.server.sim.player.health < full,
+            game.server.sim.player_mut(game.server.local).on_ground,
+            "it landed"
+        );
+        assert!(
+            game.server.sim.player_mut(game.server.local).health < full,
             "landing from ten blocks left {} of {full} health",
-            game.server.sim.player.health
+            game.server.sim.player_mut(game.server.local).health
         );
     }
 
@@ -2352,27 +2509,31 @@ mod tests {
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
         let spawn = cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 3.0, 0.5]);
-        game.server.sim.player = Player::new(spawn, Angle::ZERO, Angle::ZERO);
+        *game.server.sim.player_mut(game.server.local) =
+            Player::new(spawn, Angle::ZERO, Angle::ZERO);
         // Give them something to lose, then drop them from lethal height.
         hold(&mut game, "cubara:iron_pick");
-        let carried = game.server.sim.player.inventory;
-        game.server.sim.player.pos =
+        let carried = game.server.sim.player_mut(game.server.local).inventory;
+        game.server.sim.player_mut(game.server.local).pos =
             cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 60.0, 0.5]);
 
         for _ in 0..600 {
             game.advance(TICK_DT);
-            if game.server.sim.player.pos.y <= spawn.y && game.server.sim.player.on_ground {
+            if game.server.sim.player_mut(game.server.local).pos.y <= spawn.y
+                && game.server.sim.player_mut(game.server.local).on_ground
+            {
                 break;
             }
         }
 
         assert_eq!(
-            game.server.sim.player.health,
+            game.server.sim.player_mut(game.server.local).health,
             cubara_sim::MAX_HEALTH,
             "respawned at full health"
         );
         assert_eq!(
-            game.server.sim.player.inventory, carried,
+            game.server.sim.player_mut(game.server.local).inventory,
+            carried,
             "and kept the pick"
         );
         // **Position too.** Without this the test passed while respawn did not
@@ -2380,10 +2541,14 @@ mod tests {
         // local box *after* the damage was applied, silently undoing the
         // respawn. Health and inventory alone could not see that.
         assert!(
-            game.server.sim.player.pos.distance_squared(spawn)
+            game.server
+                .sim
+                .player_mut(game.server.local)
+                .pos
+                .distance_squared(spawn)
                 < (5 * cubara_voxel::fixed::ONE as i128 / 2).pow(2),
             "respawned at {:?} rather than near spawn {spawn:?}",
-            game.server.sim.player.pos
+            game.server.sim.player_mut(game.server.local).pos
         );
     }
 
@@ -2394,18 +2559,22 @@ mod tests {
             .world()
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
-        game.server.sim.player = Player::new(
+        *game.server.sim.player_mut(game.server.local) = Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 2.5, 0.5]),
             Angle::ZERO,
             Angle::ZERO,
         );
-        let full = game.server.sim.player.health;
+        let full = game.server.sim.player_mut(game.server.local).health;
 
         for _ in 0..300 {
             game.advance(TICK_DT);
         }
 
-        assert_eq!(game.server.sim.player.health, full, "a short drop is free");
+        assert_eq!(
+            game.server.sim.player_mut(game.server.local).health,
+            full,
+            "a short drop is free"
+        );
     }
 
     #[test]
@@ -2417,7 +2586,7 @@ mod tests {
             .world()
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
-        game.server.sim.player = Player::new(
+        *game.server.sim.player_mut(game.server.local) = Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 80.0, 0.5]),
             Angle::ZERO,
             Angle::from_radians(-1.5),
@@ -2428,7 +2597,7 @@ mod tests {
         for _ in 0..600 {
             game.advance(TICK_DT);
         }
-        let health_in_flight = game.server.sim.player.health;
+        let health_in_flight = game.server.sim.player_mut(game.server.local).health;
         assert_eq!(
             health_in_flight,
             cubara_sim::MAX_HEALTH,
@@ -2458,14 +2627,15 @@ mod tests {
         }
 
         assert!(
-            game.server.sim.player.on_ground,
+            game.server.sim.player_mut(game.server.local).on_ground,
             "the player never settled on the ground"
         );
+        let health = game.server.sim.player(game.server.local).health;
         assert_eq!(
-            game.server.sim.player.health,
+            health,
             cubara_sim::MAX_HEALTH,
             "starting the game cost {} health",
-            cubara_sim::MAX_HEALTH - game.server.sim.player.health
+            cubara_sim::MAX_HEALTH - health
         );
     }
 
@@ -2483,17 +2653,23 @@ mod tests {
         );
 
         // Kill them outright, then let the world run.
-        game.server.sim.player.take_damage(cubara_sim::MAX_HEALTH);
+        game.server
+            .sim
+            .player_mut(game.server.local)
+            .take_damage(cubara_sim::MAX_HEALTH);
         for _ in 0..600 {
             game.advance(TICK_DT);
         }
 
         assert_eq!(
-            game.server.sim.player.health,
+            game.server.sim.player_mut(game.server.local).health,
             cubara_sim::MAX_HEALTH,
             "respawning cost health, so death loops"
         );
-        assert!(game.server.sim.player.on_ground, "and it landed");
+        assert!(
+            game.server.sim.player_mut(game.server.local).on_ground,
+            "and it landed"
+        );
     }
 
     #[test]
@@ -2583,8 +2759,10 @@ mod tests {
             f.fuel = Some((log, 4));
         });
         // Stand next to it.
-        game.server.sim.player.pos = cubara_voxel::FixedVec3::from_f32([0.5, -1_000.0, 0.5]);
-        game.server.sim.player.spawn = game.server.sim.player.pos;
+        game.server.sim.player_mut(game.server.local).pos =
+            cubara_voxel::FixedVec3::from_f32([0.5, -1_000.0, 0.5]);
+        game.server.sim.player_mut(game.server.local).spawn =
+            game.server.sim.player_mut(game.server.local).pos;
 
         for _ in 0..250 {
             game.advance(TICK_DT);
@@ -2637,10 +2815,10 @@ mod tests {
                 .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
                 .expect("ground");
             mined = ground.block;
-            game.server.sim.player.pos =
+            game.server.sim.player_mut(game.server.local).pos =
                 cubara_voxel::FixedVec3::from_f32([0.5, mined[1] as f32 + 3.5, 0.5]);
             game.break_at(mined);
-            carried = game.server.sim.player.inventory;
+            carried = game.server.sim.player_mut(game.server.local).inventory;
 
             game.server.save_to(&dir);
         }
@@ -2655,7 +2833,8 @@ mod tests {
             "the mined block came back"
         );
         assert_eq!(
-            reopened.server.sim.player.inventory, carried,
+            reopened.server.sim.player(reopened.server.local).inventory,
+            carried,
             "the inventory did not survive"
         );
         let _ = std::fs::remove_dir_all(&dir);

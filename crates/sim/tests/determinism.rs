@@ -13,9 +13,12 @@
 //! round-trip (the next consumer of this same hash) than an inline test
 //! with access to crate internals would be.
 
-use cubara_sim::{hash_region, InputFrame, Player, Sim, WorldHash};
-use cubara_voxel::{Angle, BlockId, ChunkCoord};
+use cubara_sim::{hash_region, InputFrame, Player, PlayerId, PlayerInputs, Sim, WorldHash};
+use cubara_voxel::{Angle, BlockId, ChunkCoord, FixedVec3};
 use cubara_world::{TerrainBlocks, World};
+
+/// The single player these fixtures drive.
+const P: PlayerId = PlayerId::LOCAL;
 
 /// Arbitrary, fixed -- the only requirement is that it never changes once
 /// a hash below is pinned against it.
@@ -61,7 +64,7 @@ fn replay(seed: u64, script: &[InputFrame]) -> (Sim, World) {
         ),
     );
     for input in script {
-        sim.tick(&mut world, input, fixture_blocks());
+        sim.tick(&mut world, &PlayerInputs::one(P, *input), fixture_blocks());
     }
     (sim, world)
 }
@@ -85,7 +88,7 @@ fn replay_with_edits(
         ),
     );
     for (i, input) in script.iter().enumerate() {
-        sim.tick(&mut world, input, fixture_blocks());
+        sim.tick(&mut world, &PlayerInputs::one(P, *input), fixture_blocks());
         for &(tick, coord, block) in edits {
             if tick == i {
                 world.set_block(coord[0], coord[1], coord[2], block);
@@ -191,7 +194,15 @@ fn fixture_edits() -> Vec<(usize, [i32; 3], BlockId)> {
 /// makes the toolchain pin a lint convenience again rather than load-bearing
 /// for correctness: a hash built from integers cannot drift with a compiler
 /// version.
-const KNOWN_FIXTURE_HASH: u64 = 0x7616_a4bd_6251_ca49;
+///
+/// **Moved again in block 2.10** (`0x7616_a4bd_6251_ca49` before it), and this
+/// time not because a representation changed but because the *shape* did: the
+/// world holds many players, so the digest folds a player count, the id counter
+/// that hands out `PlayerId`s, and each player's id beside their state. The
+/// fixture still drives exactly one player through exactly the same script, and
+/// that player ends in exactly the same condition; what moved is the frame
+/// around them.
+const KNOWN_FIXTURE_HASH: u64 = 0x3935_6967_c3f3_6b29;
 
 #[test]
 fn replay_of_the_same_seed_and_script_is_deterministic() {
@@ -263,4 +274,128 @@ fn chunk_hash_alone_is_independent_of_worker_count_at_fixture_scale() {
 /// meant, rather than quietly turning 454 times as far.
 fn pixels(px: f32) -> Angle {
     Angle::from_raw((px * cubara_sim::SENSITIVITY_PER_PIXEL as f32) as i32)
+}
+
+// ---------------------------------------------------------------------------
+// Block 2.10: the world holds many players.
+// ---------------------------------------------------------------------------
+
+/// **Who holds which id is part of the world**, so swapping two players between
+/// ids is a different world and the hash says so.
+///
+/// Stated as a test because the opposite is a tempting simplification: it would
+/// be easy to fold players' state without their ids and call the result
+/// order-independent. It would also be wrong -- two people who swapped bodies
+/// are not the same world, and a server reconciling against that hash would
+/// never notice they had.
+///
+/// The companion property -- that the *order the map was filled in* does not
+/// matter -- is `crates/sim/tests/save_load.rs`'s
+/// `a_saved_player_lists_order_does_not_change_the_world`, because loading is
+/// the only path that can present ids out of order.
+#[test]
+fn who_holds_which_id_is_part_of_the_world() {
+    let blocks = fixture_blocks();
+    let region = fixture_region();
+
+    let alice = || {
+        Player::new(
+            FixedVec3::from_f32([0.5, 40.0, 0.5]),
+            Angle::ZERO,
+            Angle::ZERO,
+        )
+    };
+    let bob = || {
+        Player::new(
+            FixedVec3::from_f32([4.5, 42.0, -2.5]),
+            Angle::from_radians(1.0),
+            Angle::ZERO,
+        )
+    };
+
+    // `Sim::new` seats its argument as PlayerId::LOCAL, so the two runs differ
+    // in which of the two that is -- which is what "join order" means here.
+    let run = |first: Player, second: Player| {
+        let mut world = World::with_seed(FIXTURE_SEED);
+        let mut sim = Sim::new(FIXTURE_SEED, first);
+        sim.join(second);
+        for _ in 0..30 {
+            sim.tick(&mut world, &PlayerInputs::default(), fixture_blocks());
+        }
+        sim
+    };
+
+    let a = run(alice(), bob());
+    let b = run(bob(), alice());
+
+    assert_eq!(a.player_count(), 2, "both players are in the world");
+    // Not equal, and that is the point: ids are positional on join, so the two
+    // runs really did seat different people at PlayerId(0). The *hash* below is
+    // what must not care about anything except who holds which id.
+    assert_ne!(
+        a.player(PlayerId::LOCAL).pos,
+        b.player(PlayerId::LOCAL).pos,
+        "the two runs seated the same player first, so this proves nothing"
+    );
+
+    // Same world, described from either end: fold each run's players by id and
+    // the digests agree, because the map is ordered rather than insertion-kept.
+    let world_a = World::with_seed(FIXTURE_SEED);
+    let world_b = World::with_seed(FIXTURE_SEED);
+    let ha = WorldHash::compute(&a, &world_a, &region, blocks, 1);
+    let hb = WorldHash::compute(&b, &world_b, &region, blocks, 1);
+    assert_ne!(
+        ha, hb,
+        "swapping who is player 0 is a different world, and the hash should say so"
+    );
+}
+
+/// Ids are never reused. A player who leaves does not free their id for the
+/// next joiner -- the same promise `EntityKey` makes, and for the same reason.
+#[test]
+fn a_left_players_id_never_comes_back() {
+    let p = || {
+        Player::new(
+            FixedVec3::from_f32([0.5, 40.0, 0.5]),
+            Angle::ZERO,
+            Angle::ZERO,
+        )
+    };
+    let mut sim = Sim::new(FIXTURE_SEED, p());
+
+    let second = sim.join(p());
+    assert_eq!(second, PlayerId(1));
+    sim.leave(second).expect("they were here");
+    assert_eq!(sim.player_count(), 1);
+
+    let third = sim.join(p());
+    assert_eq!(third, PlayerId(2), "an id was reused after a player left");
+    assert!(sim.get(second).is_none(), "the departed player came back");
+}
+
+/// Every player steps on the same tick, not just the one an input names.
+#[test]
+fn a_player_who_sent_no_input_is_still_simulated() {
+    let mut world = World::with_seed(FIXTURE_SEED);
+    let high = FixedVec3::from_f32([0.5, 60.0, 0.5]);
+    let mut sim = Sim::new(FIXTURE_SEED, Player::new(high, Angle::ZERO, Angle::ZERO));
+    let quiet = sim.join(Player::new(
+        FixedVec3::from_f32([2.5, 60.0, 2.5]),
+        Angle::ZERO,
+        Angle::ZERO,
+    ));
+
+    let before = sim.player(quiet).pos.y;
+    for _ in 0..20 {
+        // An input for the local player only. The other sent nothing.
+        sim.tick(
+            &mut world,
+            &PlayerInputs::one(PlayerId::LOCAL, InputFrame::default()),
+            fixture_blocks(),
+        );
+    }
+    assert!(
+        sim.player(quiet).pos.y < before,
+        "gravity skipped the player who sent no input this tick"
+    );
 }

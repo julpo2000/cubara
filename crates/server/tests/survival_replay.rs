@@ -92,7 +92,15 @@ const STANCES: [(i32, i32, [i32; 3]); 8] = [
 ///
 /// If this value moves, something about the simulation moved. Update it only
 /// together with a sentence saying what moved and why that is correct.
-const KNOWN_SURVIVAL_HASH: u64 = 0x6B0A_E217_5FC1_296D;
+///
+/// **Moved once, in block 2.10** (`0x6B0A_E217_5FC1_296D` before it). The world
+/// holds many players now, so the hash folds a player *count*, the id counter,
+/// and each player's id alongside their state — where it used to fold one
+/// player's fields bare. The run this test drives is unchanged and its single
+/// player ends in exactly the same condition; what changed is the encoding
+/// around them, which is the whole point of a version-style bump being visible
+/// here.
+const KNOWN_SURVIVAL_HASH: u64 = 0x7E1A_65EB_A55A_BB2D;
 
 /// How many logs the script fells: three become planks, three become furnace
 /// fuel. Oak burns 80 ticks and an ingot takes 200, so three is the smallest
@@ -156,8 +164,8 @@ impl Fixture {
         server.open(std::path::Path::new("cubara-nonexistent-survival-fixture"));
         // Known angles to count deltas from. `Server::new`'s default look is a
         // presentation choice; this test needs an arithmetic one.
-        let pos = server.sim.player.pos;
-        server.sim.player = Player::new(pos, Angle::ZERO, Angle::ZERO);
+        let pos = server.sim.player(server.local).pos;
+        *server.sim.player_mut(server.local) = Player::new(pos, Angle::ZERO, Angle::ZERO);
         server.place_player_on_ground();
         Self {
             server,
@@ -187,7 +195,7 @@ impl Fixture {
         };
         self.server
             .sim
-            .player
+            .player(self.server.local)
             .inventory
             .slots()
             .flatten()
@@ -224,7 +232,7 @@ impl Fixture {
     /// made, and the damage station is supposed to earn its damage.
     fn stand_at(&mut self, b: [i32; 3]) {
         let half = Fixed::from_raw(cubara_voxel::fixed::ONE / 2);
-        let p = &mut self.server.sim.player;
+        let p = self.server.sim.player_mut(self.server.local);
         p.pos = FixedVec3::from_blocks(b[0], b[1], b[2]) + FixedVec3::new(half, half, half);
         p.velocity = FixedVec3::ZERO;
         p.fall_distance = Fixed::ZERO;
@@ -248,8 +256,13 @@ impl Fixture {
     /// the block and the face, exactly as `Action::Break` and `Action::Place`
     /// will read them a moment later.
     fn looking_at(&self) -> Option<([i32; 3], [i32; 3])> {
-        let origin = self.server.sim.player.pos.to_f32();
-        let dir = self.server.sim.player.look_dir_f32().to_array();
+        let origin = self.server.sim.player(self.server.local).pos.to_f32();
+        let dir = self
+            .server
+            .sim
+            .player(self.server.local)
+            .look_dir_f32()
+            .to_array();
         self.server
             .world
             .raycast(origin, dir, cubara_sim::REACH, self.server.terrain())
@@ -312,7 +325,7 @@ impl Fixture {
     /// Sorted by `(distance, x, y, z)` — a total order, so *which* log the
     /// script fells is fixed rather than whatever the scan reached first.
     fn find(&self, name: &str, radius: i32) -> Vec<[i32; 3]> {
-        let p = self.server.sim.player.pos.to_f32();
+        let p = self.server.sim.player(self.server.local).pos.to_f32();
         let (cx, cy, cz) = (p[0] as i32, p[1] as i32, p[2] as i32);
         let mut found = Vec::new();
         for dx in -radius..=radius {
@@ -338,7 +351,7 @@ impl Fixture {
             if self
                 .server
                 .sim
-                .player
+                .player_mut(self.server.local)
                 .inventory
                 .slot(slot)
                 .map(|s| s.item())
@@ -349,7 +362,7 @@ impl Fixture {
             if self
                 .server
                 .sim
-                .player
+                .player_mut(self.server.local)
                 .inventory
                 .take_one(slot, items)
                 .is_some()
@@ -375,14 +388,32 @@ impl Fixture {
         // displaced stack straight back into the slot it just left — `add`
         // fills the first free slot, and that is the one — where `set_slot`
         // then destroys it. Seat the tool first, and the stow lands elsewhere.
-        let displaced = self.server.sim.player.inventory.take(0);
+        let displaced = self
+            .server
+            .sim
+            .player_mut(self.server.local)
+            .inventory
+            .take(0);
         let items = self.server.items.as_ref().expect("assets loaded");
         let stack = items.new_stack(id, 1).expect("one of anything is a stack");
-        self.server.sim.player.inventory.set_slot(0, Some(stack));
-        self.server.sim.player.inventory.select(0);
+        self.server
+            .sim
+            .player_mut(self.server.local)
+            .inventory
+            .set_slot(0, Some(stack));
+        self.server
+            .sim
+            .player_mut(self.server.local)
+            .inventory
+            .select(0);
         if let Some(displaced) = displaced {
             let items = self.server.items.as_ref().expect("assets loaded");
-            let rest = self.server.sim.player.inventory.add(displaced, items);
+            let rest = self
+                .server
+                .sim
+                .player_mut(self.server.local)
+                .inventory
+                .add(displaced, items);
             assert!(
                 rest.is_none(),
                 "no room to stow what the hotbar was holding"
@@ -402,19 +433,43 @@ impl Fixture {
                 assert!(self.take_one(id), "ran out of {name} while crafting {what}");
                 let items = self.server.items.as_ref().expect("assets loaded");
                 let stack = items.new_stack(id, 1).expect("one is a stack");
-                self.server.sim.player.crafting.set_cell(index, Some(stack));
+                self.server
+                    .sim
+                    .player_mut(self.server.local)
+                    .crafting
+                    .set_cell(index, Some(stack));
             }
             // Disjoint field borrows: the registries hang off `server.items` and
             // `server.recipes`, the grid off `server.sim`.
             let items = self.server.items.as_ref().expect("assets loaded");
             let book = self.server.recipes.as_ref().expect("recipes loaded");
-            let made = self.server.sim.player.crafting.take_result(book, items);
+            let made = self
+                .server
+                .sim
+                .player_mut(self.server.local)
+                .crafting
+                .take_result(book, items);
             assert!(made, "the grid did not match a recipe for {what}");
 
-            let held = self.server.sim.player.crafting.held().expect("a result");
-            self.server.sim.player.crafting.set_held(None);
+            let held = self
+                .server
+                .sim
+                .player_mut(self.server.local)
+                .crafting
+                .held()
+                .expect("a result");
+            self.server
+                .sim
+                .player_mut(self.server.local)
+                .crafting
+                .set_held(None);
             let items = self.server.items.as_ref().expect("assets loaded");
-            let rest = self.server.sim.player.inventory.add(held, items);
+            let rest = self
+                .server
+                .sim
+                .player_mut(self.server.local)
+                .inventory
+                .add(held, items);
             assert!(rest.is_none(), "no room in the inventory to bank {what}");
         }
         self.log.push(what);
@@ -527,7 +582,7 @@ fn run_survival_script() -> Fixture {
         "interacting with the bench did not open it: {opened:?}"
     );
     assert_eq!(
-        f.server.sim.player.crafting.width(),
+        f.server.sim.player_mut(f.server.local).crafting.width(),
         3,
         "the bench opened but the grid is still 2x2"
     );
@@ -618,7 +673,11 @@ fn run_survival_script() -> Fixture {
     assert!(f.take_one(raw), "the raw iron went missing before smelting");
     let items = f.server.items.as_ref().expect("assets loaded");
     let ore_stack = items.new_stack(raw, 1).expect("one is a stack");
-    f.server.sim.player.crafting.set_held(Some(ore_stack));
+    f.server
+        .sim
+        .player_mut(f.server.local)
+        .crafting
+        .set_held(Some(ore_stack));
     f.server.apply(Action::ClickFurnace {
         pos: furnace_at,
         slot: FurnaceSlot::Input,
@@ -632,13 +691,22 @@ fn run_survival_script() -> Fixture {
     }
     let items = f.server.items.as_ref().expect("assets loaded");
     let fuel_stack = items.new_stack(log_id, fuel).expect("a stack of logs");
-    f.server.sim.player.crafting.set_held(Some(fuel_stack));
+    f.server
+        .sim
+        .player_mut(f.server.local)
+        .crafting
+        .set_held(Some(fuel_stack));
     f.server.apply(Action::ClickFurnace {
         pos: furnace_at,
         slot: FurnaceSlot::Fuel,
     });
     assert!(
-        f.server.sim.player.crafting.held().is_none(),
+        f.server
+            .sim
+            .player_mut(f.server.local)
+            .crafting
+            .held()
+            .is_none(),
         "the furnace did not take the fuel"
     );
 
@@ -662,7 +730,11 @@ fn run_survival_script() -> Fixture {
     assert!(smelted, "400 ticks and the furnace produced no iron ingot");
 
     // Take it out, and bank it.
-    f.server.sim.player.crafting.set_held(None);
+    f.server
+        .sim
+        .player_mut(f.server.local)
+        .crafting
+        .set_held(None);
     f.server.apply(Action::ClickFurnace {
         pos: furnace_at,
         slot: FurnaceSlot::Output,
@@ -670,13 +742,22 @@ fn run_survival_script() -> Fixture {
     let held = f
         .server
         .sim
-        .player
+        .player_mut(f.server.local)
         .crafting
         .held()
         .expect("the output slot handed the ingot over");
-    f.server.sim.player.crafting.set_held(None);
+    f.server
+        .sim
+        .player_mut(f.server.local)
+        .crafting
+        .set_held(None);
     let items = f.server.items.as_ref().expect("assets loaded");
-    let rest = f.server.sim.player.inventory.add(held, items);
+    let rest = f
+        .server
+        .sim
+        .player_mut(f.server.local)
+        .inventory
+        .add(held, items);
     assert!(rest.is_none(), "no room to bank the ingot");
     assert_eq!(
         f.carrying("cubara:iron_ingot"),
@@ -688,7 +769,8 @@ fn run_survival_script() -> Fixture {
     // --- Take damage ------------------------------------------------------
     // A fall, which since block 2.9a is the one thing in this world that hurts.
     assert_eq!(
-        f.server.sim.player.health, MAX_HEALTH,
+        f.server.sim.player_mut(f.server.local).health,
+        MAX_HEALTH,
         "the script hurt the player before the station that is supposed to"
     );
     let drop_from = [on_top[0], on_top[1] + FALL_BLOCKS, on_top[2]];
@@ -696,18 +778,18 @@ fn run_survival_script() -> Fixture {
     let mut landed = false;
     for _ in 0..200 {
         f.tick(&InputFrame::default());
-        if f.server.sim.player.on_ground {
+        if f.server.sim.player_mut(f.server.local).on_ground {
             landed = true;
             break;
         }
     }
     assert!(landed, "the player never landed");
     assert!(
-        f.server.sim.player.health < MAX_HEALTH,
+        f.server.sim.player_mut(f.server.local).health < MAX_HEALTH,
         "a {FALL_BLOCKS}-block fall cost nothing; SAFE_FALL is 3"
     );
     assert!(
-        f.server.sim.player.health > 0,
+        f.server.sim.player_mut(f.server.local).health > 0,
         "the fall was meant to hurt, not to kill"
     );
     f.log.push("took damage");
@@ -787,5 +869,8 @@ fn every_station_of_the_loop_actually_ran() {
         f.raycast_breaks
     );
     assert_eq!(f.carrying("cubara:iron_ingot"), 1, "no ingot at the end");
-    assert!(f.server.sim.player.health < MAX_HEALTH, "nothing hurt");
+    assert!(
+        f.server.sim.player(f.server.local).health < MAX_HEALTH,
+        "nothing hurt"
+    );
 }

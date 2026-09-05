@@ -309,7 +309,7 @@ mod tests {
         let plank = items.id_of("cubara:plank").expect("plank exists");
 
         // Right next to the player, so it is inside the simulation radius.
-        let p = s.server.sim.player.pos.to_f32();
+        let p = s.server.sim.player(s.server.local).pos.to_f32();
         let pos = [p[0] as i32 + 1, p[1] as i32, p[2] as i32];
         {
             let world = Arc::make_mut(&mut s.server.world);
@@ -371,7 +371,7 @@ mod tests {
         let mut first = Session::open(&cfg);
         first.advance(120, &cfg);
         // An edit only a save can carry: dig out the block under the player.
-        let p = first.server.sim.player.pos.to_f32();
+        let p = first.server.sim.player(first.server.local).pos.to_f32();
         let block = [p[0] as i32, p[1] as i32 - 2, p[2] as i32];
         first.server.break_at(block);
         let hash = first.server.hash();

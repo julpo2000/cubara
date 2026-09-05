@@ -29,6 +29,27 @@ const SPEED: f32 = 24.0;
 /// ~88°, as a binary angle.
 const PITCH_LIMIT: Angle = Angle::from_raw(1_052_690_524);
 
+/// A stable, never-reused player identifier (block 2.10).
+///
+/// A counter in world state, assigned on join. **Never reused**, and never
+/// derived from a position in a list — the same decision [`crate::EntityKey`]
+/// already makes, for the same reason: anything depending on allocation history
+/// makes two worlds that ran the same events disagree, and Rule 1 is the
+/// keystone.
+///
+/// It is also the iteration order everything else leans on. `Sim` keeps players
+/// in a `BTreeMap` keyed by this, so "which player ticked first" is a property
+/// of the id rather than of a hash seed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PlayerId(pub u64);
+
+impl PlayerId {
+    /// The player a single-player world has, and the one a save written before
+    /// block 2.10 migrates into. Named rather than assumed: code meaning "the
+    /// player this client drives" should say so instead of writing `0`.
+    pub const LOCAL: PlayerId = PlayerId(0);
+}
+
 /// Where the player is, which way they're looking, and (block 1.7a) their
 /// walking-physics state. Free-fly and walking are two *modes* of this one
 /// type, not two competing implementations (Rule 5) -- [`Self::free_fly`]
@@ -97,6 +118,14 @@ pub struct Player {
     /// Where death returns the player to (§13.4). Set when the player is
     /// created, at the position they start from.
     pub spawn: FixedVec3,
+    /// The block this player is looking at, within [`crate::REACH`] --
+    /// recomputed every tick from their own raycast. `None` when nothing solid
+    /// is in reach.
+    ///
+    /// Moved here from `Sim` in block 2.10. It was never world-level state: it
+    /// is derived per player from where *that* player is looking, and a world
+    /// with several players has several answers to it.
+    pub target: Option<[i32; 3]>,
 }
 
 /// Full health, in points. Ten hearts of two points each (§13.1).
@@ -132,6 +161,7 @@ impl Player {
             ticks_since_damage: 0,
             fall_distance: Fixed::ZERO,
             spawn: pos,
+            target: None,
         }
     }
 
@@ -310,6 +340,10 @@ impl Player {
             fall_distance: other.fall_distance,
             spawn: other.spawn,
             crafting: other.crafting,
+            // Discrete, like health: a block is selected or it is not, and
+            // interpolating toward a different one would highlight a block the
+            // simulation never targeted.
+            target: other.target,
         }
     }
 }

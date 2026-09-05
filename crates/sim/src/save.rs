@@ -25,9 +25,10 @@ use cubara_voxel::{
 use cubara_world::{region, TerrainBlocks, World, WORLDGEN_VERSION};
 use serde::{Deserialize, Serialize};
 
-use crate::player::Player;
+use crate::player::{Player, PlayerId};
 use crate::rng::WorldRng;
 use crate::Sim;
+use std::collections::BTreeMap;
 
 /// `level.ron`'s own schema version -- independent of
 /// [`cubara_world::region::REGION_FORMAT_VERSION`] and of
@@ -39,7 +40,15 @@ use crate::Sim;
 /// (`docs/RESEARCH_MULTIPLAYER.md` §3.5). A version-3 save cannot be read as a
 /// version-4 one -- the fields have the same names and different meanings,
 /// which is exactly the case a version number exists for.
-pub const FORMAT_VERSION: u16 = 4;
+///
+/// **5:** the world holds many players (block 2.10). `player` becomes
+/// `players`, a list keyed by `PlayerId`, alongside the counter that hands ids
+/// out. Unlike 3 → 4 this one *is* readable backwards: a version-4 save still
+/// has its single `player`, and `load_world` restores it as
+/// `PlayerId::LOCAL`. Loading a version-4 world is a migration, not an error,
+/// because worlds exist on disk and losing one to a format bump is not an
+/// acceptable cost of adding multiplayer.
+pub const FORMAT_VERSION: u16 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SavedRng {
@@ -125,6 +134,22 @@ fn default_grid_width() -> usize {
     2
 }
 
+/// Read the pre-2.10 `player` field, which is a bare struct rather than
+/// `Some(..)`.
+///
+/// RON writes an `Option` as `Some(..)`/`None`, so a version-4 save -- whose
+/// field predates the `Option` -- will not deserialize into one without this.
+/// The alternative was to regenerate the committed fixture world as version 5,
+/// which would have quietly deleted the only test that proves the migration
+/// works. A committed fixture is a golden; it does not get regenerated to make
+/// a test pass.
+fn de_legacy_player<'de, D>(d: D) -> Result<Option<SavedPlayer>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    SavedPlayer::deserialize(d).map(Some)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SavedHeader {
     format_version: u16,
@@ -132,7 +157,29 @@ struct SavedHeader {
     seed: u64,
     tick: u64,
     rng: SavedRng,
-    player: SavedPlayer,
+    /// The single player, as written by format versions before block 2.10.
+    ///
+    /// Kept, and kept optional, purely so worlds already on disk load. A save
+    /// this version writes leaves it `None` and fills `players` instead; a save
+    /// from before it has it and an empty `players`, which `load_world` turns
+    /// into one player at `PlayerId::LOCAL`. A migration, not a rejection --
+    /// the owner has worlds on disk.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_legacy_player"
+    )]
+    player: Option<SavedPlayer>,
+    /// Everyone in the world, by id (block 2.10). In id order, because that is
+    /// the order everything else uses and a save that came back in a different
+    /// one would hash differently for no reason.
+    #[serde(default)]
+    players: Vec<(u64, SavedPlayer)>,
+    /// The next id [`Sim::join`] will hand out. Saved so a restart cannot
+    /// re-issue an id this world has already used -- the same reason
+    /// `EntityKey`s are restored rather than reassigned.
+    #[serde(default)]
+    next_player: u64,
     /// The id → name table in force when this world was saved (§3.4, §7.2).
     /// Loading resolves each name against the *current* registry, so ids
     /// may be reassigned freely between runs.
@@ -322,26 +369,38 @@ pub fn save_world(
             state: sim.rng.state,
             inc: sim.rng.inc,
         },
-        player: SavedPlayer {
-            pos: to_xyz(sim.player.pos),
-            vel: to_xyz(sim.player.velocity),
-            yaw: sim.player.yaw.raw(),
-            pitch: sim.player.pitch.raw(),
-            on_ground: sim.player.on_ground,
-            free_fly: sim.player.free_fly,
-            inventory: (0..crate::inventory::SLOT_COUNT)
-                .map(|i| to_saved(sim.player.inventory.slot(i), items))
-                .collect(),
-            selected_slot: sim.player.inventory.selected_slot(),
-            grid: (0..cubara_voxel::MAX_GRID * cubara_voxel::MAX_GRID)
-                .map(|i| to_saved(sim.player.crafting.cell(i), items))
-                .collect(),
-            grid_width: sim.player.crafting.width(),
-            held: to_saved(sim.player.crafting.held(), items),
-            health: sim.player.health,
-            ticks_since_damage: sim.player.ticks_since_damage,
-            spawn: to_xyz(sim.player.spawn),
-        },
+        // Nothing writes the pre-2.10 single-player field any more; it exists
+        // only so an older save still parses.
+        player: None,
+        players: sim
+            .players()
+            .map(|(id, p)| {
+                (
+                    id.0,
+                    SavedPlayer {
+                        pos: to_xyz(p.pos),
+                        vel: to_xyz(p.velocity),
+                        yaw: p.yaw.raw(),
+                        pitch: p.pitch.raw(),
+                        on_ground: p.on_ground,
+                        free_fly: p.free_fly,
+                        inventory: (0..crate::inventory::SLOT_COUNT)
+                            .map(|i| to_saved(p.inventory.slot(i), items))
+                            .collect(),
+                        selected_slot: p.inventory.selected_slot(),
+                        grid: (0..cubara_voxel::MAX_GRID * cubara_voxel::MAX_GRID)
+                            .map(|i| to_saved(p.crafting.cell(i), items))
+                            .collect(),
+                        grid_width: p.crafting.width(),
+                        held: to_saved(p.crafting.held(), items),
+                        health: p.health,
+                        ticks_since_damage: p.ticks_since_damage,
+                        spawn: to_xyz(p.spawn),
+                    },
+                )
+            })
+            .collect(),
+        next_player: sim.next_player_id(),
         blocks: blocks_table,
         items: items
             .ids()
@@ -389,6 +448,49 @@ pub fn save_world(
 /// against *this* run's registry, which need not assign the same ids the
 /// save was made with -- that's exactly what the header's id table exists
 /// to bridge (§7.2).
+/// One saved player, back into a live one.
+///
+/// Split out of `load_world` in block 2.10: it now runs once per player rather
+/// than once per world, and a loop body that long inside an already long
+/// function is how the two drift apart.
+fn restore_player(s: &SavedPlayer, items: &ItemRegistry) -> Player {
+    Player {
+        pos: from_xyz(s.pos),
+        velocity: from_xyz(s.vel),
+        on_ground: s.on_ground,
+        free_fly: s.free_fly,
+        yaw: Angle::from_raw(s.yaw),
+        pitch: Angle::from_raw(s.pitch),
+        // Block 2.8: restored by name, so a registry that assigns different ids
+        // this run still lands the right items in the right slots (§8.1).
+        inventory: {
+            let mut inv = Inventory::new();
+            for (i, saved) in s.inventory.iter().enumerate() {
+                inv.set_slot(i, from_saved(saved, items));
+            }
+            inv.select(s.selected_slot);
+            inv
+        },
+        health: s.health,
+        ticks_since_damage: s.ticks_since_damage,
+        // Transient and derived (§13.3): a loaded world starts the player on
+        // the ground, and carrying a half-completed fall across a reload would
+        // be a fall the player never made.
+        fall_distance: cubara_voxel::Fixed::ZERO,
+        spawn: from_xyz(s.spawn),
+        crafting: {
+            let mut c = Crafting::new(s.grid_width);
+            for (i, saved) in s.grid.iter().enumerate() {
+                c.set_cell(i, from_saved(saved, items));
+            }
+            c.set_held(from_saved(&s.held, items));
+            c
+        },
+        // Recomputed by the first tick; not part of saved state.
+        target: None,
+    }
+}
+
 pub fn load_world(
     dir: &Path,
     registry: &BlockRegistry,
@@ -398,7 +500,12 @@ pub fn load_world(
     let text = std::fs::read_to_string(dir.join("level.ron")).map_err(LoadError::Io)?;
     let header: SavedHeader = ron::from_str(&text).map_err(LoadError::Ron)?;
 
-    if header.format_version != FORMAT_VERSION {
+    // Version 4 is readable: it is this format with one player instead of a
+    // list, and the only difference is where that player is found. Anything
+    // older is not -- 3 -> 4 changed what `yaw` *means*, which no amount of
+    // defaulting can repair.
+    const OLDEST_READABLE: u16 = 4;
+    if header.format_version > FORMAT_VERSION || header.format_version < OLDEST_READABLE {
         return Err(LoadError::UnsupportedFormatVersion(header.format_version));
     }
     if header.worldgen_version != WORLDGEN_VERSION {
@@ -439,39 +546,28 @@ pub fn load_world(
         }
     }
 
-    let player = Player {
-        pos: from_xyz(header.player.pos),
-        velocity: from_xyz(header.player.vel),
-        on_ground: header.player.on_ground,
-        free_fly: header.player.free_fly,
-        yaw: Angle::from_raw(header.player.yaw),
-        pitch: Angle::from_raw(header.player.pitch),
-        // Block 2.8: restored by name, so a registry that assigns different ids
-        // this run still lands the right items in the right slots (§8.1).
-        inventory: {
-            let mut inv = Inventory::new();
-            for (i, saved) in header.player.inventory.iter().enumerate() {
-                inv.set_slot(i, from_saved(saved, items));
-            }
-            inv.select(header.player.selected_slot);
-            inv
-        },
-        health: header.player.health,
-        ticks_since_damage: header.player.ticks_since_damage,
-        // Transient and derived (§13.3): a loaded world starts the player on
-        // the ground, and carrying a half-completed fall across a reload would
-        // be a fall the player never made.
-        fall_distance: cubara_voxel::Fixed::ZERO,
-        spawn: from_xyz(header.player.spawn),
-        crafting: {
-            let mut c = Crafting::new(header.player.grid_width);
-            for (i, saved) in header.player.grid.iter().enumerate() {
-                c.set_cell(i, from_saved(saved, items));
-            }
-            c.set_held(from_saved(&header.player.held, items));
-            c
-        },
+    // Version 4 wrote one player and no list; version 5 writes the list. Read
+    // whichever is there, and land both on the same shape.
+    let saved_players: Vec<(u64, &SavedPlayer)> = if !header.players.is_empty() {
+        header.players.iter().map(|(id, p)| (*id, p)).collect()
+    } else if let Some(p) = header.player.as_ref() {
+        vec![(PlayerId::LOCAL.0, p)]
+    } else {
+        // A version-5 save with nobody in it. Legitimate -- a dedicated server
+        // whose last player left -- and not an error.
+        Vec::new()
     };
+
+    let players: BTreeMap<PlayerId, Player> = saved_players
+        .iter()
+        .map(|(id, s)| (PlayerId(*id), restore_player(s, items)))
+        .collect();
+
+    // Never below what the ids already in use demand: a counter that came back
+    // low would re-issue a live id, and `PlayerId` promises it never does.
+    let next_player = header
+        .next_player
+        .max(players.keys().map(|id| id.0 + 1).max().unwrap_or(0));
 
     let sim = Sim {
         tick: header.tick,
@@ -479,8 +575,8 @@ pub fn load_world(
             state: header.rng.state,
             inc: header.rng.inc,
         },
-        player,
-        target: None, // recomputed by the first tick; not part of saved state
+        players,
+        next_player,
         entities: {
             // Block 2.8. Keys are restored as saved, not reassigned: an
             // `EntityKey` that came back would let two different histories hash

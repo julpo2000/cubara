@@ -5,12 +5,16 @@
 use std::path::PathBuf;
 
 use cubara_sim::{
-    load_world, save_world, InputFrame, LoadError, Player, Sim, WorldHash, FORMAT_VERSION,
+    load_world, save_world, InputFrame, LoadError, Player, PlayerId, PlayerInputs, Sim, WorldHash,
+    FORMAT_VERSION,
 };
 use cubara_voxel::{
     Angle, BlockId, BlockRegistry, ChunkCoord, DropRule, Faces, Interact, Material, Shape,
 };
 use cubara_world::{TerrainBlocks, World, WORLDGEN_VERSION};
+
+/// The single player these fixtures drive.
+const P: PlayerId = PlayerId::LOCAL;
 
 /// No real registry loaded from disk here (that's `cubara-render`'s job) --
 /// three synthetic materials, same pattern `cubara_world`'s own tests use,
@@ -138,7 +142,7 @@ fn round_trip_edit_hash_save_load_hash_is_equal() {
         ..InputFrame::default()
     };
     for _ in 0..30 {
-        sim.tick(&mut world, &walking, blocks);
+        sim.tick(&mut world, &PlayerInputs::one(P, walking), blocks);
     }
     let _ = sim.roll(); // advance the RNG stream too, so it's not still at its seeded start
 
@@ -361,7 +365,19 @@ fn saving_the_same_world_twice_produces_byte_identical_files() {
 /// worth paying while the alternative -- pinning per subsystem -- would let a
 /// real divergence hide in a subsystem nobody re-pinned. Revisit if the two
 /// values ever move *apart*.
-const FIXTURE_HASH: u64 = 0x29f8_32dd_1c6a_97cb;
+///
+/// **Moved in block 2.10** (`0x29f8_32dd_1c6a_97cb` before it), and the sentence
+/// above turned out to be right sooner than expected: the world holds many
+/// players, so the digest folds a player count, the id counter, and each
+/// player's id. The fixture on disk is untouched.
+///
+/// **The fixture is deliberately still `format_version: 4`, and must stay so.**
+/// `CUBARA_BLESS=1` would rewrite it as a version-5 save, and that would delete
+/// the only coverage there is of the version-4 migration path -- the case that
+/// matters most, because it is the one the owner's existing worlds on disk take.
+/// This constant was updated by hand for that reason. A committed fixture is a
+/// golden; it does not get regenerated to make a test pass.
+const FIXTURE_HASH: u64 = 0xa36d_1558_a037_9fcb;
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/save_fixture")
@@ -397,7 +413,7 @@ fn fixture_state() -> (Sim, World) {
         ..InputFrame::default()
     };
     for _ in 0..120 {
-        sim.tick(&mut world, &walking, blocks);
+        sim.tick(&mut world, &PlayerInputs::one(P, walking), blocks);
     }
     (sim, world)
 }
@@ -588,18 +604,18 @@ fn a_world_saved_mid_script_finishes_where_an_uninterrupted_one_does() {
         let log = items.id_of("cubara:oak_log").unwrap();
         let pick = items.id_of("cubara:stone_pick").unwrap();
 
-        sim.player
+        sim.player_mut(P)
             .inventory
             .set_slot(0, Some(items.new_stack(stone, 41).unwrap()));
-        sim.player
+        sim.player_mut(P)
             .inventory
             .set_slot(7, Some(items.new_stack(pick, 1).unwrap()));
-        sim.player.inventory.select(3);
-        sim.player.crafting.set_width(3);
-        sim.player
+        sim.player_mut(P).inventory.select(3);
+        sim.player_mut(P).crafting.set_width(3);
+        sim.player_mut(P)
             .crafting
             .set_cell(4, Some(items.new_stack(raw, 2).unwrap()));
-        sim.player
+        sim.player_mut(P)
             .crafting
             .set_held(Some(items.new_stack(log, 5).unwrap()));
 
@@ -622,7 +638,7 @@ fn a_world_saved_mid_script_finishes_where_an_uninterrupted_one_does() {
 
     let tick_n = |sim: &mut Sim, world: &mut World, n: usize| {
         for _ in 0..n {
-            sim.tick(world, &InputFrame::default(), blocks);
+            sim.tick(world, &PlayerInputs::default(), blocks);
             sim.tick_entities(world, blocks, &items);
         }
     };
@@ -663,17 +679,24 @@ fn a_world_saved_mid_script_finishes_where_an_uninterrupted_one_does() {
     // Without block 2.8 every one of these is empty and the hash test below
     // would still have passed.
     assert_eq!(
-        sim_b.player.inventory.slot(0).map(|s| s.count()),
+        sim_b.player_mut(P).inventory.slot(0).map(|s| s.count()),
         Some(41),
         "the inventory came back"
     );
     assert_eq!(
-        sim_b.player.inventory.selected_slot(),
+        sim_b.player_mut(P).inventory.selected_slot(),
         3,
         "and so did the selected slot"
     );
-    assert_eq!(sim_b.player.crafting.width(), 3, "the bench grid came back");
-    assert!(sim_b.player.crafting.held().is_some(), "and the cursor");
+    assert_eq!(
+        sim_b.player_mut(P).crafting.width(),
+        3,
+        "the bench grid came back"
+    );
+    assert!(
+        sim_b.player_mut(P).crafting.held().is_some(),
+        "and the cursor"
+    );
     assert!(
         world_b.furnace_at([2, 40, -3]).is_some(),
         "the furnace came back"
@@ -719,4 +742,212 @@ fn hash_region_coords() -> Vec<ChunkCoord> {
 /// meant, rather than quietly turning 454 times as far.
 fn pixels(px: f32) -> Angle {
     Angle::from_raw((px * cubara_sim::SENSITIVITY_PER_PIXEL as f32) as i32)
+}
+
+// ---------------------------------------------------------------------------
+// Block 2.10: many players, and the version-4 migration.
+// ---------------------------------------------------------------------------
+
+/// A three-player world round-trips: everyone comes back, with their own
+/// inventory and their own health, under their own id.
+#[test]
+fn a_world_of_three_players_round_trips() {
+    let registry = test_registry();
+    let items = test_items();
+    let blocks = TerrainBlocks::from_registry(&registry);
+    let seed = 0x0031_0031_0031_0031;
+
+    let mut world = World::with_seed(seed);
+    let mut sim = Sim::new(
+        seed,
+        Player::new(
+            cubara_voxel::FixedVec3::from_f32([0.5, 50.0, 0.5]),
+            Angle::ZERO,
+            Angle::ZERO,
+        ),
+    );
+    let b = sim.join(Player::new(
+        cubara_voxel::FixedVec3::from_f32([8.5, 51.0, 2.5]),
+        Angle::ZERO,
+        Angle::ZERO,
+    ));
+    let c = sim.join(Player::new(
+        cubara_voxel::FixedVec3::from_f32([-4.5, 49.0, 7.5]),
+        Angle::ZERO,
+        Angle::ZERO,
+    ));
+
+    // Distinct state per player, so a save that collapsed them into one, or
+    // handed everyone player 0's things, cannot pass.
+    let stone = items.id_of("cubara:stone").unwrap();
+    let pick = items.id_of("cubara:stone_pick").unwrap();
+    sim.player_mut(P)
+        .inventory
+        .set_slot(0, Some(items.new_stack(stone, 7).unwrap()));
+    sim.player_mut(b)
+        .inventory
+        .set_slot(3, Some(items.new_stack(pick, 1).unwrap()));
+    sim.player_mut(c).health = 11;
+
+    let dir = scratch_dir("three-players");
+    save_world(&dir, &sim, &world, &registry, &items, blocks).expect("save");
+    let (loaded, _) = load_world(&dir, &registry, &items, blocks).expect("load");
+
+    assert_eq!(loaded.player_count(), 3, "not everyone came back");
+    assert_eq!(
+        loaded.player(P).inventory.slot(0).map(|s| s.count()),
+        Some(7),
+        "player 0's stone"
+    );
+    assert_eq!(
+        loaded.player(b).inventory.slot(3).map(|s| s.item()),
+        Some(pick),
+        "player 1's pick"
+    );
+    assert_eq!(loaded.player(c).health, 11, "player 2's health");
+    assert_eq!(
+        loaded.next_player_id(),
+        sim.next_player_id(),
+        "the id counter must survive, or a restart re-issues a live id"
+    );
+
+    let region = hash_region();
+    assert_eq!(
+        WorldHash::compute(&sim, &world, &region, blocks, 1),
+        WorldHash::compute(&loaded, &World::with_seed(seed), &region, blocks, 1),
+        "a three-player world did not come back the same world"
+    );
+    let _ = &mut world;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The order players appear in the saved list must not change the world.
+///
+/// Loading is the only path that can present ids out of order -- `Sim::join`
+/// hands them out in sequence, so nothing else can. This is what makes the
+/// `BTreeMap` load-bearing rather than incidental: a `HashMap` or an
+/// insertion-ordered `Vec` would let a reordered file hash differently, and a
+/// file's field order is not something a world's identity may depend on.
+#[test]
+fn a_saved_player_lists_order_does_not_change_the_world() {
+    let registry = test_registry();
+    let items = test_items();
+    let blocks = TerrainBlocks::from_registry(&registry);
+    let seed = 0x0099_0099_0099_0099;
+
+    let mut sim = Sim::new(
+        seed,
+        Player::new(
+            cubara_voxel::FixedVec3::from_f32([0.5, 50.0, 0.5]),
+            Angle::ZERO,
+            Angle::ZERO,
+        ),
+    );
+    sim.join(Player::new(
+        cubara_voxel::FixedVec3::from_f32([6.5, 52.0, 1.5]),
+        Angle::ZERO,
+        Angle::ZERO,
+    ));
+    let world = World::with_seed(seed);
+
+    let dir = scratch_dir("player-order");
+    save_world(&dir, &sim, &world, &registry, &items, blocks).expect("save");
+
+    let level = dir.join("level.ron");
+    let text = std::fs::read_to_string(&level).expect("read level.ron");
+    let reversed = reverse_saved_players(&text);
+    assert_ne!(
+        reversed, text,
+        "the rewrite did nothing, so this proves nothing"
+    );
+    std::fs::write(&level, &reversed).expect("write reordered level.ron");
+
+    let (loaded, _) = load_world(&dir, &registry, &items, blocks).expect("load reordered");
+    let region = hash_region();
+    assert_eq!(
+        WorldHash::compute(&sim, &world, &region, blocks, 1),
+        WorldHash::compute(&loaded, &World::with_seed(seed), &region, blocks, 1),
+        "reordering the saved player list changed the world"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Swap the two entries of the saved `players:` list, textually.
+///
+/// Crude on purpose: parsing the RON back into the real header and re-emitting
+/// it would go through the same code the test is trying to check, and would
+/// pass even if that code silently sorted on the way out.
+fn reverse_saved_players(text: &str) -> String {
+    let key = "players: [";
+    let start = text.find(key).expect("a players list") + key.len();
+    // The matching `]`, by depth -- not the first one, which is some player's
+    // inventory array and would cut the list in half.
+    let mut depth = 0usize;
+    let mut end = None;
+    for (i, ch) in text[start..].char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' if depth == 0 => {
+                end = Some(start + i);
+                break;
+            }
+            ']' => depth -= 1,
+            _ => {}
+        }
+    }
+    let end = end.expect("the players list ends");
+    let body = &text[start..end];
+
+    // Entries are `(id, (..)),` at depth 0 of this list.
+    let mut entries = Vec::new();
+    let (mut depth, mut from) = (0usize, 0usize);
+    for (i, ch) in body.char_indices() {
+        match ch {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                entries.push(body[from..i].trim().to_string());
+                from = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let rest = body[from..].trim();
+    if !rest.is_empty() {
+        entries.push(rest.to_string());
+    }
+    assert_eq!(entries.len(), 2, "this fixture saves exactly two players");
+    entries.reverse();
+    format!("{}{}{}", &text[..start], entries.join(", "), &text[end..])
+}
+
+/// A world saved before block 2.10 -- one `player`, no list -- loads as exactly
+/// one player, at [`PlayerId::LOCAL`].
+///
+/// The committed fixture is still `format_version: 4`, deliberately (see
+/// [`FIXTURE_HASH`]), which makes it the real article rather than a
+/// reconstruction of one.
+#[test]
+fn a_pre_multiplayer_save_loads_as_one_local_player() {
+    let registry = test_registry();
+    let blocks = TerrainBlocks::from_registry(&registry);
+    let dir = fixture_dir();
+
+    let text = std::fs::read_to_string(dir.join("level.ron")).expect("the fixture is there");
+    assert!(
+        text.contains("format_version: 4"),
+        "the fixture stopped being a version-4 save, so it no longer covers the migration"
+    );
+
+    let (sim, _) = load_world(&dir, &registry, &test_items(), blocks).expect("fixture loads");
+    assert_eq!(sim.player_count(), 1, "a v4 save has exactly one player");
+    assert!(
+        sim.get(PlayerId::LOCAL).is_some(),
+        "the migrated player must land at PlayerId::LOCAL"
+    );
+    assert_eq!(
+        sim.next_player_id(),
+        1,
+        "the counter must clear the ids already in use, or a join re-issues one"
+    );
 }
