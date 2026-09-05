@@ -126,7 +126,7 @@ So:
 
 They are allowed to disagree. The combination that would genuinely be a bug is
 replicating **less** than is simulated — a client simulated at without being told
-— and `the_view_covers_everything_that_simulates` asserts against exactly that,
+— and a `const` assertion in `view.rs` rejects exactly that at compile time,
 which is the check the original argument was reaching for and missed.
 
 One consequence worth stating, because it looks like a regression when met in a

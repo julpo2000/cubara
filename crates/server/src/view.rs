@@ -33,7 +33,7 @@
 //! `SIM_RADIUS_CHUNKS` stays what ticks. They are allowed to disagree, and the
 //! thing that would actually be a bug — replicating *less* than is simulated,
 //! so a client is simulated at without being told — is asserted against by
-//! `the_view_covers_everything_that_simulates`.
+//! a `const` assertion below, which fails the build rather than a test.
 //!
 //! # Why membership is arithmetic, and backfill walks the edits
 //!
@@ -83,7 +83,7 @@ use crate::Effect;
 /// plane covers its diagonal, so this is that number and moves with it.
 ///
 /// Deliberately *not* `SIM_RADIUS_CHUNKS` — see the module docs. It must never
-/// be smaller than it, which `the_view_covers_everything_that_simulates` checks.
+/// be smaller than it, which the `const` assertion below enforces at compile time.
 pub const VIEW_RADIUS: i32 = 64;
 
 /// The vertical half-height of the replication box, in chunks.
@@ -93,6 +93,26 @@ pub const VIEW_RADIUS: i32 = 64;
 /// and finite so that a client standing at the bottom of a cave is not told
 /// about the sky ten thousand chunks up.
 pub const VIEW_VERTICAL: i32 = 8;
+
+/// The one relationship between the two radii that would actually be a bug.
+///
+/// Replicating *more* than is simulated is fine and expected -- that is the whole
+/// point of the render distance being larger. Replicating **less** would mean a
+/// client is simulated at without being told, which is a desync with a delay on
+/// it.
+///
+/// A `const` assertion rather than a test, because it is a compile-time fact
+/// about two constants: it should fail the *build*, not wait for someone to run
+/// the suite. (It started life as a `#[test]`, and clippy was right to reject
+/// that -- `assertions_on_constants` exists for exactly this.)
+const _: () = assert!(
+    VIEW_RADIUS >= crate::SIM_RADIUS_CHUNKS,
+    "the replication radius must not be smaller than the simulation radius"
+);
+const _: () = assert!(
+    VIEW_VERTICAL >= crate::SIM_HASH_VERTICAL_CHUNKS,
+    "the replication band must not be shorter than the simulated band"
+);
 
 /// One client's window onto the world.
 ///
@@ -222,24 +242,6 @@ mod tests {
 
     fn at(x: i32, y: i32, z: i32) -> ChunkCoord {
         ChunkCoord::new(x, y, z)
-    }
-
-    /// The one relationship between the two radii that would actually be a bug.
-    ///
-    /// Replicating *more* than is simulated is fine and expected — that is the
-    /// whole point of the render distance being larger. Replicating *less* would
-    /// mean a client is simulated at without being told, which is a desync with
-    /// a delay on it.
-    #[test]
-    fn the_view_covers_everything_that_simulates() {
-        assert!(
-            VIEW_RADIUS >= crate::SIM_RADIUS_CHUNKS,
-            "the replication radius must not be smaller than the simulation radius"
-        );
-        assert!(
-            VIEW_VERTICAL >= crate::SIM_HASH_VERTICAL_CHUNKS,
-            "the replication band must not be shorter than the simulated band"
-        );
     }
 
     #[test]
