@@ -22,6 +22,7 @@ use std::path::Path;
 use cubara_voxel::{
     Angle, BlockId, BlockRegistry, ChunkCoord, ItemId, ItemRegistry, ItemStack, ItemState,
 };
+use cubara_world::durable;
 use cubara_world::{region, TerrainBlocks, World, WORLDGEN_VERSION};
 use serde::{Deserialize, Serialize};
 
@@ -48,7 +49,7 @@ use std::collections::BTreeMap;
 /// `PlayerId::LOCAL`. Loading a version-4 world is a migration, not an error,
 /// because worlds exist on disk and losing one to a format bump is not an
 /// acceptable cost of adding multiplayer.
-pub const FORMAT_VERSION: u16 = 5;
+pub const FORMAT_VERSION: u16 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SavedRng {
@@ -340,6 +341,33 @@ fn from_saved(saved: &Option<SavedStack>, items: &ItemRegistry) -> Option<ItemSt
     ItemStack::new(id, saved.count, state, items.max_stack(id)).ok()
 }
 
+/// One player, as the save format holds them.
+///
+/// Lifted out of the header's construction when version 6 gave players their
+/// own files -- the same fields, written to a different place.
+fn saved_player(p: &Player, items: &ItemRegistry) -> SavedPlayer {
+    SavedPlayer {
+        pos: to_xyz(p.pos),
+        vel: to_xyz(p.velocity),
+        yaw: p.yaw.raw(),
+        pitch: p.pitch.raw(),
+        on_ground: p.on_ground,
+        free_fly: p.free_fly,
+        inventory: (0..crate::inventory::SLOT_COUNT)
+            .map(|i| to_saved(p.inventory.slot(i), items))
+            .collect(),
+        selected_slot: p.inventory.selected_slot(),
+        grid: (0..cubara_voxel::MAX_GRID * cubara_voxel::MAX_GRID)
+            .map(|i| to_saved(p.crafting.cell(i), items))
+            .collect(),
+        grid_width: p.crafting.width(),
+        held: to_saved(p.crafting.held(), items),
+        health: p.health,
+        ticks_since_damage: p.ticks_since_damage,
+        spawn: to_xyz(p.spawn),
+    }
+}
+
 /// Save `sim`/`world` to `dir` (created if it doesn't exist): `level.ron`
 /// plus one region file per dirty region under `dir/region/`. `registry`
 /// supplies the block id → name table (§7.2) and `items` the item one (§8.1);
@@ -372,34 +400,10 @@ pub fn save_world(
         // Nothing writes the pre-2.10 single-player field any more; it exists
         // only so an older save still parses.
         player: None,
-        players: sim
-            .players()
-            .map(|(id, p)| {
-                (
-                    id.0,
-                    SavedPlayer {
-                        pos: to_xyz(p.pos),
-                        vel: to_xyz(p.velocity),
-                        yaw: p.yaw.raw(),
-                        pitch: p.pitch.raw(),
-                        on_ground: p.on_ground,
-                        free_fly: p.free_fly,
-                        inventory: (0..crate::inventory::SLOT_COUNT)
-                            .map(|i| to_saved(p.inventory.slot(i), items))
-                            .collect(),
-                        selected_slot: p.inventory.selected_slot(),
-                        grid: (0..cubara_voxel::MAX_GRID * cubara_voxel::MAX_GRID)
-                            .map(|i| to_saved(p.crafting.cell(i), items))
-                            .collect(),
-                        grid_width: p.crafting.width(),
-                        held: to_saved(p.crafting.held(), items),
-                        health: p.health,
-                        ticks_since_damage: p.ticks_since_damage,
-                        spawn: to_xyz(p.spawn),
-                    },
-                )
-            })
-            .collect(),
+        // Empty since version 6: players live in `players/<id>.ron` now, one
+        // file each, so saving one does not rewrite all of them. The field
+        // stays so a version-5 save still parses.
+        players: Vec::new(),
         next_player: sim.next_player_id(),
         blocks: blocks_table,
         items: items
@@ -434,12 +438,92 @@ pub fn save_world(
         next_entity_key: sim.entities.next_key(),
     };
 
+    // Regions, then players, then the header. The order is not arbitrary:
+    // `level.ron` carries the world-level tick and RNG, so writing it last
+    // means a crash mid-save leaves a header that is *older* than the chunk
+    // data beside it. That world loads and replays a few ticks; the reverse --
+    // a header claiming a tick the regions have not reached -- would be a world
+    // asserting a state nothing on disk supports.
+    //
+    // This is a bound, not transactional saving. The save is several files and
+    // they are not written as one unit; see the block's issue for what that
+    // costs and why a journal is a different block.
+    region::save_regions(&dir.join("region"), world, blocks).map_err(SaveError::Region)?;
+    save_players(dir, sim, items)?;
+
     let text = ron::ser::to_string_pretty(&header, ron::ser::PrettyConfig::default())
         .map_err(SaveError::Ron)?;
-    std::fs::write(dir.join("level.ron"), text).map_err(SaveError::Io)?;
-
-    region::save_regions(&dir.join("region"), world, blocks).map_err(SaveError::Region)?;
+    durable::write_atomic(&dir.join("level.ron"), text.as_bytes()).map_err(SaveError::Io)?;
     Ok(())
+}
+
+/// The directory holding one file per player (version 6).
+fn players_dir(dir: &Path) -> std::path::PathBuf {
+    dir.join("players")
+}
+
+/// One file per player, and nobody else's.
+///
+/// Files for players who are no longer in the world are **removed**. Leaving
+/// them would resurrect anyone who ever logged in the next time the world
+/// loaded, complete with their inventory -- a duplication bug that would look
+/// like a gameplay feature.
+fn save_players(dir: &Path, sim: &Sim, items: &ItemRegistry) -> Result<(), SaveError> {
+    let here = players_dir(dir);
+    std::fs::create_dir_all(&here).map_err(SaveError::Io)?;
+
+    let mut keep: Vec<String> = Vec::new();
+    for (id, p) in sim.players() {
+        let saved = saved_player(p, items);
+        let text = ron::ser::to_string_pretty(&saved, ron::ser::PrettyConfig::default())
+            .map_err(SaveError::Ron)?;
+        let name = format!("{}.ron", id.0);
+        durable::write_atomic(&here.join(&name), text.as_bytes()).map_err(SaveError::Io)?;
+        keep.push(name);
+    }
+
+    for entry in std::fs::read_dir(&here).map_err(SaveError::Io)? {
+        let entry = entry.map_err(SaveError::Io)?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Debris from an interrupted write goes too: it is not a player and it
+        // is not a file anything should read.
+        let stale = durable::is_temp(&name) || (name.ends_with(".ron") && !keep.contains(&name));
+        if stale {
+            std::fs::remove_file(entry.path()).map_err(SaveError::Io)?;
+        }
+    }
+    Ok(())
+}
+
+/// Read every `players/<id>.ron`, in id order.
+///
+/// Order matters for the same reason it does everywhere else here: the map is a
+/// `BTreeMap` and directory iteration is not sorted, so the ids are parsed and
+/// sorted rather than trusted to arrive in a useful sequence (Rule 1).
+fn load_players(dir: &Path) -> Result<Vec<(u64, SavedPlayer)>, LoadError> {
+    let here = players_dir(dir);
+    if !here.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut found: Vec<(u64, SavedPlayer)> = Vec::new();
+    for entry in std::fs::read_dir(&here).map_err(LoadError::Io)? {
+        let entry = entry.map_err(LoadError::Io)?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if durable::is_temp(&name) {
+            continue;
+        }
+        let Some(id) = name
+            .strip_suffix(".ron")
+            .and_then(|n| n.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let text = std::fs::read_to_string(entry.path()).map_err(LoadError::Io)?;
+        let saved: SavedPlayer = ron::from_str(&text).map_err(LoadError::Ron)?;
+        found.push((id, saved));
+    }
+    found.sort_by_key(|(id, _)| *id);
+    Ok(found)
 }
 
 /// Load a world saved by [`save_world`]. Regenerates every chunk
@@ -546,9 +630,16 @@ pub fn load_world(
         }
     }
 
-    // Version 4 wrote one player and no list; version 5 writes the list. Read
-    // whichever is there, and land both on the same shape.
-    let saved_players: Vec<(u64, &SavedPlayer)> = if !header.players.is_empty() {
+    // Version 4 wrote one player and no list; version 5 wrote the list in the
+    // header; version 6 writes a file each. Read whichever is there, and land
+    // all three on the same shape -- this branch already had two cases, and a
+    // format that keeps loading its own history is what makes a version bump a
+    // safe thing to do rather than an event.
+    let from_files = load_players(dir)?;
+    let saved_players: Vec<(u64, &SavedPlayer)> = if !from_files.is_empty() {
+        // Version 6: one file each.
+        from_files.iter().map(|(id, p)| (*id, p)).collect()
+    } else if !header.players.is_empty() {
         header.players.iter().map(|(id, p)| (*id, p)).collect()
     } else if let Some(p) = header.player.as_ref() {
         vec![(PlayerId::LOCAL.0, p)]

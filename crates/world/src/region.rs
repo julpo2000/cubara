@@ -212,7 +212,9 @@ pub fn decode_region(
 /// byte format itself is well-defined for it either way.
 pub fn write_region_file(path: &Path, chunks: &[(ChunkCoord, Chunk)]) -> Result<(), RegionError> {
     let bytes = encode_region(chunks)?;
-    std::fs::write(path, bytes).map_err(RegionError::Io)
+    // Atomic since block 2.15: a region torn by a crash is a hole in the world
+    // that only shows up when someone walks back to it.
+    crate::durable::write_atomic(path, &bytes).map_err(RegionError::Io)
 }
 
 /// Read and decode one region file.
