@@ -609,6 +609,15 @@ impl Game {
                 // interpolating a remote pose is exactly what design §8.4 says
                 // not to build before there is real latency to build it against.
                 Effect::PlayerMoved { .. } | Effect::PlayerGone(_) => {}
+                // This client's own items. Ignored here for the same reason
+                // `SelfState` is: `Game` still owns the `Server` in this
+                // process and reads the authoritative player straight out of
+                // it, so a copy of what it already has is nothing to apply.
+                //
+                // It becomes the *only* way a client knows what it is carrying
+                // the moment `Game` talks over a `Link` — which is the next
+                // change on this branch, and the reason the message exists now.
+                Effect::SelfItems(_) => {}
                 // The server's correction to this client's own player (block
                 // 2.12b). Ignored here **only because this client is the server**
                 // -- `Game` still owns an in-process `Server` and reads the
