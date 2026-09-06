@@ -243,3 +243,110 @@ fn a_server_without_listen_serves_nobody() {
 
     let _ = std::fs::remove_dir_all(&world);
 }
+
+/// **A dedicated server has nobody standing on spawn.**
+///
+/// Block 2.10 wrote "a dedicated server has many players and no local one" into
+/// `Server::local`'s doc comment and then made the field a bare `PlayerId`, so
+/// the sentence was a promise rather than a fact. A LAN test found the
+/// consequence: a motionless `PlayerId(0)` on spawn, replicated to every client
+/// every tick, that nobody was driving.
+///
+/// Checked from the client's side rather than by reading the server's fields,
+/// because "what a client is told" is the thing that actually mattered.
+#[test]
+fn a_served_world_has_no_ghost_standing_on_spawn() {
+    let world = scratch_world("no-ghost");
+    let (_server, addr) = start_server(&world);
+
+    let mut link = connect(&addr).expect("connect");
+    link.send(ClientMessage::Hello);
+
+    let messages = collect_until(&mut link, Duration::from_secs(20), |all| {
+        // Wait for a few ticks to pass, so anyone who was going to be announced
+        // has been.
+        all.iter()
+            .filter(|m| matches!(m, ServerMessage::Tick(_)))
+            .count()
+            >= 5
+    });
+
+    let strangers: Vec<cubara_sim::PlayerId> = messages
+        .iter()
+        .filter_map(|m| match m {
+            ServerMessage::Effects(v) => Some(v.clone()),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|e| match e {
+            cubara_server::Effect::PlayerMoved { who, .. } => Some(who),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        strangers.is_empty(),
+        "the only client on a dedicated server was told about {} other player(s): \
+         {strangers:?} — a dedicated server should have nobody but its clients",
+        strangers.len()
+    );
+}
+
+/// **A joining client is told about people who are already standing there.**
+///
+/// The join used to send `snapshot_for` and then discard whatever the client's
+/// view had queued, on the grounds that the same edits must not be sent twice.
+/// That was true when a view only backfilled edits. Once it backfilled *players*
+/// too — and `snapshot_for` has never carried them — the discard threw those
+/// away, so a joining client saw an empty world until somebody moved.
+///
+/// Two changes that were each correct on their own. This is the test that would
+/// have caught the second one.
+#[test]
+fn a_joining_client_is_told_who_is_already_here() {
+    let world = scratch_world("already-here");
+    let (_server, addr) = start_server(&world);
+
+    // Somebody is already in the world and standing perfectly still, which is
+    // the case the bug hid behind: a motionless player generates no updates.
+    let mut first = connect(&addr).expect("first connects");
+    first.send(ClientMessage::Hello);
+    let first_id = collect_until(&mut first, Duration::from_secs(20), |all| {
+        all.iter()
+            .any(|m| matches!(m, ServerMessage::Welcome { .. }))
+    })
+    .iter()
+    .find_map(|m| match m {
+        ServerMessage::Welcome { you, .. } => Some(*you),
+        _ => None,
+    })
+    .expect("first welcome");
+
+    let mut second = connect(&addr).expect("second connects");
+    second.send(ClientMessage::Hello);
+    let messages = collect_until(&mut second, Duration::from_secs(20), |all| {
+        all.iter()
+            .filter(|m| matches!(m, ServerMessage::Tick(_)))
+            .count()
+            >= 3
+    });
+
+    let seen: Vec<cubara_sim::PlayerId> = messages
+        .iter()
+        .filter_map(|m| match m {
+            ServerMessage::Effects(v) => Some(v.clone()),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|e| match e {
+            cubara_server::Effect::PlayerMoved { who, .. } => Some(who),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        seen.contains(&first_id),
+        "a client that joined a world with somebody already in it was never told \
+         they were there. Saw: {seen:?}"
+    );
+}

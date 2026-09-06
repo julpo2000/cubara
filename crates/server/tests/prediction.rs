@@ -87,7 +87,7 @@ impl Harness {
 
         // A second player, six blocks along, so this client is never the
         // server's own local player.
-        let ground = server.sim.player(server.local).pos;
+        let ground = server.sim.player(server.local.expect("a local client")).pos;
         let me = server.sim.join(Player::new(
             FixedVec3::from_blocks(
                 ground.x.floor_block() + 6,
@@ -392,7 +392,7 @@ fn a_stale_correction_is_ignored() {
     let blocks = server.terrain();
     let seed = server.world.seed();
     let mut world = World::with_seed(seed);
-    let start = *server.sim.player(server.local);
+    let start = *server.sim.player(server.local.expect("a local client"));
     let mut client = Prediction::new(seed, start);
 
     for _ in 0..10 {
@@ -432,7 +432,7 @@ fn a_repeat_of_the_same_sequence_still_applies() {
     let blocks = server.terrain();
     let seed = server.world.seed();
     let mut world = World::with_seed(seed);
-    let start = *server.sim.player(server.local);
+    let start = *server.sim.player(server.local.expect("a local client"));
     let mut client = Prediction::new(seed, start);
 
     client.predict(InputFrame::default(), &mut world, blocks);
@@ -467,7 +467,7 @@ fn an_unacknowledged_client_stops_predicting_rather_than_growing() {
     let blocks = server.terrain();
     let seed = server.world.seed();
     let mut world = World::with_seed(seed);
-    let start = *server.sim.player(server.local);
+    let start = *server.sim.player(server.local.expect("a local client"));
     let mut client = Prediction::new(seed, start);
 
     for _ in 0..(MAX_PENDING * 2) {

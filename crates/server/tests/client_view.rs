@@ -56,7 +56,7 @@ fn tick(s: &mut Server, inputs: &PlayerInputs) {
 #[test]
 fn two_clients_in_one_world_leave_one_authoritative_state() {
     let mut a = server();
-    let local = a.local;
+    let local = a.local.expect("a local client");
     let ground = a.sim.player(local).pos;
     let second = add_player(
         &mut a,
@@ -86,7 +86,7 @@ fn two_clients_in_one_world_leave_one_authoritative_state() {
     // Replay the identical script on a second server. Same events, same order,
     // same world -- and the hash is what says so, at one worker and at six.
     let mut b = server();
-    let b_local = b.local;
+    let b_local = b.local.expect("a local client");
     add_player(
         &mut b,
         [
@@ -123,7 +123,7 @@ fn two_clients_in_one_world_leave_one_authoritative_state() {
 #[test]
 fn a_client_hears_about_the_other_player_and_not_itself() {
     let mut s = server();
-    let local = s.local;
+    let local = s.local.expect("a local client");
     let p = s.sim.player(local).pos;
     let other = add_player(
         &mut s,
@@ -173,7 +173,7 @@ fn a_client_hears_about_the_other_player_and_not_itself() {
 #[test]
 fn the_join_handshake_carries_no_terrain() {
     let mut s = server();
-    let local = s.local;
+    let local = s.local.expect("a local client");
 
     // Change the world, so the handshake has something real in it and the test
     // cannot pass by the handshake being empty.
@@ -209,7 +209,7 @@ fn the_join_handshake_carries_no_terrain() {
 #[test]
 fn the_handshake_is_filtered_to_what_the_joiner_can_see() {
     let mut s = server();
-    let local = s.local;
+    let local = s.local.expect("a local client");
     let p = s.sim.player(local).pos;
 
     let near = [p.x.floor_block(), p.y.floor_block() - 2, p.z.floor_block()];
@@ -288,7 +288,7 @@ fn bytes_to_one_client_do_not_grow_with_the_player_count() {
     // what a moving player is.
     let measure = |others: i32, spread: bool| -> usize {
         let mut s = server();
-        let local = s.local;
+        let local = s.local.expect("a local client");
         let home = s.sim.player(local).pos;
 
         let mut added = Vec::new();
@@ -378,7 +378,7 @@ fn wire_size_reflects_what_an_effect_carries() {
 #[test]
 fn a_view_follows_its_player() {
     let mut s = server();
-    let local = s.local;
+    let local = s.local.expect("a local client");
 
     let start = s
         .view(local)
@@ -413,7 +413,7 @@ fn a_view_follows_its_player() {
 #[test]
 fn a_player_who_does_not_move_costs_nothing_to_watch() {
     let mut s = server();
-    let local = s.local;
+    let local = s.local.expect("a local client");
     let home = s.sim.player(local).pos;
 
     // Someone standing near enough to be watched, and not moving.
@@ -455,7 +455,7 @@ fn a_player_who_does_not_move_costs_nothing_to_watch() {
 #[test]
 fn a_player_who_moves_is_still_reported() {
     let mut s = server();
-    let local = s.local;
+    let local = s.local.expect("a local client");
     let home = s.sim.player(local).pos;
     let other = add_player(
         &mut s,
@@ -498,7 +498,7 @@ fn a_player_who_moves_is_still_reported() {
 #[test]
 fn a_motionless_player_is_backfilled_to_someone_who_walks_up() {
     let mut s = server();
-    let local = s.local;
+    let local = s.local.expect("a local client");
     let home = s.sim.player(local).pos;
 
     // Far enough that the local client cannot see them at all.

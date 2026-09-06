@@ -27,7 +27,6 @@
 //! having it invented here. It is a hole, it is a known one, and it is not this
 //! block's to close.
 
-use cubara_server::headless::MAX_ACTIONS_PER_TICK;
 use cubara_server::{Action, FurnaceSlot, Server};
 use cubara_sim::{InputFrame, Player, PlayerId, PlayerInputs};
 use cubara_voxel::{Angle, FixedVec3};
@@ -231,7 +230,7 @@ fn a_large_move_axis_does_not_move_a_player_further() {
         let mut s = Server::new();
         s.open(std::path::Path::new("cubara-nonexistent-untrusted-fixture"));
         s.place_player_on_ground();
-        let who = s.local;
+        let who = s.local.expect("a local client");
         let before = s.sim.player(who).pos;
         let input = InputFrame {
             move_axes: axes,
@@ -266,8 +265,7 @@ fn a_large_move_axis_does_not_move_a_player_further() {
 /// and the test reads the count.
 #[test]
 fn a_flood_of_actions_is_capped_at_the_limit() {
-    use cubara_server::headless::{Config, Session};
-    use cubara_server::net::connect;
+    use cubara_server::headless::{Config, Session, MAX_ACTIONS_PER_TICK};
     use cubara_server::wire::ClientMessage;
 
     let cfg = Config {
@@ -276,22 +274,22 @@ fn a_flood_of_actions_is_capped_at_the_limit() {
         ..Config::default()
     };
     let mut session = Session::open(&cfg);
-    let addr = session
-        .listen("127.0.0.1:0")
-        .expect("bind an ephemeral port");
 
-    let mut link = connect(addr.to_string()).expect("connect to the session");
+    // **Attached in-process, not over a socket.** The cap is a per-*tick*
+    // property, and testing it across a real connection measured something else
+    // entirely: whether fifty messages happened to arrive inside one tick. They
+    // did, until the server got faster -- removing a dedicated server's ghost
+    // player made ticks cheaper, the burst spread over more of them, and the
+    // test began failing about one run in four. It had already been rewritten
+    // once for a race, which is the sign it was racing something it should not
+    // have been touching.
+    //
+    // A local link delivers into the channel before `advance` is called, so the
+    // burst is in one tick by construction rather than by luck. It joins through
+    // the same `welcome` path a TCP client does, so nothing about the cap is
+    // being tested in a way that would not hold over a wire.
+    let mut link = session.attach();
     link.send(ClientMessage::Hello);
-
-    // Wait for the accept rather than assuming one tick is enough. The
-    // acceptor is non-blocking and the connection crosses a real socket, so how
-    // many ticks it takes is not something this test can know -- and asserting
-    // after a fixed single tick made it fail roughly one run in three.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while session.client_count() == 0 && std::time::Instant::now() < deadline {
-        session.advance(1, &cfg);
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
     assert_eq!(session.client_count(), 1, "the client never joined");
 
     const SENT: usize = 50;
@@ -302,18 +300,17 @@ fn a_flood_of_actions_is_capped_at_the_limit() {
         link.send(ClientMessage::Act(Action::Interact));
     }
 
-    // A generous number of ticks: the actions cross a real socket, so how many
-    // ticks they take to arrive is not something this test should pretend to
-    // know. What it asserts is the total, which does not depend on the split.
-    for _ in 0..60 {
-        session.advance(1, &cfg);
-    }
+    // One tick. Everything the client sent is already in the channel, so this is
+    // the burst the cap is supposed to be about.
+    session.advance(1, &cfg);
 
     let dropped = session.dropped_actions();
-    assert!(
-        dropped > 0,
-        "a client sent {SENT} actions and none were refused; the cap is not \
-         enforced"
+    assert_eq!(
+        dropped,
+        (SENT - MAX_ACTIONS_PER_TICK) as u64,
+        "a client sent {SENT} actions in one tick and {} were let through; the \
+         cap is {MAX_ACTIONS_PER_TICK}",
+        SENT as u64 - dropped
     );
     // The invariant, and the only assertion here that does not depend on
     // timing. An earlier version compared `dropped` against the total sent,
