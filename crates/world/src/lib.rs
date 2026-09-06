@@ -16,6 +16,7 @@
 
 pub mod block_entity;
 pub mod chunk_state;
+pub mod durable;
 pub mod mesh;
 pub mod node;
 mod noise;

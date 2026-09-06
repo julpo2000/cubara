@@ -821,15 +821,18 @@ fn a_world_of_three_players_round_trips() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The order players appear in the saved list must not change the world.
+/// Which order the saved players are *read* in does not change the world.
 ///
-/// Loading is the only path that can present ids out of order -- `Sim::join`
-/// hands them out in sequence, so nothing else can. This is what makes the
-/// `BTreeMap` load-bearing rather than incidental: a `HashMap` or an
-/// insertion-ordered `Vec` would let a reordered file hash differently, and a
-/// file's field order is not something a world's identity may depend on.
+/// Version 6 gives each player a file, so the order is whatever the filesystem
+/// hands back from `read_dir` — which is not sorted, not stable, and not the
+/// same on two machines. This rebuilds the directory in the opposite order and
+/// asserts the loaded world is identical.
+///
+/// It used to reverse the `players:` list inside `level.ron`, textually. That
+/// list no longer exists; the property it protected does, and this is where it
+/// lives now.
 #[test]
-fn a_saved_player_lists_order_does_not_change_the_world() {
+fn the_order_saved_players_are_read_in_does_not_change_the_world() {
     let registry = test_registry();
     let items = test_items();
     let blocks = TerrainBlocks::from_registry(&registry);
@@ -853,72 +856,37 @@ fn a_saved_player_lists_order_does_not_change_the_world() {
     let dir = scratch_dir("player-order");
     save_world(&dir, &sim, &world, &registry, &items, blocks).expect("save");
 
-    let level = dir.join("level.ron");
-    let text = std::fs::read_to_string(&level).expect("read level.ron");
-    let reversed = reverse_saved_players(&text);
-    assert_ne!(
-        reversed, text,
-        "the rewrite did nothing, so this proves nothing"
-    );
-    std::fs::write(&level, &reversed).expect("write reordered level.ron");
+    let players = dir.join("players");
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&players)
+        .expect("players dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    files.sort();
+    assert_eq!(files.len(), 2, "this fixture saves exactly two players");
+
+    // Rewrite them in the opposite creation order. On the filesystems this
+    // runs on, creation order is what `read_dir` tends to follow, so this is
+    // the closest a test can get to "the directory came back the other way".
+    let contents: Vec<(std::path::PathBuf, String)> = files
+        .iter()
+        .map(|f| (f.clone(), std::fs::read_to_string(f).expect("read")))
+        .collect();
+    for (f, _) in &contents {
+        std::fs::remove_file(f).expect("remove");
+    }
+    for (f, text) in contents.iter().rev() {
+        std::fs::write(f, text).expect("rewrite");
+    }
 
     let (loaded, _) = load_world(&dir, &registry, &items, blocks).expect("load reordered");
     let region = hash_region();
     assert_eq!(
         WorldHash::compute(&sim, &world, &region, blocks, 1),
         WorldHash::compute(&loaded, &World::with_seed(seed), &region, blocks, 1),
-        "reordering the saved player list changed the world"
+        "the order the player files came back in changed the world"
     );
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Swap the two entries of the saved `players:` list, textually.
-///
-/// Crude on purpose: parsing the RON back into the real header and re-emitting
-/// it would go through the same code the test is trying to check, and would
-/// pass even if that code silently sorted on the way out.
-fn reverse_saved_players(text: &str) -> String {
-    let key = "players: [";
-    let start = text.find(key).expect("a players list") + key.len();
-    // The matching `]`, by depth -- not the first one, which is some player's
-    // inventory array and would cut the list in half.
-    let mut depth = 0usize;
-    let mut end = None;
-    for (i, ch) in text[start..].char_indices() {
-        match ch {
-            '[' => depth += 1,
-            ']' if depth == 0 => {
-                end = Some(start + i);
-                break;
-            }
-            ']' => depth -= 1,
-            _ => {}
-        }
-    }
-    let end = end.expect("the players list ends");
-    let body = &text[start..end];
-
-    // Entries are `(id, (..)),` at depth 0 of this list.
-    let mut entries = Vec::new();
-    let (mut depth, mut from) = (0usize, 0usize);
-    for (i, ch) in body.char_indices() {
-        match ch {
-            '(' | '[' => depth += 1,
-            ')' | ']' => depth -= 1,
-            ',' if depth == 0 => {
-                entries.push(body[from..i].trim().to_string());
-                from = i + 1;
-            }
-            _ => {}
-        }
-    }
-    let rest = body[from..].trim();
-    if !rest.is_empty() {
-        entries.push(rest.to_string());
-    }
-    assert_eq!(entries.len(), 2, "this fixture saves exactly two players");
-    entries.reverse();
-    format!("{}{}{}", &text[..start], entries.join(", "), &text[end..])
 }
 
 /// A world saved before block 2.10 -- one `player`, no list -- loads as exactly
@@ -950,4 +918,132 @@ fn a_pre_multiplayer_save_loads_as_one_local_player() {
         1,
         "the counter must clear the ids already in use, or a join re-issues one"
     );
+}
+
+/// A version-5 save — every player inside `level.ron` — still loads.
+///
+/// Version 6 moved them into `players/`, and the reader now has three shapes to
+/// recognise. The pinned fixture covers version 4; this covers the one the
+/// format was on yesterday, which is the one an actual player's save directory
+/// is most likely to be.
+///
+/// Built by *demoting* a version-6 save rather than by hand-writing RON: a
+/// hand-written fixture drifts from the real serialiser the first time a field
+/// is added, and then tests a format nothing ever wrote.
+#[test]
+fn a_version_five_save_still_loads() {
+    let registry = test_registry();
+    let items = test_items();
+    let blocks = TerrainBlocks::from_registry(&registry);
+    let seed = 0x0055_0055_0055_0055;
+
+    let mut sim = Sim::new(
+        seed,
+        Player::new(
+            cubara_voxel::FixedVec3::from_f32([0.5, 50.0, 0.5]),
+            Angle::ZERO,
+            Angle::ZERO,
+        ),
+    );
+    sim.join(Player::new(
+        cubara_voxel::FixedVec3::from_f32([9.5, 51.0, 2.5]),
+        Angle::ZERO,
+        Angle::ZERO,
+    ));
+    let world = World::with_seed(seed);
+
+    let dir = scratch_dir("v5-load");
+    save_world(&dir, &sim, &world, &registry, &items, blocks).expect("save");
+
+    // Demote: the player files go back into the header's list, and the
+    // directory goes away.
+    let players_dir = dir.join("players");
+    let mut entries: Vec<(u64, String)> = std::fs::read_dir(&players_dir)
+        .expect("players dir")
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let id: u64 = name.strip_suffix(".ron")?.parse().ok()?;
+            Some((id, std::fs::read_to_string(e.path()).ok()?))
+        })
+        .collect();
+    entries.sort_by_key(|(id, _)| *id);
+    assert_eq!(entries.len(), 2, "the fixture saved two player files");
+
+    let list: String = entries
+        .iter()
+        .map(|(id, body)| format!("({id}, {body}),"))
+        .collect();
+    let level = dir.join("level.ron");
+    let text = std::fs::read_to_string(&level).expect("read level.ron");
+    let demoted = text
+        .replace("format_version: 6,", "format_version: 5,")
+        .replace("players: [],", &format!("players: [{list}],"));
+    assert_ne!(
+        demoted, text,
+        "the demotion did nothing, so this proves nothing"
+    );
+    std::fs::write(&level, demoted).expect("write demoted level.ron");
+    std::fs::remove_dir_all(&players_dir).expect("remove players dir");
+
+    let (loaded, _) = load_world(&dir, &registry, &items, blocks).expect("load version 5");
+    let region = hash_region();
+    assert_eq!(
+        WorldHash::compute(&sim, &world, &region, blocks, 1),
+        WorldHash::compute(&loaded, &World::with_seed(seed), &region, blocks, 1),
+        "a version-5 save loaded as a different world"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A player who left does not come back on the next load.
+///
+/// Their file has to be *removed*, not merely stopped being written: leaving it
+/// would resurrect everyone who ever logged in, inventory included, the next
+/// time the world loaded. That is a duplication bug wearing the costume of a
+/// feature.
+#[test]
+fn a_departed_players_file_is_removed() {
+    let registry = test_registry();
+    let items = test_items();
+    let blocks = TerrainBlocks::from_registry(&registry);
+    let seed = 0x0044_0044_0044_0044;
+
+    let mut sim = Sim::new(
+        seed,
+        Player::new(
+            cubara_voxel::FixedVec3::from_f32([0.5, 50.0, 0.5]),
+            Angle::ZERO,
+            Angle::ZERO,
+        ),
+    );
+    let guest = sim.join(Player::new(
+        cubara_voxel::FixedVec3::from_f32([9.5, 51.0, 2.5]),
+        Angle::ZERO,
+        Angle::ZERO,
+    ));
+    let world = World::with_seed(seed);
+    let dir = scratch_dir("departed");
+
+    save_world(&dir, &sim, &world, &registry, &items, blocks).expect("first save");
+    let count = || {
+        std::fs::read_dir(dir.join("players"))
+            .expect("players dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".ron"))
+            .count()
+    };
+    assert_eq!(count(), 2, "two players were saved");
+
+    sim.leave(guest);
+    save_world(&dir, &sim, &world, &registry, &items, blocks).expect("second save");
+    assert_eq!(count(), 1, "the departed player's file survived the save");
+
+    let (loaded, _) = load_world(&dir, &registry, &items, blocks).expect("load");
+    assert_eq!(
+        loaded.player_count(),
+        1,
+        "the departed player came back from the dead"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
