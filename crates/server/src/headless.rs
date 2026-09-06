@@ -175,6 +175,21 @@ impl Session {
         self.most_in_one_tick
     }
 
+    /// Attach an already-connected client, and hand back its end of the link.
+    ///
+    /// The in-process join: no socket, no acceptor, no waiting. What
+    /// singleplayer uses -- a client whose transport happens to be a channel --
+    /// and what a test uses when it wants delivery to be a fact rather than a
+    /// race.
+    ///
+    /// Goes through exactly the same `accept` path a TCP connection does, so
+    /// nothing can be true here that would not be true over a wire (§2).
+    pub fn attach(&mut self) -> Link<ClientMessage, ServerMessage> {
+        let (server_side, client_side) = crate::net::local_pair();
+        self.welcome(server_side);
+        client_side
+    }
+
     /// How many clients are connected.
     pub fn client_count(&self) -> usize {
         self.clients.len()
@@ -195,62 +210,70 @@ impl Session {
         let Some(acceptor) = self.acceptor.as_mut() else {
             return;
         };
-        for mut link in acceptor.accepted() {
-            // From the *world*, not from a player. This used to read the local
-            // player's spawn field, which is why a dedicated server needed a
-            // player nobody was driving.
-            let Some(spawn) = self.server.world_spawn() else {
-                log::warn!("no spawn point yet -- refusing a connection until assets are set");
-                continue;
-            };
-            let player = cubara_sim::Player::new(
-                spawn,
-                cubara_voxel::Angle::ZERO,
-                cubara_voxel::Angle::ZERO,
-            );
-            let id = self.server.sim.join(player);
-            self.server.open_view(id);
-
-            link.send(ServerMessage::Welcome {
-                seed: self.server.world.seed(),
-                you: id,
-                blocks: self
-                    .server
-                    .blocks_registry
-                    .as_ref()
-                    .map(|r| r.fingerprint())
-                    .unwrap_or(0),
-                items: self
-                    .server
-                    .items
-                    .as_ref()
-                    .map(|r| r.fingerprint())
-                    .unwrap_or(0),
-            });
-            // **The view's own backfill is the handshake.** `open_view` centres
-            // the view, and a first centring makes everything in range newly
-            // visible -- which is exactly what `snapshot_for` computes, plus the
-            // players standing in it.
-            //
-            // This used to send `snapshot_for` and then *discard* what the view
-            // had queued, on the grounds that the same edits must not go twice.
-            // That was true when the view only backfilled edits. Since players
-            // are backfilled too (and `snapshot_for` has never carried them),
-            // the discard threw those away: a joining client was never told
-            // about anybody already standing there, until they happened to move.
-            // Two changes that were each correct alone.
-            //
-            // Draining the view instead of computing a second, nearly-identical
-            // list also means there is one answer to "what can this client see"
-            // rather than two that can drift.
-            let handshake = self.server.drain_effects_for(id);
-            log::info!(
-                "player {id:?} joined; handshake is {} effects",
-                handshake.len()
-            );
-            link.send(ServerMessage::Effects(handshake));
-            self.clients.insert(id, link);
+        let arrivals = acceptor.accepted();
+        for link in arrivals {
+            self.welcome(link);
         }
+    }
+
+    /// Seat one newly-connected client: give them a player, a view, and the
+    /// handshake.
+    ///
+    /// Split out of `accept_new_clients` so that [`attach`](Self::attach) joins
+    /// by the same route a socket does rather than by a parallel one that could
+    /// drift.
+    fn welcome(&mut self, mut link: Link<ServerMessage, ClientMessage>) {
+        // From the *world*, not from a player. This used to read the local
+        // player's spawn field, which is why a dedicated server needed a
+        // player nobody was driving.
+        let Some(spawn) = self.server.world_spawn() else {
+            log::warn!("no spawn point yet -- refusing a connection until assets are set");
+            return;
+        };
+        let player =
+            cubara_sim::Player::new(spawn, cubara_voxel::Angle::ZERO, cubara_voxel::Angle::ZERO);
+        let id = self.server.sim.join(player);
+        self.server.open_view(id);
+
+        link.send(ServerMessage::Welcome {
+            seed: self.server.world.seed(),
+            you: id,
+            blocks: self
+                .server
+                .blocks_registry
+                .as_ref()
+                .map(|r| r.fingerprint())
+                .unwrap_or(0),
+            items: self
+                .server
+                .items
+                .as_ref()
+                .map(|r| r.fingerprint())
+                .unwrap_or(0),
+        });
+        // **The view's own backfill is the handshake.** `open_view` centres
+        // the view, and a first centring makes everything in range newly
+        // visible -- which is exactly what `snapshot_for` computes, plus the
+        // players standing in it.
+        //
+        // This used to send `snapshot_for` and then *discard* what the view
+        // had queued, on the grounds that the same edits must not go twice.
+        // That was true when the view only backfilled edits. Since players
+        // are backfilled too (and `snapshot_for` has never carried them),
+        // the discard threw those away: a joining client was never told
+        // about anybody already standing there, until they happened to move.
+        // Two changes that were each correct alone.
+        //
+        // Draining the view instead of computing a second, nearly-identical
+        // list also means there is one answer to "what can this client see"
+        // rather than two that can drift.
+        let handshake = self.server.drain_effects_for(id);
+        log::info!(
+            "player {id:?} joined; handshake is {} effects",
+            handshake.len()
+        );
+        link.send(ServerMessage::Effects(handshake));
+        self.clients.insert(id, link);
     }
 
     /// Read whatever every client sent, and turn it into this tick's input.
