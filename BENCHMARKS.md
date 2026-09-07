@@ -113,6 +113,7 @@ frames after 200 warmup.
 | 2026-09-01 | Client-side replica world, radius 64, band ±2⁴⁰ | 3,138 | 912,964 | ~1,101 | 0.628 ms | ~1.22 ms | `a9f238e` |
 | 2026-09-01 | Fixed-point angles, radius 64, band ±2⁴¹ | 3,138 | 912,964 | ~1,096 | 0.630 ms | ~1.38 ms | `bbb09c2` |
 | 2026-09-05 | macOS caught up to `main` — many players, per-client views, the transport [#199, #201, #203], radius 64, band ±2⁴² | 3,138 | 912,964 | ~1,108 | 0.628 ms | ~0.98 ms | `01aa32e` |
+| 2026-09-07 | Prediction, untrusted clients, server-side mining, persistence, sharding [#207, #211, #212, #216, #217, #218], radius 64, band ±2⁴³ | 3,138 | 912,964 | ~1,109 | 0.623 ms | ~1.19 ms | `397a653` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -1225,6 +1226,33 @@ p99 moved 1.04 → 1.22 ms, and the honest reading is that this scene's p99 is
 noisy rather than that a regression is hiding in it: the avg is what carries
 signal at this scale (see ¹), and the per-frame work added is one drain of an
 empty `Vec`.
+
+⁴³ **Five more blocks, and the scene is still untouched — and this is the last
+row before phase 2's gate closed.** Prediction and reconciliation (2.13),
+untrusted clients (2.14), server-side mining time, per-player atomic saves and
+saving off the tick loop (2.15), and sharding (2.16).
+
+3,138 nodes and 912,964 triangles again, identical to the four rows above.
+CPU/frame 0.628 → 0.623 ms and 1,108 → 1,109 FPS are scatter.
+
+Two of those blocks put real work into the tick and it does not show here, for
+reasons worth stating rather than assuming:
+
+- **Server-side mining** raycasts once per player per tick while a break button
+  is held. The benchmark has one player who is not holding anything, so it
+  measures the cost of the check and not of the work — and the check is a map
+  lookup.
+- **Saving off the tick loop** moves file writes to another thread. The
+  benchmark never saves, so this row says nothing about it either way. The claim
+  that the tick no longer waits for the disk is structural (`commit` runs on a
+  spawned thread), not something these numbers support.
+
+What none of these rows measure is the thing phase 2 actually changed: the cost
+of *many* clients. There is one player in the benchmark, and interest
+management, per-client views and shard handoff only start costing something when
+there are clients and shards to have. Those have their own tests, and they
+measure bytes and hashes rather than frames, because that is what those blocks
+were built to bound.
 
 ⁴² **Three multiplayer blocks, and the scene is untouched — which is the whole
 claim being checked.** Blocks 2.10 (the world holds many players), 2.11 (the
