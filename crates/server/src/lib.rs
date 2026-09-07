@@ -174,6 +174,17 @@ pub enum Action {
     /// that is not there cannot be clicked — so this is a lookup the server
     /// validates, not a claim it believes.
     ClickFurnace { pos: [i32; 3], slot: FurnaceSlot },
+    /// Select a hotbar slot.
+    ///
+    /// An action rather than something the client does to its own copy, because
+    /// which slot is selected decides what [`Place`](Action::Place) spends and
+    /// what a break is mined with — it is authority, not a screen setting. A
+    /// client that could choose it locally could hold a diamond pick for the
+    /// server's purposes while showing itself an empty hand.
+    ///
+    /// Out-of-range indices are ignored server-side rather than clamped:
+    /// clamping invents an intention, and there is no ninth slot to mean.
+    SelectSlot(u8),
 }
 
 /// Which slot of a furnace a click landed on.
@@ -1119,6 +1130,12 @@ impl Server {
                 self.place_held_as(who);
             }
             Action::ClickFurnace { pos, slot } => self.click_furnace_as(who, pos, slot),
+            Action::SelectSlot(index) => {
+                if (index as usize) < cubara_sim::HOTBAR_WIDTH {
+                    self.sim.player_mut(who).inventory.select(index);
+                    self.publish_self_items(who);
+                }
+            }
         }
     }
 

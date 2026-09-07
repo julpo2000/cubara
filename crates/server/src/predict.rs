@@ -130,6 +130,21 @@ impl Prediction {
         self.sim.player(ME)
     }
 
+    /// The client's own player, mutably.
+    ///
+    /// For the parts of a player that are **replicated rather than predicted**:
+    /// `Effect::SelfItems` writes an inventory and a crafting grid in here, and
+    /// those are not things a replay reconstructs -- they change through
+    /// deliberate acts, not through physics, which is exactly why
+    /// `PlayerState` leaves them out.
+    ///
+    /// Not a way to move the player. Doing that here would put the client's
+    /// belief somewhere the replay cannot reach, and the next correction would
+    /// silently undo it.
+    pub fn player_mut(&mut self) -> &mut Player {
+        self.sim.player_mut(ME)
+    }
+
     /// Act on one tick's input immediately, and return the sequence number to
     /// send it under.
     ///
