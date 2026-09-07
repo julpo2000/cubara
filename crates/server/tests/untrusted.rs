@@ -450,3 +450,112 @@ fn released_progress_is_not_banked() {
         "sixty ticks of tapping broke a block that needs thirty consecutive"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Saving off the tick loop (block 2.15)
+// ---------------------------------------------------------------------------
+
+/// A session's background save produces a world that loads.
+///
+/// The writer runs on another thread, so the assertion has to come after the
+/// join — `finish_save` is what a shutdown calls, and what `Drop` calls for
+/// every other way a session ends.
+#[test]
+fn a_background_save_produces_a_loadable_world() {
+    use cubara_server::headless::{Config, Session};
+
+    let dir = std::env::temp_dir().join("cubara-bg-save");
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = Config {
+        world: dir.clone(),
+        autosave_ticks: 0,
+        ..Config::default()
+    };
+
+    let mut session = Session::open(&cfg);
+    session.advance(5, &cfg);
+    session.save(&dir);
+    session.finish_save();
+
+    assert!(
+        dir.join("level.ron").is_file(),
+        "the background writer never wrote the header"
+    );
+
+    // It loads, and it is the world that was saved.
+    let mut restored = Session::open(&cfg);
+    restored.advance(1, &cfg);
+    assert!(
+        restored.server.sim.tick >= 5,
+        "the reloaded world had not kept the ticks that were saved"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// No writer thread is ever abandoned.
+///
+/// Dropping a `JoinHandle` does not stop the thread, it **detaches** it — so a
+/// `save` that forgot to wait for the previous one would leave two writers
+/// renaming into the same directory, and which files came from which save would
+/// depend on the disk. Nothing would look wrong until it did.
+///
+/// Asserted on the counters rather than on the directory contents, because two
+/// atomic writers racing still leave every individual file whole: the damage is
+/// a *mixture* of two saves, which is invisible in any single file. An earlier
+/// version of this test checked for leftover temporaries and passed happily
+/// with the wait removed.
+#[test]
+fn no_save_writer_is_left_detached() {
+    use cubara_server::headless::{Config, Session};
+
+    let dir = std::env::temp_dir().join("cubara-bg-save-twice");
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = Config {
+        world: dir.clone(),
+        autosave_ticks: 0,
+        ..Config::default()
+    };
+
+    let mut session = Session::open(&cfg);
+    session.advance(3, &cfg);
+    session.save(&dir);
+    session.advance(3, &cfg);
+    session.save(&dir);
+    session.finish_save();
+
+    assert_eq!(
+        session.writers_outstanding(),
+        0,
+        "a save writer was started and never waited for"
+    );
+
+    // And no debris: a torn or abandoned temporary would still be here.
+    let debris: Vec<String> = walk(&dir)
+        .into_iter()
+        .filter(|n| n.contains(".writing"))
+        .collect();
+    assert!(debris.is_empty(), "temporaries left behind: {debris:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every file under `root`, as slash-separated relative paths.
+fn walk(root: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(rel) = p.strip_prefix(root) {
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    out
+}

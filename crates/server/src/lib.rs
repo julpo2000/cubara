@@ -677,6 +677,31 @@ impl Server {
     /// a session is bad; losing it *and* taking the process down with it is
     /// worse, and it may be shutting down precisely because something is
     /// already wrong.
+    /// Work out everything a save would write, without writing it (block 2.15).
+    ///
+    /// `None` when there are no assets yet, which is the same condition
+    /// [`save_to`](Self::save_to) declines on: a world whose registries have not
+    /// been loaded has no id table to write, and a save without one cannot be
+    /// read back.
+    ///
+    /// The point of the split is that the returned plan borrows nothing, so the
+    /// caller can hand it to another thread and let the tick carry on. The disk
+    /// is the part of a save whose latency is unbounded.
+    pub fn plan_save(&self, dir: &std::path::Path) -> Option<cubara_sim::SavePlan> {
+        let (registry, items, blocks) = (
+            self.blocks_registry.as_deref()?,
+            self.items.as_ref()?,
+            self.terrain?,
+        );
+        match cubara_sim::plan_save(dir, &self.sim, &self.world, registry, items, blocks) {
+            Ok(plan) => Some(plan),
+            Err(e) => {
+                log::error!("could not prepare the world for saving: {e}");
+                None
+            }
+        }
+    }
+
     pub fn save_to(&self, dir: &std::path::Path) {
         let (Some(registry), Some(items), Some(blocks)) = (
             self.blocks_registry.as_deref(),

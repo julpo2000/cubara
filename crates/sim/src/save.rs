@@ -381,14 +381,22 @@ pub fn save_world(
     items: &ItemRegistry,
     blocks: TerrainBlocks,
 ) -> Result<(), SaveError> {
-    std::fs::create_dir_all(dir).map_err(SaveError::Io)?;
+    plan_save(dir, sim, world, registry, items, blocks)?.commit()
+}
 
+/// The header, as it is about to be written.
+fn build_header(
+    sim: &Sim,
+    world: &World,
+    registry: &BlockRegistry,
+    items: &ItemRegistry,
+) -> SavedHeader {
     let blocks_table: Vec<(u16, String)> = registry
         .ids()
         .filter_map(|id| registry.name_of(id).map(|name| (id.0, name.to_string())))
         .collect();
 
-    let header = SavedHeader {
+    SavedHeader {
         format_version: FORMAT_VERSION,
         worldgen_version: WORLDGEN_VERSION,
         seed: world.seed(),
@@ -436,7 +444,67 @@ pub fn save_world(
             })
             .collect(),
         next_entity_key: sim.entities.next_key(),
-    };
+    }
+}
+
+/// Everything a save is about to write, and everything it is about to delete.
+///
+/// Block 2.15. Produced on whichever thread owns the world -- it borrows the
+/// `Sim` and the `World` -- and [`committed`](SavePlan::commit) anywhere,
+/// because by then it is only bytes and paths. That split is what lets a server
+/// encode inside its tick and write outside it: the disk is the part whose
+/// latency is unbounded, and a tick loop that waits on it stalls for however
+/// long the filesystem feels like taking.
+///
+/// **Serialising still happens on the caller's thread.** Only the writing
+/// moves. Doing better would need an owned snapshot of the world, and the
+/// cheapest honest one is an `Arc` clone whose next edit deep-copies the world
+/// -- a bigger change with a real cost, and not this block's.
+#[derive(Debug)]
+pub struct SavePlan {
+    /// Written in order, each atomically.
+    files: Vec<(std::path::PathBuf, Vec<u8>)>,
+    /// Removed after the writes: players who left, and debris from an
+    /// interrupted save.
+    remove: Vec<std::path::PathBuf>,
+}
+
+impl SavePlan {
+    /// Carry it out. Safe to run on another thread -- it holds no borrow of the
+    /// world it came from.
+    pub fn commit(self) -> Result<(), SaveError> {
+        for (path, bytes) in &self.files {
+            durable::write_atomic(path, bytes).map_err(SaveError::Io)?;
+        }
+        for path in &self.remove {
+            // Already gone is the outcome this wanted, not a failure.
+            if let Err(e) = std::fs::remove_file(path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(SaveError::Io(e));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// How many files this will write. For tests and for logging.
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+}
+
+/// Work out what [`save_world`] would write, without writing any of it.
+pub fn plan_save(
+    dir: &Path,
+    sim: &Sim,
+    world: &World,
+    registry: &BlockRegistry,
+    items: &ItemRegistry,
+    blocks: TerrainBlocks,
+) -> Result<SavePlan, SaveError> {
+    std::fs::create_dir_all(dir).map_err(SaveError::Io)?;
+    std::fs::create_dir_all(players_dir(dir)).map_err(SaveError::Io)?;
+    let header = build_header(sim, world, registry, items);
 
     // Regions, then players, then the header. The order is not arbitrary:
     // `level.ron` carries the world-level tick and RNG, so writing it last
@@ -448,13 +516,15 @@ pub fn save_world(
     // This is a bound, not transactional saving. The save is several files and
     // they are not written as one unit; see the block's issue for what that
     // costs and why a journal is a different block.
-    region::save_regions(&dir.join("region"), world, blocks).map_err(SaveError::Region)?;
-    save_players(dir, sim, items)?;
+    let mut files =
+        region::plan_regions(&dir.join("region"), world, blocks).map_err(SaveError::Region)?;
+    let (player_files, remove) = plan_players(dir, sim, items)?;
+    files.extend(player_files);
 
     let text = ron::ser::to_string_pretty(&header, ron::ser::PrettyConfig::default())
         .map_err(SaveError::Ron)?;
-    durable::write_atomic(&dir.join("level.ron"), text.as_bytes()).map_err(SaveError::Io)?;
-    Ok(())
+    files.push((dir.join("level.ron"), text.into_bytes()));
+    Ok(SavePlan { files, remove })
 }
 
 /// The directory holding one file per player (version 6).
@@ -468,31 +538,38 @@ fn players_dir(dir: &Path) -> std::path::PathBuf {
 /// them would resurrect anyone who ever logged in the next time the world
 /// loaded, complete with their inventory -- a duplication bug that would look
 /// like a gameplay feature.
-fn save_players(dir: &Path, sim: &Sim, items: &ItemRegistry) -> Result<(), SaveError> {
+#[allow(clippy::type_complexity)]
+fn plan_players(
+    dir: &Path,
+    sim: &Sim,
+    items: &ItemRegistry,
+) -> Result<(Vec<(std::path::PathBuf, Vec<u8>)>, Vec<std::path::PathBuf>), SaveError> {
     let here = players_dir(dir);
-    std::fs::create_dir_all(&here).map_err(SaveError::Io)?;
 
+    let mut files = Vec::new();
     let mut keep: Vec<String> = Vec::new();
     for (id, p) in sim.players() {
         let saved = saved_player(p, items);
         let text = ron::ser::to_string_pretty(&saved, ron::ser::PrettyConfig::default())
             .map_err(SaveError::Ron)?;
         let name = format!("{}.ron", id.0);
-        durable::write_atomic(&here.join(&name), text.as_bytes()).map_err(SaveError::Io)?;
+        files.push((here.join(&name), text.into_bytes()));
         keep.push(name);
     }
 
-    for entry in std::fs::read_dir(&here).map_err(SaveError::Io)? {
-        let entry = entry.map_err(SaveError::Io)?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        // Debris from an interrupted write goes too: it is not a player and it
-        // is not a file anything should read.
-        let stale = durable::is_temp(&name) || (name.ends_with(".ron") && !keep.contains(&name));
-        if stale {
-            std::fs::remove_file(entry.path()).map_err(SaveError::Io)?;
+    let mut remove = Vec::new();
+    if here.is_dir() {
+        for entry in std::fs::read_dir(&here).map_err(SaveError::Io)? {
+            let entry = entry.map_err(SaveError::Io)?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Debris from an interrupted write goes too: it is not a player and
+            // it is not a file anything should read.
+            if durable::is_temp(&name) || (name.ends_with(".ron") && !keep.contains(&name)) {
+                remove.push(entry.path());
+            }
         }
     }
-    Ok(())
+    Ok((files, remove))
 }
 
 /// Read every `players/<id>.ron`, in id order.
