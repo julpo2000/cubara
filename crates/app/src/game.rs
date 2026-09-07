@@ -22,6 +22,7 @@ use cubara_sim::{SlotRef, HOTBAR_WIDTH};
 use cubara_voxel::{Angle, BlockRegistry, ChunkCoord, ItemRegistry, RecipeBook};
 use cubara_world::{Furnace, TerrainBlocks, World};
 
+use cubara_server::predict::Prediction;
 use cubara_server::{Action, Effect, FurnaceSlot, Screen, Server};
 
 use winit::keyboard::KeyCode;
@@ -57,6 +58,18 @@ pub struct Game {
     /// in-process for singleplayer (§3.3). Everything left on `Game` itself is
     /// input, screen state or presentation — the §8.1 table is the sorting.
     pub server: Server,
+    /// **The client's own player** (block 2.12b part B).
+    ///
+    /// Everything this client believes about itself: its pose, predicted with
+    /// block 2.13's machinery, and its inventory and crafting grid, replicated
+    /// through `Effect::SelfItems`. Nothing here is authority — it is corrected
+    /// by `Effect::SelfState` every tick.
+    ///
+    /// It exists because `Game` used to read `server.sim.player(server.local)`,
+    /// which is a field access standing in for a round trip. Over a socket there
+    /// is no such field: a connected client has no `Server` at all, and this is
+    /// what it draws itself from instead.
+    me: Prediction,
     /// The client's own world (`RESEARCH_MULTIPLAYER.md` §8.2).
     ///
     /// **A replica, not a cache, and not the server's.** The instinct is to
@@ -149,6 +162,10 @@ impl Game {
             // socket the seed arrives in the join handshake; in-process it is
             // read off the world that already exists.
             world: Arc::new(World::with_seed(server.world.seed())),
+            // The client's own copy of itself, seeded from the join handshake.
+            // In-process that handshake is a field read at construction; over a
+            // socket it is `Welcome` plus the first `SelfState`.
+            me: Prediction::new(server.world.seed(), player),
             server,
             prev_player: player,
             inventory_open: false,
@@ -179,12 +196,7 @@ impl Game {
     /// fraction. Render-side only (§9) -- never read back into the sim.
     pub fn camera_pose(&self) -> CameraPose {
         let alpha = (self.accumulator / TICK_DT as f64).clamp(0.0, 1.0) as f32;
-        let player = self.prev_player.lerp(
-            self.server
-                .sim
-                .player(self.server.local.expect("a local client")),
-            alpha,
-        );
+        let player = self.prev_player.lerp(self.me.player(), alpha);
         CameraPose {
             // The renderer works in floats, and that is the correct side of the
             // seam for it: a wrong last bit in a camera matrix is a sub-pixel
@@ -199,10 +211,7 @@ impl Game {
     /// tick (`cubara_sim::Sim::tick`), not here. The renderer draws it; it
     /// does not decide it (`ARCHITECTURE.md` Rule 3, issue #52).
     pub fn selected_block(&self) -> Option<[i32; 3]> {
-        self.server
-            .sim
-            .player(self.server.local.expect("a local client"))
-            .target
+        self.me.player().target
     }
 
     /// Record a movement key going down/up. Unmapped keys are ignored (returns
@@ -326,10 +335,18 @@ impl Game {
 
         let mut ticks = 0;
         while self.accumulator >= TICK_DT as f64 {
-            self.prev_player = *self
-                .server
-                .sim
-                .player(self.server.local.expect("a local client"));
+            self.prev_player = *self.me.player();
+
+            // The client acts on its own input first, and is corrected below.
+            // In-process the correction arrives on the same tick, so the
+            // reconciliation is a no-op -- which is the point: singleplayer is
+            // not a special case of multiplayer, it is multiplayer with a very
+            // short wire (design §5.1).
+            let blocks = self.server.terrain();
+            let seq = self
+                .me
+                .predict(input, Arc::make_mut(&mut self.world), blocks);
+
             self.server.tick_sim(&input);
             // Mining advances *per tick*, not per frame -- §4.3, and the same
             // reason the tick loop exists. A catch-up burst of N ticks is N
@@ -345,6 +362,15 @@ impl Game {
             // a client can honestly know, which is that the button is down.
             self.server.tick_mining(&input);
             self.server.tick_world();
+
+            // What the server thinks of this client, every tick: its pose, and
+            // its items when they have changed. These are the only two ways the
+            // client learns about itself now -- exactly the two a remote one
+            // would have.
+            let who = self.server.local.expect("a local client");
+            self.server.publish_self_state(who, seq.unwrap_or(0));
+            self.server.publish_self_items(who);
+
             input.jump = false;
             input.toggle_fly = false;
             input.look_delta = [Angle::ZERO, Angle::ZERO];
@@ -617,18 +643,23 @@ impl Game {
                 // It becomes the *only* way a client knows what it is carrying
                 // the moment `Game` talks over a `Link` — which is the next
                 // change on this branch, and the reason the message exists now.
-                Effect::SelfItems(_) => {}
-                // The server's correction to this client's own player (block
-                // 2.12b). Ignored here **only because this client is the server**
-                // -- `Game` still owns an in-process `Server` and reads the
-                // authoritative player straight out of it, so a correction is
-                // the state it already has.
+                // The two ways this client learns about **itself**, and since
+                // block 2.12b part B they are the only two. `Game` used to read
+                // its player straight out of the `Server` it owns, which is a
+                // field access standing in for a round trip; a connected client
+                // has no such field.
                 //
-                // The next block, where `Game` talks over a `net::Link` and can
-                // no longer reach into a `Sim`, is where this becomes the *only*
-                // way a client learns where it is. Written out rather than
-                // wildcarded for that reason: this arm is about to matter.
-                Effect::SelfState { .. } => {}
+                // `SelfItems` before `SelfState` in this arm order is not
+                // significant -- they are different fields of the same player --
+                // but they are written out rather than wildcarded, because an
+                // effect silently dropped by the replica is the kind of bug that
+                // shows up as a desync weeks later.
+                Effect::SelfItems(items) => items.apply_to(self.me.player_mut()),
+                Effect::SelfState { seq, state } => {
+                    let blocks = self.server.terrain();
+                    self.me
+                        .reconcile(seq, state, Arc::make_mut(&mut self.world), blocks);
+                }
             }
         }
         dirty
@@ -895,11 +926,7 @@ impl Game {
 
     /// Which hotbar slot is held, for the renderer.
     pub fn selected_hotbar_slot(&self) -> u8 {
-        self.server
-            .sim
-            .player(self.server.local.expect("a local client"))
-            .inventory
-            .selected_slot()
+        self.me.player().inventory.selected_slot()
     }
 
     /// Select a hotbar slot (number keys 1-9, passed as 0-8).
@@ -920,6 +947,82 @@ impl Default for Game {
 
 #[cfg(test)]
 mod tests {
+    /// The client's own player keeps up with the server's, and does so through
+    /// **messages only**.
+    ///
+    /// `Game` used to read `server.sim.player(server.local)` — a field access
+    /// standing in for a round trip, and the one shortcut a connected client
+    /// cannot take. Since block 2.12b part B the client keeps its own player,
+    /// corrected by `Effect::SelfState` and `Effect::SelfItems` every tick.
+    ///
+    /// If either of those stops being published, or stops being applied, this
+    /// is what notices — every other test here reads the *server's* player and
+    /// would go on passing with the client frozen at spawn.
+    #[test]
+    fn the_clients_own_player_tracks_the_server_through_messages_alone() {
+        let mut game = Game::new();
+        let items = load_item_registry();
+        let recipes = load_recipe_book(&items);
+        game.set_assets(
+            std::sync::Arc::new(cubara_render::load_registry()),
+            items,
+            recipes,
+        );
+
+        let start = *game.me.player();
+        game.forward = true;
+        for _ in 0..90 {
+            game.advance(TICK_DT);
+        }
+
+        let mine = game.me.player();
+        let theirs = game
+            .server
+            .sim
+            .player(game.server.local.expect("a local client"));
+
+        assert_ne!(
+            mine.pos, start.pos,
+            "the client's own player never moved, so it is not being corrected at all"
+        );
+        assert_eq!(
+            mine.pos, theirs.pos,
+            "the client and the server disagree about where the client is"
+        );
+        assert_eq!(
+            mine.health, theirs.health,
+            "health did not reach the client"
+        );
+    }
+
+    /// Selecting a hotbar slot reaches the client's copy the same way.
+    ///
+    /// Inventory is *replicated*, not predicted — `PlayerState` deliberately
+    /// leaves it out, because it changes through deliberate acts rather than
+    /// through physics. So this travels by `SelfItems` and nothing else.
+    #[test]
+    fn a_hotbar_selection_reaches_the_clients_own_copy() {
+        let mut game = Game::new();
+        let items = load_item_registry();
+        let recipes = load_recipe_book(&items);
+        game.set_assets(
+            std::sync::Arc::new(cubara_render::load_registry()),
+            items,
+            recipes,
+        );
+        game.advance(TICK_DT);
+
+        assert_eq!(game.me.player().inventory.selected_slot(), 0);
+        game.select_hotbar(3);
+        game.advance(TICK_DT);
+
+        assert_eq!(
+            game.me.player().inventory.selected_slot(),
+            3,
+            "the hotbar selection never reached the client's own copy"
+        );
+    }
+
     use super::*;
     use cubara_voxel::FixedVec3;
     use cubara_voxel::{BlockId, ItemStack, ItemState};

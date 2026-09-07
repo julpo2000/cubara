@@ -460,6 +460,10 @@ impl Action {
         match self {
             Action::Place => out.push(1),
             Action::Interact => out.push(2),
+            Action::SelectSlot(i) => {
+                out.push(4);
+                out.push(*i);
+            }
             Action::ClickFurnace { pos, slot } => {
                 out.push(3);
                 put_pos(out, *pos);
