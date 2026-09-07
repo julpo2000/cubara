@@ -125,7 +125,8 @@ if [ "$phase" = "2" ]; then
     run "the server never sends terrain (block 2.11)"         cargo test -p cubara-server --test client_view the_join_handshake_carries_no_terrain
     run "bandwidth per client does not grow with player count (block 2.11)"         cargo test -p cubara-server --test client_view bytes_to_one_client_do_not_grow_with_the_player_count
     run "a real socket, two processes (block 2.12)"         cargo test -p cubara-server --test two_processes
-    not_implemented "a region simulated elsewhere lands where it would have locally (block 2.16)"
+    run "a region simulated elsewhere lands where it would have locally (block 2.16)" \
+        cargo test -p cubara-server --test sharding a_region_simulated_elsewhere_lands_where_it_would_have_locally
 
     echo
     echo "$pass passed, $fail failed."

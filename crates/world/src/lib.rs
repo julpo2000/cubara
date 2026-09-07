@@ -29,5 +29,5 @@ mod worldgen;
 pub use block_entity::{BlockEntities, Furnace, FurnaceOutcome, SmeltCtx, TimedProcess};
 pub use chunk_state::{ChunkState, ChunkStates, Woken};
 pub use raycast::{raycast, RayHit};
-pub use world::World;
+pub use world::{simulation_box, World};
 pub use worldgen::{OreGen, OreSet, TerrainBlocks, WorldGen, MAX_ORES, WORLDGEN_VERSION};

@@ -205,39 +205,63 @@ impl World {
         radius: i32,
         now: u64,
     ) -> Vec<Woken> {
-        let in_range =
-            |c: ChunkCoord| (c.x - centre.x).abs() <= radius && (c.z - centre.z).abs() <= radius;
+        self.keep_simulating(&simulation_box(centre, radius), now)
+    }
 
-        // Sleep anything currently Active that has left the radius. Collected
-        // first: `active()` borrows the table this then mutates.
+    /// Make exactly `want` the set of chunks this world simulates: wake every
+    /// one of them, and put anything else that was awake to sleep.
+    ///
+    /// Block 2.16. `update_simulation_radius` is this with a box around a
+    /// player, and it was the only way to say which chunks tick — which made
+    /// "simulating" a property of *where somebody is standing*. A shard keeps a
+    /// region active because it was given it, not because anyone is there, so
+    /// the set has to be nameable directly (Rule 8: a shard owns a region, not
+    /// "the" region).
+    ///
+    /// Ordered iteration: `want` is a `BTreeSet`, so the catch-up work happens
+    /// in a defined sequence whatever order the caller built it in (Rule 1).
+    pub fn keep_simulating(
+        &mut self,
+        want: &std::collections::BTreeSet<ChunkCoord>,
+        now: u64,
+    ) -> Vec<Woken> {
+        // Sleep anything currently Active that is not wanted. Collected first:
+        // `active()` borrows the table this then mutates.
         let leaving: Vec<ChunkCoord> = self
             .chunk_states
             .active()
-            .filter(|c| !in_range(*c))
+            .filter(|c| !want.contains(c))
             .collect();
         for coord in leaving {
             self.chunk_states.sleep(coord, now);
         }
 
-        // Wake everything in range, in position order so the catch-up work
-        // happens in a defined sequence (Rule 1).
         let mut woken = Vec::new();
-        for x in (centre.x - radius)..=(centre.x + radius) {
-            for z in (centre.z - radius)..=(centre.z + radius) {
-                for y in
-                    (centre.y - SIM_VERTICAL_CHUNK_RADIUS)..=(centre.y + SIM_VERTICAL_CHUNK_RADIUS)
-                {
-                    let coord = ChunkCoord::new(x, y, z);
-                    match self.chunk_states.wake(coord, now) {
-                        Some(w) if w.elapsed > 0 => woken.push(w),
-                        _ => {}
-                    }
-                }
+        for &coord in want {
+            match self.chunk_states.wake(coord, now) {
+                Some(w) if w.elapsed > 0 => woken.push(w),
+                _ => {}
             }
         }
         woken
     }
+}
 
+/// The box of chunks a player at `centre` keeps simulating.
+pub fn simulation_box(centre: ChunkCoord, radius: i32) -> std::collections::BTreeSet<ChunkCoord> {
+    let mut want = std::collections::BTreeSet::new();
+    for x in (centre.x - radius)..=(centre.x + radius) {
+        for z in (centre.z - radius)..=(centre.z + radius) {
+            for y in (centre.y - SIM_VERTICAL_CHUNK_RADIUS)..=(centre.y + SIM_VERTICAL_CHUNK_RADIUS)
+            {
+                want.insert(ChunkCoord::new(x, y, z));
+            }
+        }
+    }
+    want
+}
+
+impl World {
     /// Cast a ray through the world (terrain + edits) and return the first solid
     /// block hit (see [`raycast`](crate::raycast)) — the basis for targeting a block
     /// to break/place.
