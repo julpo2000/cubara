@@ -236,3 +236,149 @@ fn a_second_claim_on_a_held_region_is_refused() {
     coord.claim(PeerId(2), &[far]).expect("a disjoint region");
     assert_eq!(coord.holder_of(far), Some(PeerId(2)));
 }
+
+// ---------------------------------------------------------------------------
+// Boundary handoff, for entities (§7.4 item 1)
+// ---------------------------------------------------------------------------
+
+/// A furnace on a seam has exactly one owner, and that falls out of claims
+/// being disjoint rather than from anything deciding it.
+///
+/// §7.4 lists this as part of the hard problem. For a block entity it is not
+/// hard *given* disjoint claims — a furnace cannot move, so whichever peer holds
+/// its chunk holds it, and no two peers hold a chunk. Asserted rather than
+/// argued, because "it follows from" is how invariants stop being true.
+#[test]
+fn a_block_on_a_seam_has_exactly_one_owner() {
+    let (_owner, chunks) = fixture();
+    let seam = ChunkCoord::from_block(SITE[0], SITE[1], SITE[2]);
+    let mut coord = Coordinator::new();
+
+    // Two peers taking the two halves of a region that touch at `seam`.
+    let left: Vec<ChunkCoord> = chunks.iter().copied().filter(|c| *c != seam).collect();
+    coord.claim(PeerId(1), &left).expect("the outer chunks");
+    coord.claim(PeerId(2), &[seam]).expect("the seam chunk");
+
+    assert_eq!(coord.holder_of(seam), Some(PeerId(2)));
+    for c in &left {
+        assert_eq!(coord.holder_of(*c), Some(PeerId(1)), "{c:?}");
+    }
+    // And nobody can take it as well.
+    assert!(coord.claim(PeerId(3), &[seam]).is_err());
+}
+
+/// An item that crosses a shard boundary is moved exactly once — not
+/// duplicated, not dropped.
+///
+/// The whole of §7.4 item 1 for entities, and the assertion that matters is the
+/// **total count on both sides**: reporting a crossing without despawning it
+/// duplicates the item, despawning without reporting loses it, and both
+/// failures are silent in any test that only looks at one server.
+#[test]
+fn an_item_crossing_a_boundary_is_moved_exactly_once() {
+    let (mut a, a_chunks) = fixture();
+    // Derive the chunk from the position rather than the other way round: a
+    // chunk's side length is `cubara_voxel::SIZE` and multiplying by a guessed
+    // 32 put the item in a different chunk than the one being claimed, which
+    // showed up as "routed to the wrong peer".
+    let landing = [-5000, 40, -5000];
+    let far = ChunkCoord::from_block(landing[0], landing[1], landing[2]);
+    let b_chunks = vec![far];
+
+    let mut coord = Coordinator::new();
+    coord.claim(PeerId(1), &a_chunks).expect("region A");
+    coord.claim(PeerId(2), &b_chunks).expect("region B");
+
+    let (mut b, _) = fixture();
+    // B holds only its own region, and starts with nothing of A's.
+    b.assign(b_chunks.iter().copied());
+    for (key, _) in b.extract_shard(&b_chunks).entities {
+        b.sim.entities.despawn(key);
+    }
+
+    // An item in A's world, sitting in B's region — it crossed.
+    let stack = {
+        let items = a.items.as_ref().expect("assets");
+        let log = items.id_of("cubara:oak_log").expect("oak log");
+        items.new_stack(log, 1).expect("a stack")
+    };
+    let travelling = a.sim.entities.spawn_item(
+        stack,
+        FixedVec3::from_blocks(landing[0], landing[1], landing[2]),
+        FixedVec3::ZERO,
+    );
+
+    let before = a.sim.entities.sorted().len() + b.sim.entities.sorted().len();
+
+    // A reports what has left it, the coordinator routes it, B takes it, and
+    // only then does A let go.
+    let escaped = a.escaped_entities(&a_chunks);
+    assert!(
+        escaped.iter().any(|(k, _)| *k == travelling),
+        "the item that crossed was not reported as having left"
+    );
+    let routed = coord.route(&escaped);
+    assert_eq!(routed.len(), 1, "the crossing went to more than one place");
+    let (to, items) = &routed[0];
+    assert_eq!(
+        *to,
+        Some(PeerId(2)),
+        "the item was routed to the wrong peer"
+    );
+    b.accept_entities(items);
+    a.despawn_escaped(&escaped);
+
+    let after = a.sim.entities.sorted().len() + b.sim.entities.sorted().len();
+    assert_eq!(
+        before, after,
+        "the crossing changed how many items exist: {before} before, {after} after"
+    );
+    assert!(
+        b.sim
+            .entities
+            .sorted()
+            .iter()
+            .any(|(k, _)| *k == travelling),
+        "the item never arrived"
+    );
+    assert!(
+        !a.sim
+            .entities
+            .sorted()
+            .iter()
+            .any(|(k, _)| *k == travelling),
+        "the item is still at its old home as well — it was duplicated"
+    );
+}
+
+/// An item that lands where nobody is responsible comes back to the caller.
+///
+/// A real case, not an error: the space between two claimed regions belongs to
+/// no peer. Dropping it here would make an item vanish for a reason nothing
+/// recorded, which is the hardest kind of bug to find later.
+#[test]
+fn an_item_crossing_into_unclaimed_space_is_reported_not_dropped() {
+    let (mut a, a_chunks) = fixture();
+    let mut coord = Coordinator::new();
+    coord.claim(PeerId(1), &a_chunks).expect("region A");
+
+    let stack = {
+        let items = a.items.as_ref().expect("assets");
+        let log = items.id_of("cubara:oak_log").expect("oak log");
+        items.new_stack(log, 1).expect("a stack")
+    };
+    a.sim.entities.spawn_item(
+        stack,
+        FixedVec3::from_blocks(-5000, 40, -5000),
+        FixedVec3::ZERO,
+    );
+
+    let escaped = a.escaped_entities(&a_chunks);
+    let routed = coord.route(&escaped);
+    assert!(
+        routed
+            .iter()
+            .any(|(to, items)| to.is_none() && !items.is_empty()),
+        "an item in unclaimed space was not reported back"
+    );
+}

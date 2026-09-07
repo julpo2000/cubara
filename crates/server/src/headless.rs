@@ -425,12 +425,39 @@ impl Session {
             self.ticks += 1;
         }
         if cfg.autosave_ticks > 0 && self.ticks - self.last_save >= cfg.autosave_ticks {
-            self.save(&cfg.world);
+            // The autosave is the whole reason saving moved off the tick
+            // loop, so it is the one caller that must not wait.
+            self.save_in_background(&cfg.world);
         }
     }
 
     /// Write the world to disk and remember that we did.
+    /// Write the world to `dir` and **wait for it**.
+    ///
+    /// The blocking one, and it keeps the plain name on purpose. Block 2.15
+    /// moved saving onto a worker thread and gave `save` that behaviour, which
+    /// turned every existing caller into a race: `a_world_survives_a_restart`
+    /// saved and reopened the directory immediately, and started failing on
+    /// macOS CI while passing on Windows and locally. Atomic writes mean the
+    /// files it did see were whole — they were simply not all there yet.
+    ///
+    /// So the surprising behaviour got the surprising name. A caller that wants
+    /// the tick loop back straight away asks for
+    /// [`save_in_background`](Self::save_in_background) and says so.
     pub fn save(&mut self, dir: &Path) {
+        self.save_in_background(dir);
+        self.finish_save();
+    }
+
+    /// Start writing the world to `dir` and return immediately.
+    ///
+    /// **The world is not on disk when this returns.** Call
+    /// [`finish_save`](Self::finish_save) before reading the directory, or use
+    /// [`save`](Self::save), which is this plus that wait.
+    ///
+    /// What the autosave uses: the disk's latency is unbounded and a tick loop
+    /// has no business waiting on it (block 2.15).
+    pub fn save_in_background(&mut self, dir: &Path) {
         let Some(plan) = self.server.plan_save(dir) else {
             return;
         };

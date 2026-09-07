@@ -144,6 +144,60 @@ impl Server {
         }
     }
 
+    /// Everything in this server's simulation that is **not** inside `chunks`.
+    ///
+    /// Block 2.17. A shard host holds one region, so anything that has wandered
+    /// outside it has left this host's authority — a dropped item that fell,
+    /// bounced or was flung across a seam. Stateless on purpose: it does not
+    /// remember what was installed, it asks where things are *now*, which is
+    /// the question that cannot go stale.
+    ///
+    /// The caller pairs this with [`despawn_escaped`](Self::despawn_escaped) and
+    /// the coordinator's routing, and the pairing is what makes a crossing
+    /// happen exactly once. Reporting without despawning duplicates the item;
+    /// despawning without reporting loses it. Both failures are silent, which
+    /// is why the test for this asserts the total count on both sides.
+    pub fn escaped_entities(&self, chunks: &[ChunkCoord]) -> Vec<(EntityKey, DroppedItem)> {
+        let inside: BTreeSet<ChunkCoord> = chunks.iter().copied().collect();
+        self.sim
+            .entities
+            .sorted()
+            .into_iter()
+            .filter(|(_, d)| {
+                !inside.contains(&ChunkCoord::from_block(
+                    d.pos.x.floor_block(),
+                    d.pos.y.floor_block(),
+                    d.pos.z.floor_block(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Forget the entities [`escaped_entities`](Self::escaped_entities) reported,
+    /// because somebody else is taking them.
+    ///
+    /// Separate from the reporting so the caller can fail in between without
+    /// having already destroyed anything: an item is removed here only once the
+    /// coordinator has it, which is the order that loses nothing if the second
+    /// step never happens.
+    pub fn despawn_escaped(&mut self, escaped: &[(EntityKey, DroppedItem)]) {
+        for (key, _) in escaped {
+            self.sim.entities.despawn(*key);
+        }
+    }
+
+    /// Take entities that crossed into this shard from somewhere else.
+    ///
+    /// Keyed, so an item keeps its identity across the seam and the world hash
+    /// does not move (§10.2 rule 3). An item that arrives twice overwrites
+    /// itself rather than becoming two items, which makes a duplicated delivery
+    /// harmless where a duplicated *spawn* would not be.
+    pub fn accept_entities(&mut self, arriving: &[(EntityKey, DroppedItem)]) {
+        for (key, item) in arriving {
+            self.sim.entities.restore_item(*key, *item);
+        }
+    }
+
     /// Put a shard's state into this server, replacing whatever was there.
     ///
     /// Replacing, not merging: a handoff carries the whole of the shard's

@@ -474,7 +474,7 @@ fn a_background_save_produces_a_loadable_world() {
 
     let mut session = Session::open(&cfg);
     session.advance(5, &cfg);
-    session.save(&dir);
+    session.save_in_background(&dir);
     session.finish_save();
 
     assert!(
@@ -519,9 +519,9 @@ fn no_save_writer_is_left_detached() {
 
     let mut session = Session::open(&cfg);
     session.advance(3, &cfg);
-    session.save(&dir);
+    session.save_in_background(&dir);
     session.advance(3, &cfg);
-    session.save(&dir);
+    session.save_in_background(&dir);
     session.finish_save();
 
     assert_eq!(
@@ -558,4 +558,50 @@ fn walk(root: &std::path::Path) -> Vec<String> {
         }
     }
     out
+}
+
+/// `save` waits; `save_in_background` does not, and says so in its name.
+///
+/// This is a regression test with a story. Block 2.15 moved saving onto a
+/// worker thread and gave `save` that behaviour, which quietly turned every
+/// existing caller into a race — `a_world_survives_a_restart` saved and
+/// reopened the directory immediately, and began failing on macOS CI while
+/// passing on Windows and locally. Atomic writes meant the files it did see
+/// were whole; they were simply not all there yet.
+///
+/// The fix was to give the surprising behaviour the surprising name. This pins
+/// that: after `save` returns, the world is on disk.
+#[test]
+fn save_returns_only_once_the_world_is_on_disk() {
+    use cubara_server::headless::{Config, Session};
+
+    let dir = std::env::temp_dir().join("cubara-save-is-sync");
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = Config {
+        world: dir.clone(),
+        autosave_ticks: 0,
+        ..Config::default()
+    };
+
+    let mut session = Session::open(&cfg);
+    session.advance(5, &cfg);
+    session.save(&dir);
+
+    // No join, no sleep: if `save` were the background one this would race, and
+    // on a loaded CI runner it would lose.
+    assert!(
+        dir.join("level.ron").is_file(),
+        "`save` returned before the header was on disk"
+    );
+    assert!(
+        dir.join("players").is_dir(),
+        "`save` returned before the players were on disk"
+    );
+    assert_eq!(
+        session.writers_outstanding(),
+        0,
+        "`save` returned with a writer still running"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
