@@ -29,6 +29,7 @@
 
 pub mod assets;
 pub mod clock;
+pub mod coordinator;
 pub mod headless;
 pub mod join;
 pub mod net;
