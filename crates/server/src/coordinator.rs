@@ -45,7 +45,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use cubara_sim::PlayerInputs;
+use cubara_sim::{DroppedItem, EntityKey, PlayerInputs};
 use cubara_voxel::ChunkCoord;
 
 use crate::shard::Shard;
@@ -188,6 +188,38 @@ impl Coordinator {
         } else {
             Audit::Disagrees
         }
+    }
+
+    /// Work out where entities that left one peer's region should go.
+    ///
+    /// Block 2.17, the entity half of §7.4's boundary handoff. Grouped by
+    /// destination peer and returned in `PeerId` order, so two coordinators
+    /// given the same crossings route them the same way (Rule 1).
+    ///
+    /// Entities whose new position is held by **nobody** come back under
+    /// `None`. That is a real case rather than an error — a region between two
+    /// shards that no peer has claimed — and the caller decides whether to hold
+    /// them, claim the region, or hand them to the coordinator's own server.
+    /// Silently dropping them here would make an item vanish for a reason
+    /// nothing recorded.
+    #[allow(clippy::type_complexity)]
+    pub fn route(
+        &self,
+        crossings: &[(EntityKey, DroppedItem)],
+    ) -> Vec<(Option<PeerId>, Vec<(EntityKey, DroppedItem)>)> {
+        let mut by_peer: BTreeMap<Option<PeerId>, Vec<(EntityKey, DroppedItem)>> = BTreeMap::new();
+        for (key, item) in crossings {
+            let chunk = ChunkCoord::from_block(
+                item.pos.x.floor_block(),
+                item.pos.y.floor_block(),
+                item.pos.z.floor_block(),
+            );
+            by_peer
+                .entry(self.holder_of(chunk))
+                .or_default()
+                .push((*key, *item));
+        }
+        by_peer.into_iter().collect()
     }
 
     /// A peer has gone. Hand back what it was holding and the last state
