@@ -236,11 +236,31 @@ pub fn save_regions(
     world: &World,
     blocks: TerrainBlocks,
 ) -> Result<(), RegionError> {
+    for (path, bytes) in plan_regions(region_dir, world, blocks)? {
+        crate::durable::write_atomic(&path, &bytes).map_err(RegionError::Io)?;
+    }
+    Ok(())
+}
+
+/// The bytes [`save_regions`] would write, without writing them (block 2.15).
+///
+/// Split out so a server can *encode* on the tick thread and *write* somewhere
+/// else: the disk is the part whose latency is unbounded, and a tick loop that
+/// waits on it stalls for however long the filesystem feels like taking.
+///
+/// `save_regions` is this function plus the writes, rather than a second copy
+/// of the grouping logic (Rule 5) -- if the two ever disagreed about which
+/// chunks belong in which region file, one of them would be writing worlds the
+/// other could not read.
+pub fn plan_regions(
+    region_dir: &Path,
+    world: &World,
+    blocks: TerrainBlocks,
+) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>, RegionError> {
     let dirty = world.dirty_chunks();
     if dirty.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    std::fs::create_dir_all(region_dir).map_err(RegionError::Io)?;
 
     let mut by_region: std::collections::BTreeMap<(i32, i32, i32), Vec<(ChunkCoord, Chunk)>> =
         std::collections::BTreeMap::new();
@@ -252,11 +272,14 @@ pub fn save_regions(
             .push((coord, chunk));
     }
 
+    let mut planned = Vec::with_capacity(by_region.len());
     for (region, chunks) in &by_region {
-        let path = region_dir.join(region_file_name(*region));
-        write_region_file(&path, chunks)?;
+        planned.push((
+            region_dir.join(region_file_name(*region)),
+            encode_region(chunks)?,
+        ));
     }
-    Ok(())
+    Ok(planned)
 }
 
 #[cfg(test)]

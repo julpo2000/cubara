@@ -28,7 +28,7 @@ pub use player::{
     SAFE_FALL, SENSITIVITY_PER_PIXEL,
 };
 pub use rng::WorldRng;
-pub use save::{load_world, save_world, LoadError, SaveError, FORMAT_VERSION};
+pub use save::{load_world, plan_save, save_world, LoadError, SaveError, SavePlan, FORMAT_VERSION};
 
 use std::collections::BTreeMap;
 

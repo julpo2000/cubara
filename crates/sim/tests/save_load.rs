@@ -1047,3 +1047,127 @@ fn a_departed_players_file_is_removed() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Planning a save and committing it writes exactly what saving directly does.
+///
+/// The two paths exist so a server can encode inside its tick and write outside
+/// it, and they are only worth having if they cannot disagree. This compares
+/// the resulting directories byte for byte rather than comparing hashes of the
+/// loaded worlds: two different byte layouts can load to the same world today
+/// and stop doing so after any format change, and then the divergence would be
+/// discovered by a player rather than by this test.
+#[test]
+fn a_planned_save_writes_what_a_direct_save_writes() {
+    let registry = test_registry();
+    let items = test_items();
+    let blocks = TerrainBlocks::from_registry(&registry);
+    let seed = 0x00AB_00AB_00AB_00AB;
+
+    let mut sim = Sim::new(
+        seed,
+        Player::new(
+            cubara_voxel::FixedVec3::from_f32([0.5, 50.0, 0.5]),
+            Angle::ZERO,
+            Angle::ZERO,
+        ),
+    );
+    sim.join(Player::new(
+        cubara_voxel::FixedVec3::from_f32([4.5, 51.0, 4.5]),
+        Angle::ZERO,
+        Angle::ZERO,
+    ));
+    let mut world = World::with_seed(seed);
+    // Something in the region files, so this is not comparing two empty
+    // directories and calling them equal.
+    world.set_block(3, 50, 3, cubara_voxel::BlockId::STONE);
+    world.set_block(4, 50, 3, cubara_voxel::BlockId::STONE);
+
+    let direct = scratch_dir("plan-direct");
+    save_world(&direct, &sim, &world, &registry, &items, blocks).expect("direct save");
+
+    let planned = scratch_dir("plan-planned");
+    cubara_sim::plan_save(&planned, &sim, &world, &registry, &items, blocks)
+        .expect("plan")
+        .commit()
+        .expect("commit");
+
+    let listing = |root: &std::path::Path| {
+        let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).expect("read dir") {
+                let e = e.expect("entry");
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    let rel = p
+                        .strip_prefix(root)
+                        .expect("under root")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.push((rel, std::fs::read(&p).expect("read file")));
+                }
+            }
+        }
+        out.sort();
+        out
+    };
+
+    let a = listing(&direct);
+    let b = listing(&planned);
+    assert!(
+        a.len() >= 4,
+        "expected level.ron, two players and a region; got {:?}",
+        a.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        a.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+        b.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+        "the two paths wrote different files"
+    );
+    for ((name, x), (_, y)) in a.iter().zip(b.iter()) {
+        assert_eq!(x, y, "{name} differs between a direct and a planned save");
+    }
+
+    let _ = std::fs::remove_dir_all(&direct);
+    let _ = std::fs::remove_dir_all(&planned);
+}
+
+/// A plan holds no borrow of the world, so it can cross a thread.
+///
+/// This is the whole point of the split — a compile-time property, asserted by
+/// a test that would not compile if it stopped holding.
+#[test]
+fn a_plan_can_be_committed_on_another_thread() {
+    let registry = test_registry();
+    let items = test_items();
+    let blocks = TerrainBlocks::from_registry(&registry);
+    let seed = 0x00CD_00CD_00CD_00CD;
+
+    let sim = Sim::new(
+        seed,
+        Player::new(
+            cubara_voxel::FixedVec3::from_f32([0.5, 50.0, 0.5]),
+            Angle::ZERO,
+            Angle::ZERO,
+        ),
+    );
+    let mut world = World::with_seed(seed);
+    world.set_block(2, 50, 2, cubara_voxel::BlockId::STONE);
+
+    let dir = scratch_dir("plan-thread");
+    let plan = cubara_sim::plan_save(&dir, &sim, &world, &registry, &items, blocks).expect("plan");
+
+    let handle = std::thread::spawn(move || plan.commit());
+    handle.join().expect("the writer thread").expect("commit");
+
+    let (loaded, _) = load_world(&dir, &registry, &items, blocks).expect("load");
+    let region = hash_region();
+    assert_eq!(
+        WorldHash::compute(&sim, &world, &region, blocks, 1),
+        WorldHash::compute(&loaded, &World::with_seed(seed), &region, blocks, 1),
+        "a save written on another thread loaded as a different world"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

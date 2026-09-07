@@ -118,6 +118,22 @@ pub struct Session {
     /// the socket, not of the limit, so counting refusals alone makes a test
     /// that fails on a slow runner and passes on a fast one.
     most_in_one_tick: usize,
+    /// The save currently being written, if any (block 2.15).
+    ///
+    /// One at a time. A save asked for while one is in flight waits for it
+    /// rather than queueing: a queue of world snapshots is a memory leak with a
+    /// slow disk attached, and the newer save supersedes the older one anyway.
+    writing: Option<std::thread::JoinHandle<()>>,
+    /// Writer threads started, and writer threads waited for.
+    ///
+    /// They must be equal whenever no save is in flight. Counted rather than
+    /// trusted because the failure they guard against is invisible: dropping a
+    /// `JoinHandle` does not stop the thread, it *detaches* it, so a `save` that
+    /// forgot to wait would leave an older writer running into the same
+    /// directory as a newer one and nothing would look wrong until two saves
+    /// interleaved on a slow disk.
+    writers_started: u64,
+    writers_joined: u64,
 }
 
 impl Session {
@@ -144,6 +160,9 @@ impl Session {
             last_seq: BTreeMap::new(),
             dropped_actions: 0,
             most_in_one_tick: 0,
+            writing: None,
+            writers_started: 0,
+            writers_joined: 0,
         }
     }
 
@@ -161,6 +180,12 @@ impl Session {
         // a player for the simulation to be about.
         self.server.go_headless();
         Ok(bound)
+    }
+
+    /// Writer threads started but never waited for. Zero whenever no save is
+    /// in flight; anything else is a detached writer.
+    pub fn writers_outstanding(&self) -> u64 {
+        self.writers_started - self.writers_joined
     }
 
     /// How many actions have been refused for exceeding
@@ -406,8 +431,35 @@ impl Session {
 
     /// Write the world to disk and remember that we did.
     pub fn save(&mut self, dir: &Path) {
-        self.server.save_to(dir);
+        let Some(plan) = self.server.plan_save(dir) else {
+            return;
+        };
+        // Wait for the previous writer before starting another, so there is
+        // never more than one process writing into this directory.
+        self.finish_save();
+        let where_to = dir.to_path_buf();
+        self.writers_started += 1;
+        self.writing = Some(std::thread::spawn(move || match plan.commit() {
+            Ok(()) => log::info!("world saved to {}", where_to.display()),
+            Err(e) => log::error!("could not save the world: {e}"),
+        }));
         self.last_save = self.ticks;
+    }
+
+    /// Wait for any save still being written.
+    ///
+    /// Called before starting another and on shutdown. A process that exits
+    /// with a writer mid-flight leaves exactly the half-written directory
+    /// atomic writes exist to prevent -- each *file* would still be whole, but
+    /// the set would be missing the ones the thread had not reached.
+    pub fn finish_save(&mut self) {
+        if let Some(handle) = self.writing.take() {
+            // A writer thread that panicked has already logged it; there is
+            // nothing useful to do here but carry on, and propagating it would
+            // take a running server down over a failed autosave.
+            let _ = handle.join();
+            self.writers_joined += 1;
+        }
     }
 
     /// One line of "is it alive and is it keeping up", for the operator.
@@ -492,7 +544,23 @@ pub fn run(cfg: &Config) {
 
     log::info!("{}", session.status());
     session.save(&cfg.world);
+    // Explicit rather than left to `Drop`, so "stopped after N ticks" is the
+    // last thing printed and means it: the world really is on disk by then.
+    session.finish_save();
     log::info!("stopped after {} ticks", session.ticks);
+}
+
+impl Drop for Session {
+    /// Never leave a save half-written.
+    ///
+    /// Every *file* would still be whole -- that is what atomic writes buy --
+    /// but a writer killed part-way through leaves the set incomplete: newer
+    /// regions with no header, or a header with no players. The shutdown path
+    /// joins explicitly; this catches every other way a `Session` ends,
+    /// including a test that drops one.
+    fn drop(&mut self) {
+        self.finish_save();
+    }
 }
 
 /// Parse the dedicated server's arguments.
