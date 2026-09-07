@@ -45,7 +45,7 @@
 //! module say "no floats" without a footnote. It changes `physics::step` and
 //! every pinned hash with it, so it is not this block's business.
 
-use cubara_voxel::{Angle, BlockId, Fixed, FixedVec3, ItemId};
+use cubara_voxel::{Angle, BlockId, Fixed, FixedVec3, ItemId, ItemStack, ItemState};
 use cubara_world::Furnace;
 
 use cubara_sim::{InputFrame, PlayerId, PlayerState};
@@ -203,6 +203,69 @@ fn put_item_slot(out: &mut Vec<u8>, slot: Option<(ItemId, u8)>) {
 /// Every field `Sim::tick` reads, because a client replaying its input has to
 /// start from all of it -- see `PlayerState`'s own docs for what dropping one
 /// costs.
+/// One slot: present-or-not, then the stack.
+///
+/// `ItemState` is written as a discriminant byte plus its payload rather than
+/// only the payload -- without it a stateless item and a tool at zero remaining
+/// would encode alike, and those are very different things. The same discipline
+/// `WorldHash::write_inventory` already uses.
+fn put_stack(out: &mut Vec<u8>, stack: Option<ItemStack>) {
+    match stack {
+        None => out.push(0),
+        Some(s) => {
+            out.push(1);
+            out.extend_from_slice(&s.item().0.to_le_bytes());
+            out.push(s.count());
+            match s.state() {
+                ItemState::None => out.push(0),
+                ItemState::Durability { remaining } => {
+                    out.push(1);
+                    out.extend_from_slice(&remaining.to_le_bytes());
+                }
+            }
+        }
+    }
+}
+
+fn get_stack(c: &mut Cursor<'_>) -> Result<Option<ItemStack>, WireError> {
+    if !c.bool()? {
+        return Ok(None);
+    }
+    let item = ItemId(c.u16()?);
+    let count = c.u8()?;
+    let state = match c.u8()? {
+        0 => ItemState::None,
+        1 => ItemState::Durability {
+            remaining: c.u16()?,
+        },
+        t => return Err(WireError::BadTag(t)),
+    };
+    // `max_stack` is the receiving side's business: it comes from the item
+    // registry, which the fingerprint check has already proved we agree about.
+    // Passing `count` as the maximum accepts whatever the server said rather
+    // than second-guessing it with a number we would have to look up.
+    ItemStack::new(item, count, state, count)
+        .map(Some)
+        .map_err(|_| WireError::BadTag(count))
+}
+
+/// A run of slots, length-prefixed so the reader knows how much work it faces.
+fn put_stacks(out: &mut Vec<u8>, stacks: &[Option<ItemStack>]) {
+    out.extend_from_slice(&(stacks.len() as u32).to_le_bytes());
+    for s in stacks {
+        put_stack(out, *s);
+    }
+}
+
+fn get_stacks(c: &mut Cursor<'_>) -> Result<Vec<Option<ItemStack>>, WireError> {
+    let n = c.u32()?;
+    let mut out = Vec::new();
+    for _ in 0..n {
+        out.push(get_stack(c)?);
+    }
+    Ok(out)
+}
+
 fn put_player_state(out: &mut Vec<u8>, s: &PlayerState) {
     put_fixed_vec3(out, s.pos);
     put_fixed_vec3(out, s.velocity);
@@ -324,6 +387,14 @@ impl Effect {
                 out.extend_from_slice(&seq.to_le_bytes());
                 put_player_state(out, state);
             }
+            Effect::SelfItems(items) => {
+                out.push(7);
+                put_stacks(out, &items.inventory);
+                out.push(items.selected);
+                put_stacks(out, &items.grid);
+                out.push(items.grid_width as u8);
+                put_stack(out, items.held);
+            }
         }
     }
 
@@ -355,6 +426,13 @@ impl Effect {
                 seq: c.u64()?,
                 state: get_player_state(c)?,
             },
+            7 => Effect::SelfItems(Box::new(crate::ClientItems {
+                inventory: get_stacks(c)?,
+                selected: c.u8()?,
+                grid: get_stacks(c)?,
+                grid_width: c.u8()? as usize,
+                held: get_stack(c)?,
+            })),
             t => return Err(WireError::BadTag(t)),
         })
     }
@@ -694,6 +772,23 @@ mod tests {
             seq: u64::MAX,
             state: a_player_state(),
         });
+        round_trip_effect(Effect::SelfItems(Box::new(crate::ClientItems {
+            inventory: vec![
+                None,
+                Some(ItemStack::new(ItemId(3), 17, ItemState::None, 64).unwrap()),
+                Some(
+                    ItemStack::new(ItemId(9), 1, ItemState::Durability { remaining: 77 }, 1)
+                        .unwrap(),
+                ),
+            ],
+            selected: 2,
+            grid: vec![
+                None,
+                Some(ItemStack::new(ItemId(4), 1, ItemState::None, 64).unwrap()),
+            ],
+            grid_width: 3,
+            held: Some(ItemStack::new(ItemId(5), 8, ItemState::None, 64).unwrap()),
+        })));
     }
 
     /// Every field of a correction survives, checked one at a time.

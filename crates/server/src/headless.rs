@@ -210,6 +210,10 @@ impl Session {
     /// Goes through exactly the same `accept` path a TCP connection does, so
     /// nothing can be true here that would not be true over a wire (§2).
     pub fn attach(&mut self) -> Link<ClientMessage, ServerMessage> {
+        // Same as `listen`: a world with clients is served, not played here. The
+        // attached client *is* a player, so keeping the local one would leave a
+        // second body standing on spawn -- the ghost, by another door.
+        self.server.go_headless();
         let (server_side, client_side) = crate::net::local_pair();
         self.welcome(server_side);
         client_side
@@ -395,6 +399,11 @@ impl Session {
         for &who in self.clients.keys() {
             let seq = self.last_seq.get(&who).copied().unwrap_or(0);
             self.server.publish_self_state(who, seq);
+        }
+        // Items separately, and only when they changed -- an inventory is large
+        // and changes rarely, where a pose is small and changes constantly.
+        for who in self.clients.keys().copied().collect::<Vec<_>>() {
+            self.server.publish_self_items(who);
         }
         for (&who, link) in self.clients.iter_mut() {
             let owed = self.server.drain_effects_for(who);

@@ -131,6 +131,10 @@ pub struct Server {
     /// arrive late are handled by `refresh_view`'s backfill instead, which is
     /// where "new to *you*" belongs.
     last_pose: BTreeMap<PlayerId, (FixedVec3, Angle, Angle)>,
+    /// The items each client was last told about, so an unchanged inventory is
+    /// not re-sent. Same reasoning as `last_pose`, and the same trap avoided by
+    /// `open_view` sending a fresh copy to anyone who joins.
+    last_items: BTreeMap<PlayerId, ClientItems>,
     /// Each player's break in progress (block 2.14).
     ///
     /// Not in the save format and not in the world hash, for the reason §4.3
@@ -190,7 +194,7 @@ pub enum FurnaceSlot {
 
 /// A screen the server says should open. The *screen* is client state (§8.1);
 /// what is behind it is not.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Screen {
     Bench,
     Furnace([i32; 3]),
@@ -207,7 +211,7 @@ pub enum Screen {
 /// *edit*, the client applies it to its own world, and the dirty chunk is what
 /// its own `set_block` hands back. A remote client would derive it the same way,
 /// because there is no other way for it to derive it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Effect {
     /// A block changed. The client applies it to its replica.
     Edit { pos: [i32; 3], block: BlockId },
@@ -264,6 +268,62 @@ pub enum Effect {
     /// without it would make block 2.13's first commit a breaking change to a
     /// message a day old. Do not remove it as dead code.
     SelfState { seq: u64, state: PlayerState },
+    /// **What this client is carrying** (block 2.12b).
+    ///
+    /// Separate from [`SelfState`](Effect::SelfState), and the separation is
+    /// load-bearing rather than tidy: `SelfState` is what a replay rewinds to,
+    /// and rewinding an inventory would un-pick-up an item that was genuinely
+    /// picked up between a correction being sent and it arriving. Physics is
+    /// replayed; possessions are not.
+    ///
+    /// Sent when it changes rather than every tick, for the same reason a
+    /// motionless player is not re-sent: an inventory is large and changes
+    /// rarely.
+    SelfItems(Box<ClientItems>),
+}
+
+/// The item half of a client's own state.
+///
+/// Boxed inside [`Effect`] because it dwarfs every other variant, and an enum is
+/// as large as its largest arm -- every `Edit` in a batch would otherwise carry
+/// the footprint of a whole inventory.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClientItems {
+    pub inventory: Vec<Option<ItemStack>>,
+    pub selected: u8,
+    pub grid: Vec<Option<ItemStack>>,
+    pub grid_width: usize,
+    pub held: Option<ItemStack>,
+}
+
+impl ClientItems {
+    /// Read a player's items out, as they stand.
+    pub fn of(p: &cubara_sim::Player) -> Self {
+        Self {
+            inventory: (0..cubara_sim::SLOT_COUNT)
+                .map(|i| p.inventory.slot(i))
+                .collect(),
+            selected: p.inventory.selected_slot(),
+            grid: (0..cubara_voxel::MAX_GRID * cubara_voxel::MAX_GRID)
+                .map(|i| p.crafting.cell(i))
+                .collect(),
+            grid_width: p.crafting.width(),
+            held: p.crafting.held(),
+        }
+    }
+
+    /// Write them onto a player -- what a client does to its own copy.
+    pub fn apply_to(&self, p: &mut cubara_sim::Player) {
+        for (i, slot) in self.inventory.iter().enumerate() {
+            p.inventory.set_slot(i, *slot);
+        }
+        p.inventory.select(self.selected);
+        p.crafting.set_width(self.grid_width);
+        for (i, cell) in self.grid.iter().enumerate() {
+            p.crafting.set_cell(i, *cell);
+        }
+        p.crafting.set_held(self.held);
+    }
 }
 
 impl Server {
@@ -295,6 +355,7 @@ impl Server {
             assigned: std::collections::BTreeSet::new(),
             assigned_changed: false,
             last_pose: BTreeMap::new(),
+            last_items: BTreeMap::new(),
             local: Some(PlayerId::LOCAL),
         };
         // The local client is watching from the start. A `Server` with no view
@@ -815,6 +876,24 @@ impl Server {
         self.views.remove(&who);
     }
 
+    /// Send `who` their own items, if they have changed since last time.
+    ///
+    /// Compared against what was last sent rather than tracked by a dirty flag:
+    /// there are a dozen places that can change an inventory, and a flag that
+    /// one of them forgets to set is a client whose hotbar is quietly wrong.
+    /// Comparing is O(slots) once per client per tick, which is nothing beside
+    /// the meshing.
+    pub fn publish_self_items(&mut self, who: PlayerId) {
+        let Some(now) = self.sim.get(who).map(ClientItems::of) else {
+            return;
+        };
+        if self.last_items.get(&who) == Some(&now) {
+            return;
+        }
+        self.last_items.insert(who, now.clone());
+        self.publish_to(who, Effect::SelfItems(Box::new(now)));
+    }
+
     /// Send `who` the server's view of their own player (block 2.12b).
     ///
     /// `seq` is the last input from that client the server had applied when this
@@ -841,6 +920,7 @@ impl Server {
         // somebody else -- but a table that only grows is still a leak on a
         // server that stays up.
         self.last_pose.remove(&who);
+        self.last_items.remove(&who);
         for view in self.views.values_mut() {
             view.push(Effect::PlayerGone(who));
         }
@@ -936,7 +1016,7 @@ impl Server {
     fn publish_at(&mut self, pos: [i32; 3], effect: Effect) {
         for view in self.views.values_mut() {
             if view.perceives(pos) {
-                view.push(effect);
+                view.push(effect.clone());
             }
         }
     }
