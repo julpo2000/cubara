@@ -114,6 +114,22 @@ impl Entities {
         self.next_key = self.next_key.max(key.0 + 1);
     }
 
+    /// Remove one entity by key.
+    ///
+    /// Block 2.16: a shard that comes back without an item it left with means
+    /// that item was picked up or aged out while it was away, and the server
+    /// taking it back has to agree. Keys are never reused, so a despawned key
+    /// stays gone and cannot collide with a later spawn (§10.2).
+    ///
+    /// Silently does nothing for a key that is not here, which is the outcome
+    /// the caller wanted either way.
+    pub fn despawn(&mut self, key: EntityKey) {
+        let Some((_, entity, _)) = self.all().into_iter().find(|(k, _, _)| *k == key) else {
+            return;
+        };
+        let _ = self.world.despawn(entity);
+    }
+
     /// Set the counter after restoring a save.
     pub fn set_next_key(&mut self, next: u64) {
         self.next_key = self.next_key.max(next);

@@ -63,6 +63,7 @@ fn vertex_ao(side1: bool, side2: bool, corner: bool) -> u8 {
 
 /// A cubic chunk of `SIZE³` blocks, stored palette-compressed (see
 /// [`ChunkStorage`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
     storage: ChunkStorage,
 }

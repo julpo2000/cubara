@@ -15,7 +15,13 @@ use crate::block::BlockId;
 
 /// One chunk's blocks: every voxel the same id (no allocation), or a palette
 /// of the distinct ids present plus a packed index per voxel.
-#[derive(Debug)]
+/// `PartialEq` is **structural**, so two storages agree only when their
+/// palettes agree too. Every chunk this project compares is built by the same
+/// construction path (`World::edited_chunk_at`), which produces a canonical
+/// palette for a given set of blocks — so equal worlds compare equal. A palette
+/// that differed while the blocks matched would make a comparison fail, never
+/// pass, which is the safe direction for a check to be wrong in.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChunkStorage {
     Uniform(BlockId),
     Palette {

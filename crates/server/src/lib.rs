@@ -33,6 +33,7 @@ pub mod headless;
 pub mod join;
 pub mod net;
 pub mod predict;
+pub mod shard;
 pub mod view;
 pub mod wire;
 
@@ -135,6 +136,13 @@ pub struct Server {
     /// gives: progress is transient, belongs to one player, and is abandoned
     /// rather than banked. A world reloaded mid-swing starts the swing again.
     mining: BTreeMap<PlayerId, Mining>,
+    /// Chunks this server simulates because it was given them, rather than
+    /// because a player is near them (block 2.16).
+    assigned: std::collections::BTreeSet<ChunkCoord>,
+    /// Whether [`assign`](Self::assign) has changed the set since the active
+    /// chunks were last recomputed. The memo that skips the recompute keys off
+    /// the player's chunk, which does not move when an assignment does.
+    assigned_changed: bool,
 }
 
 /// What a client asks the world to do (`docs/RESEARCH_MULTIPLAYER.md` §8.3).
@@ -283,6 +291,8 @@ impl Server {
             sim_centre: None,
             views: BTreeMap::new(),
             mining: BTreeMap::new(),
+            assigned: std::collections::BTreeSet::new(),
+            assigned_changed: false,
             last_pose: BTreeMap::new(),
             local: Some(PlayerId::LOCAL),
         };
@@ -1418,16 +1428,39 @@ impl Server {
         // change no chunk's state, and this walks a (2r+1)²x3 box -- 243
         // lookups at radius 4 -- which is pure waste every tick the player is
         // not moving, which is most of them.
-        let Some(who) = self.centre_player() else {
+        // Which chunks tick is the union of two answers, and until block 2.16
+        // there was only one of them. A player keeps a box around themselves
+        // active; a **shard** keeps the chunks it was assigned active whether or
+        // not anybody is there. A server holding a shard for a region nobody is
+        // standing in used to simulate nothing at all -- it returned here, on
+        // the missing player, before reaching a single furnace.
+        let centre = self
+            .centre_player()
+            .map(|who| ChunkCoord::from_world_pos(self.sim.player(who).pos.to_f32()));
+        if centre.is_none() && self.assigned.is_empty() {
+            // Nobody here and nothing assigned: this server genuinely has
+            // nothing to simulate, which is the honest answer rather than an
+            // early return hiding a shard.
             return;
-        };
-        let centre = ChunkCoord::from_world_pos(self.sim.player(who).pos.to_f32());
+        }
         let now = self.sim.tick;
-        let woken = if self.sim_centre == Some(centre) {
+
+        let mut want = match centre {
+            Some(c) => cubara_world::simulation_box(c, SIM_RADIUS_CHUNKS),
+            None => std::collections::BTreeSet::new(),
+        };
+        want.extend(self.assigned.iter().copied());
+
+        // Recomputing the set every tick would walk a 243-chunk box for a player
+        // who has not moved, which is most ticks. The centre changing is still
+        // the trigger; an assignment change goes through `assign`, which clears
+        // the memo.
+        let woken = if self.sim_centre == centre && !self.assigned_changed {
             Vec::new()
         } else {
-            self.sim_centre = Some(centre);
-            Arc::make_mut(&mut self.world).update_simulation_radius(centre, SIM_RADIUS_CHUNKS, now)
+            self.sim_centre = centre;
+            self.assigned_changed = false;
+            Arc::make_mut(&mut self.world).keep_simulating(&want, now)
         };
         let caught_up: std::collections::BTreeMap<ChunkCoord, u64> =
             woken.into_iter().map(|w| (w.coord, w.elapsed)).collect();
