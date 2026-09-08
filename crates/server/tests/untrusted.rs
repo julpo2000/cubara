@@ -605,3 +605,34 @@ fn save_returns_only_once_the_world_is_on_disk() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A hotbar index a real client cannot produce is ignored, not clamped.
+///
+/// `Action::SelectSlot` is authority — which slot is held decides what a place
+/// spends and what a break is mined with — so a client sending 200 is a client
+/// naming a slot that does not exist. `Inventory::select` clamps, which is the
+/// right answer for a UI bug reaching it from inside the process; over the wire
+/// clamping would silently turn nonsense into a *choice*, and the choice it
+/// invents is "the last slot", which is not what anybody asked for.
+///
+/// Found by `scripts/check-tests-can-fail.sh`: the bounds check was written and
+/// nothing could see it removed, because the clamp underneath hid the
+/// difference.
+#[test]
+fn an_impossible_hotbar_slot_is_ignored_rather_than_clamped() {
+    let (mut s, who, _) = server_with_player_and_furnace();
+
+    s.apply_as(who, Action::SelectSlot(3));
+    assert_eq!(
+        s.sim.player(who).inventory.selected_slot(),
+        3,
+        "an ordinary selection did not take effect, so this proves nothing"
+    );
+
+    s.apply_as(who, Action::SelectSlot(200));
+    assert_eq!(
+        s.sim.player(who).inventory.selected_slot(),
+        3,
+        "a slot that does not exist moved the selection instead of being ignored"
+    );
+}
