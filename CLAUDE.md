@@ -116,6 +116,36 @@ Do not drive the app with synthetic OS-level input (AppleScript keystrokes and
 similar) to "verify" something — it lands on the user's real desktop, not
 reliably in the app, and proves nothing either way.
 
+### A test that has never been seen to fail is not yet evidence
+
+The failure this catches is not "no test". It is a test that runs the code,
+asserts something true, and cannot tell the difference when the code is wrong.
+Six of those were written in a single day of phase 2 work — by both sessions,
+independently:
+
+- a gate criterion that went green while multiplayer did not work
+- a bandwidth criterion blind to players standing still
+- a test that checked the state *before* the crash it was written for
+- a registry fingerprint that was sent and never verified
+- a prediction test that passed with the replay deleted
+- a furnace test giving both players the same item, so reading the wrong one
+  looked identical to reading the right one
+
+Every one was found the same way: **break the code on purpose and see whether
+anything goes red.** So do that, and put the result in the PR — a table of what
+was injected and what caught it. Where a defect survives, either write the
+assertion that would notice or say plainly that the line does not need one.
+
+```bash
+./scripts/check-tests-can-fail.sh          # mutates lines this branch added
+```
+
+It is minutes rather than seconds, so it is a before-the-PR check like the
+benchmark, not a CI job. And a clean run is **not** a pass mark: it means the
+mutations it tried were noticed. A test can still assert the wrong thing in a
+way no line edit reveals — the six above are all of that shape, and only three
+would have been caught by this script.
+
 ## Installing software
 
 **Never install anything (winget, cargo tools, global npm/pip packages, etc.)
