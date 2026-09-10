@@ -181,6 +181,13 @@ pub enum Action {
     /// are looking at a screen. What stops it being a claim the server believes
     /// is that a slot index is bounded and its contents are the server's own.
     ClickSlot { slot: SlotRef, right: bool },
+    /// Choose which hotbar slot is held.
+    ///
+    /// World state, not a UI preference: the server reads the held stack to
+    /// decide what a break yields and what a place puts down (§4's tiers). A
+    /// client that picked its own slot locally could hold a diamond pick for
+    /// the tier check and a dirt block for the placement.
+    SelectHotbar(u8),
     /// Close the open screen, returning the grid and the cursor to the
     /// inventory.
     ///
@@ -460,7 +467,14 @@ impl Server {
     /// the 3-block safe fall, and it avoids having to reach for the private
     /// eye-height constant from another crate.
     pub fn place_player_on_ground(&mut self) {
-        let (Some(who), Some(standing)) = (self.local, self.world_spawn()) else {
+        let Some(who) = self.local else { return };
+        self.place_on_ground_as(who);
+    }
+
+    /// The same, for a named player -- what a host does for a client that joined
+    /// before the world had ground under it.
+    pub fn place_on_ground_as(&mut self, who: PlayerId) {
+        let (true, Some(standing)) = (self.sim.get(who).is_some(), self.world_spawn()) else {
             return;
         };
         let p = self.sim.player_mut(who);
@@ -484,17 +498,26 @@ impl Server {
     /// every machine and after every restart. No new state, no save format
     /// change, and nothing that can drift out of agreement with itself.
     ///
-    /// `None` before assets are set, because "solid" is a question about block
-    /// ids and there are none yet. Two blocks above the surface, not exactly on
-    /// it: the eye is 1.62 above the feet, so this leaves a fraction of a block
-    /// to settle — well inside the 3-block safe fall, and it avoids reaching for
-    /// a private eye-height constant in another crate.
+    /// Two blocks above the surface, not exactly on it: the eye is 1.62 above
+    /// the feet, so this leaves a fraction of a block to settle — well inside
+    /// the 3-block safe fall, and it avoids reaching for a private eye-height
+    /// constant in another crate.
+    ///
+    /// **Before assets are set there is no ground**, because "solid" is a
+    /// question about block ids and there are none yet. That is not a reason to
+    /// refuse: a world with no blocks still has somewhere to stand, and this
+    /// returns the same y = 48 `Server::new` has always used. Refusing instead
+    /// would mean a client cannot join its own world until the renderer has
+    /// finished validating textures, which is a coupling between a window and a
+    /// simulation that Rule 4 exists to prevent.
     ///
     /// A world where players choose their own spawn (a bed) would make this
     /// per-player state that has to be saved. That is a gameplay decision nobody
     /// has made, and this is the smallest thing that is true until they do.
     pub fn world_spawn(&self) -> Option<FixedVec3> {
-        let terrain = self.terrain?;
+        let Some(terrain) = self.terrain else {
+            return Some(FixedVec3::from_blocks(0, 48, 0));
+        };
         let hit = self
             .world
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, terrain)?;
@@ -1153,6 +1176,11 @@ impl Server {
                 self.place_held_as(who);
             }
             Action::ClickSlot { slot, right } => self.click_slot_as(who, slot, right),
+            Action::SelectHotbar(slot) => {
+                if self.sim.get(who).is_some() {
+                    self.sim.player_mut(who).inventory.select(slot);
+                }
+            }
             Action::CloseScreen => {
                 self.close_screen_as(who);
             }

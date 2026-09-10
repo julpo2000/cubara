@@ -155,10 +155,12 @@ impl ApplicationHandler for App {
                     && state == ElementState::Pressed
                     && button == MouseButton::Right
                 {
-                    // The game decides what changed; streaming re-meshes it.
-                    if let Some(cc) = self.game.place_block() {
-                        streaming.invalidate(self.game.world(), cc);
-                    }
+                    // Asked for, not done. What the placement changed arrives
+                    // on the next frame's tick like every other effect, and
+                    // `advance` below invalidates it there -- one frame later,
+                    // which is exactly what a client on the other end of a
+                    // socket gets.
+                    self.game.place_block();
                 }
             }
             WindowEvent::RedrawRequested => {

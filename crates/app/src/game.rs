@@ -17,13 +17,16 @@ use std::sync::Arc;
 
 use cubara_render::CameraPose;
 use cubara_render::{swatch_color, HotbarSlot, InventoryPanel, PanelSlotKind};
-use cubara_sim::{InputFrame, Player, SENSITIVITY_PER_PIXEL, TICK_DT};
+use cubara_sim::{InputFrame, Player, PlayerId, SENSITIVITY_PER_PIXEL, TICK_DT};
 use cubara_sim::{SlotRef, HOTBAR_WIDTH};
-use cubara_voxel::{Angle, BlockRegistry, ChunkCoord, ItemRegistry, RecipeBook};
+use cubara_voxel::{Angle, BlockRegistry, ChunkCoord, FixedVec3, ItemRegistry, RecipeBook};
 use cubara_world::{Furnace, TerrainBlocks, World};
 
+use cubara_server::headless::{Config, Session};
+use cubara_server::net::Link;
 use cubara_server::others::OtherPlayers;
 use cubara_server::predict::Prediction;
+use cubara_server::wire::{ClientMessage, ServerMessage};
 use cubara_server::{Action, Effect, FurnaceSlot, Screen, Server};
 
 use winit::keyboard::KeyCode;
@@ -58,7 +61,36 @@ pub struct Game {
     /// `Game` is now the **client**, plus the wiring that runs a server
     /// in-process for singleplayer (§3.3). Everything left on `Game` itself is
     /// input, screen state or presentation — the §8.1 table is the sorting.
-    pub server: Server,
+    ///
+    /// **`None` when connected to somebody else's world**, which is the point of
+    /// the `Option`: a client that can only exist next to a server is a client
+    /// that cannot connect to one. Singleplayer is not a special case here — it
+    /// is a client that happens to run the server in its own process, reached
+    /// over the same [`Link`] a socket carries (design §5.1).
+    ///
+    /// A `Session` rather than a bare `Server` because hosting is more than
+    /// ticking: accepting clients, collecting their input, flushing what they
+    /// are owed, autosaving. All of that exists there already, and a second copy
+    /// inside `Game` is how the two would drift apart.
+    host: Option<Session>,
+    /// How this client talks to whichever server it is on.
+    ///
+    /// `None` before there is one: `Game::new()` runs before a window exists and
+    /// a world cannot open until assets are loaded, so there is a moment where a
+    /// client has no server at all.
+    link: Option<Link<ClientMessage, ServerMessage>>,
+    /// What a host needs to run a world. Meaningless when connected to a remote
+    /// one, because then there is no world here to run.
+    cfg: Config,
+    /// Which player this client drives, **as the server named it** in `Welcome`.
+    ///
+    /// Not assumed to be `PlayerId::LOCAL`: over a socket the id depends on who
+    /// joined first, and a client that guessed would be a client acting as
+    /// somebody else.
+    me_id: PlayerId,
+    /// How many inputs this client has sent, echoed back in `SelfState` so the
+    /// prediction knows what has been acknowledged.
+    seq: u64,
     /// **The client's own definitions** (block 2.12b).
     ///
     /// What a block drops, what an item stacks to, what a recipe makes. The
@@ -189,20 +221,49 @@ impl Game {
     /// you land in and walk, not one you start already flying over) -- gravity
     /// carries the player down onto the terrain below.
     pub fn new() -> Self {
-        let server = Server::new();
-        let player = *server.sim.player(server.local.expect("a local client"));
+        // **No server yet, and no world.** A client is constructed before the
+        // window exists, and a world cannot open until assets are loaded --
+        // which happens once the renderer has validated its textures. Until
+        // then this is a client with nothing to look at, which is exactly what
+        // a client waiting to connect also is.
+        //
+        // The placeholder seed and player are replaced the moment a server is
+        // joined, by `Welcome` and the first `SelfState`. In-process that is
+        // milliseconds later, in `set_assets`.
+        let player = Player::new(
+            FixedVec3::from_blocks(0, 48, 0),
+            Angle::from_radians(0.6),
+            Angle::from_radians(-0.3),
+        );
+        // Hosting from the first tick, over a link, exactly as a connected
+        // client would be. The world it hosts is empty until `set_assets`, which
+        // is the same moment the old code stood the player on the ground.
+        let cfg = Config {
+            world: world_dir(),
+            autosave_ticks: 0,
+            ..Config::default()
+        };
+        // **Hosted, but not yet joined.** A server with no assets has no
+        // spawn point -- "which block is solid" is a question about ids, and
+        // there are none until `set_assets`. So the world exists and this
+        // client is not in it yet, which is exactly the state a client waiting
+        // to connect is in.
+        let mut host = Session::around(Server::new(), &cfg);
+        // Joined immediately, over a link, exactly as a connected client is.
+        // A world with no assets still has somewhere to stand, so there is no
+        // reason to make this client wait for the renderer.
+        let mut link = host.attach();
+        let me_id = welcome_id(&mut link).unwrap_or(PlayerId::LOCAL);
+
         Self {
-            // Same seed, so the same terrain -- generated here rather than
-            // copied from the server, which is the whole point of §8.2. Over a
-            // socket the seed arrives in the join handshake; in-process it is
-            // read off the world that already exists.
-            world: Arc::new(World::with_seed(server.world.seed())),
-            // The client's own copy of itself, seeded from the join handshake.
-            // In-process that handshake is a field read at construction; over a
-            // socket it is `Welcome` plus the first `SelfState`.
-            me: Prediction::new(server.world.seed(), player),
+            world: Arc::new(World::new()),
+            me: Prediction::new(World::new().seed(), player),
             others: OtherPlayers::new(),
-            server,
+            host: Some(host),
+            link: Some(link),
+            cfg,
+            me_id,
+            seq: 0,
             prev_player: player,
             assets: None,
             inventory_open: false,
@@ -238,6 +299,93 @@ impl Game {
                 soil: cubara_voxel::BlockId::AIR,
                 stone: cubara_voxel::BlockId::AIR,
             })
+    }
+
+    /// This client's player *as the host has it*, for tests that need to look
+    /// past the client's own copy at what the world actually says.
+    #[cfg(test)]
+    fn host_player(&self) -> &Player {
+        let who = self.me_id;
+        self.server().sim.player(who)
+    }
+
+    #[cfg(test)]
+    fn host_player_mut(&mut self) -> &mut Player {
+        let who = self.me_id;
+        self.server_mut().sim.player_mut(who)
+    }
+
+    /// Run the host one tick and take in what it produced, without advancing
+    /// the client's own clock.
+    ///
+    /// What a test needs after reaching past the client to set something up on
+    /// the host: the client learns about the world through messages now, so
+    /// state poked directly into the server has not reached it yet. Naming the
+    /// step is better than hiding it — the delay is real, and over a socket it
+    /// is longer.
+    /// [`settle`](Self::settle), returning which chunks it made stale.
+    #[cfg(test)]
+    fn settle_dirty(&mut self) -> Vec<ChunkCoord> {
+        if let Some(host) = self.host.as_mut() {
+            host.advance(1, &self.cfg);
+        }
+        self.sync()
+    }
+
+    #[cfg(test)]
+    fn settle(&mut self) {
+        if let Some(host) = self.host.as_mut() {
+            host.advance(1, &self.cfg);
+        }
+        self.sync();
+    }
+
+    /// Let the host run once so the client hears about the world it just got.
+    ///
+    /// Separate from the test-only `settle` because this one runs in the real
+    /// app: `set_assets` moves the player onto ground the client has never been
+    /// told about, and without a tick the first frame would render them at
+    /// y = 48 and then snap.
+    fn settle_after_assets(&mut self) {
+        if let Some(host) = self.host.as_mut() {
+            host.advance(1, &self.cfg);
+        }
+        self.sync();
+        self.prev_player = *self.me.player();
+    }
+
+    /// Ask the server to do something.
+    ///
+    /// The one place an action leaves this client. In-process it is a channel
+    /// push the host picks up on its next tick; over a socket it is a packet.
+    /// Neither the caller nor this method can tell which, which is the point of
+    /// there being one type of link (design §5.1).
+    fn act(&mut self, action: Action) {
+        if let Some(link) = self.link.as_mut() {
+            link.send(ClientMessage::Act(action));
+        }
+    }
+
+    /// The server this client is hosting.
+    ///
+    /// Panics when there is none, deliberately: everything that reaches for it
+    /// is host-only work — saving, loading, standing a player on the ground —
+    /// and a connected client asking to save somebody else's world is a bug in
+    /// the caller rather than a condition to handle.
+    fn server(&self) -> &Server {
+        &self
+            .host
+            .as_ref()
+            .expect("this client is not hosting a world")
+            .server
+    }
+
+    fn server_mut(&mut self) -> &mut Server {
+        &mut self
+            .host
+            .as_mut()
+            .expect("this client is not hosting a world")
+            .server
     }
 
     /// The client's replica (§8.2) -- what the renderer meshes and what the
@@ -436,7 +584,24 @@ impl Game {
                 .me
                 .predict(input, Arc::make_mut(&mut self.world), blocks);
 
-            self.server.tick_sim(&input);
+            // **Sent, not called.** The input leaves this client the same way
+            // it would over a socket; what happens next is the server's, and
+            // in-process that server happens to be a field away.
+            self.seq = self.seq.wrapping_add(1);
+            let seq_sent = seq.unwrap_or(self.seq);
+            if let Some(link) = self.link.as_mut() {
+                link.send(ClientMessage::Input {
+                    seq: seq_sent,
+                    frame: input,
+                });
+            }
+            // The host runs one tick: accepting, collecting what clients sent,
+            // simulating, flushing what they are owed. All of `Session::advance`
+            // rather than a hand-rolled copy of it, so hosting here and hosting
+            // headlessly cannot drift.
+            if let Some(host) = self.host.as_mut() {
+                host.advance(1, &self.cfg);
+            }
             // Mining advances *per tick*, not per frame -- §4.3, and the same
             // reason the tick loop exists. A catch-up burst of N ticks is N
             // ticks of progress, which is correct: that time really did pass.
@@ -449,16 +614,11 @@ impl Game {
             // enough -- and a client that skipped the counting broke blocks
             // instantly. `InputFrame::breaking` already carries the only thing
             // a client can honestly know, which is that the button is down.
-            self.server.tick_mining(&input);
-            self.server.tick_world();
 
             // What the server thinks of this client, every tick: its pose, and
             // its items when they have changed. These are the only two ways the
             // client learns about itself now -- exactly the two a remote one
             // would have.
-            let who = self.server.local.expect("a local client");
-            self.server.publish_self_state(who, seq.unwrap_or(0));
-            self.server.publish_self_items(who);
 
             input.jump = false;
             input.toggle_fly = false;
@@ -482,7 +642,7 @@ impl Game {
     /// Write the world to disk (#179). The server owns the world, so it owns
     /// the save; this is the client's shutdown reaching for it.
     pub fn save(&self) {
-        self.server.save_to(&world_dir());
+        self.server().save_to(&world_dir());
     }
 
     /// Replace this game's world with the one on disk, if there is one (#179).
@@ -492,19 +652,19 @@ impl Game {
 
     /// [`load`](Self::load) from a specific directory.
     pub fn load_from(&mut self, dir: &std::path::Path) -> bool {
-        let loaded = self.server.load_from(dir);
+        let loaded = self.server_mut().load_from(dir);
         if loaded {
             // A load replaces the server's world wholesale, so the replica is
             // rebuilt rather than patched: there is no edit stream that turns
             // one world into another. Over a socket this is a fresh join.
-            self.world = Arc::new(World::with_seed(self.server.world.seed()));
+            self.world = Arc::new(World::with_seed(self.server().world.seed()));
             self.resync();
             // A load replaces the player wholesale, so the previous pose the
             // client interpolates from is now a pose from a different world.
-            self.prev_player = *self
-                .server
-                .sim
-                .player(self.server.local.expect("a local client"));
+            // From the client's own copy, not the server's. A load replaces the
+            // player wholesale, and the client learns about it the way a remote
+            // one would: through `SelfState`, which the resync above delivered.
+            self.prev_player = *self.me.player();
         }
         loaded
     }
@@ -516,11 +676,7 @@ impl Game {
     /// it is told the points and the maximum and works out the hearts (Rule 3).
     pub fn health_view(&self) -> cubara_render::HealthView {
         cubara_render::HealthView {
-            points: self
-                .server
-                .sim
-                .player(self.server.local.expect("a local client"))
-                .health,
+            points: self.me.player().health,
             max_points: cubara_sim::MAX_HEALTH,
         }
     }
@@ -544,7 +700,7 @@ impl Game {
     /// interpolation is a render-only concern (§9) that must never feed back
     /// into it. Raycasts fresh rather than reusing [`Sim::target`](cubara_sim::Sim)
     /// -- that field only updates on the next tick, so it can go stale
-    /// against `self.server.world` after an edit lands (e.g. two edits between
+    /// against `self.server().world` after an edit lands (e.g. two edits between
     /// ticks); issue #52 scoped out any change to raycasting itself anyway.
     /// Give the game the assets it needs to turn blocks into items and back.
     /// Called once, when the window and its registry exist.
@@ -566,13 +722,18 @@ impl Game {
             items: items.clone(),
             recipes: recipes.clone(),
         });
-        self.server.set_assets(registry, items, recipes);
+        self.server_mut().set_assets(registry, items, recipes);
+        // Now that the world has ids it has a spawn point, so this client can
+        // join it -- through `attach`, which is the same `welcome` a socket
+        // takes. Before this there was nowhere to stand.
+        // The world now has ids, so the player can be stood on real ground.
+        let who = self.me_id;
+        self.server_mut().place_on_ground_as(who);
+        // And the client learns where that is the way it learns everything now.
+        self.settle_after_assets();
         // The server just moved the player onto the ground; the client's
         // interpolation would otherwise smear them there from y = 48.
-        self.prev_player = *self
-            .server
-            .sim
-            .player(self.server.local.expect("a local client"));
+        self.prev_player = *self.me.player();
     }
 
     /// Break the targeted block and put its drop in the inventory.
@@ -610,9 +771,21 @@ impl Game {
     ///
     /// Reached only through [`apply`](Self::apply) -- the raycast is the
     /// server's, which is what stops a client naming its own target (§8.3).
+    /// **Waits for the host**, which only a test can do. Play breaks blocks by
+    /// holding the button: `InputFrame::breaking` crosses the wire every tick
+    /// and the server counts the ticks (block 2.14), so nothing in the game
+    /// reaches here. `place_block`, which *is* on the game's path, deliberately
+    /// does not wait -- ticking the world on a mouse click would move the
+    /// simulation off its own clock.
+    #[cfg(test)]
     pub fn break_block(&mut self) -> Option<ChunkCoord> {
-        self.server
-            .break_looked_at_as(self.server.local.expect("a local client"));
+        let who = self.me_id;
+        self.server_mut().break_looked_at_as(who);
+        // The break happened on the host; its effects reach this client's queue
+        // when the host next flushes, which is a tick.
+        if let Some(host) = self.host.as_mut() {
+            host.advance(1, &self.cfg);
+        }
         self.sync().into_iter().next()
     }
 
@@ -627,14 +800,18 @@ impl Game {
     /// caller, and the shape it should take depends on what the overlay needs.
     #[allow(dead_code)]
     pub fn mining_progress(&self) -> Option<f32> {
-        self.server
-            .mining_progress(self.server.local.expect("a local client"))
+        self.server().mining_progress(self.me_id)
     }
 
     /// Place the held block, or use an interactive block under the crosshair.
-    pub fn place_block(&mut self) -> Option<ChunkCoord> {
-        self.server.apply(Action::Place);
-        self.sync().into_iter().next()
+    /// **Asked for, not answered.** What the placement changed arrives on the
+    /// next tick like every other effect, and `advance` invalidates it there --
+    /// one frame later, which is exactly what a client on a socket gets. It used
+    /// to return the dirty chunk, which only worked because the server was a
+    /// field away.
+    pub fn place_block(&mut self) {
+        self.act(Action::Place);
+        self.sync();
     }
 
     /// Use whatever the player is looking at, reporting whether a screen
@@ -645,9 +822,19 @@ impl Game {
     /// while holding a block. This is the direct entry point the interaction
     /// tests drive, and the shape a second input binding would use.
     #[allow(dead_code)]
+    /// Ask the server to use whatever is under the crosshair, and report
+    /// whether a screen opened.
+    ///
+    /// **Waits for the host**, which only a test can do: in play the answer
+    /// arrives on the next frame's tick like every other effect, and nothing
+    /// asks this question synchronously. Reached only from tests since actions
+    /// became messages -- a client cannot know what a click did until it is
+    /// told, and pretending otherwise here would be the in-process shortcut §2
+    /// forbids.
+    #[cfg(test)]
     fn interact(&mut self) -> bool {
-        self.server.apply(Action::Interact);
-        self.sync();
+        self.act(Action::Interact);
+        self.settle();
         self.open_furnace.is_some() || self.inventory_open
     }
 
@@ -660,10 +847,15 @@ impl Game {
     /// rather than naming one, so nothing on the game's own path reaches here.
     #[allow(dead_code)]
     fn break_at(&mut self, block: [i32; 3]) -> ChunkCoord {
-        let cc = self.server.break_at(block);
+        let who = self.me_id;
+        let cc = self.server_mut().break_at_as(who, block);
         // The server does not journal a screen-close for a targeted break --
         // `CloseIfAt` is `Action::Break`'s doing, and this bypasses it.
-        self.server.close_if_at(block);
+        self.server_mut().close_if_at(block);
+        // The host has to run for the effects to reach this client's queue.
+        if let Some(host) = self.host.as_mut() {
+            host.advance(1, &self.cfg);
+        }
         self.sync();
         cc
     }
@@ -678,14 +870,31 @@ impl Game {
     /// it out exactly this way, because the server has no idea how its chunks
     /// are laid out on screen.
     fn sync(&mut self) -> Vec<ChunkCoord> {
-        let effects = self.server.drain_effects();
+        // Everything the server has said since last time. In-process the host
+        // put it there a moment ago; over a socket it arrived on a thread. This
+        // side cannot tell, and that is the point.
+        let mut effects = Vec::new();
+        if let Some(link) = self.link.as_mut() {
+            for msg in link.poll() {
+                match msg {
+                    ServerMessage::Effects(v) => effects.extend(v),
+                    // The id is read once, at the join. A second welcome would
+                    // mean a reconnection, which nothing does yet.
+                    ServerMessage::Welcome { .. } | ServerMessage::Tick(_) => {}
+                }
+            }
+        }
         self.apply_effects(effects)
     }
 
     /// Rebuild the replica from the server's full state (§8.3's join
     /// handshake), rather than from a delta there is no way to compute.
     fn resync(&mut self) {
-        let snapshot = self.server.snapshot();
+        // The join handshake, for this client specifically. `snapshot()` would
+        // ask for the *local* client's, and a host that has gone headless has
+        // none -- the whole point of the id coming from `Welcome`.
+        let who = self.me_id;
+        let snapshot = self.server().snapshot_for(who);
         self.apply_effects(snapshot);
     }
 
@@ -786,11 +995,7 @@ impl Game {
     /// are art that does not exist yet.
     pub fn hotbar_slots(&self) -> Option<[Option<HotbarSlot>; HOTBAR_WIDTH]> {
         let items = self.assets.as_ref().map(|a| &a.items)?;
-        let inv = &self
-            .server
-            .sim
-            .player(self.server.local.expect("a local client"))
-            .inventory;
+        let inv = &self.me.player().inventory;
         let mut out = [None; HOTBAR_WIDTH];
         for (i, out_slot) in out.iter_mut().enumerate() {
             let Some(stack) = inv.slot(i) else { continue };
@@ -836,22 +1041,11 @@ impl Game {
         // the block and stay in it. Only the cursor needs somewhere to go.
         if self.open_furnace.take().is_some() {
             self.inventory_open = false;
-            if let Some(items) = self.assets.as_ref().map(|a| &a.items) {
-                let player = self
-                    .server
-                    .sim
-                    .player_mut(self.server.local.expect("a local client"));
-                if let Some(held) = player.crafting.held() {
-                    if let Some(lost) = player.inventory.add(held, items) {
-                        log::debug!(
-                            "inventory full: {} x{} lost closing a furnace",
-                            items.name_of(lost.item()).unwrap_or("?"),
-                            lost.count()
-                        );
-                    }
-                    player.crafting.set_held(None);
-                }
-            }
+            // The cursor's contents go back to the inventory, and that is a rule
+            // about items rather than about a window -- so the server applies
+            // it. A furnace screen has no grid of its own, so `CloseScreen` has
+            // nothing else to return.
+            self.act(Action::CloseScreen);
             return;
         }
         let Some(items) = self.assets.as_ref().map(|a| &a.items) else {
@@ -862,9 +1056,12 @@ impl Game {
         // server applies it and answers whether everything fitted. `false` keeps
         // the screen open, which is `Crafting::close`'s own rule: refusing to
         // close is more honest than eating what does not fit.
-        let _ = items;
-        let who = self.server.local.expect("a local client");
-        if self.server.close_screen_as(who) {
+        let items = items.clone();
+        let player = self.me.player_mut();
+        let closed = player.crafting.close(&mut player.inventory, &items);
+        if closed {
+            player.crafting.set_width(2);
+            self.act(Action::CloseScreen);
             self.inventory_open = false;
         } else {
             log::debug!("inventory full: the crafting grid still holds items, staying open");
@@ -885,15 +1082,7 @@ impl Game {
         };
         let panel = match self.open_furnace {
             Some(_) => InventoryPanel::layout_furnace(width, height),
-            None => InventoryPanel::layout(
-                width,
-                height,
-                self.server
-                    .sim
-                    .player_mut(self.server.local.expect("a local client"))
-                    .crafting
-                    .width(),
-            ),
+            None => InventoryPanel::layout(width, height, self.me.player().crafting.width()),
         };
         let Some((kind, index)) = panel.hit(x, y) else {
             return;
@@ -914,8 +1103,16 @@ impl Game {
         // grid changes world state, and a client that did it locally would be a
         // client that could conjure items (§3.4). The rules still live in
         // `Crafting::click`; what changed is who runs them.
-        let _ = (items, book);
-        self.server.apply(Action::ClickSlot { slot, right });
+        // **Predicted, then sent.** Run with the client's own definitions, which
+        // the fingerprint check has already proved match the server's, so the
+        // screen responds on the frame it was clicked. `SelfItems` replaces the
+        // result a tick later; if the server disagreed, the disagreement is what
+        // shows rather than a silent divergence.
+        let (items, book) = (items.clone(), book.clone());
+        let player = self.me.player_mut();
+        let (crafting, inventory) = (&mut player.crafting, &mut player.inventory);
+        crafting.click(slot, right, inventory, &items, &book);
+        self.act(Action::ClickSlot { slot, right });
     }
 
     /// Route a click on the open furnace's screen.
@@ -931,13 +1128,15 @@ impl Game {
             return;
         };
         if kind == PanelSlotKind::Inventory {
-            let player = self
-                .server
-                .sim
-                .player_mut(self.server.local.expect("a local client"));
-            player
-                .crafting
-                .click_inventory_only(index, &mut player.inventory, items);
+            // `click_inventory_only` is `click`'s inventory case reached without
+            // a grid, and a furnace screen has no grid -- so the same action
+            // carries it. Left-click only, which is what that method already
+            // restricted itself to.
+            let _ = items;
+            self.act(Action::ClickSlot {
+                slot: SlotRef::Inventory(index),
+                right: false,
+            });
             return;
         }
         let slot = match kind {
@@ -946,7 +1145,7 @@ impl Game {
             PanelSlotKind::Result => FurnaceSlot::Output,
             PanelSlotKind::Inventory => return,
         };
-        self.server.apply(Action::ClickFurnace { pos, slot });
+        self.act(Action::ClickFurnace { pos, slot });
         // The furnace's new contents come back as a `BlockEntity` effect, and
         // the screen is drawn from the replica -- so without this the click
         // would appear to do nothing until the next tick.
@@ -967,11 +1166,7 @@ impl Game {
             return None;
         }
         let items = self.assets.as_ref().map(|a| &a.items)?;
-        let crafting = &self
-            .server
-            .sim
-            .player(self.server.local.expect("a local client"))
-            .crafting;
+        let crafting = &self.me.player().crafting;
         let book = self.assets.as_ref().map(|a| &a.recipes);
         let furnace = self.open_furnace();
         let panel = match self.open_furnace {
@@ -1000,13 +1195,9 @@ impl Game {
             .slots()
             .iter()
             .map(|s| match (s.kind, furnace) {
-                (PanelSlotKind::Inventory, _) => self
-                    .server
-                    .sim
-                    .player(self.server.local.expect("a local client"))
-                    .inventory
-                    .slot(s.index)
-                    .and_then(swatch),
+                (PanelSlotKind::Inventory, _) => {
+                    self.me.player().inventory.slot(s.index).and_then(swatch)
+                }
                 (PanelSlotKind::Grid, Some(f)) => furnace_swatch(f.input),
                 (PanelSlotKind::Fuel, Some(f)) => furnace_swatch(f.fuel),
                 (PanelSlotKind::Result, Some(f)) => furnace_swatch(f.output),
@@ -1029,11 +1220,11 @@ impl Game {
 
     /// Select a hotbar slot (number keys 1-9, passed as 0-8).
     pub fn select_hotbar(&mut self, index: u8) {
-        self.server
-            .sim
-            .player_mut(self.server.local.expect("a local client"))
-            .inventory
-            .select(index);
+        // Predicted, then sent -- a hotbar that only lit up after a round trip
+        // would feel broken in singleplayer and worse over a wire. The same
+        // predict-and-be-corrected shape movement already uses.
+        self.me.player_mut().inventory.select(index);
+        self.act(Action::SelectHotbar(index));
     }
 }
 
@@ -1041,6 +1232,18 @@ impl Default for Game {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The `PlayerId` a server named in its `Welcome`, if it has sent one.
+///
+/// Peeks at what is already queued rather than blocking: in-process the welcome
+/// is there before `attach` returns, and over a socket a client that blocked
+/// here would freeze its own window waiting for a packet.
+fn welcome_id(link: &mut Link<ClientMessage, ServerMessage>) -> Option<PlayerId> {
+    link.poll().into_iter().find_map(|m| match m {
+        ServerMessage::Welcome { you, .. } => Some(you),
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -1118,10 +1321,7 @@ mod tests {
         }
 
         let mine = game.me.player();
-        let theirs = game
-            .server
-            .sim
-            .player(game.server.local.expect("a local client"));
+        let theirs = game.host_player();
 
         assert_ne!(
             mine.pos, start.pos,
@@ -1154,12 +1354,13 @@ mod tests {
         );
         game.advance(TICK_DT);
 
-        assert_eq!(game.me.player().inventory.selected_slot(), 0);
+        assert_eq!(game.host_player().inventory.selected_slot(), 0);
         game.select_hotbar(3);
+        game.settle();
         game.advance(TICK_DT);
 
         assert_eq!(
-            game.me.player().inventory.selected_slot(),
+            game.host_player().inventory.selected_slot(),
             3,
             "the hotbar selection never reached the client's own copy"
         );
@@ -1174,10 +1375,7 @@ mod tests {
         // No GPU involved — this is why gameplay does not belong on the renderer.
         let mut game = Game::new();
         // Look straight down from above the terrain.
-        *game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client")) = Player::new(
+        *game.host_player_mut() = Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, 60.0, 0.5]),
             Angle::ZERO,
             Angle::from_radians(-1.5),
@@ -1203,13 +1401,10 @@ mod tests {
             .expect("ground below");
         // Stand just above the surface, looking down — now it is within reach.
         let eye = cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 3.5, 0.5]);
-        *game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client")) =
-            Player::new(eye, Angle::ZERO, Angle::from_radians(-1.5));
+        *game.host_player_mut() = Player::new(eye, Angle::ZERO, Angle::from_radians(-1.5));
 
-        let dirty = game.break_block().expect("a block was in reach");
+        let dirty = game.break_block();
+        game.settle();
         assert!(
             !game.world().is_solid_at(
                 ground.block[0],
@@ -1222,7 +1417,11 @@ mod tests {
         let b = ground.block;
         assert_eq!(
             dirty,
-            ChunkCoord::from_world_pos([b[0] as f32, b[1] as f32, b[2] as f32]),
+            Some(ChunkCoord::from_world_pos([
+                b[0] as f32,
+                b[1] as f32,
+                b[2] as f32
+            ])),
             "the dirty chunk is the one containing the broken block"
         );
     }
@@ -1246,21 +1445,17 @@ mod tests {
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
         let eye = cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 3.5, 0.5]);
-        *game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client")) =
-            Player::new(eye, Angle::ZERO, Angle::from_radians(-1.5));
+        *game.host_player_mut() = Player::new(eye, Angle::ZERO, Angle::from_radians(-1.5));
         (game, ground.block)
     }
 
     #[test]
     fn breaking_a_block_puts_its_item_in_the_inventory() {
         let (mut game, block) = game_looking_at_ground();
-        let terrain = game.server.terrain.expect("assets are set");
+        let terrain = game.server().terrain.expect("assets are set");
         let broken = game.world().block_at(block[0], block[1], block[2], terrain);
         let name = game
-            .server
+            .server_mut()
             .blocks_registry
             .as_ref()
             .unwrap()
@@ -1268,13 +1463,12 @@ mod tests {
             .expect("the block has a name")
             .to_string();
 
-        game.break_block().expect("a block was in reach");
+        game.break_block();
 
-        let items = game.server.items.as_ref().unwrap();
+        game.settle();
+        let items = game.server().items.as_ref().unwrap().clone();
         let stack = game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
+            .host_player_mut()
             .inventory
             .slot(0)
             .expect("slot 0 holds the drop");
@@ -1292,35 +1486,29 @@ mod tests {
         // The terrain's own stone, resolved by name in both registries, so
         // this test does not depend on which materials happen to ship -- only
         // on the block and its item sharing a name, which is the drop policy.
+        let stone = game.server().terrain.unwrap().stone;
         let stone_name = game
-            .server
+            .server()
             .blocks_registry
             .as_ref()
             .unwrap()
-            .name_of(game.server.terrain.unwrap().stone)
+            .name_of(stone)
             .expect("terrain stone has a name")
             .to_string();
-        let items = game.server.items.as_ref().unwrap();
+        let items = game.server().items.as_ref().unwrap().clone();
         let held = items
             .id_of(&stone_name)
             .expect("every shipped block needs an item of the same name to be placeable");
         let stack = items.new_stack(held, 5).unwrap();
-        game.server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .inventory
-            .add(stack, items);
+        game.host_player_mut().inventory.add(stack, &items);
         game.select_hotbar(0);
+        game.settle();
+        game.place_block();
+        game.settle();
 
-        game.place_block().expect("a face was in reach");
-
+        game.settle();
         assert_eq!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .inventory
-                .slot(0)
-                .map(|s| s.count()),
+            game.host_player_mut().inventory.slot(0).map(|s| s.count()),
             Some(4),
             "placing spends exactly one"
         );
@@ -1330,7 +1518,8 @@ mod tests {
     fn placing_with_an_empty_hand_changes_nothing() {
         let (mut game, _) = game_looking_at_ground();
         let before = game.world().edit_count();
-        assert_eq!(game.place_block(), None, "nothing held, nothing placed");
+        game.place_block();
+        game.settle();
         assert_eq!(game.world().edit_count(), before);
     }
 
@@ -1340,27 +1529,21 @@ mod tests {
         // spend the stick -- an action that fails silently should not also
         // cost you something.
         let (mut game, _) = game_looking_at_ground();
-        let items = game.server.items.as_ref().unwrap();
+        let items = game.server().items.as_ref().unwrap().clone();
         let stick = items
             .id_of("cubara:stick")
             .expect("assets/items has a stick");
-        game.server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
+        game.host_player_mut()
             .inventory
-            .add(items.new_stack(stick, 3).unwrap(), items);
+            .add(items.new_stack(stick, 3).unwrap(), &items);
         game.select_hotbar(0);
-
+        game.settle();
         let before = game.world().edit_count();
-        assert_eq!(game.place_block(), None);
+        game.place_block();
+        game.settle();
         assert_eq!(game.world().edit_count(), before, "nothing was placed");
         assert_eq!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .inventory
-                .slot(0)
-                .map(|s| s.count()),
+            game.host_player_mut().inventory.slot(0).map(|s| s.count()),
             Some(3),
             "and nothing was consumed"
         );
@@ -1372,17 +1555,17 @@ mod tests {
         // (2.5). Recorded behaviour, not a silent bug: what must not happen is
         // the block refusing to break, which would read as the game being stuck.
         let (mut game, block) = game_looking_at_ground();
-        let items = game.server.items.as_ref().unwrap();
+        let items = game.server().items.as_ref().unwrap().clone();
         let filler = items.id_of("cubara:stick").unwrap();
         for _ in 0..cubara_sim::SLOT_COUNT {
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
+            game.host_player_mut()
                 .inventory
-                .add(items.new_stack(filler, 64).unwrap(), items);
+                .add(items.new_stack(filler, 64).unwrap(), &items);
         }
 
-        game.break_block().expect("a block was in reach");
+        game.break_block();
+
+        game.settle();
         assert!(
             !game
                 .world()
@@ -1395,93 +1578,68 @@ mod tests {
     fn number_keys_select_hotbar_slots_on_press_only() {
         let mut game = Game::new();
         assert!(game.key_input(KeyCode::Digit4, true));
-        assert_eq!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .inventory
-                .selected_slot(),
-            3
-        );
+        game.settle();
+        assert_eq!(game.host_player_mut().inventory.selected_slot(), 3);
 
         // Releasing must not reselect -- otherwise every key-up would snap the
         // selection back to whichever number was let go of last.
         game.key_input(KeyCode::Digit1, true);
         game.key_input(KeyCode::Digit4, false);
-        assert_eq!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .inventory
-                .selected_slot(),
-            0
-        );
+        game.settle();
+        assert_eq!(game.host_player_mut().inventory.selected_slot(), 0);
     }
 
     /// Place a bench right where the player is looking, and aim at it.
     fn game_facing_a_bench() -> (Game, [i32; 3]) {
         let (mut game, ground) = game_looking_at_ground();
         let bench = game
-            .server
+            .server_mut()
             .blocks_registry
             .as_ref()
             .unwrap()
             .id_of("cubara:crafting_bench")
             .expect("assets/blocks defines the bench");
-        game.server.set_block(ground, bench);
-        game.sync();
+        game.server_mut().set_block(ground, bench);
+        game.settle();
         (game, ground)
     }
 
     #[test]
     fn right_clicking_a_bench_opens_the_three_by_three_grid() {
         let (mut game, _) = game_facing_a_bench();
-        let items = game.server.items.as_ref().unwrap();
+        let items = game.server().items.as_ref().unwrap().clone();
         // Holding something placeable, to prove interaction wins over placing.
-        game.server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .inventory
-            .add(
-                items
-                    .new_stack(items.id_of("cubara:stone").unwrap(), 5)
-                    .unwrap(),
-                items,
-            );
+        game.host_player_mut().inventory.add(
+            items
+                .new_stack(items.id_of("cubara:stone").unwrap(), 5)
+                .unwrap(),
+            &items,
+        );
         game.select_hotbar(0);
+        game.settle();
         let before = game.world().edit_count();
 
-        assert_eq!(game.place_block(), None, "no block was placed");
+        game.place_block();
+        game.settle();
         assert_eq!(game.world().edit_count(), before, "the world is unchanged");
         assert!(game.inventory_open(), "the screen opened");
-        assert_eq!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .crafting
-                .width(),
-            3,
-            "at bench size"
-        );
+        assert_eq!(game.host_player_mut().crafting.width(), 3, "at bench size");
     }
 
     #[test]
     fn right_clicking_anything_else_still_places() {
         let (mut game, _) = game_looking_at_ground();
-        let items = game.server.items.as_ref().unwrap();
-        game.server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .inventory
-            .add(
-                items
-                    .new_stack(items.id_of("cubara:stone").unwrap(), 5)
-                    .unwrap(),
-                items,
-            );
+        let items = game.server().items.as_ref().unwrap().clone();
+        game.host_player_mut().inventory.add(
+            items
+                .new_stack(items.id_of("cubara:stone").unwrap(), 5)
+                .unwrap(),
+            &items,
+        );
         game.select_hotbar(0);
-
-        assert!(game.place_block().is_some(), "a normal block still places");
+        game.settle();
+        game.place_block();
+        game.settle();
         assert!(!game.inventory_open(), "and no screen opened");
     }
 
@@ -1490,33 +1648,26 @@ mod tests {
     /// rather than reaching into the cells keeps these tests honest about the
     /// path the real game takes.
     fn load_cell(game: &mut Game, cell: usize, item: cubara_voxel::ItemId, count: u8) {
-        let items = game.server.items.as_ref().unwrap();
-        let book = game.server.recipes.as_ref().unwrap();
+        let items = game.server().items.as_ref().unwrap().clone();
+        let book = game.server().recipes.as_ref().unwrap().clone();
         let mut scratch = cubara_sim::Inventory::new();
-        scratch.add(items.new_stack(item, count).unwrap(), items);
-        let mut c = game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .crafting;
+        scratch.add(items.new_stack(item, count).unwrap(), &items);
+        let mut c = game.host_player_mut().crafting;
         c.click(
             cubara_sim::SlotRef::Inventory(0),
             false,
             &mut scratch,
-            items,
-            book,
+            &items,
+            &book,
         );
         c.click(
             cubara_sim::SlotRef::Grid(cell),
             false,
             &mut scratch,
-            items,
-            book,
+            &items,
+            &book,
         );
-        game.server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .crafting = c;
+        game.host_player_mut().crafting = c;
     }
 
     #[test]
@@ -1527,17 +1678,11 @@ mod tests {
         // says why that mattered.
         let (mut game, _) = game_facing_a_bench();
         game.place_block();
-        assert_eq!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .crafting
-                .width(),
-            3
-        );
+        game.settle();
+        assert_eq!(game.host_player_mut().crafting.width(), 3);
 
         let stone = game
-            .server
+            .server_mut()
             .items
             .as_ref()
             .unwrap()
@@ -1545,39 +1690,21 @@ mod tests {
             .unwrap();
         load_cell(&mut game, 8, stone, 4);
         assert!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .crafting
-                .cell(8)
-                .is_some(),
+            game.host_player_mut().crafting.cell(8).is_some(),
             "cell 8 is loaded"
         );
 
         game.toggle_inventory();
+
+        game.settle();
         assert!(!game.inventory_open(), "it closed");
-        assert_eq!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .crafting
-                .width(),
-            2,
-            "and narrowed"
-        );
+        assert_eq!(game.host_player_mut().crafting.width(), 2, "and narrowed");
         assert!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .crafting
-                .cell(8)
-                .is_none(),
+            game.host_player_mut().crafting.cell(8).is_none(),
             "the outer cell was emptied, not stranded"
         );
         assert!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
+            game.host_player_mut()
                 .inventory
                 .slots()
                 .flatten()
@@ -1592,9 +1719,9 @@ mod tests {
         // first rung of the ladder that needs a bench at all.
         let (mut game, _) = game_facing_a_bench();
         game.place_block();
-
+        game.settle();
         let (plank, stick) = {
-            let items = game.server.items.as_ref().unwrap();
+            let items = game.server().items.as_ref().unwrap().clone();
             (
                 items.id_of("cubara:plank").unwrap(),
                 items.id_of("cubara:stick").unwrap(),
@@ -1605,13 +1732,12 @@ mod tests {
             load_cell(&mut game, cell, item, 1);
         }
 
-        let items = game.server.items.as_ref().unwrap();
+        let items = game.server().items.as_ref().unwrap().clone();
+        let book = game.server().recipes.as_ref().unwrap().clone();
         let made = game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
+            .host_player()
             .crafting
-            .result(game.server.recipes.as_ref().unwrap(), items)
+            .result(&book, &items)
             .expect("the grid makes something");
         assert_eq!(
             items.name_of(made.item()),
@@ -1659,20 +1785,12 @@ mod tests {
     fn fly_toggle_flips_the_mode_on_a_single_press() {
         let mut game = Game::new();
         assert!(
-            !game
-                .server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .is_free_fly(),
+            !game.host_player_mut().is_free_fly(),
             "walking is the default mode"
         );
         game.key_input(KeyCode::F4, true);
         game.advance(TICK_DT);
-        assert!(game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .is_free_fly());
+        assert!(game.host_player_mut().is_free_fly());
     }
 
     #[test]
@@ -1687,12 +1805,9 @@ mod tests {
         let mut game = Game::new();
         game.key_input(KeyCode::F4, true);
         game.advance(2.0 * TICK_DT);
-        assert_eq!(game.server.sim.tick, 2);
+        assert_eq!(game.server().sim.tick, 2);
         assert!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .is_free_fly(),
+            game.host_player_mut().is_free_fly(),
             "one press should flip the mode once (false -> true), not twice (-> false)"
         );
     }
@@ -1700,9 +1815,9 @@ mod tests {
     #[test]
     fn advance_by_exactly_one_tick_worth_of_time_runs_one_tick() {
         let mut game = Game::new();
-        assert_eq!(game.server.sim.tick, 0);
+        assert_eq!(game.server().sim.tick, 0);
         game.advance(TICK_DT);
-        assert_eq!(game.server.sim.tick, 1);
+        assert_eq!(game.server().sim.tick, 1);
     }
 
     #[test]
@@ -1710,11 +1825,12 @@ mod tests {
         let mut game = Game::new();
         game.advance(TICK_DT * 0.5);
         assert_eq!(
-            game.server.sim.tick, 0,
+            game.server().sim.tick,
+            0,
             "half a tick's worth of time isn't a tick"
         );
         game.advance(TICK_DT * 0.5);
-        assert_eq!(game.server.sim.tick, 1, "the other half completes it");
+        assert_eq!(game.server().sim.tick, 1, "the other half completes it");
     }
 
     #[test]
@@ -1730,28 +1846,22 @@ mod tests {
             spread.advance(TICK_DT * 0.1); // sub-tick: no tick runs yet
         }
         assert_eq!(
-            spread.server.sim.tick, 0,
+            spread.server().sim.tick,
+            0,
             "5 * 0.1 tick < one tick: nothing simulated"
         );
         spread.advance(TICK_DT); // now cross the threshold -> exactly one tick
-        assert_eq!(spread.server.sim.tick, 1);
+        assert_eq!(spread.server().sim.tick, 1);
 
         // The same 500 px of motion delivered in a single tick-sized frame.
         let mut once = Game::new();
         once.mouse_look(500.0, 0.0);
         once.advance(TICK_DT);
-        assert_eq!(once.server.sim.tick, 1);
+        assert_eq!(once.server().sim.tick, 1);
 
         assert_eq!(
-            spread
-                .server
-                .sim
-                .player(spread.server.local.expect("a local client"))
-                .look_dir(),
-            once.server
-                .sim
-                .player(once.server.local.expect("a local client"))
-                .look_dir(),
+            spread.host_player().look_dir(),
+            once.host_player().look_dir(),
             "mouse motion spread over sub-tick frames must turn the player by \
              the same total as the same motion in one frame -- none dropped"
         );
@@ -1771,19 +1881,11 @@ mod tests {
         burst.mouse_look(1000.0, 0.0);
         burst.advance(3.0 * TICK_DT); // three ticks in one catch-up burst
 
-        assert_eq!(single.server.sim.tick, 1);
-        assert_eq!(burst.server.sim.tick, 3);
+        assert_eq!(single.server().sim.tick, 1);
+        assert_eq!(burst.server().sim.tick, 3);
         assert_eq!(
-            single
-                .server
-                .sim
-                .player(single.server.local.expect("a local client"))
-                .look_dir(),
-            burst
-                .server
-                .sim
-                .player(burst.server.local.expect("a local client"))
-                .look_dir(),
+            single.host_player().look_dir(),
+            burst.host_player().look_dir(),
             "the same single mouse-look delta must turn the player by the same \
              amount regardless of how many ticks ran in the same `advance` call"
         );
@@ -1794,7 +1896,8 @@ mod tests {
         let mut game = Game::new();
         game.advance(1000.0 * TICK_DT); // a 1000-tick backlog in one call
         assert_eq!(
-            game.server.sim.tick, MAX_TICKS_PER_FRAME as u64,
+            game.server().sim.tick,
+            MAX_TICKS_PER_FRAME as u64,
             "capped at MAX_TICKS_PER_FRAME, not fully caught up"
         );
         assert_eq!(
@@ -1837,17 +1940,8 @@ mod tests {
             i += 1;
         }
 
-        assert_eq!(steady.server.sim.tick, jittery.server.sim.tick);
-        assert_eq!(
-            steady
-                .server
-                .sim
-                .player(steady.server.local.expect("a local client")),
-            jittery
-                .server
-                .sim
-                .player(jittery.server.local.expect("a local client"))
-        );
+        assert_eq!(steady.server().sim.tick, jittery.server().sim.tick);
+        assert_eq!(steady.host_player(), jittery.host_player());
     }
 
     /// Put `block` directly in front of the player and aim at it, so a test can
@@ -1855,7 +1949,7 @@ mod tests {
     /// underfoot. Returns the position it was placed at.
     fn stand_over(game: &mut Game, block_name: &str) -> [i32; 3] {
         let id = game
-            .server
+            .server_mut()
             .blocks_registry
             .as_ref()
             .unwrap()
@@ -1866,65 +1960,54 @@ mod tests {
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
         let b = ground.block;
-        game.server.set_block(b, id);
+        game.server_mut().set_block(b, id);
         // Drain it, so the setup's own edit is not mistaken for the first thing
         // the test does. A client only ever learns about a world through these.
-        game.sync();
+        game.settle();
         b
     }
 
     /// Put the furnace at `pos` into a known state **through the server**, so
     /// the client's replica is told about it.
     ///
-    /// Reaching into `game.server.world` directly is the shortcut a real client
+    /// Reaching into `game.server().world` directly is the shortcut a real client
     /// does not have (§8.2), so a test does not get it either -- a test that
     /// took it would be setting up a world the client never sees, and would
     /// then fail for a reason unrelated to what it asserts.
     fn edit_furnace(game: &mut Game, pos: [i32; 3], f: impl FnOnce(&mut cubara_world::Furnace)) {
         let mut furnace = game
-            .server
+            .server_mut()
             .world
             .furnace_at(pos)
             .copied()
             .unwrap_or_default();
         f(&mut furnace);
-        game.server.set_furnace(pos, furnace);
-        game.sync();
+        game.server_mut().set_furnace(pos, furnace);
+        game.settle();
     }
 
     /// Give the player `item` in the selected hotbar slot.
     fn hold(game: &mut Game, item: &str) {
-        let items = game.server.items.as_ref().unwrap();
+        let items = game.server().items.as_ref().unwrap().clone();
         let id = items
             .id_of(item)
             .unwrap_or_else(|| panic!("no item {item}"));
         let stack = items.new_stack(id, 1).expect("a stack of one");
-        let slot = game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .inventory
-            .selected_slot() as usize;
-        game.server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .inventory
-            .set_slot(slot, Some(stack));
+        let slot = game.host_player_mut().inventory.selected_slot() as usize;
+        game.host_player_mut().inventory.set_slot(slot, Some(stack));
+        // Let the client hear about it. Poking the host's inventory directly is
+        // a test shortcut past the wire; without this the change would arrive on
+        // the first measured tick and be mistaken for whatever that tick did.
+        game.settle();
     }
 
     fn count_of(game: &Game, item: &str) -> u8 {
-        let items = game.server.items.as_ref().unwrap();
+        let items = game.server().items.as_ref().unwrap().clone();
         let Some(id) = items.id_of(item) else {
             return 0;
         };
         (0..cubara_sim::SLOT_COUNT)
-            .filter_map(|i| {
-                game.server
-                    .sim
-                    .player(game.server.local.expect("a local client"))
-                    .inventory
-                    .slot(i)
-            })
+            .filter_map(|i| game.host_player().inventory.slot(i))
             .filter(|s| s.item() == id)
             .map(|s| s.count())
             .sum()
@@ -1939,8 +2022,9 @@ mod tests {
         let b = stand_over(&mut game, "cubara:iron_ore");
         hold(&mut game, "cubara:wooden_pick");
 
-        game.break_block().expect("a block was in reach");
+        game.break_block();
 
+        game.settle();
         assert!(
             !game.world().is_solid_at(b[0], b[1], b[2], game.terrain()),
             "the block still breaks"
@@ -1957,8 +2041,9 @@ mod tests {
         stand_over(&mut game, "cubara:iron_ore");
         hold(&mut game, "cubara:stone_pick");
 
-        game.break_block().expect("a block was in reach");
+        game.break_block();
 
+        game.settle();
         assert_eq!(count_of(&game, "cubara:raw_iron"), 1);
         assert_eq!(count_of(&game, "cubara:iron_ore"), 0);
     }
@@ -1969,8 +2054,9 @@ mod tests {
         stand_over(&mut game, "cubara:stone");
         hold(&mut game, "cubara:wooden_pick");
 
-        game.break_block().expect("a block was in reach");
+        game.break_block();
 
+        game.settle();
         assert_eq!(count_of(&game, "cubara:cobble"), 1);
         assert_eq!(count_of(&game, "cubara:stone"), 0);
     }
@@ -1981,8 +2067,9 @@ mod tests {
         let (mut game, _) = game_looking_at_ground();
         stand_over(&mut game, "cubara:stone");
 
-        game.break_block().expect("a block was in reach");
+        game.break_block();
 
+        game.settle();
         assert_eq!(count_of(&game, "cubara:cobble"), 0);
     }
 
@@ -1994,8 +2081,9 @@ mod tests {
         stand_over(&mut game, "cubara:oak_leaves");
         hold(&mut game, "cubara:iron_pick");
 
-        game.break_block().expect("a block was in reach");
+        game.break_block();
 
+        game.settle();
         assert_eq!(count_of(&game, "cubara:oak_leaves"), 0);
     }
 
@@ -2005,9 +2093,7 @@ mod tests {
         stand_over(&mut game, "cubara:stone");
         hold(&mut game, "cubara:stone_pick");
         let before = match game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
+            .host_player_mut()
             .inventory
             .selected_stack()
             .unwrap()
@@ -2017,12 +2103,11 @@ mod tests {
             other => panic!("a pick should carry durability, got {other:?}"),
         };
 
-        game.break_block().expect("a block was in reach");
+        game.break_block();
 
+        game.settle();
         let after = match game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
+            .host_player_mut()
             .inventory
             .selected_stack()
             .unwrap()
@@ -2041,9 +2126,7 @@ mod tests {
         stand_over(&mut game, "cubara:iron_ore");
         hold(&mut game, "cubara:wooden_pick");
         let before = match game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
+            .host_player_mut()
             .inventory
             .selected_stack()
             .unwrap()
@@ -2053,12 +2136,11 @@ mod tests {
             other => panic!("a pick should carry durability, got {other:?}"),
         };
 
-        game.break_block().expect("a block was in reach");
+        game.break_block();
 
+        game.settle();
         let after = match game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
+            .host_player_mut()
             .inventory
             .selected_stack()
             .unwrap()
@@ -2073,7 +2155,7 @@ mod tests {
     #[test]
     fn a_tool_at_zero_durability_leaves_the_slot() {
         let (mut game, _) = game_looking_at_ground();
-        let items = game.server.items.as_ref().unwrap();
+        let items = game.server().items.as_ref().unwrap().clone();
         let pick = items.id_of("cubara:stone_pick").unwrap();
         let nearly_dead = ItemStack::new(
             pick,
@@ -2082,28 +2164,17 @@ mod tests {
             items.max_stack(pick),
         )
         .expect("a worn pick");
-        let slot = game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .inventory
-            .selected_slot() as usize;
-        game.server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
+        let slot = game.host_player_mut().inventory.selected_slot() as usize;
+        game.host_player_mut()
             .inventory
             .set_slot(slot, Some(nearly_dead));
         stand_over(&mut game, "cubara:stone");
 
-        game.break_block().expect("a block was in reach");
+        game.break_block();
 
+        game.settle();
         assert!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .inventory
-                .slot(slot)
-                .is_none(),
+            game.host_player_mut().inventory.slot(slot).is_none(),
             "the spent tool is gone"
         );
         assert_eq!(
@@ -2120,8 +2191,9 @@ mod tests {
         let (mut game, _) = game_looking_at_ground();
         stand_over(&mut game, "cubara:soil");
 
-        game.break_block().expect("a block was in reach");
+        game.break_block();
 
+        game.settle();
         assert_eq!(count_of(&game, "cubara:soil"), 1);
     }
 
@@ -2304,15 +2376,20 @@ mod tests {
     /// Place a furnace at the block the player is looking at and open it.
     fn open_a_furnace(game: &mut Game) -> [i32; 3] {
         let pos = stand_over(game, "cubara:furnace");
-        game.server.add_furnace(pos);
-        game.sync();
+        game.server_mut().add_furnace(pos);
+        game.settle();
         game.open_furnace = Some(pos);
         game.inventory_open = true;
         pos
     }
 
     fn item(game: &Game, name: &str) -> cubara_voxel::ItemId {
-        game.server.items.as_ref().unwrap().id_of(name).expect(name)
+        game.server()
+            .items
+            .as_ref()
+            .unwrap()
+            .id_of(name)
+            .expect(name)
     }
 
     #[test]
@@ -2340,14 +2417,7 @@ mod tests {
         assert!(game.interact());
         assert!(game.inventory_open());
         assert!(game.open_furnace().is_none(), "a bench, not a furnace");
-        assert_eq!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .crafting
-                .width(),
-            3
-        );
+        assert_eq!(game.host_player_mut().crafting.width(), 3);
     }
 
     #[test]
@@ -2400,45 +2470,33 @@ mod tests {
         let pos = open_a_furnace(&mut game);
         let raw = item(&game, "cubara:raw_iron");
         let stack = game
-            .server
+            .server_mut()
             .items
             .as_ref()
             .unwrap()
             .new_stack(raw, 3)
             .unwrap();
-        game.server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .crafting
-            .set_held(Some(stack));
+        game.host_player_mut().crafting.set_held(Some(stack));
 
         // Into the input slot.
         game.click_furnace(pos, PanelSlotKind::Grid, 0);
+        game.settle();
         assert_eq!(
             game.open_furnace().unwrap().input,
             Some((raw, 3)),
             "the held stack went in"
         );
         assert!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .crafting
-                .held()
-                .is_none(),
+            game.host_player_mut().crafting.held().is_none(),
             "hand is empty"
         );
 
         // And back out.
         game.click_furnace(pos, PanelSlotKind::Grid, 0);
+        game.settle();
         assert_eq!(game.open_furnace().unwrap().input, None);
         assert_eq!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .crafting
-                .held()
-                .map(|s| s.count()),
+            game.host_player_mut().crafting.held().map(|s| s.count()),
             Some(3)
         );
     }
@@ -2451,28 +2509,20 @@ mod tests {
         let pos = open_a_furnace(&mut game);
         let raw = item(&game, "cubara:raw_iron");
         let stack = game
-            .server
+            .server_mut()
             .items
             .as_ref()
             .unwrap()
             .new_stack(raw, 1)
             .unwrap();
-        game.server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .crafting
-            .set_held(Some(stack));
+        game.host_player_mut().crafting.set_held(Some(stack));
 
         game.click_furnace(pos, PanelSlotKind::Result, 0);
 
+        game.settle();
         assert_eq!(game.open_furnace().unwrap().output, None, "nothing went in");
         assert!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .crafting
-                .held()
-                .is_some(),
+            game.host_player_mut().crafting.held().is_some(),
             "still held"
         );
     }
@@ -2496,29 +2546,21 @@ mod tests {
         // world hash must cover it either way.
         let (mut game, _) = game_looking_at_ground();
         let furnace = game
-            .server
+            .server_mut()
             .blocks_registry
             .as_ref()
             .unwrap()
             .id_of("cubara:furnace")
             .unwrap();
-        let items = game.server.items.as_ref().unwrap();
+        let items = game.server().items.as_ref().unwrap().clone();
         let id = items.id_of("cubara:furnace").unwrap();
         let stack = items.new_stack(id, 1).unwrap();
-        let slot = game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .inventory
-            .selected_slot() as usize;
-        game.server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .inventory
-            .set_slot(slot, Some(stack));
+        let slot = game.host_player_mut().inventory.selected_slot() as usize;
+        game.host_player_mut().inventory.set_slot(slot, Some(stack));
 
-        let cc = game.place_block().expect("placed");
-        let _ = (furnace, cc);
+        game.place_block();
+        game.settle();
+        let _ = furnace;
         assert_eq!(
             game.world().block_entities().count(),
             1,
@@ -2537,6 +2579,7 @@ mod tests {
 
         game.toggle_inventory();
 
+        game.settle();
         assert!(!game.inventory_open(), "closed");
         assert_eq!(
             game.world().furnace_at(pos).unwrap().input,
@@ -2555,29 +2598,29 @@ mod tests {
         let raw = item(&game, "cubara:raw_iron");
         for i in 0..cubara_sim::SLOT_COUNT {
             let full = game
-                .server
+                .server_mut()
                 .items
                 .as_ref()
                 .unwrap()
                 .new_stack(raw, 64)
                 .unwrap();
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .inventory
-                .set_slot(i, Some(full));
+            game.host_player_mut().inventory.set_slot(i, Some(full));
         }
 
         game.break_at(b);
 
         assert_eq!(
-            game.server.sim.entities.len(),
+            game.server().sim.entities.len(),
             1,
             "the drop is on the floor"
         );
-        let (_, d) = game.server.sim.entities.sorted()[0];
+        let (_, d) = game.server().sim.entities.sorted()[0];
         assert_eq!(
-            game.server.items.as_ref().unwrap().name_of(d.stack.item()),
+            game.server()
+                .items
+                .as_ref()
+                .unwrap()
+                .name_of(d.stack.item()),
             Some("cubara:soil")
         );
     }
@@ -2598,9 +2641,9 @@ mod tests {
         // Three would-be-lost stacks: input, fuel, and the furnace's own drop
         // goes to the inventory, so two entities plus whatever did not fit.
         assert!(
-            game.server.sim.entities.len() >= 2,
+            game.server().sim.entities.len() >= 2,
             "input and fuel are on the floor, got {}",
-            game.server.sim.entities.len()
+            game.server().sim.entities.len()
         );
     }
 
@@ -2608,24 +2651,20 @@ mod tests {
     fn walking_over_a_dropped_item_picks_it_up() {
         let (mut game, _) = game_looking_at_ground();
         let stack = {
-            let items = game.server.items.as_ref().unwrap();
+            let items = game.server().items.as_ref().unwrap().clone();
             let id = items.id_of("cubara:cobble").unwrap();
             items.new_stack(id, 7).unwrap()
         };
         // Right where the player is standing.
-        let at = game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .pos;
-        game.server
+        let at = game.host_player_mut().pos;
+        game.server_mut()
             .sim
             .entities
             .spawn_item(stack, at, FixedVec3::ZERO);
 
         game.advance(TICK_DT);
 
-        assert_eq!(game.server.sim.entities.len(), 0, "collected");
+        assert_eq!(game.server().sim.entities.len(), 0, "collected");
         assert_eq!(count_of(&game, "cubara:cobble"), 7);
     }
 
@@ -2655,24 +2694,14 @@ mod tests {
                 // Exactly `total` ticks here too, or the comparison is against
                 // a different amount of elapsed time rather than against
                 // dormancy: one nearby, the middle away, one back home.
-                let home = game
-                    .server
-                    .sim
-                    .player_mut(game.server.local.expect("a local client"))
-                    .pos;
+                let home = game.host_player_mut().pos;
                 game.advance(TICK_DT);
-                game.server
-                    .sim
-                    .player_mut(game.server.local.expect("a local client"))
-                    .pos = home + FixedVec3::from_f32([4000.0, 0.0, 0.0]);
+                game.host_player_mut().pos = home + FixedVec3::from_f32([4000.0, 0.0, 0.0]);
                 for _ in 0..total - 2 {
                     game.advance(TICK_DT);
                 }
                 // Come back: the chunk wakes and catches up.
-                game.server
-                    .sim
-                    .player_mut(game.server.local.expect("a local client"))
-                    .pos = home;
+                game.host_player_mut().pos = home;
                 game.advance(TICK_DT);
                 game.world().furnace_at(pos).copied().expect("still there")
             };
@@ -2710,20 +2739,17 @@ mod tests {
         // and the client's replica has no lifecycle at all -- it is told about
         // edits, not about what is ticking.
         assert_eq!(
-            game.server.world.chunk_states().get(coord),
+            game.server().world.chunk_states().get(coord),
             cubara_world::ChunkState::Active,
             "active while the player is here"
         );
 
-        game.server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .pos += FixedVec3::from_f32([4000.0, 0.0, 0.0]);
+        game.host_player_mut().pos += FixedVec3::from_f32([4000.0, 0.0, 0.0]);
         game.advance(TICK_DT);
 
         assert!(
             matches!(
-                game.server.world.chunk_states().get(coord),
+                game.server().world.chunk_states().get(coord),
                 cubara_world::ChunkState::Dormant { .. }
             ),
             "dormant once they leave"
@@ -2740,10 +2766,7 @@ mod tests {
         game.advance(TICK_DT);
         let after_one = game.world().furnace_at(pos).copied().unwrap();
 
-        game.server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .pos += FixedVec3::from_f32([4000.0, 0.0, 0.0]);
+        game.host_player_mut().pos += FixedVec3::from_f32([4000.0, 0.0, 0.0]);
         for _ in 0..500 {
             game.advance(TICK_DT);
         }
@@ -2770,50 +2793,25 @@ mod tests {
         // it -- so a lethal fall reads as "no damage" here. That is what the
         // first version of this test measured, and it is why the lethal case
         // has its own test below, asserting the respawn instead.
-        *game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client")) = Player::new(
+        *game.host_player_mut() = Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 11.0, 0.5]),
             Angle::ZERO,
             Angle::ZERO,
         );
-        let full = game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .health;
+        let full = game.host_player_mut().health;
 
         for _ in 0..600 {
             game.advance(TICK_DT);
-            if game
-                .server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .on_ground
-            {
+            if game.host_player_mut().on_ground {
                 break;
             }
         }
 
+        assert!(game.host_player_mut().on_ground, "it landed");
         assert!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .on_ground,
-            "it landed"
-        );
-        assert!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .health
-                < full,
+            game.host_player_mut().health < full,
             "landing from ten blocks left {} of {full} health",
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .health
+            game.host_player_mut().health
         );
     }
 
@@ -2826,55 +2824,27 @@ mod tests {
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
         let spawn = cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 3.0, 0.5]);
-        *game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client")) =
-            Player::new(spawn, Angle::ZERO, Angle::ZERO);
+        *game.host_player_mut() = Player::new(spawn, Angle::ZERO, Angle::ZERO);
         // Give them something to lose, then drop them from lethal height.
         hold(&mut game, "cubara:iron_pick");
-        let carried = game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .inventory;
-        game.server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .pos = cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 60.0, 0.5]);
+        let carried = game.host_player_mut().inventory;
+        game.host_player_mut().pos =
+            cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 60.0, 0.5]);
 
         for _ in 0..600 {
             game.advance(TICK_DT);
-            if game
-                .server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .pos
-                .y
-                <= spawn.y
-                && game
-                    .server
-                    .sim
-                    .player_mut(game.server.local.expect("a local client"))
-                    .on_ground
-            {
+            if game.host_player_mut().pos.y <= spawn.y && game.host_player_mut().on_ground {
                 break;
             }
         }
 
         assert_eq!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .health,
+            game.host_player_mut().health,
             cubara_sim::MAX_HEALTH,
             "respawned at full health"
         );
         assert_eq!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .inventory,
+            game.host_player_mut().inventory,
             carried,
             "and kept the pick"
         );
@@ -2883,17 +2853,10 @@ mod tests {
         // local box *after* the damage was applied, silently undoing the
         // respawn. Health and inventory alone could not see that.
         assert!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .pos
-                .distance_squared(spawn)
+            game.host_player_mut().pos.distance_squared(spawn)
                 < (5 * cubara_voxel::fixed::ONE as i128 / 2).pow(2),
             "respawned at {:?} rather than near spawn {spawn:?}",
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .pos
+            game.host_player_mut().pos
         );
     }
 
@@ -2904,32 +2867,18 @@ mod tests {
             .world()
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
-        *game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client")) = Player::new(
+        *game.host_player_mut() = Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 2.5, 0.5]),
             Angle::ZERO,
             Angle::ZERO,
         );
-        let full = game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .health;
+        let full = game.host_player_mut().health;
 
         for _ in 0..300 {
             game.advance(TICK_DT);
         }
 
-        assert_eq!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .health,
-            full,
-            "a short drop is free"
-        );
+        assert_eq!(game.host_player_mut().health, full, "a short drop is free");
     }
 
     #[test]
@@ -2941,10 +2890,7 @@ mod tests {
             .world()
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
             .expect("ground below");
-        *game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client")) = Player::new(
+        *game.host_player_mut() = Player::new(
             cubara_voxel::FixedVec3::from_f32([0.5, ground.block[1] as f32 + 80.0, 0.5]),
             Angle::ZERO,
             Angle::from_radians(-1.5),
@@ -2955,11 +2901,7 @@ mod tests {
         for _ in 0..600 {
             game.advance(TICK_DT);
         }
-        let health_in_flight = game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .health;
+        let health_in_flight = game.host_player_mut().health;
         assert_eq!(
             health_in_flight,
             cubara_sim::MAX_HEALTH,
@@ -2989,17 +2931,10 @@ mod tests {
         }
 
         assert!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .on_ground,
+            game.host_player_mut().on_ground,
             "the player never settled on the ground"
         );
-        let health = game
-            .server
-            .sim
-            .player(game.server.local.expect("a local client"))
-            .health;
+        let health = game.host_player().health;
         assert_eq!(
             health,
             cubara_sim::MAX_HEALTH,
@@ -3022,29 +2957,17 @@ mod tests {
         );
 
         // Kill them outright, then let the world run.
-        game.server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .take_damage(cubara_sim::MAX_HEALTH);
+        game.host_player_mut().take_damage(cubara_sim::MAX_HEALTH);
         for _ in 0..600 {
             game.advance(TICK_DT);
         }
 
         assert_eq!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .health,
+            game.host_player_mut().health,
             cubara_sim::MAX_HEALTH,
             "respawning cost health, so death loops"
         );
-        assert!(
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .on_ground,
-            "and it landed"
-        );
+        assert!(game.host_player_mut().on_ground, "and it landed");
     }
 
     #[test]
@@ -3052,8 +2975,8 @@ mod tests {
         // The world has no floor. Generation never had `y` bounds -- what was
         // missing was streaming and simulating anywhere but chunk layers 0..=2.
         let (game, _) = game_looking_at_ground();
-        let terrain = game.server.terrain.expect("assets are set");
-        let registry = game.server.blocks_registry.as_ref().unwrap();
+        let terrain = game.server().terrain.expect("assets are set");
+        let registry = game.server().blocks_registry.as_ref().unwrap();
         for y in [-1, -100, -5_000, -100_000] {
             let block = game.world().block_at(0, y, 0, terrain);
             assert_eq!(
@@ -3068,7 +2991,7 @@ mod tests {
     #[test]
     fn there_is_open_sky_however_far_up_you_go() {
         let (game, _) = game_looking_at_ground();
-        let terrain = game.server.terrain.expect("assets are set");
+        let terrain = game.server().terrain.expect("assets are set");
         for y in [100, 5_000, 100_000] {
             assert!(
                 !game.world().is_solid_at(0, y, 0, terrain),
@@ -3083,11 +3006,11 @@ mod tests {
         // persist like any other edit -- the overlay is keyed by world
         // position and never had a floor either.
         let (mut game, _) = game_looking_at_ground();
-        let terrain = game.server.terrain.expect("assets are set");
+        let terrain = game.server().terrain.expect("assets are set");
         let deep = [3, -2_000, 7];
 
-        let cc = game.server.set_block(deep, BlockId::AIR);
-        game.sync();
+        let cc = game.server_mut().set_block(deep, BlockId::AIR);
+        game.settle();
         assert_eq!(cc, ChunkCoord::from_block(deep[0], deep[1], deep[2]));
 
         // Asserted against the **server's** world, not the replica. It used to
@@ -3099,7 +3022,7 @@ mod tests {
         // pins that as the deliberate behaviour it is.
         assert!(
             !game
-                .server
+                .server_mut()
                 .world
                 .is_solid_at(deep[0], deep[1], deep[2], terrain),
             "the deep block was mined out"
@@ -3107,7 +3030,7 @@ mod tests {
 
         // And its neighbours are still stone, so the edit is local.
         assert!(game
-            .server
+            .server_mut()
             .world
             .is_solid_at(deep[0] + 1, deep[1], deep[2], terrain));
     }
@@ -3123,8 +3046,11 @@ mod tests {
         let (mut game, _) = game_looking_at_ground();
         let deep = [3, -2_000, 7];
 
-        game.server.set_block(deep, BlockId::AIR);
-        let effects = game.server.drain_effects();
+        game.server_mut().set_block(deep, BlockId::AIR);
+        let effects = {
+            let who = game.me_id;
+            game.server_mut().drain_effects_for(who)
+        };
         assert!(
             !effects.iter().any(|e| matches!(
                 e,
@@ -3136,16 +3062,14 @@ mod tests {
         // The same edit, made where the player is standing, *is* sent -- so the
         // assertion above is about distance and not about `set_block` being mute.
         let near = {
-            let p = game
-                .server
-                .sim
-                .player(game.server.local.expect("a local client"))
-                .pos
-                .to_f32();
+            let p = game.host_player().pos.to_f32();
             [p[0] as i32, p[1] as i32 - 3, p[2] as i32]
         };
-        game.server.set_block(near, BlockId::AIR);
-        let effects = game.server.drain_effects();
+        game.server_mut().set_block(near, BlockId::AIR);
+        let effects = {
+            let who = game.me_id;
+            game.server_mut().drain_effects_for(who)
+        };
         assert!(
             effects.iter().any(|e| matches!(
                 e,
@@ -3161,13 +3085,13 @@ mod tests {
         // panicking one -- `ChunkCoord` is i32 and `region_of` uses div_euclid,
         // both of which were already correct for negative coordinates.
         let (game, _) = game_looking_at_ground();
-        let terrain = game.server.terrain.expect("assets are set");
+        let terrain = game.server().terrain.expect("assets are set");
         let deep = ChunkCoord::new(0, -64, 0);
         let chunk = game
             .world()
             .chunk_at(deep, terrain)
             .expect("a chunk that deep still generates");
-        let registry = game.server.blocks_registry.as_ref().unwrap();
+        let registry = game.server().blocks_registry.as_ref().unwrap();
         assert_eq!(
             registry.name_of(chunk.get(0, 0, 0)),
             Some("cubara:stone"),
@@ -3181,7 +3105,7 @@ mod tests {
         // player is next to it -- the simulated band moves with them now.
         let (mut game, _) = game_looking_at_ground();
         let deep = [0, -1_000, 0];
-        game.server.add_furnace(deep);
+        game.server_mut().add_furnace(deep);
         let raw = item(&game, "cubara:raw_iron");
         let log = item(&game, "cubara:oak_log");
         edit_furnace(&mut game, deep, |f| {
@@ -3189,18 +3113,8 @@ mod tests {
             f.fuel = Some((log, 4));
         });
         // Stand next to it.
-        game.server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .pos = cubara_voxel::FixedVec3::from_f32([0.5, -1_000.0, 0.5]);
-        game.server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .spawn = game
-            .server
-            .sim
-            .player_mut(game.server.local.expect("a local client"))
-            .pos;
+        game.host_player_mut().pos = cubara_voxel::FixedVec3::from_f32([0.5, -1_000.0, 0.5]);
+        game.host_player_mut().spawn = game.host_player_mut().pos;
 
         for _ in 0..250 {
             game.advance(TICK_DT);
@@ -3253,18 +3167,12 @@ mod tests {
                 .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, game.terrain())
                 .expect("ground");
             mined = ground.block;
-            game.server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .pos = cubara_voxel::FixedVec3::from_f32([0.5, mined[1] as f32 + 3.5, 0.5]);
+            game.host_player_mut().pos =
+                cubara_voxel::FixedVec3::from_f32([0.5, mined[1] as f32 + 3.5, 0.5]);
             game.break_at(mined);
-            carried = game
-                .server
-                .sim
-                .player_mut(game.server.local.expect("a local client"))
-                .inventory;
+            carried = game.host_player_mut().inventory;
 
-            game.server.save_to(&dir);
+            game.server_mut().save_to(&dir);
         }
 
         let mut reopened = game_with_assets();
@@ -3277,11 +3185,7 @@ mod tests {
             "the mined block came back"
         );
         assert_eq!(
-            reopened
-                .server
-                .sim
-                .player(reopened.server.local.expect("a local client"))
-                .inventory,
+            reopened.host_player().inventory,
             carried,
             "the inventory did not survive"
         );
@@ -3311,16 +3215,16 @@ mod tests {
     #[test]
     fn the_replica_generates_the_same_terrain_as_the_server_with_nothing_sent() {
         let (game, _) = game_looking_at_ground();
-        let terrain = game.server.terrain.expect("assets are set");
+        let terrain = game.server().terrain.expect("assets are set");
         assert_eq!(
             game.world().seed(),
-            game.server.world.seed(),
+            game.server().world.seed(),
             "same seed, which is all the client is given"
         );
         for y in -40..80 {
             assert_eq!(
                 game.world().is_solid_at(3, y, 7, terrain),
-                game.server.world.is_solid_at(3, y, 7, terrain),
+                game.server().world.is_solid_at(3, y, 7, terrain),
                 "the two worlds disagree about (3, {y}, 7)"
             );
         }
@@ -3336,21 +3240,23 @@ mod tests {
     #[test]
     fn an_edit_that_skips_the_journal_never_reaches_the_client() {
         let (mut game, _) = game_looking_at_ground();
-        let terrain = game.server.terrain.expect("assets are set");
+        let terrain = game.server().terrain.expect("assets are set");
         let at = [11, 30, 11];
         let stone = game
-            .server
+            .server_mut()
             .blocks_registry
             .as_ref()
             .unwrap()
             .id_of("cubara:stone")
             .unwrap();
 
-        Arc::make_mut(&mut game.server.world).set_block(at[0], at[1], at[2], stone);
-        game.sync();
+        Arc::make_mut(&mut game.server_mut().world).set_block(at[0], at[1], at[2], stone);
+        game.settle();
 
         assert!(
-            game.server.world.is_solid_at(at[0], at[1], at[2], terrain),
+            game.server()
+                .world
+                .is_solid_at(at[0], at[1], at[2], terrain),
             "the server has it"
         );
         assert!(
@@ -3364,10 +3270,10 @@ mod tests {
     #[test]
     fn an_edit_reaches_the_replica_and_names_its_own_dirty_chunk() {
         let (mut game, ground) = game_looking_at_ground();
-        let terrain = game.server.terrain.expect("assets are set");
+        let terrain = game.server().terrain.expect("assets are set");
 
-        game.server.set_block(ground, BlockId::AIR);
-        let dirty = game.sync();
+        game.server_mut().set_block(ground, BlockId::AIR);
+        let dirty = game.settle_dirty();
 
         assert!(
             !game
@@ -3389,10 +3295,14 @@ mod tests {
     fn a_burst_of_edits_in_one_chunk_is_one_dirty_chunk() {
         let (mut game, ground) = game_looking_at_ground();
         for dy in 0..4 {
-            game.server
+            game.server_mut()
                 .set_block([ground[0], ground[1] - dy, ground[2]], BlockId::AIR);
         }
-        assert_eq!(game.sync().len(), 1, "four edits, one chunk, one re-mesh");
+        assert_eq!(
+            game.settle_dirty().len(),
+            1,
+            "four edits, one chunk, one re-mesh"
+        );
     }
 
     /// The furnace screen is drawn from the **replica**, so a furnace smelting
@@ -3424,7 +3334,7 @@ mod tests {
         );
         assert_eq!(
             after,
-            game.server.world.furnace_at(pos).copied().unwrap(),
+            game.server().world.furnace_at(pos).copied().unwrap(),
             "and matches it exactly"
         );
     }
@@ -3438,15 +3348,15 @@ mod tests {
     #[test]
     fn a_snapshot_rebuilds_a_replica_that_has_seen_nothing() {
         let (mut game, ground) = game_looking_at_ground();
-        let terrain = game.server.terrain.expect("assets are set");
+        let terrain = game.server().terrain.expect("assets are set");
         let pos = open_a_furnace(&mut game);
         let raw = item(&game, "cubara:raw_iron");
         edit_furnace(&mut game, pos, |f| f.input = Some((raw, 2)));
-        game.server.set_block(ground, BlockId::AIR);
-        game.sync();
+        game.server_mut().set_block(ground, BlockId::AIR);
+        game.settle();
 
         // Throw the replica away, exactly as a load does, and rejoin.
-        game.world = Arc::new(World::with_seed(game.server.world.seed()));
+        game.world = Arc::new(World::with_seed(game.server().world.seed()));
         assert!(
             game.world()
                 .is_solid_at(ground[0], ground[1], ground[2], terrain),
@@ -3462,7 +3372,7 @@ mod tests {
         );
         assert_eq!(
             game.world().furnace_at(pos).copied(),
-            game.server.world.furnace_at(pos).copied(),
+            game.server().world.furnace_at(pos).copied(),
             "and the block entity"
         );
     }
@@ -3477,7 +3387,7 @@ mod tests {
         hold(&mut game, "cubara:stone_pick");
         mine_for(&mut game, 20).expect("it broke");
 
-        let server_edits: Vec<_> = game.server.world.edits().collect();
+        let server_edits: Vec<_> = game.server().world.edits().collect();
         let client_edits: Vec<_> = game.world().edits().collect();
         assert_eq!(
             server_edits, client_edits,

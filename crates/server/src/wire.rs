@@ -493,6 +493,10 @@ impl Action {
                 out.push(*right as u8);
             }
             Action::CloseScreen => out.push(5),
+            Action::SelectHotbar(slot) => {
+                out.push(6);
+                out.push(*slot);
+            }
         }
     }
 
@@ -527,6 +531,7 @@ impl Action {
                 }
             }
             5 => Action::CloseScreen,
+            6 => Action::SelectHotbar(c.u8()?),
             t => return Err(WireError::BadTag(t)),
         })
     }
@@ -906,6 +911,7 @@ mod tests {
                 right: false,
             }),
             ClientMessage::Act(Action::CloseScreen),
+            ClientMessage::Act(Action::SelectHotbar(8)),
         ];
         for m in messages {
             let mut buf = Vec::new();
