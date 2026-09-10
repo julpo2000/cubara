@@ -370,6 +370,31 @@ of being written.
 **Not started: phase 3.** Per the autonomy contract above, a phase ends with a
 report and the owner playing it.
 
+#### Where the work stands, 2026-09-10
+
+The gate is met and the phase is closed, but the owner has set a goal that runs
+past it: *the game on both screens, each showing the character running on the
+other laptop.* That is not a phase-3 feature — it is finishing what phase 2
+started — so it is being worked before phase 3 begins.
+
+| Piece | State |
+|---|---|
+| The client keeps its own player | landed, #222 |
+| Where the other players are, interpolated | landed, #224 |
+| Drawing them — red and green shirts, sized to the collision box | landed, #225 |
+| `--connect`: the game window joins a world elsewhere | **open, #226** |
+| Two people actually seeing each other | **never yet run** |
+
+Everything except the last row is evidence from tests and one golden image. The
+arrangement to try first is the one §3.3 describes and nothing has exercised: the
+dedicated server on a *third* machine with no GPU, and both game windows as
+clients.
+
+Three sessions are working on this — a Mac, a Windows laptop, and an older
+laptop offered the headless-server role. What each is doing at any moment is
+agreed between them, not written here; this table is what a restarted session
+needs to know.
+
 ---
 
 ## Phase 3 — Modern depth, with synergy
