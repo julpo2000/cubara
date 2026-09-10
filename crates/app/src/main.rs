@@ -37,6 +37,14 @@ struct App {
     /// lifecycle (both created together in `resumed`, since streaming exists
     /// to feed the renderer and needs its own `MeshAssets`).
     streaming: Option<NodeStreaming>,
+    /// A server to join instead of hosting one, from `--connect <addr>`.
+    ///
+    /// Acted on in `resumed`, not here: joining needs the client's registries,
+    /// and those exist only once the renderer has validated its textures. A
+    /// failed join is fatal rather than a silent fall back to singleplayer --
+    /// somebody who typed an address wants that world, and quietly giving them
+    /// a different one is worse than saying no.
+    connect_to: Option<String>,
     /// Whether the mouse is captured for first-person look (toggled with Escape).
     cursor_captured: bool,
     /// Last known cursor position in window pixels. Only meaningful while the
@@ -62,9 +70,20 @@ impl ApplicationHandler for App {
         let items = load_item_registry();
         let recipes = load_recipe_book(&items);
         self.game.set_assets(registry.clone(), items, recipes);
-        // After `set_assets`, which stands the player on the ground -- loading
-        // replaces that with wherever they actually were (#179).
-        self.game.load();
+        match self.connect_to.clone() {
+            Some(addr) => {
+                if let Err(e) = self.game.connect(&addr) {
+                    eprintln!("could not join {addr}: {e}");
+                    std::process::exit(1);
+                }
+            }
+            // After `set_assets`, which stands the player on the ground --
+            // loading replaces that with wherever they actually were (#179).
+            // Only when hosting: a joined world is the server's to load.
+            None => {
+                self.game.load();
+            }
+        }
         let structures = load_structure_registry();
         let ores = load_ore_registry();
         self.streaming = Some(NodeStreaming::new(
@@ -267,8 +286,21 @@ fn main() {
     // Poll continuously rather than waiting for OS events — we want max FPS.
     event_loop.set_control_flow(ControlFlow::Poll);
 
+    // Join somebody else's world: `cargo run --release -- --connect 192.168.0.5:25650`.
+    let connect_to = args
+        .iter()
+        .position(|a| a == "--connect")
+        .map(|i| match args.get(i + 1) {
+            Some(addr) => addr.clone(),
+            None => {
+                eprintln!("--connect needs an address, e.g. --connect 192.168.0.5:25650");
+                std::process::exit(2);
+            }
+        });
+
     let mut app = App {
         _profiler: Profiler::init(),
+        connect_to,
         ..App::default()
     };
     event_loop.run_app(&mut app).expect("run app");

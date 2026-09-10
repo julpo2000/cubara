@@ -207,6 +207,11 @@ pub struct Game {
 /// `blocks`, and a recipe book resolved against one item registry cannot be read
 /// against another.
 pub struct ClientAssets {
+    /// Kept for the join handshake: `join::accept` fingerprints it against the
+    /// server's. It was left out when this struct was written, correctly --
+    /// nothing read it then, and a field held "for later" is dead code with a
+    /// promise attached. `connect` is the reader that earns it.
+    pub blocks: Arc<BlockRegistry>,
     pub items: ItemRegistry,
     pub recipes: RecipeBook,
     /// Which ids the terrain is made of. Derived from `blocks` once, here,
@@ -338,6 +343,81 @@ impl Game {
             host.advance(1, &self.cfg);
         }
         self.sync();
+    }
+
+    /// Leave this client's own world and join somebody else's.
+    ///
+    /// The host is dropped, which stops the world it was running: a machine that
+    /// has connected somewhere is not also simulating a world nobody is in.
+    /// After this every field that answers a question about the world answers it
+    /// from messages, because there is nothing else left to ask.
+    ///
+    /// The registries stay: they were loaded from `assets/` on this machine and
+    /// the handshake has just proved they match the server's. That check is the
+    /// reason this can refuse rather than desynchronise -- ids cross the wire
+    /// raw, and two machines whose assets differ disagree about every id from
+    /// the first differing name onward.
+    pub fn connect(&mut self, addr: &str) -> Result<(), String> {
+        // The assets check lives in `join_over`, which is where the handshake
+        // needs them -- opening a socket first and failing after would leave a
+        // connection nobody closes.
+        if self.assets.is_none() {
+            return Err("connect before assets are loaded".to_string());
+        }
+        let link = cubara_server::net::connect(addr)
+            .map_err(|e| format!("could not reach {addr}: {e}"))?;
+        self.join_over(link)
+            .map_err(|e| format!("could not join {addr}: {e}"))
+    }
+
+    /// The join itself, over a link that is already open.
+    ///
+    /// Split from [`connect`](Self::connect) because nothing about a handshake
+    /// is a property of a socket: the same exchange happens over a channel, and
+    /// a test that had to open a port to check it would be testing the operating
+    /// system. `crates/server/tests/two_processes.rs` covers the socket.
+    fn join_over(&mut self, mut link: Link<ClientMessage, ServerMessage>) -> Result<(), String> {
+        let Some(assets) = self.assets.as_ref() else {
+            return Err("joined before assets are loaded".to_string());
+        };
+        link.send(ClientMessage::Hello);
+
+        // Wait for the welcome, and only for that. A client that blocked on the
+        // whole handshake would freeze its window on a slow connection; a client
+        // that did not block at all would not know its own id, and every action
+        // it sent before the answer arrived would be sent as nobody.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let welcome = loop {
+            if let Some(m) = link
+                .poll()
+                .into_iter()
+                .find(|m| matches!(m, ServerMessage::Welcome { .. }))
+            {
+                break m;
+            }
+            if link.is_closed() {
+                return Err("the server closed the connection".to_string());
+            }
+            if std::time::Instant::now() > deadline {
+                return Err("the server did not answer".to_string());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+
+        let joined = cubara_server::join::accept(&welcome, &assets.blocks, &assets.items)
+            .map_err(|e| e.to_string())?;
+
+        // Terrain is generated here from the seed, never received (§3). Nothing
+        // of the old world survives: a different seed is a different world.
+        self.world = Arc::new(World::with_seed(joined.seed));
+        self.me = Prediction::new(joined.seed, *self.me.player());
+        self.others = OtherPlayers::new();
+        self.me_id = joined.you;
+        self.seq = 0;
+        self.link = Some(link);
+        self.host = None;
+        log::info!("joined as {:?} (seed {})", joined.you, joined.seed);
+        Ok(())
     }
 
     /// Let the host run once so the client hears about the world it just got.
@@ -714,11 +794,9 @@ impl Game {
         // socket there is nothing to share, and a client holding an `Arc` into
         // the server's registry would be an in-process shortcut that stops
         // existing the moment somebody connects.
-        // The block registry itself is not kept: nothing on the client reads it
-        // that `terrain` does not already answer, and a field held "for later"
-        // is dead code with a promise attached. The renderer loads its own.
         self.assets = Some(ClientAssets {
             terrain: TerrainBlocks::from_registry(&registry),
+            blocks: Arc::clone(&registry),
             items: items.clone(),
             recipes: recipes.clone(),
         });
@@ -3392,6 +3470,123 @@ mod tests {
         assert_eq!(
             server_edits, client_edits,
             "the replica saw every edit the server made, and no others"
+        );
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+
+    /// A client leaves its own world and joins one running elsewhere.
+    ///
+    /// Driven against a `Session` in this process rather than a spawned binary:
+    /// what is being checked is that `Game` can live with no host at all, and a
+    /// local link proves that as well as a socket does while keeping the test
+    /// deterministic. `crates/server/tests/two_processes.rs` is where a real
+    /// socket is exercised.
+    fn hosted_elsewhere() -> (Session, Config) {
+        let cfg = Config {
+            world: std::path::PathBuf::from("cubara-nonexistent-connect-fixture"),
+            autosave_ticks: 0,
+            ..Config::default()
+        };
+        (Session::open(&cfg), cfg)
+    }
+
+    fn a_client() -> Game {
+        let mut game = Game::new();
+        let items = load_item_registry();
+        let recipes = load_recipe_book(&items);
+        game.set_assets(
+            std::sync::Arc::new(cubara_render::load_registry()),
+            items,
+            recipes,
+        );
+        game
+    }
+
+    /// Joining replaces the world, and **drops the host**: a machine that has
+    /// connected somewhere is not also simulating a world nobody is in.
+    #[test]
+    fn joining_a_server_gives_up_the_one_this_client_was_hosting() {
+        let (mut remote, cfg) = hosted_elsewhere();
+        let mut game = a_client();
+        assert!(game.host.is_some(), "a fresh client hosts its own world");
+
+        let link = remote.attach();
+        game.join_over(link).expect("the handshake is accepted");
+
+        assert!(
+            game.host.is_none(),
+            "a connected client kept hosting a second world"
+        );
+        assert_eq!(
+            game.world().seed(),
+            remote.server.world.seed(),
+            "the client generates the server's world, from the seed it was sent"
+        );
+        let _ = cfg;
+    }
+
+    /// The id comes from the server, not from an assumption.
+    #[test]
+    fn a_joined_client_drives_the_player_the_server_named() {
+        let (mut remote, _cfg) = hosted_elsewhere();
+        let mut game = a_client();
+
+        let link = remote.attach();
+        game.join_over(link).expect("joined");
+
+        assert_ne!(
+            game.me_id,
+            PlayerId::LOCAL,
+            "the joining client was handed the host's own player"
+        );
+        assert!(
+            remote.server.sim.get(game.me_id).is_some(),
+            "the id the client believes is its own is not a player on the server"
+        );
+    }
+
+    /// A server whose assets are not ours is refused, and the refusal says which.
+    ///
+    /// Ids cross the wire raw, so a mismatch is not a cosmetic difference: every
+    /// id from the first differing name onward means something else, and stone
+    /// arrives as iron. Refusing is the only honest answer, and naming the
+    /// registry is the difference between a minute and an evening.
+    #[test]
+    fn a_server_with_different_assets_is_refused_by_name() {
+        let (mut remote, _cfg) = hosted_elsewhere();
+        let mut game = a_client();
+
+        // Pretend this client's item table is not the server's.
+        let wrong = cubara_voxel::ItemRegistry::from_defs(vec![(
+            std::path::PathBuf::from("x.ron"),
+            cubara_voxel::ItemDef {
+                name: "cubara:not_a_real_item".to_string(),
+                max_stack: 64,
+                durability: None,
+                tier: 0,
+                speed: None,
+                burn_ticks: None,
+                rarity: cubara_voxel::Rarity::Common,
+            },
+        )])
+        .expect("valid");
+        game.assets.as_mut().unwrap().items = wrong;
+
+        let link = remote.attach();
+        let err = game
+            .join_over(link)
+            .expect_err("a mismatch must be refused");
+        assert!(
+            err.contains("items"),
+            "the refusal must say which registry differs; got {err:?}"
+        );
+        assert!(
+            game.host.is_some(),
+            "a refused join must leave this client hosting the world it had"
         );
     }
 }
