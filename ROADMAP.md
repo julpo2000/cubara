@@ -282,6 +282,94 @@ what is missing before the work is done.
 That third test is the real gate. If a scripted agent can survive in the world
 without a human, the world is playable; if it cannot, no screenshot proves it is.
 
+### Closeout — 2026-09-10
+
+`./scripts/check-phase-gate.sh 2` at `b82e051`, **16 passed, 0 failed**, on both
+machines, both on a clean tree.
+
+| Machine | Perf criterion (radius 64) | Gate margin |
+|---|---|---|
+| Win11 / i7-12650H, RTX 4060 (Vulkan) | ~2,469 FPS | ~2.5× |
+| macOS / Apple M3 (Metal) | ~1,109 FPS, 0.623 ms CPU/frame | ~1.1× |
+
+The Windows figure was measured twice, on `b82e051` and on the same code plus an
+unmerged refactor: **2,469 and 2,746 FPS**. That is 11% apart on functionally
+identical code, and it is recorded here rather than tidied away because this
+file's own footnotes warn that FPS at this scene size is run-to-run noise.
+Neither number is a change; the CPU/frame column is the comparable one, and the
+macOS table is where it is tracked.
+
+#### What the phase built
+
+Blocks 2.1 – 2.9a shipped the survival loop: items, inventory, crafting, trees,
+ores, tools, mining time, the furnace, dropped items, chunk dormancy, bounded
+catch-up, the save format, and health. 2.9b (hunger, food, hostile mobs) was
+**deferred to phase 3 by the owner** rather than built — the entry above records
+that decision and the amended gate criterion that came with it.
+
+Multiplayer joined the phase mid-flight, on the owner's call, and became blocks
+2.10 – 2.17: many players in one world, per-client views and interest
+management, a hand-written wire over a real socket, prediction and
+reconciliation, untrusted clients, per-player atomic saves with the disk off the
+tick loop, sharding, and a shard coordinator that checkpoints and audits by
+replay.
+
+#### What the gate did not catch, and what did
+
+Three defects reached `main` and were found by something other than the test
+suite. All three are worth recording because none was found by the check that
+should have found it:
+
+- **Every action was performed by the server's own player, not by the client
+  that sent it** (#209). From block 2.10 until it was fixed, a second client's
+  break destroyed whatever the *first* player was looking at, and the drop went
+  into their inventory. The LAN run for 2.12b had already shown this — a client
+  at yaw 0 received an edit at a diagonal coordinate it could not have produced
+  — and **both sessions read "an `Edit` came back" as "the right `Edit` came
+  back"**. It survived because a joining client spawns exactly where the local
+  player stands, so acting as the wrong player looks identical to acting as the
+  right one.
+- **`Session::save` was made asynchronous without being renamed** (#221), which
+  turned every existing caller into a race. macOS CI caught it; Windows and
+  local runs passed. The fix was the name, not the test.
+- **A gate that checked less than CI, twice.** First the command (`--workspace`),
+  then the environment (`RUSTFLAGS: -D warnings`). The script carried a comment
+  about the first when the second happened.
+
+#### The practice this phase produced
+
+Six tests were written across the phase that **could not fail** — they ran the
+code, asserted something true, and could not tell the difference when it was
+wrong. A gate criterion green while multiplayer did not work; a bandwidth
+criterion blind to idle players; a test checking the state before the crash it
+was for; a fingerprint sent and never verified; a prediction test that passed
+with the replay deleted; a furnace test giving both players the same item.
+
+Every one was found by breaking the code on purpose. That is now
+`scripts/check-tests-can-fail.sh` and a section in `CLAUDE.md`, because a habit
+that has to be remembered is not yet a rule. It found a seventh within one run
+of being written.
+
+#### Open, and deliberately not closed by this phase
+
+- **The game window cannot join a server.** `--connect` does not exist and
+  `Game` does not talk over a `net::Link`. Block 2.12b's first half landed (the
+  client keeps its own player); the second half did not.
+- **Two players still cannot see each other.** `Effect::PlayerMoved` is a no-op
+  in the client and the renderer has no player model at all. Even with
+  `--connect`, what a second person would see is each other's *edits* appearing
+  in real time — which is real multiplayer, and is not a figure standing there.
+  What a player looks like is a content decision the owner has not made.
+- **Players crossing a shard boundary.** Entities cross exactly once (#221);
+  players are not part of a shard in this model at all.
+- **The 5,000-player target is a *shape*, not a demonstration.** The gate asserts
+  that bytes to one client do not grow with the player count. No live run at that
+  scale exists, and §6 of the design doc says why claiming otherwise would be
+  invention.
+
+**Not started: phase 3.** Per the autonomy contract above, a phase ends with a
+report and the owner playing it.
+
 ---
 
 ## Phase 3 — Modern depth, with synergy

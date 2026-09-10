@@ -104,13 +104,28 @@ package_of() {
 # Collect candidates: lines this branch added, in order, so two runs on the
 # same branch try the same mutations (Rule 1's habit, applied to the tooling).
 # ---------------------------------------------------------------------------
+# Mutations stay out of `mod tests`. Mutating a test proves nothing: a test
+# whose own constant changed and still passes is not evidence about the code it
+# covers, it is noise. The first run of this script reported three such
+# "survivors" and every one was a line in a test module.
+#
+# Computed once per file rather than memoised in an associative array -- macOS
+# ships bash 3.2, which has none, and a script that only runs on one of the two
+# machines this project targets is not a check.
 candidates=()
+considered=0
 current=""
+test_cutoff=999999999
 lineno=0
 while IFS= read -r diffline; do
     case "$diffline" in
         "+++ b/"*)
             current="${diffline#+++ b/}"
+            test_cutoff=999999999
+            if [ -f "$current" ]; then
+                n="$(grep -n '^#\[cfg(test)\]' "$current" 2>/dev/null | head -1 | cut -d: -f1)"
+                [ -n "$n" ] && test_cutoff="$n"
+            fi
             ;;
         "@@"*)
             # @@ -a,b +c,d @@ -- c is the first new line number.
@@ -122,9 +137,12 @@ while IFS= read -r diffline; do
             case "$trimmed" in
                 ""|"//"*|"///"*|"#["*|"}"*|"use "*) ;;
                 *)
-                    mutated="$(mutate_line "$body")"
-                    if [ -n "$mutated" ] && [ "$mutated" != "$body" ]; then
-                        candidates+=("$current	$lineno	$body	$mutated")
+                    if [ -f "$current" ] && [ "$lineno" -lt "${test_cutoff:-999999999}" ]; then
+                        considered=$((considered + 1))
+                        mutated="$(mutate_line "$body")"
+                        if [ -n "$mutated" ] && [ "$mutated" != "$body" ]; then
+                            candidates+=("$current	$lineno	$body	$mutated")
+                        fi
                     fi
                     ;;
             esac
@@ -137,7 +155,25 @@ done < <(git diff --unified=0 "$base"...HEAD -- 'crates/*/src/*.rs')
 
 total="${#candidates[@]}"
 if [ "$total" -eq 0 ]; then
-    echo "No mutable lines added under crates/*/src since $base — nothing to check."
+    if [ "$considered" -gt 0 ]; then
+        echo "$considered lines of new code, and **none of them is a shape this"
+        echo "script knows how to break**. That is a limit of the tool, not a"
+        echo "verdict on the code: it mutates guards, comparisons and off-by-ones,"
+        echo "and code that mostly moves data around has none of those."
+        echo
+        echo "Break it by hand instead, and put what you tried in the PR."
+    else
+        echo "No new code under crates/*/src since $base — nothing to check."
+    fi
+    # A silent "nothing to check" on uncommitted work is the same shape of
+    # failure this script exists to catch: an answer that looks like a pass and
+    # is really a blind spot. It reads commits, so work still in the tree is
+    # invisible to it.
+    if ! git diff --quiet -- 'crates/*/src/*.rs'; then
+        echo
+        echo "NOTE: there are uncommitted changes under crates/*/src. This reads"
+        echo "      commits, so those were not examined. Commit them first."
+    fi
     exit 0
 fi
 
