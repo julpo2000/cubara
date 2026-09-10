@@ -13,7 +13,7 @@ pub mod entity;
 mod hash;
 mod input;
 mod inventory;
-mod physics;
+pub mod physics;
 mod player;
 mod rng;
 mod save;

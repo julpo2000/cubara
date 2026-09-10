@@ -509,6 +509,7 @@ impl Renderer {
         &mut self,
         camera: CameraPose,
         selected_block: Option<[i32; 3]>,
+        players: &[crate::figure::PlayerView],
         hotbar: Option<crate::scene::HotbarView<'_>>,
         panel: Option<crate::scene::PanelView<'_>>,
         health: Option<crate::scene::HealthView>,
@@ -544,6 +545,7 @@ impl Renderer {
             puffin::profile_scope!("encode-pass");
             let overlay = self.show_debug.then(|| self.debug_text(camera));
             self.scene.encode_scene(
+                &self.device,
                 &self.queue,
                 &mut encoder,
                 &view,
@@ -551,6 +553,7 @@ impl Renderer {
                     arena: &self.arena,
                     draw_count,
                     selected_block,
+                    players,
                     overlay: overlay.as_deref(),
                     hotbar,
                     panel,
@@ -808,6 +811,77 @@ pub fn build_pipeline(
 /// z-fighting it (issue #52's Design decisions). Doesn't write depth --
 /// nothing needs to be occluded by a wireframe -- and doesn't cull (lines
 /// have no winding).
+const FIGURE_VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
+    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+
+/// One figure vertex: a world-space position and a colour.
+pub const fn figure_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: (6 * std::mem::size_of::<f32>()) as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &FIGURE_VERTEX_ATTRS,
+    }
+}
+
+/// The pipeline that draws other players.
+///
+/// Depth-tested and back-face culled like the terrain, so a figure behind a
+/// hill is behind it. Camera bind group only: the vertices come in already
+/// placed, so there is no per-figure uniform to bind or to keep in step.
+pub fn build_figure_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    camera_bgl: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("figure-shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/figure.wgsl").into()),
+    });
+
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("figure-layout"),
+        bind_group_layouts: &[camera_bgl],
+        push_constant_ranges: &[],
+    });
+
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("figure-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[figure_vertex_layout()],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: Some(wgpu::Face::Back),
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: true,
+            // Reversed-Z, like the terrain: greater is nearer.
+            depth_compare: wgpu::CompareFunction::Greater,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    })
+}
+
 pub fn build_outline_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,

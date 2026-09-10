@@ -17,9 +17,9 @@ use crate::arena::ChunkArena;
 use crate::materials;
 use crate::panel::{InventoryPanel, PanelSlotKind};
 use crate::render::{
-    build_outline_pipeline, build_pipeline, camera_bind_group_layout, create_depth_view,
-    origins_bind_group_layout, outline_bind_group_layout, CameraUniform, OutlineUniform,
-    OUTLINE_CUBE_EDGES,
+    build_figure_pipeline, build_outline_pipeline, build_pipeline, camera_bind_group_layout,
+    create_depth_view, origins_bind_group_layout, outline_bind_group_layout, CameraUniform,
+    OutlineUniform, OUTLINE_CUBE_EDGES,
 };
 use crate::text::font;
 use crate::text::TextRenderer;
@@ -52,6 +52,11 @@ pub struct SceneFrame<'a> {
     pub hotbar: Option<HotbarView<'a>>,
     /// The open inventory screen, or `None` when it is closed.
     pub panel: Option<PanelView<'a>>,
+    /// The other players in sight, to draw as figures (block 2.12b).
+    ///
+    /// Empty in singleplayer and in every headless shot that does not ask for
+    /// one. The local player is **not** in here: you are the camera.
+    pub players: &'a [crate::figure::PlayerView],
     /// Health in **points**, or `None` to draw no hearts.
     ///
     /// Points, not hearts, and not a fraction: this crate is told the number
@@ -125,6 +130,12 @@ pub struct SceneRenderer {
     /// pipeline sharing `camera_bind_group` (`@group(0)`), plus its own tiny
     /// uniform for the highlighted voxel's world position and a static
     /// vertex buffer of unit-cube edges uploaded once here.
+    figure_pipeline: wgpu::RenderPipeline,
+    /// Rebuilt every frame from the players in sight, and grown when it has to
+    /// be. A figure is 216 vertices, so this stays small enough that reusing
+    /// one buffer beats managing per-player ones.
+    figure_vertex_buffer: wgpu::Buffer,
+    figure_capacity: usize,
     outline_pipeline: wgpu::RenderPipeline,
     outline_vertex_buffer: wgpu::Buffer,
     outline_uniform_buffer: wgpu::Buffer,
@@ -169,6 +180,15 @@ impl SceneRenderer {
         let texture_bind_group =
             materials::bind_group(device, &textures_bgl, texture_view, texture_sampler);
 
+        let figure_pipeline = build_figure_pipeline(device, format, &camera_bgl);
+        let figure_capacity = crate::figure::VERTICES_PER_FIGURE * 8;
+        let figure_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("figure-vertices"),
+            size: (figure_capacity * 6 * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let outline_bgl = outline_bind_group_layout(device);
         let outline_pipeline = build_outline_pipeline(device, format, &camera_bgl, &outline_bgl);
         let outline_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -202,6 +222,9 @@ impl SceneRenderer {
             camera_buffer,
             camera_bind_group,
             texture_bind_group,
+            figure_pipeline,
+            figure_vertex_buffer,
+            figure_capacity,
             outline_pipeline,
             outline_vertex_buffer,
             outline_uniform_buffer,
@@ -239,6 +262,7 @@ impl SceneRenderer {
     /// is the whole point of the rule.
     pub fn encode_scene(
         &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         color: &wgpu::TextureView,
@@ -248,11 +272,42 @@ impl SceneRenderer {
             arena,
             draw_count,
             selected_block,
+            players,
             overlay,
             hotbar,
             panel,
             health,
         } = frame;
+
+        // Build this frame's figures and upload them. Done before the pass so
+        // the write is ordered against the draw that reads it.
+        let mut figure_vertices: Vec<crate::figure::FigureVertex> =
+            Vec::with_capacity(players.len() * crate::figure::VERTICES_PER_FIGURE);
+        for &view in players {
+            crate::figure::figure_vertices(view, &mut figure_vertices);
+        }
+        if figure_vertices.len() > self.figure_capacity {
+            // More people came into view than the buffer holds. Grown rather
+            // than clamped: silently dropping the last player to arrive is a
+            // bug that only shows up in a crowd, which is the worst place to
+            // find one.
+            self.figure_capacity = figure_vertices.len().next_power_of_two();
+            self.figure_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("figure-vertices"),
+                size: (self.figure_capacity * 6 * std::mem::size_of::<f32>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        let figure_vertices_count = figure_vertices.len();
+        if figure_vertices_count > 0 {
+            queue.write_buffer(
+                &self.figure_vertex_buffer,
+                0,
+                bytemuck::cast_slice(&figure_vertices),
+            );
+        }
+
         if let Some(block) = selected_block {
             let origin = [block[0] as f32, block[1] as f32, block[2] as f32];
             queue.write_buffer(
@@ -289,6 +344,14 @@ impl SceneRenderer {
             pass.set_bind_group(1, arena.origins_bind_group(), &[]);
             pass.set_bind_group(2, &self.texture_bind_group, &[]);
             arena.encode(&mut pass, draw_count);
+
+            // Other players, same pass so a figure behind a hill is behind it.
+            if figure_vertices_count > 0 {
+                pass.set_pipeline(&self.figure_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.figure_vertex_buffer.slice(..));
+                pass.draw(0..figure_vertices_count as u32, 0..1);
+            }
 
             // The selected-block outline, same pass so it's depth-tested
             // against the geometry just drawn (issue #52).
