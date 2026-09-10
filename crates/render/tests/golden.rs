@@ -407,6 +407,7 @@ fn a_cave_mouth_is_visible() {
         region_radius: 3,
         orbit_t: 0.0,
         camera: Some((eye, target - eye)),
+        players: Vec::new(),
         highlighted_block: None,
         hotbar: None,
         panel: None,
@@ -441,6 +442,7 @@ fn iron_ore_is_visible_in_a_cave_wall() {
         region_radius: 3,
         orbit_t: 0.0,
         camera: Some((eye, target - eye)),
+        players: Vec::new(),
         highlighted_block: None,
         hotbar: None,
         panel: None,
@@ -509,6 +511,7 @@ fn the_selected_block_shows_an_outline() {
         region_radius: 3,
         orbit_t: 0.0,
         camera: Some((eye, target - eye)),
+        players: Vec::new(),
         highlighted_block: Some(hit.block),
         hotbar: None,
         panel: None,
@@ -552,6 +555,7 @@ fn the_hotbar_shows_slots_counts_and_the_held_one() {
         region_radius: 2,
         orbit_t: 0.0,
         camera: None,
+        players: Vec::new(),
         highlighted_block: None,
         hotbar: Some(hotbar),
         panel: None,
@@ -600,6 +604,7 @@ fn the_inventory_screen_shows_slots_a_recipe_and_the_cursor() {
         region_radius: 2,
         orbit_t: 0.0,
         camera: None,
+        players: Vec::new(),
         highlighted_block: None,
         hotbar: None,
         health: None,
@@ -629,6 +634,7 @@ fn hearts_show_health_including_a_half() {
         region_radius: 2,
         orbit_t: 0.0,
         camera: None,
+        players: Vec::new(),
         highlighted_block: None,
         hotbar: Some([None; 9]),
         panel: None,
@@ -674,6 +680,7 @@ fn the_furnace_screen_shows_input_fuel_and_output() {
         region_radius: 2,
         orbit_t: 0.0,
         camera: None,
+        players: Vec::new(),
         highlighted_block: None,
         hotbar: None,
         health: None,
@@ -723,6 +730,7 @@ fn distinct_materials_render_with_distinct_textures() {
         region_radius: 0, // unused by render_chunks -- the chunk list is explicit
         orbit_t: 5.0,
         camera: None,
+        players: Vec::new(),
         highlighted_block: None,
         hotbar: None,
         panel: None,
@@ -809,4 +817,51 @@ fn edits_change_what_is_drawn() {
          comparison is too loose to catch a real regression",
         diff.differing_fraction * 100.0
     );
+}
+
+/// Two players stand in front of the camera, one in a red shirt and one in
+/// green.
+///
+/// The owner's goal for this block is *seeing the character running on the
+/// other laptop*, and this is the pixel-level half of it: that a figure is
+/// drawn at all, that it is human-shaped rather than a cube, and that the two
+/// shirts are the two colours he asked for.
+///
+/// The geometry itself is checked without a GPU in `figure.rs` — where an arm
+/// ends up is a number, not a picture. What only an image can show is that the
+/// pipeline is bound, the depth test is the right way round, and the figures
+/// are not inside-out from back-face culling.
+#[test]
+fn two_players_stand_in_front_of_the_camera() {
+    let world = World::with_seed(119);
+    // Looking level, along −Z, at two figures a few blocks out and a stride
+    // apart. High enough above the terrain that the ground is not what fills
+    // the frame — this shot is about the people.
+    let eye = glam::vec3(0.0, 40.0, 6.0);
+    let shot = Shot {
+        width: 960,
+        height: 540,
+        region_radius: 2,
+        orbit_t: 0.0,
+        camera: Some((eye, glam::vec3(0.0, -0.15, -1.0))),
+        players: vec![
+            cubara_render::PlayerView {
+                eye: [-1.2, 40.0, -1.0],
+                yaw: 0.0,
+                shirt: [0.80, 0.16, 0.16],
+            },
+            cubara_render::PlayerView {
+                eye: [1.2, 40.0, -1.0],
+                // Turned a quarter, so the golden also covers yaw: a figure
+                // that ignored it would be identical to the one beside it.
+                yaw: std::f32::consts::FRAC_PI_2,
+                shirt: [0.20, 0.70, 0.24],
+            },
+        ],
+        highlighted_block: None,
+        hotbar: None,
+        panel: None,
+        health: None,
+    };
+    assert_golden("two_players", &world, shot);
 }

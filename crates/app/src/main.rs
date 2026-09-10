@@ -189,9 +189,11 @@ impl ApplicationHandler for App {
                     held: *held,
                     cursor: self.cursor,
                 });
+                let others = self.game.other_players();
                 renderer.render(
                     camera,
                     self.game.selected_block(),
+                    &others,
                     hotbar,
                     panel,
                     Some(self.game.health_view()),

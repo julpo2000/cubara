@@ -31,9 +31,9 @@ use crate::player::Player;
 // in both directions (see `Fixed::div_floor`).
 
 /// Half the player's horizontal footprint, blocks (full width 0.6).
-const HALF_WIDTH: Fixed = Fixed::from_raw(3 * ONE / 10);
+pub const HALF_WIDTH: Fixed = Fixed::from_raw(3 * ONE / 10);
 /// Collision-box height, feet to head, blocks.
-const HEIGHT: Fixed = Fixed::from_raw(18 * ONE / 10);
+pub const HEIGHT: Fixed = Fixed::from_raw(18 * ONE / 10);
 /// How far above the feet [`Player::pos`] (the eye) sits -- the box is
 /// derived from `pos` by subtracting this, so `pos` keeps meaning "the
 /// camera" in both movement modes.
@@ -42,7 +42,7 @@ const HEIGHT: Fixed = Fixed::from_raw(18 * ONE / 10);
 /// and re-adding an integer returns the number you started with, so a box
 /// resting on a boundary arrives on the boundary rather than a few ULPs below
 /// it.
-const EYE_HEIGHT: Fixed = Fixed::from_raw(162 * ONE / 100);
+pub const EYE_HEIGHT: Fixed = Fixed::from_raw(162 * ONE / 100);
 /// The tallest ledge walking climbs without a jump.
 const STEP_HEIGHT: Fixed = Fixed::ONE;
 /// Ticks per second -- what a per-second velocity is divided by.

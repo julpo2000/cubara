@@ -74,6 +74,12 @@ pub struct Shot {
     /// as its distance, so the angle never changes) — which a shot that needs to
     /// look *into* something at ground level, like a cave mouth, needs.
     pub camera: Option<(glam::Vec3, glam::Vec3)>,
+    /// Other players to draw as figures, or empty for none (block 2.12b).
+    ///
+    /// Explicit rather than derived: a headless shot has no simulation to ask,
+    /// and a golden image of a figure has to put it somewhere the camera is
+    /// known to be looking.
+    pub players: Vec<crate::figure::PlayerView>,
     /// A block to draw the selected-block outline around (issue #52), or
     /// `None` for no outline. In the real game this is `cubara_sim::Sim::target`
     /// (the sim's own raycast); a golden test sets it explicitly to whatever
@@ -108,6 +114,7 @@ impl Default for Shot {
             region_radius: 6,
             orbit_t: 6.0,
             camera: None,
+            players: Vec::new(),
             highlighted_block: None,
             hotbar: None,
             panel: None,
@@ -187,6 +194,7 @@ fn render_arena(
         region_radius: _,
         orbit_t,
         camera,
+        players,
         highlighted_block,
         hotbar,
         panel,
@@ -276,6 +284,7 @@ fn render_arena(
     // reference differ on every run. `highlighted_block` does go through --
     // a golden test needs to be able to show the outline.
     scene.encode_scene(
+        &device,
         &queue,
         &mut encoder,
         &color_view,
@@ -283,6 +292,7 @@ fn render_arena(
             arena: &arena,
             draw_count,
             selected_block: highlighted_block,
+            players: &players,
             overlay: None,
             hotbar: hotbar.as_ref().map(|slots| crate::scene::HotbarView {
                 slots: slots.as_slice(),

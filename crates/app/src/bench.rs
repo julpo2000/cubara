@@ -165,6 +165,7 @@ pub fn run(radius: i32) {
             // No selected block, no overlay: the bench measures the world,
             // not a UI highlight or the debug HUD.
             scene.encode_scene(
+                &device,
                 &queue,
                 &mut encoder,
                 &color_view,
@@ -172,6 +173,7 @@ pub fn run(radius: i32) {
                     arena,
                     draw_count,
                     selected_block: None,
+                    players: &[],
                     overlay: None,
                     // The benchmark measures the scene, not the HUD.
                     health: None,

@@ -22,6 +22,7 @@ use cubara_sim::{SlotRef, HOTBAR_WIDTH};
 use cubara_voxel::{Angle, BlockRegistry, ChunkCoord, ItemRegistry, RecipeBook};
 use cubara_world::{Furnace, TerrainBlocks, World};
 
+use cubara_server::others::OtherPlayers;
 use cubara_server::predict::Prediction;
 use cubara_server::{Action, Effect, FurnaceSlot, Screen, Server};
 
@@ -70,6 +71,12 @@ pub struct Game {
     /// is no such field: a connected client has no `Server` at all, and this is
     /// what it draws itself from instead.
     me: Prediction,
+    /// Everyone else this client can see (block 2.12b).
+    ///
+    /// Fed by `Effect::PlayerMoved` and `PlayerGone`, which were no-ops here
+    /// until there was something to draw. The *local* player is never in it:
+    /// you are the camera.
+    others: OtherPlayers,
     /// The client's own world (`RESEARCH_MULTIPLAYER.md` §8.2).
     ///
     /// **A replica, not a cache, and not the server's.** The instinct is to
@@ -166,6 +173,7 @@ impl Game {
             // In-process that handshake is a field read at construction; over a
             // socket it is `Welcome` plus the first `SelfState`.
             me: Prediction::new(server.world.seed(), player),
+            others: OtherPlayers::new(),
             server,
             prev_player: player,
             inventory_open: false,
@@ -204,6 +212,40 @@ impl Game {
             eye: glam::Vec3::from_array(player.pos.to_f32()),
             look_dir: player.look_dir_f32(),
         }
+    }
+
+    /// The other players in sight, ready to draw (block 2.12b).
+    ///
+    /// Interpolated at the same `alpha` the camera uses, so everyone on screen
+    /// is showing the same instant.
+    ///
+    /// **Shirt colours.** The owner asked for a red and a green shirt, and the
+    /// two are handed out by `PlayerId` order — lowest is red, next is green.
+    /// By id rather than by "whoever I am not", because the id comes from the
+    /// server: both machines then agree about who is red, and two people
+    /// describing what they see to each other are describing the same thing.
+    /// If they were assigned per-screen, you would each be red on your own.
+    ///
+    /// A third player onwards gets a colour hashed from their id through
+    /// `swatch_color`, the same function that colours a block with no texture.
+    /// Two shirts were what was asked for; running out of them silently is not
+    /// something to leave for a stranger to discover.
+    pub fn other_players(&self) -> Vec<cubara_render::PlayerView> {
+        let alpha = (self.accumulator / TICK_DT as f64).clamp(0.0, 1.0) as f32;
+        self.others
+            .drawn(alpha)
+            .into_iter()
+            .enumerate()
+            .map(|(rank, (who, pose))| cubara_render::PlayerView {
+                eye: pose.pos,
+                yaw: pose.yaw,
+                shirt: match rank {
+                    0 => [0.80, 0.16, 0.16],
+                    1 => [0.20, 0.70, 0.24],
+                    _ => cubara_render::swatch_color(&format!("cubara:player_{}", who.0)),
+                },
+            })
+            .collect()
     }
 
     /// The block the player is currently looking at, within [`REACH`], for
@@ -634,7 +676,13 @@ impl Game {
                 // Drawing another player needs a model and an interpolator, and
                 // interpolating a remote pose is exactly what design §8.4 says
                 // not to build before there is real latency to build it against.
-                Effect::PlayerMoved { .. } | Effect::PlayerGone(_) => {}
+                Effect::PlayerMoved {
+                    who,
+                    pos,
+                    yaw,
+                    pitch,
+                } => self.others.moved(who, pos, yaw, pitch),
+                Effect::PlayerGone(who) => self.others.gone(who),
                 // This client's own items. Ignored here for the same reason
                 // `SelfState` is: `Game` still owns the `Server` in this
                 // process and reads the authoritative player straight out of
@@ -947,6 +995,50 @@ impl Default for Game {
 
 #[cfg(test)]
 mod tests {
+    /// The figure the renderer draws is the size of the body the simulation
+    /// collides with.
+    ///
+    /// `cubara-render` cannot import these — it depends on neither the sim nor
+    /// the world crate, and taking a dependency so a placeholder can read three
+    /// numbers would be the wrong trade. So they are written out in both places
+    /// and tied together *here*, in the one crate that sees both.
+    ///
+    /// Without this, changing the player's height in `physics.rs` leaves every
+    /// other player in the world drawn at the old size, and the only thing that
+    /// would notice is somebody looking at a screenshot.
+    #[test]
+    fn the_drawn_figure_matches_the_simulated_body() {
+        use cubara_sim::physics::{EYE_HEIGHT, HALF_WIDTH, HEIGHT};
+
+        // Within one fixed-point step. The simulation stores these as `Fixed`,
+        // so 1.8 comes back as 1.7999878 -- a float constant can only agree
+        // with it to the nearest representable value, and demanding exactness
+        // would fail on a difference nothing can see.
+        let step = 2.0 / 65536.0;
+        let agree = |drawn: f32, simulated: f32, what: &str| {
+            assert!(
+                (drawn - simulated).abs() < step,
+                "{what}: drawn {drawn}, simulated {simulated}"
+            );
+        };
+
+        agree(
+            cubara_render::figure::PLAYER_HEIGHT,
+            HEIGHT.to_f32(),
+            "the figure is drawn at a different height than the body collides at",
+        );
+        agree(
+            cubara_render::figure::PLAYER_WIDTH,
+            HALF_WIDTH.to_f32() * 2.0,
+            "the figure is drawn at a different width than the body collides at",
+        );
+        agree(
+            cubara_render::figure::EYE_HEIGHT,
+            EYE_HEIGHT.to_f32(),
+            "the figure's eye is not where the simulation puts it",
+        );
+    }
+
     /// The client's own player keeps up with the server's, and does so through
     /// **messages only**.
     ///

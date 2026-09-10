@@ -14,6 +14,7 @@
 
 mod arena;
 pub mod culling;
+pub mod figure;
 pub mod headless;
 pub mod materials;
 pub mod panel;
@@ -24,6 +25,7 @@ mod text;
 
 pub use arena::{ArenaUsage, ChunkArena, MeshedNode, NodeId};
 pub use culling::{Aabb, Frustum};
+pub use figure::{figure_vertices, FigureVertex, PlayerView};
 pub use headless::{Frame, PanelLayout, Shot};
 pub use materials::{swatch_color, MeshAssets};
 pub use panel::{InventoryPanel, PanelSlot, PanelSlotKind};
