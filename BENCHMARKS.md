@@ -47,6 +47,7 @@ frames after 200 warmup.
 | 2026-08-24 | **Skirt no longer overlaps a real face** [#125], radius 64³² | 1,585 | **758,754** | ~3,665 | 0.112 ms | ~0.45 ms | `3af8d3b` |
 | 2026-08-24 | Reversed-Z depth [#129], radius 64³³ | 1,585 | 758,754 | ~3,952 | 0.100 ms | ~0.40 ms | `5277ddf` |
 | 2026-08-24 | Texture mip chain [#128], radius 64³⁴ | 1,585 | 758,754 | ~3,990 | 0.100 ms | ~0.38 ms | *(this PR)* |
+| 2026-09-10 | Windows caught up to `main` — phase 2 complete, radius 64, band ±2⁴⁴ | 3,138 | 912,964 | ~2,506 | 0.136 ms | ~0.43 ms | `b82e051` |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -1226,6 +1227,29 @@ p99 moved 1.04 → 1.22 ms, and the honest reading is that this scene's p99 is
 noisy rather than that a regression is hiding in it: the avg is what carries
 signal at this scale (see ¹), and the per-frame work added is one drain of an
 empty `Vec`.
+
+⁴⁴ **The first Windows measurement of *this* scene, and it must not be read
+against the row above it.** The Windows table stopped on 2026-08-24 at 1,585
+nodes and 758,754 triangles. This one is 3,138 and 912,964 — a different world,
+because the height limit was removed in between (see ³⁸). Nodes roughly doubled;
+comparing FPS across that is comparing two scenes.
+
+Recorded because the gap nearly produced a false claim. Reading the last
+*macOS* row (`bbb09c2`, 0.630 ms) as though it were the last Windows one made
+0.136 ms look like a **4.6× speedup from fifteen blocks of server and netcode**,
+which is not a thing that happens. The two numbers are two machines: an M3's
+integrated GPU and an RTX 4060.
+
+That is the same defect phase 1's closeout recorded as #123 — *"a benchmark row
+sat in the wrong machine's table, which made a hardware difference read as an
+unexplained 4× speedup on identical code"*. Second time, and the warning was in
+the file both sessions were reading. Last time a row was in the wrong table;
+this time the right table was read wrong. The lesson is the one this file
+already argues, and it is apparently worth arguing twice: **a number without its
+machine attached is not a measurement.**
+
+The comparable macOS row is `397a653` at 0.623 ms. An M3 and an RTX 4060 being
+4.6× apart on a submit-bound scene is unremarkable.
 
 ⁴³ **Five more blocks, and the scene is still untouched — and this is the last
 row before phase 2's gate closed.** Prediction and reconciliation (2.13),
