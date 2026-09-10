@@ -33,6 +33,7 @@ pub mod coordinator;
 pub mod headless;
 pub mod join;
 pub mod net;
+pub mod others;
 pub mod predict;
 pub mod shard;
 pub mod view;
