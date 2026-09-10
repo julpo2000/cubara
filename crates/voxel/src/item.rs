@@ -267,7 +267,7 @@ impl fmt::Display for ItemRegistryError {
 
 impl std::error::Error for ItemRegistryError {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Entry {
     name: String,
     max_stack: u8,
@@ -279,7 +279,7 @@ struct Entry {
 }
 
 /// Which items exist, and the runtime ids assigned to them.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ItemRegistry {
     entries: Vec<Entry>,
     by_name: HashMap<String, ItemId>,

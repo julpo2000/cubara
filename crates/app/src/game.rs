@@ -59,6 +59,20 @@ pub struct Game {
     /// in-process for singleplayer (§3.3). Everything left on `Game` itself is
     /// input, screen state or presentation — the §8.1 table is the sorting.
     pub server: Server,
+    /// **The client's own definitions** (block 2.12b).
+    ///
+    /// What a block drops, what an item stacks to, what a recipe makes. The
+    /// client needs all of it to draw a hotbar and preview a craft, and it used
+    /// to read every one out of `self.server` — another field access standing in
+    /// for something a connected client has no way to reach.
+    ///
+    /// Loaded from `assets/` on this machine rather than sent over the wire.
+    /// That is the same decision terrain rests on: definitions are data both
+    /// sides already have, and shipping them would be shipping a copy of the
+    /// game. What crosses the wire instead is a *fingerprint* of them, and
+    /// `join::accept` refuses a server whose registries are not ours — so
+    /// "both sides already have it" is checked rather than hoped for.
+    assets: Option<ClientAssets>,
     /// **The client's own player** (block 2.12b part B).
     ///
     /// Everything this client believes about itself: its pose, predicted with
@@ -154,6 +168,20 @@ pub struct Game {
     look_delta: (Angle, Angle),
 }
 
+/// The definitions a client needs, held by the client.
+///
+/// Bundled rather than four fields on `Game` because they arrive together, are
+/// replaced together, and are meaningless apart: `terrain` is derived from
+/// `blocks`, and a recipe book resolved against one item registry cannot be read
+/// against another.
+pub struct ClientAssets {
+    pub items: ItemRegistry,
+    pub recipes: RecipeBook,
+    /// Which ids the terrain is made of. Derived from `blocks` once, here,
+    /// rather than recomputed at each of the places that raycast.
+    pub terrain: TerrainBlocks,
+}
+
 impl Game {
     /// Start above the terrain near the origin, looking out over it and slightly
     /// down (yaw ~35°, gentle downward pitch). Walking mode by default (not
@@ -176,6 +204,7 @@ impl Game {
             others: OtherPlayers::new(),
             server,
             prev_player: player,
+            assets: None,
             inventory_open: false,
             open_furnace: None,
             breaking: false,
@@ -191,6 +220,24 @@ impl Game {
             fly_toggle_pending: false,
             look_delta: (Angle::ZERO, Angle::ZERO),
         }
+    }
+
+    /// Which ids the terrain is made of, from the client's own definitions.
+    ///
+    /// A treeless default before assets are set, matching `Server::terrain` --
+    /// `Game::new()` runs before a window exists, and a headless test that never
+    /// loads anything should still be able to walk around.
+    pub fn terrain(&self) -> TerrainBlocks {
+        self.assets
+            .as_ref()
+            .map(|a| a.terrain)
+            .unwrap_or(TerrainBlocks {
+                oak: None,
+                ores: cubara_world::OreSet::EMPTY,
+                grass: cubara_voxel::BlockId::AIR,
+                soil: cubara_voxel::BlockId::AIR,
+                stone: cubara_voxel::BlockId::AIR,
+            })
     }
 
     /// The client's replica (§8.2) -- what the renderer meshes and what the
@@ -384,7 +431,7 @@ impl Game {
             // reconciliation is a no-op -- which is the point: singleplayer is
             // not a special case of multiplayer, it is multiplayer with a very
             // short wire (design §5.1).
-            let blocks = self.server.terrain();
+            let blocks = self.terrain();
             let seq = self
                 .me
                 .predict(input, Arc::make_mut(&mut self.world), blocks);
@@ -507,6 +554,18 @@ impl Game {
         items: ItemRegistry,
         recipes: RecipeBook,
     ) {
+        // The client keeps its own copy. Cloned rather than shared: over a
+        // socket there is nothing to share, and a client holding an `Arc` into
+        // the server's registry would be an in-process shortcut that stops
+        // existing the moment somebody connects.
+        // The block registry itself is not kept: nothing on the client reads it
+        // that `terrain` does not already answer, and a field held "for later"
+        // is dead code with a promise attached. The renderer loads its own.
+        self.assets = Some(ClientAssets {
+            terrain: TerrainBlocks::from_registry(&registry),
+            items: items.clone(),
+            recipes: recipes.clone(),
+        });
         self.server.set_assets(registry, items, recipes);
         // The server just moved the player onto the ground; the client's
         // interpolation would otherwise smear them there from y = 48.
@@ -704,7 +763,7 @@ impl Game {
                 // shows up as a desync weeks later.
                 Effect::SelfItems(items) => items.apply_to(self.me.player_mut()),
                 Effect::SelfState { seq, state } => {
-                    let blocks = self.server.terrain();
+                    let blocks = self.terrain();
                     self.me
                         .reconcile(seq, state, Arc::make_mut(&mut self.world), blocks);
                 }
@@ -726,7 +785,7 @@ impl Game {
     /// and a stone item in the hand read as the same material. Real item icons
     /// are art that does not exist yet.
     pub fn hotbar_slots(&self) -> Option<[Option<HotbarSlot>; HOTBAR_WIDTH]> {
-        let items = self.server.items.as_ref()?;
+        let items = self.assets.as_ref().map(|a| &a.items)?;
         let inv = &self
             .server
             .sim
@@ -760,15 +819,6 @@ impl Game {
     /// Which ids the terrain is made of — delegated to the server, which owns
     /// the registries (§8.1).
     ///
-    /// Only the tests below reach for it since block 2.14 moved mining to the
-    /// server; kept rather than inlined into each of them because "which ids is
-    /// the terrain made of" is a question about this client, and the tests
-    /// asking it should not each have to know it is the server's to answer.
-    #[allow(dead_code)]
-    fn terrain(&self) -> TerrainBlocks {
-        self.server.terrain()
-    }
-
     /// Whether the inventory screen is open.
     pub fn inventory_open(&self) -> bool {
         self.inventory_open
@@ -786,7 +836,7 @@ impl Game {
         // the block and stay in it. Only the cursor needs somewhere to go.
         if self.open_furnace.take().is_some() {
             self.inventory_open = false;
-            if let Some(items) = self.server.items.as_ref() {
+            if let Some(items) = self.assets.as_ref().map(|a| &a.items) {
                 let player = self
                     .server
                     .sim
@@ -804,7 +854,7 @@ impl Game {
             }
             return;
         }
-        let Some(items) = self.server.items.as_ref() else {
+        let Some(items) = self.assets.as_ref().map(|a| &a.items) else {
             self.inventory_open = false;
             return;
         };
@@ -828,8 +878,10 @@ impl Game {
     /// same one the screen is drawn from, so a click cannot land on a slot other
     /// than the one under the cursor.
     pub fn click_panel(&mut self, x: f32, y: f32, right: bool, width: u32, height: u32) {
-        let (Some(items), Some(book)) = (self.server.items.as_ref(), self.server.recipes.as_ref())
-        else {
+        let (Some(items), Some(book)) = (
+            self.assets.as_ref().map(|a| &a.items),
+            self.assets.as_ref().map(|a| &a.recipes),
+        ) else {
             return;
         };
         let panel = match self.open_furnace {
@@ -877,7 +929,7 @@ impl Game {
     /// (what it is) -- is the client's job, because a server that spoke in panel
     /// layouts would be a server that knew what a screen looks like.
     fn click_furnace(&mut self, pos: [i32; 3], kind: PanelSlotKind, index: usize) {
-        let Some(items) = self.server.items.as_ref() else {
+        let Some(items) = self.assets.as_ref().map(|a| &a.items) else {
             return;
         };
         if kind == PanelSlotKind::Inventory {
@@ -916,13 +968,13 @@ impl Game {
         if !self.inventory_open {
             return None;
         }
-        let items = self.server.items.as_ref()?;
+        let items = self.assets.as_ref().map(|a| &a.items)?;
         let crafting = &self
             .server
             .sim
             .player(self.server.local.expect("a local client"))
             .crafting;
-        let book = self.server.recipes.as_ref();
+        let book = self.assets.as_ref().map(|a| &a.recipes);
         let furnace = self.open_furnace();
         let panel = match self.open_furnace {
             Some(_) => InventoryPanel::layout_furnace(width, height),
