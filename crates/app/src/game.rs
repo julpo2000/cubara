@@ -858,15 +858,14 @@ impl Game {
             self.inventory_open = false;
             return;
         };
-        let player = self
-            .server
-            .sim
-            .player_mut(self.server.local.expect("a local client"));
-        if player.crafting.close(&mut player.inventory, items) {
+        // What happens to a half-finished craft is a rule about items, so the
+        // server applies it and answers whether everything fitted. `false` keeps
+        // the screen open, which is `Crafting::close`'s own rule: refusing to
+        // close is more honest than eating what does not fit.
+        let _ = items;
+        let who = self.server.local.expect("a local client");
+        if self.server.close_screen_as(who) {
             self.inventory_open = false;
-            // Back to the inventory's own grid. `close` emptied all nine cells
-            // regardless of width, so narrowing strands nothing.
-            player.crafting.set_width(2);
         } else {
             log::debug!("inventory full: the crafting grid still holds items, staying open");
         }
@@ -911,13 +910,12 @@ impl Game {
             // is the safe branch rather than mapping it to a grid cell.
             PanelSlotKind::Fuel => return,
         };
-        let player = self
-            .server
-            .sim
-            .player_mut(self.server.local.expect("a local client"));
-        player
-            .crafting
-            .click(slot, right, &mut player.inventory, items, book);
+        // **Asked for, not done.** Moving an item between an inventory and a
+        // grid changes world state, and a client that did it locally would be a
+        // client that could conjure items (§3.4). The rules still live in
+        // `Crafting::click`; what changed is who runs them.
+        let _ = (items, book);
+        self.server.apply(Action::ClickSlot { slot, right });
     }
 
     /// Route a click on the open furnace's screen.

@@ -48,7 +48,7 @@
 use cubara_voxel::{Angle, BlockId, Fixed, FixedVec3, ItemId, ItemStack, ItemState};
 use cubara_world::Furnace;
 
-use cubara_sim::{InputFrame, PlayerId, PlayerState};
+use cubara_sim::{InputFrame, PlayerId, PlayerState, SlotRef};
 
 use crate::{Action, Effect, FurnaceSlot, Screen};
 
@@ -473,6 +473,26 @@ impl Action {
                     FurnaceSlot::Output => 2,
                 });
             }
+            // 4 and 5, not a renumbering: tag 0 is already a hole where
+            // `Action::Break` used to be, and shuffling the rest would make an
+            // old client's `Place` decode as something else on a new server --
+            // worse than a clean refusal.
+            Action::ClickSlot { slot, right } => {
+                out.push(4);
+                match slot {
+                    SlotRef::Inventory(i) => {
+                        out.push(0);
+                        out.extend_from_slice(&(*i as u32).to_le_bytes());
+                    }
+                    SlotRef::Grid(i) => {
+                        out.push(1);
+                        out.extend_from_slice(&(*i as u32).to_le_bytes());
+                    }
+                    SlotRef::Result => out.push(2),
+                }
+                out.push(*right as u8);
+            }
+            Action::CloseScreen => out.push(5),
         }
     }
 
@@ -494,6 +514,19 @@ impl Action {
                 };
                 Action::ClickFurnace { pos, slot }
             }
+            4 => {
+                let slot = match c.u8()? {
+                    0 => SlotRef::Inventory(c.u32()? as usize),
+                    1 => SlotRef::Grid(c.u32()? as usize),
+                    2 => SlotRef::Result,
+                    t => return Err(WireError::BadTag(t)),
+                };
+                Action::ClickSlot {
+                    slot,
+                    right: c.bool()?,
+                }
+            }
+            5 => Action::CloseScreen,
             t => return Err(WireError::BadTag(t)),
         })
     }
@@ -860,6 +893,19 @@ mod tests {
                 pos: [1, 2, 3],
                 slot: FurnaceSlot::Output,
             }),
+            ClientMessage::Act(Action::ClickSlot {
+                slot: SlotRef::Inventory(35),
+                right: true,
+            }),
+            ClientMessage::Act(Action::ClickSlot {
+                slot: SlotRef::Grid(8),
+                right: false,
+            }),
+            ClientMessage::Act(Action::ClickSlot {
+                slot: SlotRef::Result,
+                right: false,
+            }),
+            ClientMessage::Act(Action::CloseScreen),
         ];
         for m in messages {
             let mut buf = Vec::new();

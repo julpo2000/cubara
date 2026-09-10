@@ -39,7 +39,7 @@ pub mod shard;
 pub mod view;
 pub mod wire;
 
-use cubara_sim::{InputFrame, Player, PlayerId, PlayerInputs, PlayerState, Sim};
+use cubara_sim::{InputFrame, Player, PlayerId, PlayerInputs, PlayerState, Sim, SlotRef};
 use cubara_voxel::{Angle, BlockRegistry, ChunkCoord, ItemRegistry, RecipeBook, SmeltBook};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -167,6 +167,28 @@ pub enum Action {
     Place,
     /// Use whatever the player is looking at.
     Interact,
+    /// Click a slot on the inventory or crafting screen.
+    ///
+    /// Planned as `ClickSlot` in `RESEARCH_MULTIPLAYER.md` §8.3, and it lands
+    /// now for the reason that section gives: moving items between an inventory
+    /// and a grid is a change to *world state*, and a client that did it locally
+    /// would be a client that could conjure items. It reached into
+    /// `sim.player_mut` from the UI until block 2.12b — which worked exactly as
+    /// long as the UI and the world were in one process.
+    ///
+    /// The slot is named, unlike `Break`, and for the same reason
+    /// `ClickFurnace`'s position is: the player is not *looking* at a slot, they
+    /// are looking at a screen. What stops it being a claim the server believes
+    /// is that a slot index is bounded and its contents are the server's own.
+    ClickSlot { slot: SlotRef, right: bool },
+    /// Close the open screen, returning the grid and the cursor to the
+    /// inventory.
+    ///
+    /// A separate action rather than something the client does on its way out:
+    /// what happens to a half-finished craft is a rule about items, and rules
+    /// about items are the server's. A client that closed its own screen could
+    /// keep the cursor.
+    CloseScreen,
     /// Click a slot on the open furnace's screen.
     ///
     /// The one action that names its target, and for a reason the raycast rule
@@ -1130,6 +1152,10 @@ impl Server {
                 }
                 self.place_held_as(who);
             }
+            Action::ClickSlot { slot, right } => self.click_slot_as(who, slot, right),
+            Action::CloseScreen => {
+                self.close_screen_as(who);
+            }
             Action::ClickFurnace { pos, slot } => self.click_furnace_as(who, pos, slot),
             Action::SelectSlot(index) => {
                 if (index as usize) < cubara_sim::HOTBAR_WIDTH {
@@ -1242,6 +1268,45 @@ impl Server {
     fn note_block_entity(&mut self, pos: [i32; 3]) {
         let furnace = self.world.furnace_at(pos).copied();
         self.publish_at(pos, Effect::BlockEntity { pos, furnace });
+    }
+
+    /// Move an item between this player's inventory and their crafting grid.
+    ///
+    /// Every rule about what a click does already lives in `Crafting::click`;
+    /// this only decides *whose* inventory it happens to, which is the part a
+    /// client may not be trusted with (§3.4).
+    pub fn click_slot_as(&mut self, who: PlayerId, slot: SlotRef, right: bool) {
+        let (Some(items), Some(book)) = (self.items.as_ref(), self.recipes.as_ref()) else {
+            return;
+        };
+        if self.sim.get(who).is_none() {
+            return;
+        }
+        let player = self.sim.player_mut(who);
+        let (crafting, inventory) = (&mut player.crafting, &mut player.inventory);
+        crafting.click(slot, right, inventory, items, book);
+    }
+
+    /// Close this player's screen, putting the grid and the cursor back.
+    ///
+    /// Returns whether everything fitted. `false` means the screen should stay
+    /// open, which is `Crafting::close`'s own rule: refusing to close is more
+    /// honest than eating the items.
+    pub fn close_screen_as(&mut self, who: PlayerId) -> bool {
+        let Some(items) = self.items.as_ref() else {
+            return false;
+        };
+        if self.sim.get(who).is_none() {
+            return false;
+        }
+        let player = self.sim.player_mut(who);
+        let closed = player.crafting.close(&mut player.inventory, items);
+        if closed {
+            // Back to the inventory's own grid. `close` emptied all nine cells
+            // regardless of width, so narrowing strands nothing.
+            player.crafting.set_width(2);
+        }
+        closed
     }
 
     /// Which ids the terrain is made of, or a treeless default before assets
