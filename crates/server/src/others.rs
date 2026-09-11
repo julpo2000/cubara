@@ -51,6 +51,8 @@ pub struct DrawnPose {
     pub pos: [f32; 3],
     pub yaw: f32,
     pub pitch: f32,
+    /// The colour they asked for, or `None` if they have not said yet.
+    pub shirt: Option<crate::wire::Shirt>,
 }
 
 /// The last two poses this client was told about, per player.
@@ -58,6 +60,10 @@ pub struct DrawnPose {
 struct Track {
     previous: Pose,
     current: Pose,
+    /// What they asked to be drawn in, once they have said. `None` until the
+    /// `PlayerShirt` for them arrives, which is normally in the same batch as
+    /// the pose that brought them into view.
+    shirt: Option<crate::wire::Shirt>,
 }
 
 /// Everyone this client can see, except itself.
@@ -71,6 +77,8 @@ pub struct OtherPlayers {
     /// In `PlayerId` order, so two clients given the same updates draw the same
     /// list in the same order (Rule 1's habit, applied to what is on screen).
     tracks: BTreeMap<PlayerId, Track>,
+    /// Shirts heard about, including for players not yet seen.
+    pending_shirts: BTreeMap<PlayerId, crate::wire::Shirt>,
 }
 
 impl OtherPlayers {
@@ -96,9 +104,22 @@ impl OtherPlayers {
                     Track {
                         previous: now,
                         current: now,
+                        shirt: self.pending_shirts.get(&who).copied(),
                     },
                 );
             }
+        }
+    }
+
+    /// Take an `Effect::PlayerShirt`: the colour they asked to be drawn in.
+    ///
+    /// Kept even for a player not yet seen, so the order the two effects arrive
+    /// in does not matter. A shirt without a pose draws nobody; a pose that
+    /// arrives later finds its colour waiting.
+    pub fn wears(&mut self, who: PlayerId, shirt: crate::wire::Shirt) {
+        self.pending_shirts.insert(who, shirt);
+        if let Some(track) = self.tracks.get_mut(&who) {
+            track.shirt = Some(shirt);
         }
     }
 
@@ -108,6 +129,7 @@ impl OtherPlayers {
     /// them, so anything drawn after this would be this client's invention.
     pub fn gone(&mut self, who: PlayerId) {
         self.tracks.remove(&who);
+        self.pending_shirts.remove(&who);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -136,6 +158,7 @@ impl OtherPlayers {
                 (
                     who,
                     DrawnPose {
+                        shirt: t.shirt,
                         pos: [
                             lerp(t.previous.pos.x, t.current.pos.x),
                             lerp(t.previous.pos.y, t.current.pos.y),

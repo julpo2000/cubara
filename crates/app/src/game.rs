@@ -216,6 +216,35 @@ pub struct ClientAssets {
     pub terrain: TerrainBlocks,
 }
 
+/// **The colour this build wears**, chosen by which machine it was built for.
+///
+/// The owner's arrangement for three machines in one world: Linux red, Windows
+/// yellow, macOS green. Hard-coded per client, which is the whole design —
+/// a client announces its own colour when it joins and the server relays it
+/// without ever interpreting it. A server that mapped platforms to colours
+/// would be a server that knew what an operating system is, which is not its
+/// business (Rule 3, in the direction nobody usually checks).
+///
+/// Anything else is grey, and deliberately drab: an unnamed platform should
+/// look unnamed rather than quietly borrow one of the three.
+pub const MY_SHIRT: cubara_server::wire::Shirt = if cfg!(target_os = "linux") {
+    [204, 41, 41]
+} else if cfg!(target_os = "windows") {
+    [235, 209, 41]
+} else if cfg!(target_os = "macos") {
+    [51, 179, 61]
+} else {
+    [140, 140, 140]
+};
+
+/// What somebody is drawn in before they have said what they wear.
+///
+/// Only ever seen for the tick or two between a pose arriving and the colour
+/// that goes with it -- normally they are in the same batch. Grey rather than a
+/// guess: briefly drab is better than briefly wrong, because wrong is
+/// indistinguishable from somebody else.
+const UNKNOWN_SHIRT: [f32; 3] = [0.55, 0.55, 0.55];
+
 impl Game {
     /// Start above the terrain near the origin, looking out over it and slightly
     /// down (yaw ~35°, gentle downward pitch). Walking mode by default (not
@@ -376,7 +405,7 @@ impl Game {
         let Some(assets) = self.assets.as_ref() else {
             return Err("joined before assets are loaded".to_string());
         };
-        link.send(ClientMessage::Hello);
+        link.send(ClientMessage::Hello(MY_SHIRT));
 
         // Wait for the welcome, and only for that. A client that blocked on the
         // whole handshake would freeze its window on a slow connection; a client
@@ -513,14 +542,12 @@ impl Game {
         self.others
             .drawn(alpha)
             .into_iter()
-            .enumerate()
-            .map(|(rank, (who, pose))| cubara_render::PlayerView {
+            .map(|(_, pose)| cubara_render::PlayerView {
                 eye: pose.pos,
                 yaw: pose.yaw,
-                shirt: match rank {
-                    0 => [0.80, 0.16, 0.16],
-                    1 => [0.20, 0.70, 0.24],
-                    _ => cubara_render::swatch_color(&format!("cubara:player_{}", who.0)),
+                shirt: match pose.shirt {
+                    Some([r, g, b]) => [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0],
+                    None => UNKNOWN_SHIRT,
                 },
             })
             .collect()
@@ -1039,6 +1066,10 @@ impl Game {
                     pitch,
                 } => self.others.moved(who, pos, yaw, pitch),
                 Effect::PlayerGone(who) => self.others.gone(who),
+                // What somebody asked to be drawn in. Written out rather than
+                // wildcarded, like every other arm here: an effect the replica
+                // silently drops is a bug that surfaces weeks later.
+                Effect::PlayerShirt { who, shirt } => self.others.wears(who, shirt),
                 // This client's own items. Ignored here for the same reason
                 // `SelfState` is: `Game` still owns the `Server` in this
                 // process and reads the authoritative player straight out of
@@ -1336,6 +1367,102 @@ fn welcome_id(link: &mut Link<ClientMessage, ServerMessage>) -> Option<PlayerId>
 
 #[cfg(test)]
 mod tests {
+    /// A player is drawn in the colour **they** announced, not one this client
+    /// picked for them.
+    ///
+    /// The whole arrangement: each machine hard-codes its own shirt, says so
+    /// when it joins, and the server relays it without interpreting it. So two
+    /// people looking at the same third person see the same colour, and nobody
+    /// has to agree about an ordering.
+    #[test]
+    fn a_player_is_drawn_in_the_colour_they_announced() {
+        let mut game = Game::new();
+        let pos = cubara_voxel::FixedVec3::from_blocks(3, 40, 0);
+
+        game.others
+            .moved(PlayerId(7), pos, Angle::ZERO, Angle::ZERO);
+        assert_eq!(
+            game.other_players()[0].shirt,
+            UNKNOWN_SHIRT,
+            "somebody who has not said what they wear should be drawn drab, \
+             not in a guess that could be somebody else's colour"
+        );
+
+        game.others.wears(PlayerId(7), [204, 41, 41]);
+        let drawn = game.other_players();
+        assert_eq!(drawn.len(), 1);
+        let [r, g, b] = drawn[0].shirt;
+        assert!(
+            (r - 0.8).abs() < 0.01 && g < 0.2 && b < 0.2,
+            "announced red came out as {:?}",
+            drawn[0].shirt
+        );
+    }
+
+    /// A shirt that arrives **before** the pose is not lost.
+    ///
+    /// They normally come in one batch, but nothing in the protocol promises an
+    /// order, and a colour dropped because it was early would show as somebody
+    /// permanently grey.
+    #[test]
+    fn a_shirt_that_arrives_before_the_pose_still_lands() {
+        let mut game = Game::new();
+        game.others.wears(PlayerId(4), [51, 179, 61]);
+        game.others.moved(
+            PlayerId(4),
+            cubara_voxel::FixedVec3::from_blocks(3, 40, 0),
+            Angle::ZERO,
+            Angle::ZERO,
+        );
+
+        let [r, g, b] = game.other_players()[0].shirt;
+        assert!(
+            g > 0.6 && r < 0.3 && b < 0.3,
+            "a shirt announced before the first pose was lost: got {:?}",
+            [r, g, b]
+        );
+    }
+
+    /// This build wears the colour its platform was given, and the three are
+    /// tellable apart on a screen.
+    ///
+    /// Only one of the three exists in any one build, so the separation is
+    /// checked against the literals. Two shirts that are nearly the same are
+    /// worse than one colour, because the difference looks deliberate and is
+    /// not readable.
+    #[test]
+    fn the_three_machines_wear_three_tellable_colours() {
+        let linux = [204u8, 41, 41];
+        let windows = [235u8, 209, 41];
+        let mac = [51u8, 179, 61];
+
+        let expected = if cfg!(target_os = "linux") {
+            linux
+        } else if cfg!(target_os = "windows") {
+            windows
+        } else if cfg!(target_os = "macos") {
+            mac
+        } else {
+            [140, 140, 140]
+        };
+        assert_eq!(MY_SHIRT, expected, "this build wears the wrong colour");
+
+        let apart = |a: [u8; 3], b: [u8; 3]| {
+            let d = |i: usize| (a[i] as f32 - b[i] as f32).powi(2);
+            (d(0) + d(1) + d(2)).sqrt()
+        };
+        for (a, b, what) in [
+            (linux, windows, "Linux and Windows"),
+            (linux, mac, "Linux and macOS"),
+            (windows, mac, "Windows and macOS"),
+        ] {
+            assert!(
+                apart(a, b) > 80.0,
+                "{what} are too close to tell apart on a screen"
+            );
+        }
+    }
+
     /// The figure the renderer draws is the size of the body the simulation
     /// collides with.
     ///

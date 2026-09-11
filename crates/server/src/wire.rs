@@ -382,6 +382,11 @@ impl Effect {
                 out.push(5);
                 out.extend_from_slice(&who.0.to_le_bytes());
             }
+            Effect::PlayerShirt { who, shirt } => {
+                out.push(8);
+                out.extend_from_slice(&who.0.to_le_bytes());
+                out.extend_from_slice(shirt);
+            }
             Effect::SelfState { seq, state } => {
                 out.push(6);
                 out.extend_from_slice(&seq.to_le_bytes());
@@ -422,6 +427,10 @@ impl Effect {
                 pitch: c.angle()?,
             },
             5 => Effect::PlayerGone(PlayerId(c.u64()?)),
+            8 => Effect::PlayerShirt {
+                who: PlayerId(c.u64()?),
+                shirt: [c.u8()?, c.u8()?, c.u8()?],
+            },
             6 => Effect::SelfState {
                 seq: c.u64()?,
                 state: get_player_state(c)?,
@@ -562,12 +571,33 @@ fn get_input(c: &mut Cursor<'_>) -> Result<InputFrame, WireError> {
 // The messages themselves
 // ---------------------------------------------------------------------------
 
+/// A player's shirt colour, as bytes.
+///
+/// The client picks its own and says so when it joins; the server relays it and
+/// never interprets it. That is why this is three bytes rather than an enum of
+/// platforms: **the server has no business knowing what an operating system
+/// is.** Which machine wears which colour is a decision that lives in one place,
+/// hard-coded in the client, and everything else just carries it.
+///
+/// Bytes rather than floats, so nothing crossing the wire is a float (§3.5) —
+/// even though a colour is presentation and could not desynchronise anything,
+/// keeping one rule for the whole protocol is cheaper than remembering which
+/// half it applies to.
+///
+/// **Not believed**, in §3.4's sense: a client can claim any colour it likes.
+/// The only thing it decides is what somebody looks like.
+pub type Shirt = [u8; 3];
+
 /// What a client sends.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClientMessage {
-    /// Asking to join. Carries nothing: a client does not get to say who it is
-    /// (§3.4), so the server names it in [`ServerMessage::Welcome`].
-    Hello,
+    /// Asking to join, and saying what colour to draw this player in.
+    ///
+    /// The client chooses; the server relays and never interprets. A client
+    /// could claim any colour, which is fine — the only thing it decides is
+    /// what somebody looks like (§3.4's rule, and the one place where being
+    /// unable to believe a client costs nothing).
+    Hello(Shirt),
     /// One tick's controls, and which input this is.
     ///
     /// `seq` counts this client's inputs, starting at 0 and never reset. The
@@ -637,7 +667,10 @@ pub enum ServerMessage {
 impl ClientMessage {
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
-            ClientMessage::Hello => out.push(0),
+            ClientMessage::Hello(shirt) => {
+                out.push(0);
+                out.extend_from_slice(shirt);
+            }
             ClientMessage::Input { seq, frame } => {
                 out.push(1);
                 out.extend_from_slice(&seq.to_le_bytes());
@@ -653,7 +686,7 @@ impl ClientMessage {
     pub fn decode(buf: &[u8]) -> Result<Self, WireError> {
         let c = &mut Cursor::new(buf);
         Ok(match c.u8()? {
-            0 => ClientMessage::Hello,
+            0 => ClientMessage::Hello([c.u8()?, c.u8()?, c.u8()?]),
             1 => ClientMessage::Input {
                 seq: c.u64()?,
                 frame: get_input(c)?,
@@ -810,6 +843,10 @@ mod tests {
             pitch: Angle::from_raw(-7_654),
         });
         round_trip_effect(Effect::PlayerGone(PlayerId(u64::MAX)));
+        round_trip_effect(Effect::PlayerShirt {
+            who: PlayerId(3),
+            shirt: [204, 41, 41],
+        });
         round_trip_effect(Effect::SelfState {
             seq: u64::MAX,
             state: a_player_state(),
@@ -882,7 +919,7 @@ mod tests {
     #[test]
     fn every_client_message_survives_a_round_trip() {
         let messages = [
-            ClientMessage::Hello,
+            ClientMessage::Hello([204, 41, 41]),
             ClientMessage::Input {
                 seq: u64::MAX,
                 frame: InputFrame {

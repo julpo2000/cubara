@@ -295,8 +295,8 @@ mod tests {
     fn a_local_pair_carries_messages_both_ways() {
         let (mut server, mut client) = local_pair();
 
-        client.send(ClientMessage::Hello);
-        assert_eq!(server.poll(), vec![ClientMessage::Hello]);
+        client.send(ClientMessage::Hello([1, 2, 3]));
+        assert_eq!(server.poll(), vec![ClientMessage::Hello([1, 2, 3])]);
 
         server.send(ServerMessage::Welcome {
             seed: 7,
@@ -342,7 +342,7 @@ mod tests {
         let addr = acceptor.addr();
 
         let mut client = connect(addr).expect("connect");
-        client.send(ClientMessage::Hello);
+        client.send(ClientMessage::Hello([1, 2, 3]));
 
         // Accepting and delivery are on other threads, so this is the one place
         // the test has to wait for something.
@@ -364,7 +364,11 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert_eq!(got, vec![ClientMessage::Hello], "over a real socket");
+        assert_eq!(
+            got,
+            vec![ClientMessage::Hello([1, 2, 3])],
+            "over a real socket"
+        );
     }
 
     /// A batch bigger than one `read` must come back whole, in order. This is

@@ -145,6 +145,8 @@ pub struct Server {
     /// Chunks this server simulates because it was given them, rather than
     /// because a player is near them (block 2.16).
     assigned: std::collections::BTreeSet<ChunkCoord>,
+    /// What colour each player asked to be drawn in.
+    shirts: BTreeMap<PlayerId, crate::wire::Shirt>,
     /// Whether [`assign`](Self::assign) has changed the set since the active
     /// chunks were last recomputed. The memo that skips the recompute keys off
     /// the player's chunk, which does not move when an assignment does.
@@ -288,6 +290,20 @@ pub enum Effect {
     /// A player left the world, or walked out of sight. The client stops
     /// drawing them.
     PlayerGone(PlayerId),
+    /// What colour to draw a player in.
+    ///
+    /// Sent once per viewer per player rather than with every pose: it does not
+    /// change, and putting it in `PlayerMoved` would pay for it on every tick
+    /// somebody walks. Resent when they come back into view, because a client
+    /// that forgot them forgot this too.
+    ///
+    /// The server relays it and never interprets it -- which machine wears
+    /// which colour is the client's business, hard-coded there, and a server
+    /// that knew would be a server that knew what an operating system is.
+    PlayerShirt {
+        who: PlayerId,
+        shirt: crate::wire::Shirt,
+    },
     /// **The server's correction to the client this is addressed to** (block
     /// 2.12b).
     ///
@@ -394,6 +410,7 @@ impl Server {
             views: BTreeMap::new(),
             mining: BTreeMap::new(),
             assigned: std::collections::BTreeSet::new(),
+            shirts: BTreeMap::new(),
             assigned_changed: false,
             last_pose: BTreeMap::new(),
             last_items: BTreeMap::new(),
@@ -933,6 +950,26 @@ impl Server {
         self.views.remove(&who);
     }
 
+    /// Record the colour a client asked for, and tell everyone who can see
+    /// them (block 2.12b).
+    ///
+    /// Told to *everyone* now, not only the people currently in view: a viewer
+    /// who has not met them yet gets it from the backfill when they do.
+    pub fn note_shirt(&mut self, who: PlayerId, shirt: crate::wire::Shirt) {
+        self.shirts.insert(who, shirt);
+        let watchers: Vec<PlayerId> = self.views.keys().copied().collect();
+        for watcher in watchers {
+            if watcher != who {
+                self.publish_to(watcher, Effect::PlayerShirt { who, shirt });
+            }
+        }
+    }
+
+    /// The colour `who` asked to be drawn in, if they said.
+    pub fn shirt_of(&self, who: PlayerId) -> Option<crate::wire::Shirt> {
+        self.shirts.get(&who).copied()
+    }
+
     /// Send `who` their own items, if they have changed since last time.
     ///
     /// Compared against what was last sent rather than tracked by a dirty flag:
@@ -1123,12 +1160,19 @@ impl Server {
             self.last_pose.insert(who, (pos, yaw, pitch));
         }
 
+        let shirts = &self.shirts;
         for (&watcher, view) in self.views.iter_mut() {
             for &(who, pos, yaw, pitch) in &moved {
                 if who == watcher {
                     continue; // you are not news to yourself
                 }
                 if view.perceives(block_of(pos)) {
+                    // The appearance rides along with the pose that brings them
+                    // into view: a client told where somebody is and not what
+                    // they look like would draw them in a stranger's colour.
+                    if let Some(&shirt) = shirts.get(&who) {
+                        view.push(Effect::PlayerShirt { who, shirt });
+                    }
                     view.push(Effect::PlayerMoved {
                         who,
                         pos,

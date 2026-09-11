@@ -31,6 +31,10 @@ use cubara_server::{Action, FurnaceSlot, Server};
 use cubara_sim::{InputFrame, Player, PlayerId, PlayerInputs};
 use cubara_voxel::{Angle, FixedVec3};
 
+/// Any colour will do here: what is being tested is the exchange, not the
+/// paint. A real client hard-codes its own (`cubara::game::MY_SHIRT`).
+const TEST_SHIRT: cubara_server::wire::Shirt = [10, 20, 30];
+
 const SKY: i32 = 400;
 
 /// One player in empty sky, and a furnace they can see.
@@ -289,7 +293,7 @@ fn a_flood_of_actions_is_capped_at_the_limit() {
     // the same `welcome` path a TCP client does, so nothing about the cap is
     // being tested in a way that would not hold over a wire.
     let mut link = session.attach();
-    link.send(ClientMessage::Hello);
+    link.send(ClientMessage::Hello(TEST_SHIRT));
     assert_eq!(session.client_count(), 1, "the client never joined");
 
     const SENT: usize = 50;
