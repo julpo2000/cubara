@@ -337,6 +337,7 @@ impl Session {
     /// clients are visited in id order.
     fn collect_input(&mut self) -> PlayerInputs {
         let mut inputs = PlayerInputs::default();
+        let mut took_shirt: Vec<(PlayerId, crate::wire::Shirt)> = Vec::new();
         let last_seq = &mut self.last_seq;
         let dropped = &mut self.dropped_actions;
         let mut actions: Vec<(PlayerId, Action)> = Vec::new();
@@ -345,7 +346,9 @@ impl Session {
         for (&who, link) in self.clients.iter_mut() {
             for msg in link.poll() {
                 match msg {
-                    ClientMessage::Hello => {} // already welcomed on accept
+                    // Already welcomed on accept; what it carries is the
+                    // colour this client asked to be drawn in.
+                    ClientMessage::Hello(shirt) => took_shirt.push((who, shirt)),
                     ClientMessage::Input { seq, frame } => {
                         // Block 2.14: the one place untrusted input enters the
                         // simulation, so the one place it is cleaned.
@@ -391,6 +394,9 @@ impl Session {
         for &who in self.clients.keys() {
             let n = actions.iter().filter(|(p, _)| *p == who).count();
             self.most_in_one_tick = self.most_in_one_tick.max(n);
+        }
+        for (who, shirt) in took_shirt {
+            self.server.note_shirt(who, shirt);
         }
         for (who, action) in actions {
             self.server.apply_as(who, action);

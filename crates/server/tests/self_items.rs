@@ -8,6 +8,10 @@ use cubara_server::headless::{Config, Session};
 use cubara_server::wire::{ClientMessage, ServerMessage};
 use cubara_server::Effect;
 
+/// Any colour will do here: what is being tested is the exchange, not the
+/// paint. A real client hard-codes its own (`cubara::game::MY_SHIRT`).
+const TEST_SHIRT: cubara_server::wire::Shirt = [10, 20, 30];
+
 fn session() -> (Session, Config) {
     let cfg = Config {
         world: std::path::PathBuf::from("cubara-nonexistent-self-items-fixture"),
@@ -42,7 +46,7 @@ fn items_in(messages: &[ServerMessage]) -> Vec<cubara_server::ClientItems> {
 fn a_client_is_told_its_items_when_it_joins() {
     let (mut s, cfg) = session();
     let mut link = s.attach();
-    link.send(ClientMessage::Hello);
+    link.send(ClientMessage::Hello(TEST_SHIRT));
     s.advance(1, &cfg);
 
     let got = items_in(&link.poll());
@@ -68,7 +72,7 @@ fn a_client_is_told_its_items_when_it_joins() {
 fn items_are_sent_on_change_and_not_otherwise() {
     let (mut s, cfg) = session();
     let mut link = s.attach();
-    link.send(ClientMessage::Hello);
+    link.send(ClientMessage::Hello(TEST_SHIRT));
     s.advance(1, &cfg);
     // The id from the welcome, which is how a client actually learns it -- not
     // from poking at the server's player list, which would happen to be right

@@ -23,6 +23,10 @@ use cubara_server::net::connect;
 use cubara_server::wire::{ClientMessage, ServerMessage};
 use cubara_sim::InputFrame;
 
+/// Any colour will do here: what is being tested is the exchange, not the
+/// paint. A real client hard-codes its own (`cubara::game::MY_SHIRT`).
+const TEST_SHIRT: cubara_server::wire::Shirt = [10, 20, 30];
+
 /// Kills the server when the test ends, however it ends.
 ///
 /// Without this a failing assertion leaves a world ticking in the background
@@ -119,7 +123,7 @@ fn a_client_process_joins_a_server_process_over_a_real_socket() {
     let (_server, addr) = start_server(&world);
 
     let mut link = connect(&addr).expect("connect to the server process");
-    link.send(ClientMessage::Hello);
+    link.send(ClientMessage::Hello(TEST_SHIRT));
 
     // 1. The welcome. This is the whole of "the server never sends terrain":
     //    a seed and an id, and the client generates the world from the first.
@@ -188,7 +192,7 @@ fn two_client_processes_get_two_different_players() {
     let (_server, addr) = start_server(&world);
 
     let mut first = connect(&addr).expect("first client connects");
-    first.send(ClientMessage::Hello);
+    first.send(ClientMessage::Hello(TEST_SHIRT));
     let id_of = |link: &mut cubara_server::net::Link<ClientMessage, ServerMessage>| {
         let messages = collect_until(link, Duration::from_secs(20), |all| {
             all.iter()
@@ -205,7 +209,7 @@ fn two_client_processes_get_two_different_players() {
     let a = id_of(&mut first);
 
     let mut second = connect(&addr).expect("second client connects");
-    second.send(ClientMessage::Hello);
+    second.send(ClientMessage::Hello(TEST_SHIRT));
     let b = id_of(&mut second);
 
     assert_ne!(a, b, "both connections were given the same player");
@@ -260,7 +264,7 @@ fn a_served_world_has_no_ghost_standing_on_spawn() {
     let (_server, addr) = start_server(&world);
 
     let mut link = connect(&addr).expect("connect");
-    link.send(ClientMessage::Hello);
+    link.send(ClientMessage::Hello(TEST_SHIRT));
 
     let messages = collect_until(&mut link, Duration::from_secs(20), |all| {
         // Wait for a few ticks to pass, so anyone who was going to be announced
@@ -310,7 +314,7 @@ fn a_joining_client_is_told_who_is_already_here() {
     // Somebody is already in the world and standing perfectly still, which is
     // the case the bug hid behind: a motionless player generates no updates.
     let mut first = connect(&addr).expect("first connects");
-    first.send(ClientMessage::Hello);
+    first.send(ClientMessage::Hello(TEST_SHIRT));
     let first_id = collect_until(&mut first, Duration::from_secs(20), |all| {
         all.iter()
             .any(|m| matches!(m, ServerMessage::Welcome { .. }))
@@ -323,7 +327,7 @@ fn a_joining_client_is_told_who_is_already_here() {
     .expect("first welcome");
 
     let mut second = connect(&addr).expect("second connects");
-    second.send(ClientMessage::Hello);
+    second.send(ClientMessage::Hello(TEST_SHIRT));
     let messages = collect_until(&mut second, Duration::from_secs(20), |all| {
         all.iter()
             .filter(|m| matches!(m, ServerMessage::Tick(_)))
@@ -372,9 +376,9 @@ fn two_clients_see_each_other_move() {
     let (_server, addr) = start_server(&world);
 
     let mut walker = connect(&addr).expect("the first client connects");
-    walker.send(ClientMessage::Hello);
+    walker.send(ClientMessage::Hello(TEST_SHIRT));
     let mut watcher = connect(&addr).expect("the second client connects");
-    watcher.send(ClientMessage::Hello);
+    watcher.send(ClientMessage::Hello(TEST_SHIRT));
 
     // Each learns which player it is. The watcher needs the walker's id to know
     // which of the poses arriving is not its own.

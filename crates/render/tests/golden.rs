@@ -819,25 +819,29 @@ fn edits_change_what_is_drawn() {
     );
 }
 
-/// Two players stand in front of the camera, one in a red shirt and one in
-/// green.
+/// Three players stand in front of the camera: Linux red, Windows yellow,
+/// macOS green.
 ///
-/// The owner's goal for this block is *seeing the character running on the
-/// other laptop*, and this is the pixel-level half of it: that a figure is
-/// drawn at all, that it is human-shaped rather than a cube, and that the two
-/// shirts are the two colours he asked for.
+/// The owner's arrangement for three machines in one world. Each client
+/// hard-codes its own colour and announces it on joining; this is what the
+/// three look like side by side.
 ///
 /// The geometry itself is checked without a GPU in `figure.rs` — where an arm
 /// ends up is a number, not a picture. What only an image can show is that the
-/// pipeline is bound, the depth test is the right way round, and the figures
-/// are not inside-out from back-face culling.
+/// pipeline is bound, the depth test is the right way round, the figures are
+/// not inside-out from back-face culling, and that the three colours are
+/// actually tellable apart by eye rather than only by distance in a test.
 #[test]
-fn two_players_stand_in_front_of_the_camera() {
+fn three_players_stand_in_front_of_the_camera() {
     let world = World::with_seed(119);
-    // Looking level, along −Z, at two figures a few blocks out and a stride
-    // apart. High enough above the terrain that the ground is not what fills
-    // the frame — this shot is about the people.
     let eye = glam::vec3(0.0, 40.0, 6.0);
+    let shirt = |c: [u8; 3]| {
+        [
+            c[0] as f32 / 255.0,
+            c[1] as f32 / 255.0,
+            c[2] as f32 / 255.0,
+        ]
+    };
     let shot = Shot {
         width: 960,
         height: 540,
@@ -846,16 +850,21 @@ fn two_players_stand_in_front_of_the_camera() {
         camera: Some((eye, glam::vec3(0.0, -0.15, -1.0))),
         players: vec![
             cubara_render::PlayerView {
-                eye: [-1.2, 40.0, -1.0],
+                eye: [-1.8, 40.0, -1.0],
                 yaw: 0.0,
-                shirt: [0.80, 0.16, 0.16],
+                shirt: shirt([204, 41, 41]),
             },
             cubara_render::PlayerView {
-                eye: [1.2, 40.0, -1.0],
-                // Turned a quarter, so the golden also covers yaw: a figure
-                // that ignored it would be identical to the one beside it.
+                eye: [0.0, 40.0, -1.0],
+                // Turned a quarter, so the image covers yaw as well: a figure
+                // that ignored it would be identical to its neighbours.
                 yaw: std::f32::consts::FRAC_PI_2,
-                shirt: [0.20, 0.70, 0.24],
+                shirt: shirt([235, 209, 41]),
+            },
+            cubara_render::PlayerView {
+                eye: [1.8, 40.0, -1.0],
+                yaw: 0.0,
+                shirt: shirt([51, 179, 61]),
             },
         ],
         highlighted_block: None,
@@ -863,5 +872,5 @@ fn two_players_stand_in_front_of_the_camera() {
         panel: None,
         health: None,
     };
-    assert_golden("two_players", &world, shot);
+    assert_golden("three_players", &world, shot);
 }
