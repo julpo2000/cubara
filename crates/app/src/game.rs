@@ -88,9 +88,6 @@ pub struct Game {
     /// joined first, and a client that guessed would be a client acting as
     /// somebody else.
     me_id: PlayerId,
-    /// How many inputs this client has sent, echoed back in `SelfState` so the
-    /// prediction knows what has been acknowledged.
-    seq: u64,
     /// **The client's own definitions** (block 2.12b).
     ///
     /// What a block drops, what an item stacks to, what a recipe makes. The
@@ -268,7 +265,6 @@ impl Game {
             link: Some(link),
             cfg,
             me_id,
-            seq: 0,
             prev_player: player,
             assets: None,
             inventory_open: false,
@@ -401,6 +397,14 @@ impl Game {
             if std::time::Instant::now() > deadline {
                 return Err("the server did not answer".to_string());
             }
+            // Deliberately untested, and said rather than left ambiguous: a
+            // test would need a socket that accepts and then stays silent for
+            // the whole ten seconds, on every run on three platforms. The
+            // failure this guards against is also the loudest kind -- a broken
+            // deadline makes *every* join fail instantly with "the server did
+            // not answer", which the first person to try `--connect` sees. The
+            // opposite direction, that a prompt server is not timed out, is
+            // covered by `a_joined_client_drives_the_player_the_server_named`.
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
 
@@ -413,7 +417,6 @@ impl Game {
         self.me = Prediction::new(joined.seed, *self.me.player());
         self.others = OtherPlayers::new();
         self.me_id = joined.you;
-        self.seq = 0;
         self.link = Some(link);
         self.host = None;
         log::info!("joined as {:?} (seed {})", joined.you, joined.seed);
@@ -667,13 +670,20 @@ impl Game {
             // **Sent, not called.** The input leaves this client the same way
             // it would over a socket; what happens next is the server's, and
             // in-process that server happens to be a field away.
-            self.seq = self.seq.wrapping_add(1);
-            let seq_sent = seq.unwrap_or(self.seq);
-            if let Some(link) = self.link.as_mut() {
-                link.send(ClientMessage::Input {
-                    seq: seq_sent,
-                    frame: input,
-                });
+            // Only when the prediction handed out a number. `None` means it
+            // has stalled -- two seconds without an acknowledgement -- and its
+            // contract is that there is then nothing to send, because sending
+            // would lengthen a queue nobody is draining
+            // (`crates/server/tests/prediction.rs` asserts exactly that).
+            //
+            // This used to fall back to a second counter on `Game`, which made
+            // two numbers for one thing: the one the prediction reconciles
+            // against, and one incremented every tick and read *only* when the
+            // first said not to send. They agree until a stall and drift after
+            // it, which is the worst possible moment for a sequence number to
+            // become a guess.
+            if let (Some(seq), Some(link)) = (seq, self.link.as_mut()) {
+                link.send(ClientMessage::Input { seq, frame: input });
             }
             // The host runs one tick: accepting, collecting what clients sent,
             // simulating, flushing what they are owed. All of `Session::advance`
@@ -3504,6 +3514,55 @@ mod connect_tests {
             recipes,
         );
         game
+    }
+
+    /// Closing the inventory is **refused** while the crafting grid cannot
+    /// empty, and refusing it is what stops items being eaten.
+    ///
+    /// `Crafting::close` reports whether everything fitted. Ignoring that answer
+    /// and closing anyway narrows the grid back to 2x2, which drops whatever is
+    /// in the outer cells — silently, with no message and nothing on the floor.
+    ///
+    /// Found by `scripts/check-tests-can-fail.sh`: the guard was there and
+    /// nothing could see it removed.
+    #[test]
+    fn the_inventory_refuses_to_close_on_a_grid_that_cannot_empty() {
+        let mut game = a_client();
+        let items = load_item_registry();
+        let plank = items.id_of("cubara:plank").expect("plank is an item");
+        // **Full** stacks. A first version filled every slot with a stack of
+        // one, and the grid emptied fine -- a plank stacks to 64, so there was
+        // room for it in any of them. "The inventory is full" means no slot can
+        // take another of this item, not that every slot is occupied.
+        let full = items
+            .new_stack(plank, items.max_stack(plank))
+            .expect("a full stack");
+        let stack = items.new_stack(plank, 1).expect("a stack");
+        {
+            let inv = &mut game.me.player_mut().inventory;
+            for i in 0..cubara_sim::SLOT_COUNT {
+                inv.set_slot(i, Some(full));
+            }
+        }
+        // A bench-sized grid with something in a cell only 3x3 has.
+        {
+            let crafting = &mut game.me.player_mut().crafting;
+            crafting.set_width(3);
+            crafting.set_cell(8, Some(stack));
+        }
+        game.inventory_open = true;
+
+        game.toggle_inventory();
+
+        assert!(
+            game.inventory_open(),
+            "the screen closed over a grid that could not empty"
+        );
+        assert_eq!(
+            game.me.player().crafting.cell(8),
+            Some(stack),
+            "the item in the grid was eaten by closing the screen"
+        );
     }
 
     /// Joining replaces the world, and **drops the host**: a machine that has
