@@ -1077,11 +1077,31 @@ impl Server {
             .map(|(id, p)| (id, p.pos, p.yaw(), p.pitch()))
             .collect();
 
+        // Their colours, read before the view is borrowed mutably below.
+        let arriving_shirts: Vec<Option<crate::wire::Shirt>> = arrivals
+            .iter()
+            .map(|(id, ..)| self.shirts.get(id).copied())
+            .collect();
+
         if let Some(view) = self.views.get_mut(&who) {
             for e in owed {
                 view.push(e);
             }
-            for (id, pos, yaw, pitch) in arrivals {
+            for ((id, pos, yaw, pitch), shirt) in arrivals.into_iter().zip(arriving_shirts) {
+                // The colour goes with the pose that introduces them, here as
+                // well as in `publish_player_states`. Both are needed and for
+                // different people: that one catches somebody who *moves* into
+                // your view, this one catches everybody already standing there
+                // when you arrive.
+                //
+                // Missing here, a joining client saw the whole world in grey
+                // until each person happened to move -- and since block 2.15
+                // a player standing still sends nothing at all, so somebody
+                // idle stayed grey indefinitely. Found by three machines in one
+                // world, not by a test.
+                if let Some(shirt) = shirt {
+                    view.push(Effect::PlayerShirt { who: id, shirt });
+                }
                 view.push(Effect::PlayerMoved {
                     who: id,
                     pos,

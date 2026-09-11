@@ -2428,56 +2428,113 @@ mod tests {
 
     #[test]
     fn mining_takes_ceil_hardness_over_speed_ticks() {
-        // §4.3's formula, on the real assets: stone is hardness 30, a stone
-        // pick is speed 4, so ceil(30/4) = 8 ticks.
+        // §4.3's formula, on the real assets — with the numbers **read** rather
+        // than written down. The formula is what this test is about; stone's
+        // hardness is tuning, and a test that hard-codes it fails every time
+        // somebody adjusts how long digging feels, which teaches people to
+        // edit tests when they change balance. That is a habit worth not
+        // starting.
         let (mut game, _) = game_looking_at_ground();
         stand_over(&mut game, "cubara:stone");
         hold(&mut game, "cubara:stone_pick");
 
-        assert_eq!(mine_for(&mut game, 20), Some(8));
+        let hardness = registry_hardness(&game, "cubara:stone");
+        let speed = item_speed(&game, "cubara:stone_pick");
+        let expected = hardness.div_ceil(speed);
+
+        assert!(expected > 1, "a one-tick block would not test the formula");
+        assert_eq!(mine_for(&mut game, expected * 3), Some(expected));
+    }
+
+    /// A block's hardness, from the loaded registry.
+    fn registry_hardness(game: &Game, name: &str) -> u32 {
+        let blocks = game.assets.as_ref().expect("assets").blocks.clone();
+        let id = blocks.id_of(name).expect("a known block");
+        blocks.hardness(id).expect("a breakable block")
+    }
+
+    /// An item's mining speed, from the loaded registry.
+    fn item_speed(game: &Game, name: &str) -> u32 {
+        let items = &game.assets.as_ref().expect("assets").items;
+        items.speed(items.id_of(name).expect("a known item"))
     }
 
     #[test]
     fn a_faster_tool_breaks_the_same_block_in_fewer_ticks() {
         // The whole point of the block: the tool changes the time, not just
-        // whether you get a drop. Stone at hardness 30: hand 30, wooden 15,
-        // stone 8, iron 5.
-        let cases = [
-            (None, 30),
-            (Some("cubara:wooden_pick"), 15),
-            (Some("cubara:stone_pick"), 8),
-            (Some("cubara:iron_pick"), 5),
+        // whether you get a drop. Expected times are derived from the registry
+        // for the same reason as above.
+        let tools = [
+            None,
+            Some("cubara:wooden_pick"),
+            Some("cubara:stone_pick"),
+            Some("cubara:iron_pick"),
         ];
-        for (tool, want) in cases {
+
+        let mut previous: Option<u32> = None;
+        for tool in tools {
             let (mut game, _) = game_looking_at_ground();
             stand_over(&mut game, "cubara:stone");
-            if let Some(t) = tool {
-                hold(&mut game, t);
-            }
+            let speed = match tool {
+                Some(name) => {
+                    hold(&mut game, name);
+                    item_speed(&game, name)
+                }
+                None => 1,
+            };
+            let hardness = registry_hardness(&game, "cubara:stone");
+            let expected = hardness.div_ceil(speed);
+
             assert_eq!(
-                mine_for(&mut game, 60),
-                Some(want),
-                "wrong tick count for {tool:?}"
+                mine_for(&mut game, expected * 3),
+                Some(expected),
+                "{tool:?} should take ceil({hardness}/{speed}) ticks"
             );
+            if let Some(slower) = previous {
+                assert!(
+                    expected <= slower,
+                    "{tool:?} is not faster than the tool before it"
+                );
+            }
+            previous = Some(expected);
         }
+        assert!(
+            previous.expect("at least one tool")
+                < registry_hardness(&game_looking_at_ground().0, "cubara:stone"),
+            "the best tool is no faster than a bare hand, so nothing is being tested"
+        );
     }
 
     #[test]
     fn releasing_the_button_abandons_progress() {
-        // §4.3: abandoned, not banked. Six ticks of an eight-tick break, then
-        // let go -- starting again must cost the full eight, not two.
+        // §4.3: abandoned, not banked. Most of a break, then let go -- starting
+        // again must cost the whole thing, not the remainder.
         let (mut game, _) = game_looking_at_ground();
         stand_over(&mut game, "cubara:stone");
         hold(&mut game, "cubara:stone_pick");
+        let full = break_ticks(&game, "cubara:stone", "cubara:stone_pick");
 
         game.set_breaking(true);
-        for _ in 0..6 {
+        for _ in 0..(full - 2) {
             assert!(game.advance(TICK_DT).is_empty());
         }
         game.set_breaking(false);
         game.advance(TICK_DT);
 
-        assert_eq!(mine_for(&mut game, 20), Some(8), "restarted from zero");
+        assert_eq!(
+            mine_for(&mut game, full * 3),
+            Some(full),
+            "restarted from zero"
+        );
+    }
+
+    /// How many ticks `block` takes with `tool`, from the registries.
+    ///
+    /// Derived rather than written down: these numbers are *tuning*, and a test
+    /// that hard-codes them fails whenever somebody adjusts how long digging
+    /// feels -- which teaches people to edit tests when they change balance.
+    fn break_ticks(game: &Game, block: &str, tool: &str) -> u32 {
+        registry_hardness(game, block).div_ceil(item_speed(game, tool))
     }
 
     #[test]
@@ -2493,9 +2550,10 @@ mod tests {
         }
         hold(&mut game, "cubara:stone_pick");
 
-        // Fresh start at speed 4: eight more ticks, not the two that would be
-        // left if the wooden pick's progress had carried over.
-        assert_eq!(mine_for(&mut game, 20), Some(8));
+        // A fresh start at the new tool's own cost, not the remainder that
+        // would be left if the wooden pick's progress had carried over.
+        let fresh = break_ticks(&game, "cubara:stone", "cubara:stone_pick");
+        assert_eq!(mine_for(&mut game, fresh * 3), Some(fresh));
     }
 
     #[test]
@@ -2506,15 +2564,16 @@ mod tests {
         stand_over(&mut game, "cubara:iron_ore");
         hold(&mut game, "cubara:wooden_pick");
 
-        // hardness 45 at speed 2 -> 23 ticks.
-        assert_eq!(mine_for(&mut game, 40), Some(23));
+        let slow = break_ticks(&game, "cubara:iron_ore", "cubara:wooden_pick");
+        assert_eq!(mine_for(&mut game, slow * 3), Some(slow));
         assert_eq!(count_of(&game, "cubara:raw_iron"), 0, "tier too low");
 
         let (mut game, _) = game_looking_at_ground();
         stand_over(&mut game, "cubara:iron_ore");
         hold(&mut game, "cubara:stone_pick");
-        // hardness 45 at speed 4 -> 12 ticks.
-        assert_eq!(mine_for(&mut game, 40), Some(12));
+        let quick = break_ticks(&game, "cubara:iron_ore", "cubara:stone_pick");
+        assert!(quick < slow, "the better tool should be faster");
+        assert_eq!(mine_for(&mut game, quick * 3), Some(quick));
         assert_eq!(count_of(&game, "cubara:raw_iron"), 1);
     }
 
@@ -2525,9 +2584,12 @@ mod tests {
         hold(&mut game, "cubara:stone_pick");
         assert_eq!(game.mining_progress(), None, "nothing started yet");
 
+        // Every tick but the last, so the count comes from the registry rather
+        // than from how long digging happened to take when this was written.
+        let total = break_ticks(&game, "cubara:stone", "cubara:stone_pick");
         game.set_breaking(true);
         let mut last = 0.0;
-        for _ in 0..7 {
+        for _ in 0..(total - 1) {
             game.advance(TICK_DT);
             let p = game.mining_progress().expect("a break is in progress");
             assert!(p > last, "progress must climb: {p} after {last}");
@@ -2556,20 +2618,39 @@ mod tests {
         // A catch-up burst is N ticks of progress, unlike `jump`, which is a
         // one-shot. That difference is deliberate (see `InputFrame::breaking`).
         //
-        // Five ticks, not more: `MAX_TICKS_PER_FRAME` caps a frame's catch-up
-        // at five, so an iron pick (speed 6) on stone (hardness 30) is the
-        // longest break that can finish inside one frame.
+        // Asserted as **progress made**, not as a block finishing. The first
+        // version needed a block breakable inside one five-tick frame, which
+        // tied it to how long digging happens to take -- and it duly broke the
+        // day those times were tuned. What the burst does is add five ticks of
+        // work; whether that finishes anything is a different question, asked
+        // by `a_frame_longer_than_the_catch_up_cap_still_only_mines_the_cap`.
+        // Two identical games: one given a frame worth a single tick, the
+        // other a frame worth five.
+        let mut one_tick = mining_stone_with_an_iron_pick();
+        let mut five_ticks = mining_stone_with_an_iron_pick();
+
+        one_tick.advance(TICK_DT);
+        let after_one = one_tick.mining_progress().expect("a break in progress");
+        // 5.5 rather than exactly 5.0: `TICK_DT * 5.0` in `f32` can land a
+        // hair under five ticks' worth once widened to the `f64` accumulator.
+        // The surplus stays in the accumulator; the cap still limits it to five.
+        five_ticks.advance(TICK_DT * 5.5);
+        let after_five = five_ticks.mining_progress().expect("a break in progress");
+
+        assert!(
+            after_five > after_one * 3.0,
+            "five ticks in one frame advanced mining by {after_five}, barely \
+             more than one tick's {after_one} -- the burst is not being applied"
+        );
+    }
+
+    /// A game standing on stone, holding an iron pick, button already down.
+    fn mining_stone_with_an_iron_pick() -> Game {
         let (mut game, _) = game_looking_at_ground();
         stand_over(&mut game, "cubara:stone");
         hold(&mut game, "cubara:iron_pick");
         game.set_breaking(true);
-
-        // 5.5 rather than exactly 5.0: `TICK_DT * 5.0` in `f32` can land a
-        // hair under five ticks' worth once widened to the `f64` accumulator,
-        // and this test is about the burst, not about a rounding boundary.
-        // The surplus stays in the accumulator; the cap still limits it to five.
-        let dirty = game.advance(TICK_DT * 5.5);
-        assert!(!dirty.is_empty(), "five ticks in one frame breaks it");
+        game
     }
 
     #[test]
@@ -3600,7 +3681,8 @@ mod tests {
         let (mut game, _) = game_looking_at_ground();
         stand_over(&mut game, "cubara:stone");
         hold(&mut game, "cubara:stone_pick");
-        mine_for(&mut game, 20).expect("it broke");
+        let ticks = break_ticks(&game, "cubara:stone", "cubara:stone_pick");
+        mine_for(&mut game, ticks * 3).expect("it broke");
 
         let server_edits: Vec<_> = game.server().world.edits().collect();
         let client_edits: Vec<_> = game.world().edits().collect();

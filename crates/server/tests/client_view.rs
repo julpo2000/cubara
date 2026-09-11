@@ -531,3 +531,58 @@ fn a_motionless_player_is_backfilled_to_someone_who_walks_up() {
         "walked up to a motionless player and was never told they were there"
     );
 }
+
+/// Somebody joining is told what the people already standing there look like.
+///
+/// **Found by running it, not by a test.** Three machines in one world, and a
+/// client that joined last saw the two already there in grey. The colour was
+/// sent with the pose in `publish_player_states` — which only fires when
+/// somebody *moves* — and not in the backfill that introduces the people who
+/// were already in view. Since idle players stopped sending poses at all, a
+/// person standing still stayed grey indefinitely.
+///
+/// The two paths are both needed and serve different people: one catches
+/// somebody walking into your view, this one catches everybody already there
+/// when you arrive.
+#[test]
+fn a_newcomer_is_told_what_the_people_already_there_are_wearing() {
+    let mut s = server();
+    let ground = s.sim.player(s.local.expect("a local client")).pos;
+    let at = |dx: i32| {
+        [
+            ground.x.floor_block() + dx,
+            ground.y.floor_block(),
+            ground.z.floor_block(),
+        ]
+    };
+
+    // Somebody is already here, standing still, and has said what they wear.
+    let resident = add_player(&mut s, at(2));
+    s.note_shirt(resident, [204, 41, 41]);
+    // Drain whatever that queued for existing views, so the assertion below is
+    // about the *newcomer's* backfill and not a leftover.
+    let _ = s.drain_effects_for(s.local.expect("a local client"));
+
+    // And now somebody joins.
+    let newcomer = add_player(&mut s, at(4));
+    s.refresh_views();
+
+    let told = s.drain_effects_for(newcomer);
+    let shirt = told.iter().find_map(|e| match e {
+        Effect::PlayerShirt { who, shirt } if *who == resident => Some(*shirt),
+        _ => None,
+    });
+    assert_eq!(
+        shirt,
+        Some([204, 41, 41]),
+        "a joining client was told where somebody is but not what colour they \
+         are, so it would draw them grey until they happened to move"
+    );
+
+    // And the pose, or there is nobody to paint.
+    assert!(
+        told.iter()
+            .any(|e| matches!(e, Effect::PlayerMoved { who, .. } if *who == resident)),
+        "the newcomer was not told where the resident is"
+    );
+}

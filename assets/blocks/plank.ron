@@ -4,7 +4,8 @@ Material(
     solid:  true,
     faces:  All("plank"),
     shapes: [Full],
-    // Ticks of work at speed 1 (PHASE2_ARCHITECTURE.md 4.3). Absent would
-    // mean unbreakable, so every shipped block declares one.
-    hardness: Some(15),
+    // Ticks of work at speed 1 (PHASE2_ARCHITECTURE.md 4.3), at 60 tps:
+    // 1.5 s bare-handed. Absent would mean unbreakable, so every shipped
+    // block declares one.
+    hardness: Some(90),
 )
