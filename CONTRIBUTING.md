@@ -110,6 +110,40 @@ whether work is cross-platform (one wgpu code path) or specific to a backend.
 A phase is finished when `./scripts/check-phase-gate.sh <n>` passes on both
 machines — not when the issues happen to be closed.
 
+## Playing it together
+
+```bash
+./scripts/play-together.sh          # starts the world, prints how to join
+cargo run --release -- --connect <address>
+```
+
+The server it starts is **headless** — no window, no GPU (`ARCHITECTURE.md`
+Rule 4). Both game windows are clients, including the one on the machine
+running the server, which is the arrangement `docs/PHASE2_MULTIPLAYER.md` §3.3
+describes and the reason a local player and a remote one are the same thing
+here.
+
+Shirts go by player id: first to join is red, second is green. By id rather than
+per screen, so both people agree about who is who.
+
+### When the build fails and the code is fine
+
+`ld: tapi error: malformed file` naming a path under
+`/Library/Developer/CommandLineTools/SDKs/` means macOS Command Line Tools
+updated and left an SDK half-written. **Nothing links** until it is fixed —
+not the game, not the crates that never touch graphics — and it looks exactly
+like a build error in this repo.
+
+Point one command at the previous SDK to confirm that is what it is:
+
+```bash
+SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk cargo test --all
+```
+
+If that works, the repo is fine and the toolchain is not. Fixing it properly
+means reinstalling the Command Line Tools, which is a decision for whoever owns
+the machine rather than something to do on their behalf.
+
 ## Copyright
 
 Cubara is an original project. Do not copy assets, names, code, or branding from

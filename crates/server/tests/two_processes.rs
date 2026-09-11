@@ -350,3 +350,113 @@ fn a_joining_client_is_told_who_is_already_here() {
          they were there. Saw: {seen:?}"
     );
 }
+
+/// **Two people, one world, and each one sees the other move.**
+///
+/// This is the owner's goal reduced to what a test can hold: two clients on one
+/// server, over real sockets, and when one walks the other is *told* — with the
+/// position it walked to, not merely that something happened.
+///
+/// Everything else about seeing each other is pixels, and pixels have their own
+/// check (`cubara-render`'s `two_players` golden image). What no picture can
+/// show is that the position travelled between two processes at all. Until this
+/// test, nothing did: `a_client_process_joins_a_server_process_over_a_real_socket`
+/// proves a client can join, and `two_client_processes_get_two_different_players`
+/// proves they are told apart, and neither proves they can *see* each other.
+#[test]
+fn two_clients_see_each_other_move() {
+    use cubara_server::others::OtherPlayers;
+    use cubara_server::Effect;
+
+    let world = scratch_world("see-each-other");
+    let (_server, addr) = start_server(&world);
+
+    let mut walker = connect(&addr).expect("the first client connects");
+    walker.send(ClientMessage::Hello);
+    let mut watcher = connect(&addr).expect("the second client connects");
+    watcher.send(ClientMessage::Hello);
+
+    // Each learns which player it is. The watcher needs the walker's id to know
+    // which of the poses arriving is not its own.
+    let id_of = |link: &mut cubara_server::net::Link<ClientMessage, ServerMessage>| {
+        collect_until(link, Duration::from_secs(20), |all| {
+            all.iter()
+                .any(|m| matches!(m, ServerMessage::Welcome { .. }))
+        })
+        .into_iter()
+        .find_map(|m| match m {
+            ServerMessage::Welcome { you, .. } => Some(you),
+            _ => None,
+        })
+        .expect("a welcome")
+    };
+    let walker_id = id_of(&mut walker);
+    let watcher_id = id_of(&mut watcher);
+    assert_ne!(walker_id, watcher_id, "both clients got the same player");
+
+    // One of them walks, for long enough that the distance is unmistakable.
+    // Sent as numbered input, the way a real client does since block 2.13.
+    let forward = InputFrame {
+        move_axes: [0.0, 0.0, 1.0],
+        ..InputFrame::default()
+    };
+    for seq in 0..120 {
+        walker.send(ClientMessage::Input {
+            seq,
+            frame: forward,
+        });
+        std::thread::sleep(Duration::from_millis(4));
+    }
+
+    // The watcher assembles what it was told, exactly as a real client does --
+    // through `OtherPlayers`, not by reading the messages by hand, so this
+    // covers the client-side half as well as the wire.
+    let mut others = OtherPlayers::new();
+    let mut first: Option<[f32; 3]> = None;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        for msg in watcher.poll() {
+            if let ServerMessage::Effects(effects) = msg {
+                for e in effects {
+                    match e {
+                        Effect::PlayerMoved {
+                            who,
+                            pos,
+                            yaw,
+                            pitch,
+                        } => {
+                            assert_ne!(
+                                who, watcher_id,
+                                "a client was sent its own pose as somebody else's"
+                            );
+                            others.moved(who, pos, yaw, pitch);
+                            if first.is_none() {
+                                first = others.drawn(1.0).first().map(|(_, p)| p.pos);
+                            }
+                        }
+                        Effect::PlayerGone(who) => others.gone(who),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // Enough movement to be sure it is movement and not a first sighting.
+        if let (Some(start), Some((_, now))) = (first, others.drawn(1.0).first().copied()) {
+            let moved = (now.pos[0] - start[0]).abs() + (now.pos[2] - start[2]).abs();
+            if moved > 2.0 {
+                let _ = std::fs::remove_dir_all(&world);
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let seen = others.drawn(1.0);
+    let _ = std::fs::remove_dir_all(&world);
+    panic!(
+        "the watcher never saw the walker move more than two blocks. \
+         Players it knows about: {}, first seen at {first:?}, now {:?}",
+        seen.len(),
+        seen.first().map(|(_, p)| p.pos)
+    );
+}
