@@ -48,6 +48,7 @@ frames after 200 warmup.
 | 2026-08-24 | Reversed-Z depth [#129], radius 64³³ | 1,585 | 758,754 | ~3,952 | 0.100 ms | ~0.40 ms | `5277ddf` |
 | 2026-08-24 | Texture mip chain [#128], radius 64³⁴ | 1,585 | 758,754 | ~3,990 | 0.100 ms | ~0.38 ms | *(this PR)* |
 | 2026-09-10 | Windows caught up to `main` — phase 2 complete, radius 64, band ±2⁴⁴ | 3,138 | 912,964 | ~2,506 | 0.136 ms | ~0.43 ms | `b82e051` |
+| 2026-09-11 | Gate re-run after six PRs, radius 64, band ±2⁴⁵ | 3,138 | 912,964 | ~2,774 | 0.124 ms | ~0.385 ms | `9dee4a6` |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -115,6 +116,7 @@ frames after 200 warmup.
 | 2026-09-01 | Fixed-point angles, radius 64, band ±2⁴¹ | 3,138 | 912,964 | ~1,096 | 0.630 ms | ~1.38 ms | `bbb09c2` |
 | 2026-09-05 | macOS caught up to `main` — many players, per-client views, the transport [#199, #201, #203], radius 64, band ±2⁴² | 3,138 | 912,964 | ~1,108 | 0.628 ms | ~0.98 ms | `01aa32e` |
 | 2026-09-07 | Prediction, untrusted clients, server-side mining, persistence, sharding [#207, #211, #212, #216, #217, #218], radius 64, band ±2⁴³ | 3,138 | 912,964 | ~1,109 | 0.623 ms | ~1.19 ms | `397a653` |
+| 2026-09-11 | Multiplayer played: --connect, player figures, per-machine shirts, mining retuned, radius 64, band ±2⁴⁵ | 3,138 | 912,964 | ~1,112 | 0.611 ms | ~1.08 ms | `b5dcfec` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -1227,6 +1229,45 @@ p99 moved 1.04 → 1.22 ms, and the honest reading is that this scene's p99 is
 noisy rather than that a regression is hiding in it: the avg is what carries
 signal at this scale (see ¹), and the per-frame work added is one drain of an
 empty `Vec`.
+
+⁴⁵ **Six PRs and a played multiplayer session later, and nothing measured
+moved.** Both machines were re-run after `--connect`, player figures, per-machine
+shirt colours, a large `game.rs` refactor and a mining retune had landed. Nodes
+and triangles are identical on both; the scene has not changed since ⁴³.
+
+| | CPU/frame before | after | FPS before | after |
+|---|---|---|---|---|
+| macOS M3 | 0.623 ms | 0.611 ms | ~1,109 | ~1,112 |
+| Windows RTX 4060 | 0.136 ms | 0.124 ms | ~2,506 | ~2,774 |
+
+**Read neither as an improvement.** Windows is +10.7% FPS, which sounds like
+something until you notice this file has already recorded 2,469 and 2,746 on
+functionally identical code — an 11% spread. This sits inside it. macOS moved
+0.4%. The honest summary of a gate re-run is *no regression*, which was the
+question, and that is what these numbers say.
+
+**A separate thing this session established, which no row can show.** The game
+window on the M3 runs at exactly 60 while `--bench` reaches ~1,112 on the same
+machine. Those are not two measurements of the same thing: `--bench` renders
+offscreen and never presents (`bench.rs` asks for an adapter with
+`compatible_surface: None`), so it measures drawing, not delivery.
+
+Three machines, asked what their surface offers:
+
+| | offered | resolved to | window FPS |
+|---|---|---|---|
+| Windows RTX 4060, Vulkan | Fifo, FifoRelaxed, Mailbox, Immediate | Mailbox | ~5,000 |
+| Linux GTX 1060, Vulkan | Mailbox, Fifo | Mailbox | ~2,000 |
+| macOS M3, Metal | Fifo, Immediate | **Immediate** | **60** |
+
+Both machines that get Mailbox run fast; the only one that gets Immediate sits
+on exactly its refresh rate. So Metal's `Immediate` appears to present at display
+sync in practice. Measured on three machines, not diagnosed on one, and **not
+fixed** — it does not touch the gate, which never presents.
+
+The code now picks a concrete mode from `caps.present_modes` instead of asking
+for `AutoNoVsync`. That changes no number; it means the log can say what was
+chosen, where reading `config.present_mode` back only ever echoed the request.
 
 ⁴⁴ **The first Windows measurement of *this* scene, and it must not be read
 against the row above it.** The Windows table stopped on 2026-08-24 at 1,585

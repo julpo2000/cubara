@@ -284,13 +284,18 @@ without a human, the world is playable; if it cannot, no screenshot proves it is
 
 ### Closeout — 2026-09-10
 
-`./scripts/check-phase-gate.sh 2` at `b82e051`, **16 passed, 0 failed**, on both
+`./scripts/check-phase-gate.sh 2` at `b5dcfec`, **16 passed, 0 failed**, on both
 machines, both on a clean tree.
+
+Re-run there after the first pass at `b82e051`, because six PRs had landed on
+top of it — including `--connect`, a large `game.rs` refactor and a retune of
+how long digging takes. A closeout that cites a commit the code has moved past
+is a closeout nobody can check.
 
 | Machine | Perf criterion (radius 64) | Gate margin |
 |---|---|---|
-| Win11 / i7-12650H, RTX 4060 (Vulkan) | ~2,469 FPS | ~2.5× |
-| macOS / Apple M3 (Metal) | ~1,109 FPS, 0.623 ms CPU/frame | ~1.1× |
+| Win11 / i7-12650H, RTX 4060 (Vulkan) | ~2,774 FPS, 0.124 ms CPU/frame | ~2.8× |
+| macOS / Apple M3 (Metal) | ~1,112 FPS, 0.611 ms CPU/frame | ~1.1× |
 
 The Windows figure was measured twice, on `b82e051` and on the same code plus an
 unmerged refactor: **2,469 and 2,746 FPS**. That is 11% apart on functionally
@@ -382,18 +387,32 @@ started — so it is being worked before phase 3 begins.
 | The client keeps its own player | landed, #222 |
 | Where the other players are, interpolated | landed, #224 |
 | Drawing them — red and green shirts, sized to the collision box | landed, #225 |
-| `--connect`: the game window joins a world elsewhere | **open, #226** |
-| Two people actually seeing each other | **never yet run** |
+| `--connect`: the game window joins a world elsewhere | landed, #226 |
+| Two people actually seeing each other | **done, 2026-09-11** |
 
-Everything except the last row is evidence from tests and one golden image. The
-arrangement to try first is the one §3.3 describes and nothing has exercised: the
-dedicated server on a *third* machine with no GPU, and both game windows as
-clients.
+**It was played on 2026-09-11.** A headless server on the Mac, and three game
+windows — macOS, Windows, Linux — in one world, each drawing the others as
+figures in their own machine's colour. Blocks broken on one screen appeared
+broken on the others, and the characters moved live.
 
-Three sessions are working on this — a Mac, a Windows laptop, and an older
-laptop offered the headless-server role. What each is doing at any moment is
-agreed between them, not written here; this table is what a restarted session
-needs to know.
+Two things that only running it could have found, and neither was a test's
+fault so much as a test's absence:
+
+- **A joining client saw everybody already there in grey.** The shirt colour
+  travelled with the message sent when somebody *moves*, and not with the one
+  that introduces the people already standing in view — so anyone idle stayed
+  colourless indefinitely. Both paths are needed and they serve different
+  people. Caught because a third machine joined a world that already had two in
+  it, which no test did.
+- **A bare TCP connection became a player** before saying anything, seating an
+  id and a view for anyone who could reach the port. Found because one session
+  probed the port before building, and the probe showed up in the server log as
+  a player joining and leaving in the same second. Fixed in #233.
+
+Still open, and not closed by playing it: the game window on the M3 runs at 60
+while the same machine draws 1,112 in `--bench`. Measured across three machines
+and understood — Metal resolves `Immediate` to display sync — and deliberately
+not fixed, since it does not touch the gate. `BENCHMARKS.md` ⁴⁵ has the table.
 
 ---
 
