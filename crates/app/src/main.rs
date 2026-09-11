@@ -27,6 +27,35 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+/// What a mouse button does while playing.
+///
+/// A named mapping rather than two `if`s in the event handler, so the one thing
+/// somebody could silently swap back has a test. The owner asked for **right to
+/// mine, left to place** -- the opposite of the genre's default -- and an
+/// arrangement that unusual is exactly the kind a later refactor "corrects"
+/// without noticing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hand {
+    /// Held down for as long as the block is being dug (block 2.4b).
+    Mine,
+    /// A single press.
+    Place,
+}
+
+/// What `button` does with the world. `None` for buttons that do nothing.
+///
+/// Only while the cursor is captured -- the inventory screen keeps the usual
+/// meaning, where right-click is "take half". That is about a *slot* rather
+/// than the world, and swapping it would make the screen disagree with every
+/// other game's screen for no reason.
+fn hand_for(button: MouseButton) -> Option<Hand> {
+    match button {
+        MouseButton::Right => Some(Hand::Mine),
+        MouseButton::Left => Some(Hand::Place),
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 struct App {
     /// World + camera + what input does to them. The renderer draws it; it does
@@ -160,10 +189,21 @@ impl ApplicationHandler for App {
                         h,
                     );
                 }
-                // Holding left mines the targeted block over several ticks
-                // (block 2.4b); right click places one. Both only while the
+                // **Right mines, left places** -- the owner's preference, and
+                // the opposite of the genre's default. Asked for directly, so
+                // it is the binding rather than an option: a setting nobody has
+                // asked to change is a menu to maintain and a second code path
+                // to get wrong.
+                //
+                // Holding right mines the targeted block over several ticks
+                // (block 2.4b); left click places one. Both only while the
                 // cursor is captured (i.e. actually playing).
-                if self.cursor_captured && button == MouseButton::Left {
+                //
+                // The inventory screen keeps the usual meaning above -- there,
+                // right-click is "take half", which is about a *slot* rather
+                // than about the world, and swapping it would make the screen
+                // disagree with every other game's screen for no reason.
+                if self.cursor_captured && hand_for(button) == Some(Hand::Mine) {
                     // Held state, not an edge: mining advances for as long as
                     // the button is down, and `Game::advance` reads it each
                     // tick. The break itself happens on the tick the block
@@ -172,7 +212,7 @@ impl ApplicationHandler for App {
                 }
                 if self.cursor_captured
                     && state == ElementState::Pressed
-                    && button == MouseButton::Right
+                    && hand_for(button) == Some(Hand::Place)
                 {
                     // Asked for, not done. What the placement changed arrives
                     // on the next frame's tick like every other effect, and
@@ -304,4 +344,29 @@ fn main() {
         ..App::default()
     };
     event_loop.run_app(&mut app).expect("run app");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Right mines, left places.** The owner asked for it the other way round
+    /// from the genre, so it is pinned: a later refactor that "corrects" it
+    /// back has to do so deliberately.
+    #[test]
+    fn the_right_button_mines_and_the_left_places() {
+        assert_eq!(hand_for(MouseButton::Right), Some(Hand::Mine));
+        assert_eq!(hand_for(MouseButton::Left), Some(Hand::Place));
+    }
+
+    /// Nothing else reaches the world.
+    ///
+    /// A middle click that quietly placed a block would be a very confusing
+    /// afternoon, and `_ =>` arms are where that kind of thing hides.
+    #[test]
+    fn other_buttons_do_nothing_to_the_world() {
+        assert_eq!(hand_for(MouseButton::Middle), None);
+        assert_eq!(hand_for(MouseButton::Back), None);
+        assert_eq!(hand_for(MouseButton::Other(9)), None);
+    }
 }

@@ -370,23 +370,38 @@ fn mine_for(ticks: u32) -> (Server, [i32; 3], bool) {
     (s, target, gone)
 }
 
-/// Stone declares `hardness: 30`, so a bare hand at speed 1 needs thirty ticks.
+/// A block is not broken before its hardness is paid.
 ///
 /// Both halves matter. That it breaks eventually says the mechanism works; that
-/// it does *not* break early says the time is being counted rather than
-/// nodded at.
+/// it does *not* break early says the time is being counted rather than nodded
+/// at.
+///
+/// The number comes from the registry, not from this file. It used to say
+/// "stone is 30" and duly broke the day digging times were tuned -- which
+/// teaches people to edit tests when they change balance, and that is a habit
+/// worth not starting.
 #[test]
 fn a_block_is_not_broken_before_its_hardness_is_paid() {
-    let (_s, _t, early) = mine_for(20);
+    let hardness = {
+        let mut s = Server::new();
+        s.open(std::path::Path::new("cubara-nonexistent-untrusted-fixture"));
+        let blocks = s.blocks_registry.as_deref().expect("assets");
+        let id = blocks.id_of("cubara:stone").expect("stone is a block");
+        blocks.hardness(id).expect("stone is breakable")
+    };
+    assert!(hardness > 2, "a one-tick block would not test anything");
+
+    let (_s, _t, early) = mine_for(hardness - 1);
     assert!(
         !early,
-        "stone gave way after 20 ticks of a 30-tick hardness"
+        "stone gave way after {} ticks of a {hardness}-tick hardness",
+        hardness - 1
     );
 
-    let (_s, _t, late) = mine_for(30);
+    let (_s, _t, late) = mine_for(hardness);
     assert!(
         late,
-        "stone never gave way after 30 ticks of holding the button"
+        "stone never gave way after {hardness} ticks of holding the button"
     );
 }
 

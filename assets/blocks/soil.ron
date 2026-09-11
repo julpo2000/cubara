@@ -3,7 +3,8 @@ Material(
     solid:  true,
     faces:  All("soil"),
     shapes: [Full],
-    // Ticks of work at speed 1 (PHASE2_ARCHITECTURE.md 4.3). Absent would
-    // mean unbreakable, so every shipped block declares one.
-    hardness: Some(5),
+    // Ticks of work at speed 1 (PHASE2_ARCHITECTURE.md 4.3), at 60 tps:
+    // 0.75 s bare-handed. Absent would mean unbreakable, so every shipped
+    // block declares one.
+    hardness: Some(45),
 )

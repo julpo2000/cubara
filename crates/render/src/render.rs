@@ -374,12 +374,30 @@ impl Renderer {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            // Uncapped so we can actually measure FPS against the 1000-FPS goal.
-            present_mode: wgpu::PresentMode::AutoNoVsync,
+            // Uncapped so we can actually measure FPS against the 1000-FPS
+            // goal -- and **named explicitly** rather than asked for.
+            //
+            // This was `AutoNoVsync`, which is a *request*: the backend resolves
+            // it to Mailbox, Immediate or Fifo and never says which. Reading
+            // `config.present_mode` back gives you `AutoNoVsync` again, so a log
+            // line there prints your own question. On this project's Mac the
+            // window sat at exactly 60 while `--bench` reached 1,100 -- and
+            // `--bench` never presents at all (`bench.rs` asks for an adapter
+            // with `compatible_surface: None`), so the two were never measuring
+            // the same thing.
+            //
+            // Choosing from what the surface actually offers means the answer is
+            // in `present_mode` instead of hidden behind a word.
+            present_mode: chosen_present_mode(&caps),
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
+        log::info!(
+            "surface present modes offered: {:?}; chose {:?}",
+            caps.present_modes,
+            config.present_mode
+        );
         surface.configure(&device, &config);
 
         let (mesh_assets, tex_view, tex_sampler) = load_mesh_assets(&device, &queue);
@@ -828,6 +846,22 @@ pub const fn figure_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
 /// Depth-tested and back-face culled like the terrain, so a figure behind a
 /// hill is behind it. Camera bind group only: the vertices come in already
 /// placed, so there is no per-figure uniform to bind or to keep in step.
+/// The fastest presentation this surface actually offers.
+///
+/// `Mailbox` first (no tearing, no waiting), then `Immediate` (no waiting),
+/// then `Fifo`, which every surface supports and which is vsync. Returning a
+/// concrete mode rather than `AutoNoVsync` is the point: the caller can then log
+/// what it got, and "we asked for no vsync" stops being mistakable for "we got
+/// no vsync".
+pub fn chosen_present_mode(caps: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
+    for wanted in [wgpu::PresentMode::Mailbox, wgpu::PresentMode::Immediate] {
+        if caps.present_modes.contains(&wanted) {
+            return wanted;
+        }
+    }
+    wgpu::PresentMode::Fifo
+}
+
 pub fn build_figure_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,

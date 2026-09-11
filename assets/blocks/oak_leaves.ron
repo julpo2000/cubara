@@ -8,7 +8,8 @@ Material(
     shapes: [Full],
     // Nothing, whatever you hold.
     drops:  Nothing,
-    // Ticks of work at speed 1 (PHASE2_ARCHITECTURE.md 4.3). Absent would
-    // mean unbreakable, so every shipped block declares one.
-    hardness: Some(3),
+    // Ticks of work at speed 1 (PHASE2_ARCHITECTURE.md 4.3), at 60 tps:
+    // 0.2 s bare-handed. Absent would mean unbreakable, so every shipped
+    // block declares one.
+    hardness: Some(12),
 )
