@@ -181,7 +181,7 @@ impl fmt::Display for RecipeError {
 impl std::error::Error for RecipeError {}
 
 /// Every recipe that exists.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RecipeBook {
     recipes: Vec<Recipe>,
 }

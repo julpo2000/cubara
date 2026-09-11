@@ -139,6 +139,30 @@ pub struct Session {
 impl Session {
     /// Load every definition and the save at `cfg.world`, and report whether a
     /// world was restored or a fresh one generated.
+    /// A session around a server that already exists.
+    ///
+    /// What a client hosting its own world builds before assets are loaded:
+    /// `Game::new()` runs before a window does, so the world it will host cannot
+    /// be read off disk yet. Everything else about hosting -- accepting,
+    /// collecting input, flushing, autosaving -- is the same from the first
+    /// tick, which is why this is a constructor rather than a second kind of
+    /// session.
+    pub fn around(server: Server, _cfg: &Config) -> Self {
+        Self {
+            server,
+            ticks: 0,
+            last_save: 0,
+            acceptor: None,
+            clients: BTreeMap::new(),
+            last_seq: BTreeMap::new(),
+            dropped_actions: 0,
+            most_in_one_tick: 0,
+            writing: None,
+            writers_started: 0,
+            writers_joined: 0,
+        }
+    }
+
     pub fn open(cfg: &Config) -> Self {
         let mut server = Server::new();
         let loaded = server.open(&cfg.world);
