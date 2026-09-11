@@ -79,6 +79,26 @@ impl Default for Config {
 /// held over, and why the number is deliberately loose.
 pub const MAX_ACTIONS_PER_TICK: usize = 8;
 
+/// How many accepted-but-unseated connections a session will hold at once.
+///
+/// A connection costs a socket until it says `Hello`; a *player* costs a body
+/// in the world and a per-client view. This is the bound on the first, and it
+/// exists because the second used to have no bound at all (#232).
+///
+/// 64 is deliberately far above what a real join burst looks like and far
+/// below what would matter: the point is that the number exists, not where it
+/// sits.
+pub const MAX_PENDING: usize = 64;
+
+/// How long a connection may stay silent before it is dropped, in ticks.
+///
+/// 600 ticks is ten seconds at 60 tps, which is the same patience the client
+/// already has: `Game::join_over` gives up waiting for its `Welcome` after ten
+/// seconds. Both sides forgetting each other at the same moment is the property
+/// worth having -- a server that waited longer would hold connections no client
+/// is still interested in.
+pub const HELLO_DEADLINE_TICKS: u32 = 600;
+
 pub struct Session {
     pub server: Server,
     /// Ticks run since this session started. Not the world's tick count, which
@@ -134,6 +154,33 @@ pub struct Session {
     /// interleaved on a slow disk.
     writers_started: u64,
     writers_joined: u64,
+    /// Connections accepted but not yet seated: they have not said `Hello`.
+    ///
+    /// **The fix for #232.** Seating happened on `accept`, which meant a bare
+    /// TCP connection -- one that opened and closed without sending a byte --
+    /// became a player in the world, with an id and a view, that everyone
+    /// nearby could see standing there with no colour. Waiting here costs a
+    /// socket and nothing else.
+    pending: Vec<Pending>,
+    /// Connections refused because [`MAX_PENDING`] was already reached.
+    ///
+    /// Counted for the reason `dropped_actions` is: a limit whose effect cannot
+    /// be observed cannot be tested, and a test that asserts the constant is a
+    /// plausible size passes whether or not the code enforcing it exists.
+    refused_connections: u64,
+    /// Connections dropped for never saying `Hello` within
+    /// [`HELLO_DEADLINE_TICKS`].
+    silent_connections: u64,
+}
+
+/// One connection that has arrived but not yet introduced itself.
+struct Pending {
+    link: Link<ServerMessage, ClientMessage>,
+    /// Ticks since it was accepted. Ticks rather than an `Instant` because the
+    /// world is counted in ticks and nothing here may depend on wall-clock time
+    /// (Rule 1) -- a deadline in seconds would make this loop's behaviour
+    /// depend on how fast the machine ran it.
+    waited: u32,
 }
 
 impl Session {
@@ -160,6 +207,9 @@ impl Session {
             writing: None,
             writers_started: 0,
             writers_joined: 0,
+            pending: Vec::new(),
+            refused_connections: 0,
+            silent_connections: 0,
         }
     }
 
@@ -187,6 +237,9 @@ impl Session {
             writing: None,
             writers_started: 0,
             writers_joined: 0,
+            pending: Vec::new(),
+            refused_connections: 0,
+            silent_connections: 0,
         }
     }
 
@@ -239,8 +292,35 @@ impl Session {
         // second body standing on spawn -- the ghost, by another door.
         self.server.go_headless();
         let (server_side, client_side) = crate::net::local_pair();
-        self.welcome(server_side);
+        // **Seated without waiting for `Hello`, and that is deliberate.** The
+        // wait added in #232 exists because a *remote* connection is an unknown
+        // party until it says something. In-process there is no unknown party:
+        // the caller holds the other end of this channel and is the client. So
+        // this path seats directly, through the same `seat` the socket path
+        // ends at -- what differs is when the colour arrives, not what seating
+        // does.
+        //
+        // The consequence, said plainly rather than left to be discovered: the
+        // pending queue is *not* exercised by the in-process path, so it is
+        // covered by tests that drive it directly and by the socket tests,
+        // never as a side effect of singleplayer.
+        self.seat(server_side, None);
         client_side
+    }
+
+    /// How many connections are waiting to say `Hello`.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Connections refused for exceeding [`MAX_PENDING`].
+    pub fn refused_connections(&self) -> u64 {
+        self.refused_connections
+    }
+
+    /// Connections dropped for never saying `Hello`.
+    pub fn silent_connections(&self) -> u64 {
+        self.silent_connections
     }
 
     /// How many clients are connected.
@@ -265,7 +345,65 @@ impl Session {
         };
         let arrivals = acceptor.accepted();
         for link in arrivals {
-            self.welcome(link);
+            if self.pending.len() >= MAX_PENDING {
+                // Dropped by falling out of scope, which closes the socket. The
+                // alternative -- seating them anyway -- is the behaviour this
+                // limit exists to prevent.
+                self.refused_connections += 1;
+                log::warn!(
+                    "refusing a connection: {} already waiting to say hello",
+                    self.pending.len()
+                );
+                continue;
+            }
+            self.pending.push(Pending { link, waited: 0 });
+        }
+    }
+
+    /// Seat whoever has introduced themselves, and forget whoever never did.
+    ///
+    /// Runs before input is collected, so a client that says `Hello` and sends
+    /// an input in the same breath is seated in time to be heard that tick
+    /// rather than the next one.
+    fn admit_pending(&mut self) {
+        let mut admitted: Vec<(Link<ServerMessage, ClientMessage>, crate::wire::Shirt)> =
+            Vec::new();
+        let mut waiting = std::mem::take(&mut self.pending);
+
+        waiting.retain_mut(|p| {
+            // Only `Hello` is read here. Anything else a client sends before it
+            // has been seated is discarded rather than queued: it was sent by
+            // somebody who does not yet exist, and holding it would mean
+            // holding unbounded input for a party that may never introduce
+            // itself.
+            let hello = p.link.poll().into_iter().find_map(|m| match m {
+                ClientMessage::Hello(shirt) => Some(shirt),
+                _ => None,
+            });
+            if let Some(shirt) = hello {
+                // `retain_mut` cannot move the link out, so it is swapped for a
+                // dead one and the real one carried away to be seated.
+                let (dead, _) = crate::net::local_pair();
+                admitted.push((std::mem::replace(&mut p.link, dead), shirt));
+                return false;
+            }
+            if p.link.is_closed() {
+                // The #232 case exactly: opened, said nothing, closed. The
+                // world never knew about it, which is the whole point.
+                return false;
+            }
+            p.waited += 1;
+            if p.waited > HELLO_DEADLINE_TICKS {
+                self.silent_connections += 1;
+                log::warn!("dropping a connection that never said hello");
+                return false;
+            }
+            true
+        });
+
+        self.pending = waiting;
+        for (link, shirt) in admitted {
+            self.seat(link, Some(shirt));
         }
     }
 
@@ -275,7 +413,11 @@ impl Session {
     /// Split out of `accept_new_clients` so that [`attach`](Self::attach) joins
     /// by the same route a socket does rather than by a parallel one that could
     /// drift.
-    fn welcome(&mut self, mut link: Link<ServerMessage, ClientMessage>) {
+    fn seat(
+        &mut self,
+        mut link: Link<ServerMessage, ClientMessage>,
+        shirt: Option<crate::wire::Shirt>,
+    ) {
         // From the *world*, not from a player. This used to read the local
         // player's spawn field, which is why a dedicated server needed a
         // player nobody was driving.
@@ -327,6 +469,12 @@ impl Session {
         );
         link.send(ServerMessage::Effects(handshake));
         self.clients.insert(id, link);
+        // After the insert, so the new player is among the watchers told about
+        // their own colour -- `note_shirt` publishes to everyone who can see
+        // them, and that now includes them.
+        if let Some(shirt) = shirt {
+            self.server.note_shirt(id, shirt);
+        }
     }
 
     /// Read whatever every client sent, and turn it into this tick's input.
@@ -453,6 +601,7 @@ impl Session {
     pub fn advance(&mut self, ticks: u64, cfg: &Config) {
         for _ in 0..ticks {
             self.accept_new_clients();
+            self.admit_pending();
             let inputs = self.collect_input();
             self.server.tick_sim_all(&inputs);
             // Between the two halves: mining raycasts from the pose this tick
