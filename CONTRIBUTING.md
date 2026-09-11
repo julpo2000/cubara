@@ -76,6 +76,25 @@ once. A screenshot someone eyeballed proves nothing about the next commit.
 Manual driving is for exploration, not for evidence. If the only way to know a
 feature works is to launch it and look, the feature is not finished.
 
+### Waiting for a socket is not the same as waiting for a tick
+
+A test that drives the tick loop is deterministic and should spin: ticks are the
+project's unit of time and nothing about them depends on a clock. A test that
+waits for a **connection to be accepted** is not that, and treating it as though
+it were produces a test that fails on a fast machine.
+
+Both sessions working on multiplayer hit this within a day of each other, which
+is why it is here rather than in one file's comments. The shape: a helper ticked
+a fixed 200 times waiting for a client to appear, completed in microseconds, and
+failed — the operating system's accept thread had not been scheduled yet.
+**Ticking faster does not make the kernel hurry.**
+
+So: wait for the *condition*, in wall-clock time, with a budget
+(`crates/server/tests/handshake.rs` and `crates/server/tests/two_processes.rs`
+both do). Rule 1 is not weakened by this — the world still advances one tick at
+a time and no game state reads the clock. What is being waited for is the
+socket, which was never part of the simulation.
+
 ### One scene, one render path
 
 There is exactly **one** function that renders the scene. The window, `--bench`,

@@ -204,6 +204,38 @@ a special case of multiplayer; it is multiplayer with a very short wire.**
 UDP or QUIC, if measurement ever asks for them, become another way of wiring a
 `Link` rather than another implementation of anything.
 
+### §5.2 The one asymmetry, and the deadlock that put it there
+
+`Session::attach` — the in-process join — seats its client immediately.
+A socket connection does not: since #233 it waits in a pending queue until it
+sends `Hello`. **That is a difference between local and remote, which §2 says is
+a bug waiting for the socket**, so it is written down here rather than left in a
+doc comment for somebody to find and quietly "fix".
+
+It survives scrutiny for one reason, and only that reason. The wait is a check
+on **untrusted input** (§3.4): a remote connection is an unknown party until it
+says something. In-process there is no unknown party — the caller holds the
+other end of the channel and *is* the client. So what differs is not the seating
+but whether there is anyone to be suspicious of. Both paths still end at the
+same `seat()`; nothing about what seating *does* has two versions.
+
+The consequence, which is the part that can bite: **singleplayer does not
+exercise the pending queue.** A defect in it would not show up in play, only in
+the tests that drive it directly (`crates/server/tests/handshake.rs`) and in the
+socket tests. Those tests therefore assert `player_count`, never a log line — a
+server that still seated the connection and merely stopped announcing it must go
+red.
+
+**Why the uniform version was not built**, recorded so the next person does not
+spend the evening rediscovering it: making the in-process handshake wait for
+`Hello` too deadlocks `Game::new`. It calls `Session::attach` and then reads its
+`Welcome` synchronously, on the same thread that would have to tick the host for
+the `Hello` to be processed — so the client waits for a server that cannot run
+until the client stops waiting. Nothing in the code says this; it only appears
+when you try it. Making it uniform therefore means making the client's own join
+asynchronous, which is a change to `game.rs` and to how a window starts up, not
+a change to the server.
+
 ## §6 The exit gate, and the honest reading of "5000"
 
 Phase 2's gate grows by four criteria. They go red on landing, as 2.7a's did.
