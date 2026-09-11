@@ -46,8 +46,12 @@ echo "  World:  $world"
 echo "  Join from this machine:   cargo run --release -- --connect 127.0.0.1:$port"
 echo "  Join from another:        cargo run --release -- --connect $lan_ip:$port"
 echo
-echo "  Both windows are clients. Whoever joins first gets the red shirt,"
-echo "  the second gets green -- by player id, so you both agree about it."
+echo "  Both windows are clients. Each machine wears its own colour:"
+echo "  Linux red, Windows yellow, macOS green -- the client picks it and"
+echo "  says so when it joins, so everyone agrees about who is who."
+echo
+echo "  Clients must be built from the same commit as this server: the"
+echo "  protocol carries the colour now, and an older build cannot say it."
 echo
 echo "  Ctrl-C stops the world. It saves on the way out."
 echo "──────────────────────────────────────────────────────────────────"
