@@ -159,7 +159,14 @@ impl ApplicationHandler for App {
                     grab_cursor(renderer.window(), true);
                 }
             }
+            WindowEvent::Focused(true) => {
+                // Deliberately not a recapture -- see `capture::apply`. Logged
+                // because "the mouse does nothing" is otherwise undiagnosable
+                // from a report.
+                log::info!("window focused (captured: {})", self.cursor_captured);
+            }
             WindowEvent::Focused(false) => {
+                log::info!("window lost focus: mouse released");
                 let out = capture::apply(
                     self.cursor_captured,
                     self.game.inventory_open(),
@@ -191,6 +198,7 @@ impl ApplicationHandler for App {
                             Some(_) => None,
                             None => Some(Fullscreen::Borderless(None)),
                         };
+                        log::info!("fullscreen: {}", next.is_some());
                         window.set_fullscreen(next);
                     } else if code == KeyCode::Escape && pressed {
                         // Escape toggles mouse capture so you can leave the window.
@@ -199,6 +207,7 @@ impl ApplicationHandler for App {
                             self.game.inventory_open(),
                             CaptureEvent::Escape,
                         );
+                        log::info!("escape: mouse captured {}", out.captured);
                         self.cursor_captured = out.captured;
                         grab_cursor(renderer.window(), self.cursor_captured);
                     } else if code == KeyCode::F3 && pressed {
@@ -234,6 +243,7 @@ impl ApplicationHandler for App {
                         CaptureEvent::Click,
                     );
                     if out.consumed {
+                        log::info!("click in the window: mouse captured again");
                         self.cursor_captured = out.captured;
                         grab_cursor(renderer.window(), self.cursor_captured);
                         return;
