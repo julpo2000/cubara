@@ -179,6 +179,8 @@ fn fixture_edits() -> Vec<(usize, [i32; 3], BlockId)> {
 /// | `0x4f74_448e_2b83_20bb` | block 2.9a (#172), health + regen counter added |
 /// | `0xe7dc_d72a_011b_4f9b` | fixed-point positions — the hash stopped folding in most `f32` bits |
 /// | `0x7616_a4bd_6251_ca49` | fixed-point angles — **the last float left the digest** |
+/// | `0x3935_6967_c3f3_6b29` | block 2.10, many players — the digest's shape |
+/// | `0x3972_1613_3f68_ecc0` | step-up removed — a rule changed, not the hash (see below) |
 ///
 /// The last two are a different *kind* of change from the four before them,
 /// which were all "new player state joined the digest". These changed the
@@ -204,10 +206,13 @@ fn fixture_edits() -> Vec<(usize, [i32; 3], BlockId)> {
 /// around them.
 ///
 /// **Moved again when step-up was removed** (`0x3935_6967_c3f3_6b29` before
-/// it). The fixture walks a player across real terrain, and without step-up a
-/// one-block rise stops them where it used to lift them, so they end somewhere
-/// else. The same script, a different gait -- which is exactly what the hash is
-/// for noticing.
+/// it), and this is the first move that is neither what is hashed nor how: the
+/// owner asked for walking not to climb a one-block rise by itself. The fixture
+/// walks a player across real terrain, so a rise now stops them where it used
+/// to lift them and they end somewhere else. A deliberate change to a rule the
+/// sim follows, named in the PR that makes it, is the one other legitimate
+/// reason to re-pin -- the same script, a different gait, which is exactly
+/// what this hash exists to notice.
 const KNOWN_FIXTURE_HASH: u64 = 0x3972_1613_3f68_ecc0;
 
 #[test]
