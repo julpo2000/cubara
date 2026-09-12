@@ -742,7 +742,9 @@ if it can move the player, the boundary is wrong (Rule 3).
 
 An AABB swept against solid voxels, resolved **axis by axis in a fixed order**
 (Y, then X, then Z) so the result never depends on iteration or scheduling.
-Gravity, ground detection, step-up over one block, and a jump impulse. It runs
+Gravity, ground detection, and a jump impulse. (Step-up over one block was part
+of this until 2026-09: the owner asked for it off after playing, since it reads
+as the game jumping for you. A one-block rise now takes a jump.) It runs
 inside `Sim::tick`, at fixed dt — which is what makes it deterministic and
 testable without a GPU.
 
