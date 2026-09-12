@@ -15,13 +15,15 @@
 //! inputs are meshes, origins and a camera, nothing that knows what a `World`
 //! or a `NodeKey` is. See issue #38's tracking arc, sub-issue #110.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use cubara_voxel::{build_mesh_bounded, Aabb, BlockRegistry, ChunkCoord, Mesh, MeshContext};
+use cubara_voxel::{
+    build_mesh_bounded_occluded, Aabb, BlockRegistry, ChunkCoord, Mesh, MeshContext,
+};
 
 use crate::node::{desired_nodes, NodeKey, RingSchedule};
 use crate::{TerrainBlocks, World};
@@ -80,13 +82,127 @@ pub fn mesh_node(
         world_origin[2] as f32,
     ];
     let scale = node.extent_chunks() as f32;
-    let (mesh, aabb) = build_mesh_bounded(&chunk, &ctx, origin, scale)?;
+    let surfaces = std::cell::RefCell::new(HashMap::new());
+    let covered = |gx, gy, gz| border_covered(world, node, &surfaces, [gx, gy, gz]);
+    let (mesh, aabb) = build_mesh_bounded_occluded(&chunk, &ctx, origin, scale, covered)?;
     Some(NodeGeometry {
         mesh,
         aabb,
         origin,
         scale,
     })
+}
+
+/// Every chunk whose mesh can change when the block at `pos` changes: its own,
+/// and -- since a chunk leaves out border faces its neighbour covers -- the
+/// neighbour across each border `pos` sits on.
+///
+/// Without the neighbours, digging out a block at the edge of a chunk leaves
+/// the next chunk still hiding the face that now looks into the hole.
+pub fn chunks_affected_by_edit(pos: [i32; 3]) -> Vec<ChunkCoord> {
+    let size = cubara_voxel::Chunk::SIZE as i32;
+    let own = ChunkCoord::new(
+        pos[0].div_euclid(size),
+        pos[1].div_euclid(size),
+        pos[2].div_euclid(size),
+    );
+    let mut out = vec![own];
+    for axis in 0..3 {
+        let local = pos[axis].rem_euclid(size);
+        let step = match local {
+            0 => -1,
+            l if l == size - 1 => 1,
+            _ => continue,
+        };
+        let mut c = [own.x, own.y, own.z];
+        c[axis] += step;
+        out.push(ChunkCoord::new(c[0], c[1], c[2]));
+    }
+    out
+}
+
+/// Whether a border face of `node` against its outside cell `g` -- grid
+/// coordinates with exactly one axis at `-1` or `16` -- can be left out,
+/// because whatever is drawn next to it covers it completely.
+///
+/// **The neighbour may be drawn at a different level of detail**, and which one
+/// depends on where the camera is, which a node's mesh cannot know: it is built
+/// once and kept while the camera moves. So a face is dropped only when the
+/// outside is solid for *every* neighbour this node could have. Rings of
+/// detail are nested one level apart, so that is three:
+///
+/// - **the same level** -- one cell, sampled where that node samples it;
+/// - **one coarser** -- the double-size cell that contains it;
+/// - **one finer** -- the four half-size cells that touch the face.
+///
+/// If any of those is air, some neighbour draws an opening there, and this
+/// face is what a player looking through it would see -- so it stays. Drop it
+/// and the result is a hole into the inside of the terrain.
+///
+/// **At the edge of the render distance the walls go too**: the outside is not
+/// drawn, but it is solid ground. What used to be a grey cliff where the drawn
+/// world stopped is now the terrain simply ending -- which is what it is.
+fn border_covered(
+    world: &World,
+    node: NodeKey,
+    surfaces: &std::cell::RefCell<HashMap<(i32, i32), i32>>,
+    g: [i32; 3],
+) -> bool {
+    let level = node.level;
+    let step = node.extent_chunks();
+    let origin = node.world_origin();
+    let p = [
+        origin[0] + g[0] * step,
+        origin[1] + g[1] * step,
+        origin[2] + g[2] * step,
+    ];
+    // Surface heights are the expensive part of a sample, and one node's
+    // border touches few columns, so each is computed once per node.
+    let solid = |q: [i32; 3], at: u32| {
+        let surface = *surfaces
+            .borrow_mut()
+            .entry((q[0], q[2]))
+            .or_insert_with(|| world.surface_height(q[0], q[2]));
+        world.certainly_solid_at(q[0], q[1], q[2], at, surface)
+    };
+
+    if !solid(p, level) {
+        return false;
+    }
+    let coarse = 2 * step;
+    let q = [
+        p[0].div_euclid(coarse) * coarse,
+        p[1].div_euclid(coarse) * coarse,
+        p[2].div_euclid(coarse) * coarse,
+    ];
+    if !solid(q, level + 1) {
+        return false;
+    }
+    if level == 0 {
+        return true;
+    }
+    // The finer layer that touches this face: the near half of the outside
+    // cell along the face's axis, and both halves across it.
+    let half = step / 2;
+    let axis = (0..3)
+        .find(|&k| g[k] == -1 || g[k] == 16)
+        .expect("a border cell");
+    let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);
+    let mut f = p;
+    if g[axis] == -1 {
+        f[axis] += half;
+    }
+    for da in [0, half] {
+        for db in [0, half] {
+            let mut r = f;
+            r[a] += da;
+            r[b] += db;
+            if !solid(r, level - 1) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Mesh every node [`desired_nodes`] wants for `schedule` around `center`,
@@ -302,6 +418,211 @@ mod tests {
             ])
             .expect("fixture registry is valid"),
         )
+    }
+
+    /// Whether `node`'s cell containing world point `p` is solid, as the node
+    /// itself draws it. `chunks` caches generated nodes across calls.
+    fn drawn_solid(
+        world: &World,
+        blocks: TerrainBlocks,
+        chunks: &mut HashMap<NodeKey, Option<cubara_voxel::Chunk>>,
+        node: NodeKey,
+        p: [i32; 3],
+    ) -> bool {
+        let chunk = chunks
+            .entry(node)
+            .or_insert_with(|| world.node_at(node, blocks));
+        let (o, s) = (node.world_origin(), node.extent_chunks());
+        let i = |k: usize| ((p[k] - o[k]) / s) as usize;
+        chunk
+            .as_ref()
+            .is_some_and(|c| c.get(i(0), i(1), i(2)) != cubara_voxel::BlockId::AIR)
+    }
+
+    /// Whether `node`'s mesh has a face on the plane `axis = at`, pointing
+    /// `sign` along it, covering the unit square with min corner `p`.
+    fn has_face(mesh: &Mesh, node: NodeKey, axis: usize, at: i32, sign: i8, p: [i32; 3]) -> bool {
+        let (o, s) = (node.world_origin(), node.extent_chunks());
+        let face = cubara_voxel::Face::from_axis_sign(axis, sign);
+        let world = |v: cubara_voxel::Vertex| {
+            [
+                o[0] + v.x() as i32 * s,
+                o[1] + v.y() as i32 * s,
+                o[2] + v.z() as i32 * s,
+            ]
+        };
+        let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);
+        mesh.vertices.chunks(4).any(|q| {
+            if q[0].face() != face || world(q[0])[axis] != at {
+                return false;
+            }
+            let corners: Vec<[i32; 3]> = q.iter().map(|&v| world(v)).collect();
+            let lo = |k: usize| corners.iter().map(|c| c[k]).min().unwrap();
+            let hi = |k: usize| corners.iter().map(|c| c[k]).max().unwrap();
+            (lo(a)..hi(a)).contains(&p[a]) && (lo(b)..hi(b)).contains(&p[b])
+        })
+    }
+
+    /// **No holes where two nodes meet** -- the condition border covering must
+    /// never break, at every level pairing the ring schedule produces.
+    ///
+    /// Walk the shared plane one block at a time. Wherever one side draws
+    /// solid and the other air, a player in that air can look at the solid
+    /// side, so the solid side must have a face there. If neither has one, the
+    /// player sees through the terrain.
+    #[test]
+    fn where_two_nodes_meet_every_visible_solid_cell_has_a_face() {
+        let registry = test_registry();
+        let layer_of = |_: &str| 0;
+        let blocks = TerrainBlocks::from_registry(&registry);
+        let world = World::new();
+        let mut meshes: HashMap<NodeKey, Option<Mesh>> = HashMap::new();
+        let mut chunks = HashMap::new();
+        let mut face_at = |n: NodeKey, axis: usize, at: i32, sign: i8, p: [i32; 3]| {
+            meshes
+                .entry(n)
+                .or_insert_with(|| {
+                    mesh_node(&world, &registry, &layer_of, n, blocks).map(|g| g.mesh)
+                })
+                .as_ref()
+                .is_some_and(|m| has_face(m, n, axis, at, sign, p))
+        };
+
+        let mut checked = 0usize;
+        let mut mismatched = 0usize;
+        // Pairs (level of A, level of B), B beyond A along +axis. Level 0 has
+        // caves and the coarser ones do not, so 0-1 is where the two sides
+        // disagree the most.
+        for (la, lb) in [
+            (0u32, 0u32),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (1, 2),
+            (2, 1),
+            (2, 3),
+            (3, 2),
+        ] {
+            let big = 1i32 << la.max(lb);
+            for axis in [0usize, 2] {
+                for col in 0..6i32 {
+                    for layer in [-1i32, 0, 1] {
+                        // A plane both levels' node grids share.
+                        let mut plane_chunk = [0i32; 3];
+                        plane_chunk[axis] = (col * 7 + 3) * big;
+                        let other = if axis == 0 { 2 } else { 0 };
+                        plane_chunk[other] = (col * 5 - 9) * big;
+                        plane_chunk[1] = layer * big;
+                        let a_node = NodeKey::containing(
+                            ChunkCoord::new(
+                                plane_chunk[0] - (axis == 0) as i32,
+                                plane_chunk[1],
+                                plane_chunk[2] - (axis == 2) as i32,
+                            ),
+                            la,
+                        );
+                        let plane = plane_chunk[axis] * cubara_voxel::Chunk::SIZE as i32;
+                        let (ao, asz) = (a_node.world_origin(), 16 * a_node.extent_chunks());
+                        let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);
+                        for da in 0..asz {
+                            for db in 0..asz {
+                                let mut p = [0i32; 3];
+                                p[a] = ao[a] + da;
+                                p[b] = ao[b] + db;
+                                // A's cell is just below the plane, B's at it.
+                                p[axis] = plane - 1;
+                                let a_solid = drawn_solid(&world, blocks, &mut chunks, a_node, p);
+                                let mut pb = p;
+                                pb[axis] = plane;
+                                let b_node = NodeKey::containing(
+                                    ChunkCoord::from_world_pos([
+                                        pb[0] as f32,
+                                        pb[1] as f32,
+                                        pb[2] as f32,
+                                    ]),
+                                    lb,
+                                );
+                                let b_solid = drawn_solid(&world, blocks, &mut chunks, b_node, pb);
+                                checked += 1;
+                                if a_solid == b_solid {
+                                    continue;
+                                }
+                                mismatched += 1;
+                                let ok = if a_solid {
+                                    face_at(a_node, axis, plane, 1, p)
+                                } else {
+                                    face_at(b_node, axis, plane, -1, pb)
+                                };
+                                assert!(
+                                    ok,
+                                    "a hole: levels {la}|{lb}, plane {axis}={plane}, block {p:?}, solid on the {} side has no face",
+                                    if a_solid { "near" } else { "far" }
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            mismatched > 100,
+            "only {mismatched} of {checked} cells differ: the test sees nothing"
+        );
+    }
+
+    #[test]
+    fn an_edit_dirties_its_chunk_and_the_neighbours_it_borders() {
+        let c = ChunkCoord::new;
+        assert_eq!(
+            chunks_affected_by_edit([5, 5, 5]),
+            vec![c(0, 0, 0)],
+            "interior"
+        );
+        assert_eq!(
+            chunks_affected_by_edit([0, 5, 15]),
+            vec![c(0, 0, 0), c(-1, 0, 0), c(0, 0, 1)],
+            "on two borders"
+        );
+        // Negative coordinates: block -1 is local 15 of chunk -1.
+        assert_eq!(
+            chunks_affected_by_edit([-1, -16, 7]),
+            vec![c(-1, -1, 0), c(0, -1, 0), c(-1, -2, 0)]
+        );
+    }
+
+    /// A block dug out right at a node's border opens a hole the neighbour
+    /// must show its side of -- the edit is the only thing that says so.
+    #[test]
+    fn digging_at_a_border_shows_the_neighbours_side() {
+        let registry = test_registry();
+        let layer_of = |_: &str| 0;
+        let blocks = TerrainBlocks::from_registry(&registry);
+        let mut world = World::new();
+        // Deep enough to be solid rock on both sides of the x = 0 plane.
+        let (near, far) = ([-1, -40, 5], [0, -40, 5]);
+        assert!(
+            world.is_solid_at(near[0], near[1], near[2], blocks),
+            "not rock"
+        );
+        assert!(
+            world.is_solid_at(far[0], far[1], far[2], blocks),
+            "not rock"
+        );
+        let far_node = NodeKey::containing(ChunkCoord::from_world_pos([0.0, -40.0, 5.0]), 0);
+        let before = mesh_node(&world, &registry, &layer_of, far_node, blocks);
+        assert!(
+            !before
+                .as_ref()
+                .is_some_and(|g| has_face(&g.mesh, far_node, 0, 0, -1, far)),
+            "a face against solid rock: covering is not on, so this proves nothing"
+        );
+
+        world.set_block(near[0], near[1], near[2], cubara_voxel::BlockId::AIR);
+        let after = mesh_node(&world, &registry, &layer_of, far_node, blocks).expect("rock");
+        assert!(
+            has_face(&after.mesh, far_node, 0, 0, -1, far),
+            "dug a hole beside the border and the neighbour shows no side there"
+        );
     }
 
     fn zero_layer() -> Arc<dyn Fn(&str) -> u32 + Send + Sync> {

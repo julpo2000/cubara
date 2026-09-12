@@ -373,7 +373,7 @@ impl WorldGen {
     /// The terrain height field in blocks: a fractal noise surface that
     /// [`density`](Self::density)'s solid/air split (before caves) is
     /// measured against. A pure function of `(seed, x, z)` alone (§8.1).
-    fn surface_height(&self, x: i32, z: i32) -> i32 {
+    pub fn surface_height(&self, x: i32, z: i32) -> i32 {
         let n = fbm2(
             self.seed,
             x as f32 * TERRAIN_FREQ,
@@ -657,6 +657,16 @@ impl WorldGen {
     /// happens per chunk rather than per voxel. Getting that wrong is not a
     /// correctness bug, it is a 5x frame-time regression, which is how it was
     /// found.
+    /// Whether the cell a node with cells `step` blocks wide generates at
+    /// corner `(x, y, z)` is solid, given that column's `surface` height -- the
+    /// same answer [`generate`](Self::generate) gives, one cell at a time:
+    /// sampled at the corner, carved by caves only at full resolution. For
+    /// judging what a neighbouring node of another level of detail draws,
+    /// without generating it.
+    pub fn solid_at_step_on(&self, x: i32, y: i32, z: i32, step: i32, surface: i32) -> bool {
+        self.density_at(x, y, z, surface, step == 1) > 0.0
+    }
+
     pub fn terrain_block_at(
         &self,
         x: i32,

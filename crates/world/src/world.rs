@@ -85,6 +85,12 @@ impl World {
         }
     }
 
+    /// The generated ground's height at a column, in blocks -- before caves,
+    /// trees and edits.
+    pub fn surface_height(&self, x: i32, z: i32) -> i32 {
+        self.worldgen.surface_height(x, z)
+    }
+
     /// The seed this world's terrain is generated from.
     pub fn seed(&self) -> u64 {
         self.worldgen.seed()
@@ -113,6 +119,27 @@ impl World {
             Some(&block) => block != BlockId::AIR,
             None => self.worldgen.is_solid_with_trees(x, y, z, blocks),
         }
+    }
+
+    /// Whether a node of `level` *certainly* draws the cell at corner
+    /// `(x, y, z)` solid, given the column's `surface` height -- for deciding
+    /// what may be hidden, where "not sure" must come out as "no".
+    ///
+    /// Level 0 is the real world as far as edits go; coarser levels are the
+    /// generator sampled the way [`node_at`](Self::node_at) samples it.
+    /// **Without trees**: a
+    /// tree only ever makes a cell more solid, so leaving it out can only keep
+    /// a face that could have gone, never drop one that is needed. It is what
+    /// makes this cheap -- finding the trees near a block costs more than the
+    /// terrain. Edits do count: a dug-out block is air, and treating it as rock
+    /// would hide the hole.
+    pub fn certainly_solid_at(&self, x: i32, y: i32, z: i32, level: u32, surface: i32) -> bool {
+        if level == 0 {
+            if let Some(&block) = self.edits.get(&[x, y, z]) {
+                return block != BlockId::AIR;
+            }
+        }
+        self.worldgen.solid_at_step_on(x, y, z, 1 << level, surface)
     }
 
     /// Put `block` at world `(x, y, z)`, recording it in the edit overlay so

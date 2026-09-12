@@ -3,8 +3,9 @@
 //! A single 16³ chunk. Meshing culls hidden faces (a face is only emitted when its
 //! neighbour is empty) and then *greedily merges* adjacent coplanar faces into
 //! large quads, so a flat surface becomes a handful of triangles instead of one
-//! quad per block. Out-of-chunk neighbours count as empty, so the outer shell is
-//! always meshed. Merging also requires the same block id, not just the same
+//! quad per block. Out-of-chunk neighbours count as empty unless the caller
+//! says a border cell is covered ([`Chunk::build_mesh_occluded`]) -- a chunk on
+//! its own cannot see its neighbour, so only the caller can. Merging also requires the same block id, not just the same
 //! solidity, so a stone/soil boundary never gets one quad wearing one texture.
 
 use crate::block::BlockId;
@@ -206,7 +207,34 @@ impl Chunk {
     /// (0..SIZE); placing the chunk in the world is a GPU-side per-node origin,
     /// not something done here.
     pub fn build_mesh(&self, ctx: &MeshContext) -> Mesh {
-        greedy_mesh(Self::SIZE as i32, 1, |x, y, z| self.block_at(x, y, z), ctx)
+        self.build_mesh_occluded(ctx, |_, _, _| false)
+    }
+
+    /// [`build_mesh`](Self::build_mesh), leaving out faces nobody can see
+    /// because the cell *just outside the chunk* covers them.
+    ///
+    /// `occluded(x, y, z)` is asked only about cells one step outside the
+    /// chunk on exactly one axis (a coordinate of `-1` or `SIZE`), and answers
+    /// whether a face of this chunk against that cell may be dropped. A chunk
+    /// meshed on its own cannot know what is next to it, so without this every
+    /// solid cell on its border gets a wall -- and where two solid chunks meet,
+    /// both do. Those walls were 28% of the benchmark scene's triangles.
+    ///
+    /// The caller decides what "covered" means, because only the caller knows
+    /// the neighbour -- and, across a change in level of detail, that is not a
+    /// question of one cell (see `cubara_world::mesh`).
+    pub fn build_mesh_occluded(
+        &self,
+        ctx: &MeshContext,
+        occluded: impl Fn(i32, i32, i32) -> bool,
+    ) -> Mesh {
+        greedy_mesh(
+            Self::SIZE as i32,
+            1,
+            |x, y, z| self.block_at(x, y, z),
+            occluded,
+            ctx,
+        )
     }
 
     /// Greedy-mesh a downsampled copy for distant LOD. `level` halves the resolution
@@ -234,6 +262,7 @@ impl Chunk {
                     coarse[((z * n + y) * n + x) as usize]
                 }
             },
+            |_, _, _| false,
             ctx,
         )
     }
@@ -288,10 +317,14 @@ impl Chunk {
 /// constant. Positions stay integers throughout -- the packed [`Vertex`]
 /// format has no room for fractional coordinates, and greedy-meshed corners
 /// never need one.
+///
+/// `occluded` is [`Chunk::build_mesh_occluded`]'s: whether a border face of an
+/// inside solid cell may be dropped because the outside cell covers it.
 fn greedy_mesh(
     n: i32,
     scale: i32,
     block_at: impl Fn(i32, i32, i32) -> BlockId,
+    occluded: impl Fn(i32, i32, i32) -> bool,
     ctx: &MeshContext,
 ) -> Mesh {
     let mut mesh = Mesh::default();
@@ -301,6 +334,8 @@ fn greedy_mesh(
     // this cell own a real face? A skirt must never cover a cell that does
     // -- see `push_skirt`.
     let mut has_own_face = vec![false; (n * n) as usize];
+    // Which cells of the current slice had a face dropped as covered.
+    let mut covered_cell = vec![false; (n * n) as usize];
 
     for d in 0..3usize {
         let u = (d + 1) % 3;
@@ -322,13 +357,23 @@ fn greedy_mesh(
                     let b_id = block_at(pos[0] + step[0], pos[1] + step[1], pos[2] + step[2]);
                     let a = ctx.registry.is_solid(a_id);
                     let b = ctx.registry.is_solid(b_id);
-                    let sign = if a == b {
+                    let mut sign = if a == b {
                         0
                     } else if a {
                         1
                     } else {
                         -1
                     };
+                    // A border face covered by its neighbour: dropped, and
+                    // remembered as covered so no skirt is laid over it
+                    // either. `a` is outside at the -1 boundary, `b` at n.
+                    let covered = (sign == 1
+                        && pos[d] + 1 == n
+                        && occluded(pos[0] + step[0], pos[1] + step[1], pos[2] + step[2]))
+                        || (sign == -1 && pos[d] == -1 && occluded(pos[0], pos[1], pos[2]));
+                    if covered {
+                        sign = 0;
+                    }
                     mask[idx] = if sign == 0 {
                         NO_CELL
                     } else {
@@ -342,14 +387,19 @@ fn greedy_mesh(
                             block,
                         }
                     };
+                    covered_cell[idx] = covered;
                     idx += 1;
                 }
             }
 
             pos[d] += 1; // advance to the face plane
 
-            for (owns, cell) in has_own_face.iter_mut().zip(mask.iter()) {
-                *owns = cell.sign != 0;
+            for ((owns, cell), covered) in has_own_face
+                .iter_mut()
+                .zip(mask.iter())
+                .zip(covered_cell.iter())
+            {
+                *owns = cell.sign != 0 || *covered;
             }
 
             // Greedily merge the mask into quads.
@@ -728,6 +778,112 @@ mod tests {
 
     fn position(v: Vertex) -> [f32; 3] {
         [v.x() as f32, v.y() as f32, v.z() as f32]
+    }
+
+    /// Faces on each of the six border planes, by outward direction.
+    fn border_faces(mesh: &Mesh) -> [usize; 6] {
+        let n = Chunk::SIZE as u32;
+        let mut count = [0; 6];
+        for quad in mesh.vertices.chunks(4) {
+            let f = quad[0].face();
+            let on = |k: fn(Vertex) -> u32, at: u32| quad.iter().all(|&v| k(v) == at);
+            let hit = match f {
+                Face::PosX => on(Vertex::x, n),
+                Face::NegX => on(Vertex::x, 0),
+                Face::PosY => on(Vertex::y, n),
+                Face::NegY => on(Vertex::y, 0),
+                Face::PosZ => on(Vertex::z, n),
+                Face::NegZ => on(Vertex::z, 0),
+            };
+            if hit {
+                count[f as usize] += 1;
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn a_border_covered_by_its_neighbour_has_no_face() {
+        let chunk = uniform(BlockId::STONE);
+        let registry = registry();
+        let open = chunk.build_mesh(&ctx(&registry));
+        assert_eq!(border_faces(&open), [1; 6], "one merged wall per side");
+
+        // Covered only beyond +x: exactly that wall goes, nothing else moves.
+        let covered = chunk.build_mesh_occluded(&ctx(&registry), |x, _, _| x == 16);
+        assert_eq!(border_faces(&covered), [0, 1, 1, 1, 1, 1]);
+        // Covered everywhere: a solid chunk inside solid rock is nothing at all.
+        let buried = chunk.build_mesh_occluded(&ctx(&registry), |_, _, _| true);
+        assert!(
+            buried.vertices.is_empty(),
+            "{} vertices",
+            buried.vertices.len()
+        );
+    }
+
+    /// A covered cell is only covered where it covers: half a border.
+    #[test]
+    fn only_the_covered_part_of_a_border_is_dropped() {
+        let chunk = uniform(BlockId::STONE);
+        let registry = registry();
+        let half = chunk.build_mesh_occluded(&ctx(&registry), |x, y, _| x == -1 && y < 8);
+        let minus_x: Vec<Vertex> = half
+            .vertices
+            .iter()
+            .copied()
+            .filter(|v| v.face() == Face::NegX)
+            .collect();
+        assert!(!minus_x.is_empty(), "the uncovered half lost its face");
+        assert!(
+            minus_x.iter().all(|v| v.y() >= 8),
+            "a face was left on the covered half"
+        );
+    }
+
+    /// Covering is about hiding *this* chunk's faces. It must never invent one
+    /// where the inside is air, nor let the outside's solid cell show a face.
+    #[test]
+    fn covering_never_adds_a_face() {
+        let registry = registry();
+        let mut chunk = empty();
+        set(&mut chunk, 5, 5, 5);
+        let open = chunk.build_mesh(&ctx(&registry));
+        let covered = chunk.build_mesh_occluded(&ctx(&registry), |_, _, _| true);
+        assert_eq!(
+            open.vertices.len(),
+            covered.vertices.len(),
+            "an interior block is untouched"
+        );
+        assert!(empty()
+            .build_mesh_occluded(&ctx(&registry), |_, _, _| true)
+            .vertices
+            .is_empty());
+    }
+
+    /// A skirt covers a crack below a border wall. Laying one over a border
+    /// cell whose face was dropped as covered would put back hidden geometry.
+    #[test]
+    fn no_skirt_is_laid_over_a_covered_border() {
+        let registry = registry();
+        // A border wall at x = 0 from y = 8 up, air below -- the shape a skirt
+        // extends down over -- and everything below also covered.
+        let chunk = Chunk::from_fn(|x, y, _| {
+            if x == 0 && y >= 8 {
+                BlockId::STONE
+            } else {
+                BlockId::AIR
+            }
+        });
+        let open = chunk.build_mesh(&ctx(&registry));
+        let skirted = |m: &Mesh| {
+            m.vertices
+                .iter()
+                .filter(|v| v.face() == Face::NegX && v.y() < 8)
+                .count()
+        };
+        assert!(skirted(&open) > 0, "the fixture has no skirt to test");
+        let covered = chunk.build_mesh_occluded(&ctx(&registry), |x, _, _| x == -1);
+        assert_eq!(skirted(&covered), 0, "a skirt over a covered wall");
     }
 
     /// **Side textures stand upright, unmirrored, on all four sides.** A
