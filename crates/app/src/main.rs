@@ -2,12 +2,14 @@
 //!
 //! Owns the window and event loop; all GPU work lives in `cubara_render`. Forwards
 //! keyboard + mouse input to [`Game`] (WASD to move, Space to jump, mouse to look,
-//! F4 toggles the free-fly debug mode, Esc releases the cursor). Walking under
+//! F4 toggles the free-fly debug mode, Esc releases the cursor, a click takes it
+//! back, F11 or Alt+Enter toggles fullscreen). Walking under
 //! gravity is the default; free-fly (Space/Shift up/down, no collision) is a
 //! debug mode inside the same sim (`docs/PHASE1_ARCHITECTURE.md` §10).
 
 mod bench;
 mod caps;
+mod capture;
 mod game;
 mod screenshot;
 mod streaming;
@@ -16,6 +18,7 @@ use std::sync::Arc;
 
 use cubara_render::{grab_cursor, HotbarView, PanelView, Profiler, Renderer};
 
+use crate::capture::CaptureEvent;
 use crate::game::{
     load_item_registry, load_ore_registry, load_recipe_book, load_structure_registry, Game,
 };
@@ -25,7 +28,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowId};
 
 /// What a mouse button does while playing.
 ///
@@ -76,6 +79,8 @@ struct App {
     connect_to: Option<String>,
     /// Whether the mouse is captured for first-person look (toggled with Escape).
     cursor_captured: bool,
+    /// Whether an Alt key is down, for Alt+Enter.
+    alt_held: bool,
     /// Last known cursor position in window pixels. Only meaningful while the
     /// inventory screen is open -- a captured cursor does not move.
     cursor: (f32, f32),
@@ -145,13 +150,65 @@ impl ApplicationHandler for App {
                 self.game.save();
                 event_loop.exit();
             }
-            WindowEvent::Resized(size) => renderer.resize(size.width, size.height),
+            WindowEvent::Resized(size) => {
+                renderer.resize(size.width, size.height);
+                // A confined cursor is clipped to the rectangle the window had
+                // when it was grabbed; after maximising or going fullscreen
+                // that rectangle is the old one. Grab again for the new size.
+                if self.cursor_captured {
+                    grab_cursor(renderer.window(), true);
+                }
+            }
+            WindowEvent::Focused(true) => {
+                // Deliberately not a recapture -- see `capture::apply`. Logged
+                // because "the mouse does nothing" is otherwise undiagnosable
+                // from a report.
+                log::info!("window focused (captured: {})", self.cursor_captured);
+            }
+            WindowEvent::Focused(false) => {
+                log::info!("window lost focus: mouse released");
+                let out = capture::apply(
+                    self.cursor_captured,
+                    self.game.inventory_open(),
+                    CaptureEvent::FocusLost,
+                );
+                self.cursor_captured = out.captured;
+                grab_cursor(renderer.window(), self.cursor_captured);
+                // A mouse button released outside the window never arrives
+                // (winit synthesises key releases, not button ones), so a dig
+                // in progress would carry on while you are away.
+                self.game.set_breaking(false);
+                self.alt_held = false;
+            }
+            WindowEvent::ModifiersChanged(mods) => {
+                self.alt_held = mods.state().alt_key();
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let pressed = event.state == ElementState::Pressed;
-                    // Escape toggles mouse capture so you can leave the window.
-                    if code == KeyCode::Escape && pressed {
-                        self.cursor_captured = !self.cursor_captured;
+                    if pressed
+                        && !event.repeat
+                        && capture::is_fullscreen_toggle(code, self.alt_held)
+                    {
+                        // Borderless rather than exclusive: it switches
+                        // instantly, alt-tabs cleanly, and keeps the desktop's
+                        // resolution. The resize that follows re-grabs.
+                        let window = renderer.window();
+                        let next = match window.fullscreen() {
+                            Some(_) => None,
+                            None => Some(Fullscreen::Borderless(None)),
+                        };
+                        log::info!("fullscreen: {}", next.is_some());
+                        window.set_fullscreen(next);
+                    } else if code == KeyCode::Escape && pressed {
+                        // Escape toggles mouse capture so you can leave the window.
+                        let out = capture::apply(
+                            self.cursor_captured,
+                            self.game.inventory_open(),
+                            CaptureEvent::Escape,
+                        );
+                        log::info!("escape: mouse captured {}", out.captured);
+                        self.cursor_captured = out.captured;
                         grab_cursor(renderer.window(), self.cursor_captured);
                     } else if code == KeyCode::F3 && pressed {
                         renderer.toggle_debug();
@@ -179,6 +236,19 @@ impl ApplicationHandler for App {
                 self.cursor = (position.x as f32, position.y as f32);
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if state == ElementState::Pressed {
+                    let out = capture::apply(
+                        self.cursor_captured,
+                        self.game.inventory_open(),
+                        CaptureEvent::Click,
+                    );
+                    if out.consumed {
+                        log::info!("click in the window: mouse captured again");
+                        self.cursor_captured = out.captured;
+                        grab_cursor(renderer.window(), self.cursor_captured);
+                        return;
+                    }
+                }
                 if self.game.inventory_open() && state == ElementState::Pressed {
                     let (w, h) = renderer.size();
                     self.game.click_panel(
