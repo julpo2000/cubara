@@ -1,0 +1,15 @@
+// Cobblestone: what mined stone comes up as, so it can go back down as a
+// block. The owner chose a placeable cobble block over having stone drop
+// itself (2026-09-12).
+Material(
+    name:   "cubara:cobble",
+    solid:  true,
+    faces:  All("cobble"),
+    shapes: [Full],
+    // Picked up as itself, like stone asks a pick for.
+    requires_tier: 1,
+    // Ticks of work at speed 1 (PHASE2_ARCHITECTURE.md 4.3), at 60 tps:
+    // the same as stone -- 2.25 s bare-handed. Absent would mean unbreakable,
+    // so every shipped block declares one.
+    hardness: Some(135),
+)

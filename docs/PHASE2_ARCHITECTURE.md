@@ -396,9 +396,13 @@ ItemDef(
     name:       "cubara:oak_log",
     max_stack:  64,
     durability: None,
-    burn_ticks: Some(80),
+    burn_ticks: Some(800),
 )
 ```
+
+(80 when this was written; raised tenfold in 2026-09 at the owner's request,
+so one plank -- a quarter log -- smelts one ingot. It had been ten planks an
+ingot, which in play read as a furnace that did not work.)
 
 An item with no `burn_ticks` is not fuel. That is a property of the *item*
 rather than a separate fuel table, so "can this go in the fuel slot" is one

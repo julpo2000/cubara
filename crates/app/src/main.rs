@@ -375,6 +375,7 @@ impl ApplicationHandler for App {
                     held: *held,
                     cursor: self.cursor,
                     tooltip: hovered.as_deref(),
+                    gauges: self.game.furnace_gauges(),
                 });
                 let others = self.game.other_players();
                 renderer.render(

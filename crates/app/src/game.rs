@@ -213,6 +213,9 @@ pub struct ClientAssets {
     pub blocks: Arc<BlockRegistry>,
     pub items: ItemRegistry,
     pub recipes: RecipeBook,
+    /// Smelting recipes -- read for how long the item in a furnace takes, so
+    /// the screen can show how far along it is.
+    pub smelting: cubara_voxel::SmeltBook,
     /// Which ids the terrain is made of. Derived from `blocks` once, here,
     /// rather than recomputed at each of the places that raycast.
     pub terrain: TerrainBlocks,
@@ -866,6 +869,7 @@ impl Game {
         self.assets = Some(ClientAssets {
             terrain: TerrainBlocks::from_registry(&registry),
             blocks: Arc::clone(&registry),
+            smelting: cubara_server::assets::load_smelt_book(&items),
             items: items.clone(),
             recipes: recipes.clone(),
         });
@@ -1329,6 +1333,37 @@ impl Game {
             .held()
             .and_then(|s| swatch((s.item(), s.count())));
         Some((panel, contents, held))
+    }
+
+    /// The open furnace's flame and progress, as fractions, or `None` when no
+    /// furnace screen is open.
+    ///
+    /// **The flame is measured against the fuel in the slot**, because the
+    /// furnace does not remember how long the item already alight burned for --
+    /// adding that would change world state and the save format for a meter.
+    /// With the slot empty the item alight is the last of it, and the flame
+    /// shows full until it goes out: a meter that is briefly generous rather
+    /// than one that needs a new field in every save.
+    pub fn furnace_gauges(&self) -> Option<cubara_render::FurnaceGauges> {
+        let f = self.open_furnace()?;
+        let assets = self.assets.as_ref()?;
+        let burn = match f.burning {
+            0 => 0.0,
+            left => {
+                let full = f
+                    .fuel
+                    .and_then(|(id, _)| assets.items.burn_ticks(id))
+                    .unwrap_or(left)
+                    .max(left);
+                left as f32 / full as f32
+            }
+        };
+        let progress = f
+            .input
+            .and_then(|(id, _)| assets.smelting.for_input(id))
+            .map(|r| f.progress as f32 / r.ticks.max(1) as f32)
+            .unwrap_or(0.0);
+        Some(cubara_render::FurnaceGauges { burn, progress })
     }
 
     /// The name to show for whatever is under the cursor on the open screen,
@@ -2862,9 +2897,8 @@ mod tests {
     #[test]
     fn a_furnace_smelts_raw_iron_into_an_ingot_over_ticks() {
         // The last rung of REQUIREMENTS #5: ore you mined becomes metal you can
-        // craft with. 200 ticks per ingot, and a log burns 80 -- so this needs
-        // three logs' worth of fuel, which is the point of checking it end to
-        // end rather than trusting the unit tests.
+        // craft with, checked end to end rather than trusting the unit tests.
+        // (A log burns 800 ticks now, so one would do; four is not the point.)
         let (mut game, _) = game_looking_at_ground();
         let pos = open_a_furnace(&mut game);
         let raw = item(&game, "cubara:raw_iron");
@@ -2885,6 +2919,65 @@ mod tests {
             "one ingot"
         );
         assert_eq!(f.input, None, "the raw iron was consumed");
+    }
+
+    #[test]
+    fn furnace_gauges_report_burn_left_and_progress_made() {
+        let (mut game, _) = game_looking_at_ground();
+        assert_eq!(game.furnace_gauges(), None, "no furnace open");
+        let pos = open_a_furnace(&mut game);
+        let idle = game.furnace_gauges().expect("a furnace is open");
+        assert_eq!((idle.burn, idle.progress), (0.0, 0.0), "empty, so not lit");
+        let raw = item(&game, "cubara:raw_iron");
+        let plank = item(&game, "cubara:plank");
+        edit_furnace(&mut game, pos, |f| {
+            f.input = Some((raw, 2));
+            f.fuel = Some((plank, 3));
+        });
+
+        // A quarter of a plank's burn and of the recipe: 50 of 200 ticks.
+        // `edit_furnace` settles, which is the first of them.
+        for _ in 0..49 {
+            game.advance(TICK_DT);
+        }
+        let g = game.furnace_gauges().unwrap();
+        assert!((g.progress - 0.25).abs() < 0.011, "progress {}", g.progress);
+        assert!((g.burn - 0.75).abs() < 0.011, "burn {}", g.burn);
+    }
+
+    /// The owner's tuning: one plank smelts one ingot. It was ten, and a player
+    /// who put a few planks in saw nothing come out.
+    #[test]
+    fn one_plank_smelts_one_ingot() {
+        let (mut game, _) = game_looking_at_ground();
+        let pos = open_a_furnace(&mut game);
+        let raw = item(&game, "cubara:raw_iron");
+        let plank = item(&game, "cubara:plank");
+        edit_furnace(&mut game, pos, |f| {
+            f.input = Some((raw, 2));
+            f.fuel = Some((plank, 1));
+        });
+        for _ in 0..450 {
+            game.advance(TICK_DT);
+        }
+        let f = game.open_furnace().unwrap();
+        assert_eq!(f.output.map(|o| o.1), Some(1), "one plank, one ingot");
+        assert_eq!(f.input, Some((raw, 1)), "and not a second one");
+    }
+
+    /// Mined stone comes up as cobble, and cobble goes back down as a block.
+    #[test]
+    fn cobble_can_be_placed() {
+        let (mut game, ground) = game_looking_at_ground();
+        hold(&mut game, "cubara:cobble");
+        game.place_block();
+        game.settle();
+        let registry = game.server().blocks_registry.clone().unwrap();
+        let terrain = game.terrain();
+        let above = [ground[0], ground[1] + 1, ground[2]];
+        let placed = game.world().block_at(above[0], above[1], above[2], terrain);
+        assert_eq!(registry.name_of(placed), Some("cubara:cobble"));
+        assert_eq!(count_of(&game, "cubara:cobble"), 0, "the held one was used");
     }
 
     #[test]

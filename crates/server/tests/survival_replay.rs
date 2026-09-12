@@ -100,11 +100,20 @@ const STANCES: [(i32, i32, [i32; 3]); 8] = [
 /// player ends in exactly the same condition; what changed is the encoding
 /// around them, which is the whole point of a version-style bump being visible
 /// here.
-const KNOWN_SURVIVAL_HASH: u64 = 0x7E1A_65EB_A55A_BB2D;
+///
+/// **Moved again with the cobble block and the tenfold fuel** (`0x7E1A_65EB_A55A_BB2D`
+/// before it), and each change moves it on its own -- checked by reverting one
+/// at a time. *Fuel:* the script loads three logs and one now outlasts the
+/// smelt, so fuel the old run burned through is left over.
+/// *Cobble:* a new block named `cubara:cobble` sorts first, so every block id
+/// shifts up by one, and the hash folds edited blocks by id. Nothing about what
+/// the player did changed.
+const KNOWN_SURVIVAL_HASH: u64 = 0x2AA4_55D0_FE61_79ED;
 
 /// How many logs the script fells: three become planks, three become furnace
-/// fuel. Oak burns 80 ticks and an ingot takes 200, so three is the smallest
-/// number that finishes the smelt.
+/// fuel. When this was written oak burned 80 ticks and an ingot took 200, so
+/// three was the smallest number that finished the smelt; since oak burns 800,
+/// one would do. Kept at three so the script did not change when the fuel did.
 const LOGS_WANTED: usize = 6;
 
 /// Cobble the script needs: three for the stone pick, eight for the furnace.

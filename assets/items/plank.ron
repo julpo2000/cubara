@@ -9,5 +9,8 @@ ItemDef(
     max_stack:  64,
     durability: None,
     // Wood is the fuel (PHASE2_ARCHITECTURE.md 7). No coal exists.
-    burn_ticks: Some(20),
+    // One plank smelts one ingot (200 ticks); a log is four planks and
+    // two planks make four sticks, so the three agree. The owner's call:
+    // it was ten planks an ingot, which read as the furnace not working.
+    burn_ticks: Some(200),
 )
