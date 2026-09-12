@@ -914,8 +914,8 @@ mod tests {
             world.add_furnace(pos);
             let f = world.furnace_at_mut(pos).expect("just added");
             f.input = Some((raw_iron, 1));
-            // A plank burns 20 ticks and the recipe wants 200, so this is
-            // deliberate headroom rather than a round number.
+            // One plank burns the recipe's whole 200 ticks; twenty is fuel to
+            // spare, so running out cannot be why this fails.
             f.fuel = Some((plank, 20));
         }
 

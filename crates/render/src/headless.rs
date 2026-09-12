@@ -108,6 +108,8 @@ pub struct Shot {
     pub crosshair: bool,
     /// A tooltip beside the panel's cursor. Ignored without a `panel`.
     pub tooltip: Option<String>,
+    /// Furnace meters as `(burn, progress)`. Ignored without a `panel`.
+    pub gauges: Option<(f32, f32)>,
 }
 
 impl Default for Shot {
@@ -125,6 +127,7 @@ impl Default for Shot {
             health: None,
             crosshair: false,
             tooltip: None,
+            gauges: None,
         }
     }
 }
@@ -207,6 +210,7 @@ fn render_arena(
         health,
         crosshair,
         tooltip,
+        gauges,
     } = shot;
     // Slot 0 held: a fixed choice, so a golden reference has a stable
     // selection highlight to compare against.
@@ -316,6 +320,8 @@ fn render_arena(
                     held: *held,
                     cursor: *cursor,
                     tooltip: tooltip.as_deref(),
+                    gauges: gauges
+                        .map(|(burn, progress)| crate::scene::FurnaceGauges { burn, progress }),
                 }),
             crosshair,
         },

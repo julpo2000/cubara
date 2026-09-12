@@ -109,6 +109,20 @@ pub struct PanelView<'a> {
     /// A label to show beside the cursor -- the name of the item under it --
     /// or `None`. Already a string: this crate does not know what an item is.
     pub tooltip: Option<&'a str>,
+    /// A furnace's two meters, or `None` on any other screen.
+    pub gauges: Option<FurnaceGauges>,
+}
+
+/// How far a furnace has got, as two fractions in `0.0..=1.0`.
+///
+/// Fractions rather than tick counts, so this crate never learns how long a
+/// log burns or a recipe takes (Rule 3).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FurnaceGauges {
+    /// Burn left in the fuel alight: 1 just lit, 0 out.
+    pub burn: f32,
+    /// Progress on the item being smelted: 0 just started, 1 done.
+    pub progress: f32,
 }
 
 /// One hotbar slot's contents, already reduced to what drawing needs.
@@ -475,9 +489,45 @@ impl SceneRenderer {
             self.queue_item(cx - s * 0.5, cy - s * 0.5, s, PAD, held);
         }
 
+        if let Some(gauges) = view.gauges {
+            self.queue_gauges(p, gauges);
+        }
+
         if let Some(label) = view.tooltip {
             self.queue_tooltip(label, view.cursor);
         }
+    }
+
+    /// A flame meter beside the fuel slot and an arrow from the input to the
+    /// output that fills as the item smelts.
+    ///
+    /// Without them a furnace that is working looks exactly like one that is
+    /// not until an ingot appears -- which in play read as "the furnace does not
+    /// work". Placed from the layout's own slots, so they move with it.
+    fn queue_gauges(&mut self, p: &InventoryPanel, g: FurnaceGauges) {
+        const TRACK: [f32; 3] = [0.08, 0.08, 0.10];
+        const FLAME: [f32; 3] = [0.98, 0.55, 0.12];
+        const ARROW: [f32; 3] = [0.92, 0.92, 0.92];
+        const BAR: f32 = 6.0;
+        let find = |kind| p.slots().iter().find(|s| s.kind == kind).copied();
+        let (Some(fuel), Some(output)) = (find(PanelSlotKind::Fuel), find(PanelSlotKind::Result))
+        else {
+            return;
+        };
+
+        // Flame: a vertical bar left of the fuel slot, draining downward.
+        let (fx, fy, fh) = (fuel.x - BAR - 4.0, fuel.y, fuel.size);
+        self.text.queue_rect(fx, fy, BAR, fh, TRACK);
+        let lit = fh * g.burn.clamp(0.0, 1.0);
+        self.text.queue_rect(fx, fy + fh - lit, BAR, lit, FLAME);
+
+        // Arrow: a horizontal bar from the input column to the output slot.
+        let x0 = fuel.x + fuel.size + 6.0;
+        let x1 = output.x - 6.0;
+        let ay = output.y + output.size * 0.5 - BAR * 0.5;
+        self.text.queue_rect(x0, ay, x1 - x0, BAR, TRACK);
+        self.text
+            .queue_rect(x0, ay, (x1 - x0) * g.progress.clamp(0.0, 1.0), BAR, ARROW);
     }
 
     /// An item's name in a dark box just above and right of the cursor, kept

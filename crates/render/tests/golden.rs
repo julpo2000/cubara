@@ -414,6 +414,7 @@ fn a_cave_mouth_is_visible() {
         health: None,
         crosshair: false,
         tooltip: None,
+        gauges: None,
     };
     assert_golden("cave_mouth", &world, shot);
 }
@@ -451,6 +452,7 @@ fn iron_ore_is_visible_in_a_cave_wall() {
         health: None,
         crosshair: false,
         tooltip: None,
+        gauges: None,
     };
     assert_golden("iron_ore", &world, shot);
 }
@@ -522,6 +524,7 @@ fn the_selected_block_shows_an_outline() {
         health: None,
         crosshair: false,
         tooltip: None,
+        gauges: None,
     };
     assert_golden("outline", &world, shot);
 }
@@ -568,6 +571,7 @@ fn the_hotbar_shows_slots_counts_and_the_held_one() {
         health: None,
         crosshair: false,
         tooltip: None,
+        gauges: None,
     };
     assert_golden("hotbar", &world, shot);
 }
@@ -618,6 +622,7 @@ fn the_inventory_screen_shows_slots_a_recipe_and_the_cursor() {
         health: None,
         crosshair: false,
         tooltip: None,
+        gauges: None,
         panel: Some((
             PanelLayout::Grid(2),
             contents,
@@ -666,6 +671,7 @@ fn an_item_name_shows_beside_the_cursor() {
         health: None,
         crosshair: false,
         tooltip: Some("Wooden Pick".to_string()),
+        gauges: None,
         panel: Some((
             PanelLayout::Grid(2),
             contents,
@@ -695,6 +701,7 @@ fn the_crosshair_marks_the_centre_of_the_screen() {
         health: None,
         crosshair: true,
         tooltip: None,
+        gauges: None,
     };
     // A crosshair is about 0.1% of the frame -- under the golden's 0.5%
     // tolerance, so the image comparison alone passes with it missing (found
@@ -737,6 +744,7 @@ fn hearts_show_health_including_a_half() {
         health: Some((13, 20)),
         crosshair: false,
         tooltip: None,
+        gauges: None,
     };
     assert_golden("hearts", &world, shot);
 }
@@ -784,6 +792,7 @@ fn the_furnace_screen_shows_input_fuel_and_output() {
         health: None,
         crosshair: false,
         tooltip: None,
+        gauges: None,
         panel: Some((
             PanelLayout::Furnace,
             contents,
@@ -792,6 +801,85 @@ fn the_furnace_screen_shows_input_fuel_and_output() {
         )),
     };
     assert_golden("furnace_screen", &world, shot);
+}
+
+#[test]
+fn a_furnace_shows_its_flame_and_progress() {
+    // A working furnace looked exactly like a broken one until an ingot
+    // appeared, and in play that read as "the furnace does not work". Two
+    // fractions picked far apart -- a mostly-burnt flame and a mostly-done
+    // arrow -- so drawing one where the other belongs would show.
+    let panel = InventoryPanel::layout_furnace(960, 540);
+    let contents: Vec<Option<HotbarSlot>> = panel
+        .slots()
+        .iter()
+        .map(|s| match s.kind {
+            PanelSlotKind::Grid => Some(HotbarSlot {
+                color: [0.70, 0.35, 0.25],
+                count: 3,
+            }),
+            PanelSlotKind::Fuel => Some(HotbarSlot {
+                color: [0.66, 0.50, 0.31],
+                count: 6,
+            }),
+            _ => None,
+        })
+        .collect();
+
+    let world = World::new();
+    let shot = Shot {
+        width: 960,
+        height: 540,
+        region_radius: 2,
+        orbit_t: 0.0,
+        camera: None,
+        players: Vec::new(),
+        highlighted_block: None,
+        hotbar: None,
+        health: None,
+        crosshair: false,
+        tooltip: None,
+        gauges: Some((0.25, 0.75)),
+        panel: Some((PanelLayout::Furnace, contents, None, (10.0, 10.0))),
+    };
+    // Both meters together are well under the golden's 0.5% tolerance, so a
+    // missing or swapped meter would pass the image comparison. Read the
+    // pixels where each fraction should and should not have filled.
+    if let Some(frame) = render_world(&world, shot.clone()) {
+        let at = |x: f32, y: f32| {
+            let i = ((y as u32 * frame.width + x as u32) * 4) as usize;
+            [frame.pixels[i], frame.pixels[i + 1], frame.pixels[i + 2]]
+        };
+        let slot = |kind| *panel.slots().iter().find(|s| s.kind == kind).unwrap();
+        let (fuel, output) = (slot(PanelSlotKind::Fuel), slot(PanelSlotKind::Result));
+        let flame_x = fuel.x - 7.0;
+        // The target is sRGB, so the flame reads (253, 196, 97), not its
+        // linear value; the track beside it is a dark grey.
+        let orange = |p: [u8; 3]| p[0] > 220 && p[0] as i32 - p[2] as i32 > 100;
+        assert!(
+            orange(at(flame_x, fuel.y + fuel.size - 2.0)),
+            "no flame at the bottom"
+        );
+        // Halfway up: empty for a quarter flame, full if the flame were
+        // showing the arrow's three quarters instead.
+        assert!(
+            !orange(at(flame_x, fuel.y + fuel.size * 0.5)),
+            "a quarter flame reached halfway"
+        );
+
+        let (x0, x1) = (fuel.x + fuel.size + 6.0, output.x - 6.0);
+        let ay = output.y + output.size * 0.5;
+        let white = |p: [u8; 3]| p.iter().all(|&c| c > 200);
+        assert!(
+            white(at(x0 + (x1 - x0) * 0.6, ay)),
+            "the arrow has not filled to 3/4"
+        );
+        assert!(
+            !white(at(x0 + (x1 - x0) * 0.9, ay)),
+            "the arrow filled past 3/4"
+        );
+    }
+    assert_golden("furnace_gauges", &world, shot);
 }
 
 #[test]
@@ -837,6 +925,7 @@ fn distinct_materials_render_with_distinct_textures() {
         health: None,
         crosshair: false,
         tooltip: None,
+        gauges: None,
     };
 
     let Some(frame) = headless::render_chunks(&chunks, shot) else {
@@ -975,6 +1064,7 @@ fn three_players_stand_in_front_of_the_camera() {
         health: None,
         crosshair: false,
         tooltip: None,
+        gauges: None,
     };
     assert_golden("three_players", &world, shot);
 }
