@@ -112,6 +112,8 @@ pub struct Shot {
     pub tooltip: Option<String>,
     /// Furnace meters as `(burn, progress)`. Ignored without a `panel`.
     pub gauges: Option<(f32, f32)>,
+    /// Item icons that [`crate::HotbarSlot::icon`] indexes into.
+    pub icons: Vec<Option<Vec<u8>>>,
 }
 
 impl Default for Shot {
@@ -131,6 +133,7 @@ impl Default for Shot {
             crosshair: false,
             tooltip: None,
             gauges: None,
+            icons: Vec::new(),
         }
     }
 }
@@ -215,6 +218,7 @@ fn render_arena(
         crosshair,
         tooltip,
         gauges,
+        icons,
     } = shot;
     // Slot 0 held: a fixed choice, so a golden reference has a stable
     // selection highlight to compare against.
@@ -265,6 +269,9 @@ fn render_arena(
         &tex_sampler,
     );
     scene.set_camera(&queue, vp);
+    if !icons.is_empty() {
+        scene.set_icons(&device, &queue, &icons);
+    }
 
     let color = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("headless-color"),

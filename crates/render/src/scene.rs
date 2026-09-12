@@ -137,6 +137,11 @@ pub struct HotbarSlot {
     /// (`materials::placeholder_color`).
     pub color: [f32; 3],
     pub count: u8,
+    /// Which icon to draw instead of the swatch -- an index into the icons
+    /// last given to [`SceneRenderer::set_icons`] -- or `None` for the swatch.
+    /// An index the renderer has no icon for also falls back to the swatch, so
+    /// an item is never drawn as nothing.
+    pub icon: Option<u32>,
 }
 
 /// What the renderer needs to draw a hotbar: colours and counts, and which slot
@@ -273,6 +278,17 @@ impl SceneRenderer {
             width,
             height,
         }
+    }
+
+    /// Replace the item icons [`HotbarSlot::icon`] indexes into: one 16x16
+    /// RGBA tile per entry, `None` where an item has no art.
+    pub fn set_icons(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        icons: &[Option<Vec<u8>>],
+    ) {
+        self.text.set_icons(device, queue, icons);
     }
 
     /// Rebuild the depth buffer for a new target size.
@@ -593,13 +609,14 @@ impl SceneRenderer {
     /// One item swatch plus its count, inside a slot of `size` at (`x`, `y`).
     /// Shared by the hotbar and the screen so the two cannot drift apart.
     fn queue_item(&mut self, x: f32, y: f32, size: f32, pad: f32, item: HotbarSlot) {
-        self.text.queue_rect(
-            x + pad,
-            y + pad,
-            size - pad * 2.0,
-            size - pad * 2.0,
-            item.color,
-        );
+        let inner = size - pad * 2.0;
+        let drawn = item
+            .icon
+            .is_some_and(|i| self.text.queue_icon(i, x + pad, y + pad, inner, inner));
+        if !drawn {
+            self.text
+                .queue_rect(x + pad, y + pad, inner, inner, item.color);
+        }
         // Counts of 1 are noise -- a slot with one thing in it is already
         // visibly a slot with something in it.
         if item.count > 1 {

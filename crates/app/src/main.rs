@@ -151,6 +151,8 @@ impl ApplicationHandler for App {
             &ores,
             move |name: &str| layers.layer_of(name),
         ));
+        let mut renderer = renderer;
+        renderer.set_icons(self.game.item_icons());
         self.renderer = Some(renderer);
         // Capture the mouse for first-person look (Esc releases it). A window
         // concern, so the app owns it rather than the renderer.
