@@ -654,10 +654,17 @@ impl Server {
         self.tick_mining_all(&inputs);
     }
 
-    /// How far along `who`'s break is, `0.0..1.0`, for a crack overlay to draw.
+    /// Which block `who` is breaking and how far along, `0.0..1.0`, for the
+    /// crack overlay to draw.
     ///
     /// A fraction rather than the raw counters, so drawing it needs no access to
     /// the registries — the renderer does not own gameplay (Rule 3).
+    pub fn mining_target(&self, who: PlayerId) -> Option<([i32; 3], f32)> {
+        let block = self.mining.get(&who)?.block;
+        self.mining_progress(who).map(|p| (block, p))
+    }
+
+    /// The fraction alone; see [`mining_target`](Self::mining_target).
     pub fn mining_progress(&self, who: PlayerId) -> Option<f32> {
         let m = self.mining.get(&who)?;
         let registry = self.blocks_registry.as_deref()?;

@@ -13,6 +13,7 @@
 //! block 1.6).
 
 mod arena;
+pub mod crack;
 pub mod culling;
 pub mod figure;
 pub mod headless;

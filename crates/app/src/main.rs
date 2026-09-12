@@ -381,6 +381,7 @@ impl ApplicationHandler for App {
                 renderer.render(
                     camera,
                     self.game.selected_block(),
+                    self.game.cracking(),
                     &others,
                     Hud {
                         hotbar,

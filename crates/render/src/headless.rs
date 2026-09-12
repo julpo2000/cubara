@@ -85,6 +85,8 @@ pub struct Shot {
     /// (the sim's own raycast); a golden test sets it explicitly to whatever
     /// block its `camera` is known to be looking at.
     pub highlighted_block: Option<[i32; 3]>,
+    /// A block to draw cracks on, and how far the dig has got. `None` for none.
+    pub cracking: Option<([i32; 3], f32)>,
     /// Hotbar slots to draw along the bottom, or `None` for no HUD. Plain data
     /// -- a golden test builds it directly, with no sim and no inventory,
     /// which is the point of `HotbarView` carrying colours and counts rather
@@ -122,6 +124,7 @@ impl Default for Shot {
             camera: None,
             players: Vec::new(),
             highlighted_block: None,
+            cracking: None,
             hotbar: None,
             panel: None,
             health: None,
@@ -205,6 +208,7 @@ fn render_arena(
         camera,
         players,
         highlighted_block,
+        cracking,
         hotbar,
         panel,
         health,
@@ -304,6 +308,7 @@ fn render_arena(
             arena: &arena,
             draw_count,
             selected_block: highlighted_block,
+            cracking,
             players: &players,
             overlay: None,
             hotbar: hotbar.as_ref().map(|slots| crate::scene::HotbarView {

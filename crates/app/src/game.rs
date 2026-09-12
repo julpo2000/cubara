@@ -940,6 +940,17 @@ impl Game {
         self.sync().into_iter().next()
     }
 
+    /// The block being dug and how far along, for the renderer's cracks.
+    ///
+    /// **`None` when joined to someone else's world**, not a panic: progress is
+    /// counted on the server and not sent, so a remote client has nothing to
+    /// draw from -- and a missing crack is a far smaller failure than a crash
+    /// on the first frame of digging. Predicting it the way block 2.13 predicts
+    /// a pose is the way to give remote clients cracks.
+    pub fn cracking(&self) -> Option<([i32; 3], f32)> {
+        self.host.as_ref()?.server.mining_target(self.me_id)
+    }
+
     /// How far along the current break is, `0.0..1.0`, for the renderer to draw
     /// a crack overlay with. `None` when nothing is being mined.
     ///
@@ -2756,6 +2767,27 @@ mod tests {
     }
 
     #[test]
+    fn cracks_are_on_the_block_being_dug_and_grow_until_it_breaks() {
+        let (mut game, _) = game_looking_at_ground();
+        let dug = stand_over(&mut game, "cubara:stone");
+        hold(&mut game, "cubara:stone_pick");
+        assert_eq!(game.cracking(), None, "not digging");
+
+        let total = break_ticks(&game, "cubara:stone", "cubara:stone_pick");
+        game.set_breaking(true);
+        game.advance(TICK_DT);
+        let (block, first) = game.cracking().expect("digging");
+        assert_eq!(block, dug, "cracks on a different block from the one dug");
+        for _ in 1..(total - 1) {
+            game.advance(TICK_DT);
+        }
+        let (_, later) = game.cracking().expect("still digging");
+        assert!(later > first, "{later} did not grow past {first}");
+        game.advance(TICK_DT);
+        assert_eq!(game.cracking(), None, "broken, so nothing left to crack");
+    }
+
+    #[test]
     fn mining_progress_reports_a_fraction_that_climbs_to_the_break() {
         let (mut game, _) = game_looking_at_ground();
         stand_over(&mut game, "cubara:stone");
@@ -4157,6 +4189,18 @@ mod connect_tests {
             "the client generates the server's world, from the seed it was sent"
         );
         let _ = cfg;
+    }
+
+    /// Cracks are drawn from the host's count, which a joined client does not
+    /// have. It must draw nothing -- `server()` would panic.
+    #[test]
+    fn a_joined_client_has_no_cracks_rather_than_a_crash() {
+        let (mut remote, _cfg) = hosted_elsewhere();
+        let mut game = a_client();
+        let link = remote.attach();
+        game.join_over(link).expect("joined");
+        game.set_breaking(true);
+        assert_eq!(game.cracking(), None);
     }
 
     /// The id comes from the server, not from an assumption.

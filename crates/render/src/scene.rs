@@ -46,6 +46,9 @@ pub struct SceneFrame<'a> {
     pub draw_count: u32,
     /// A block to draw the selection outline around (issue #52), or `None`.
     pub selected_block: Option<[i32; 3]>,
+    /// A block being dug and how far along, `0.0..1.0`, to draw cracks on
+    /// (see [`crate::crack`]), or `None`.
+    pub cracking: Option<([i32; 3], f32)>,
     /// Screen-space debug text, or `None`.
     pub overlay: Option<&'a str>,
     /// The hotbar to draw along the bottom, or `None` to draw none.
@@ -308,6 +311,7 @@ impl SceneRenderer {
             arena,
             draw_count,
             selected_block,
+            cracking,
             players,
             overlay,
             hotbar,
@@ -322,6 +326,11 @@ impl SceneRenderer {
             Vec::with_capacity(players.len() * crate::figure::VERTICES_PER_FIGURE);
         for &view in players {
             crate::figure::figure_vertices(view, &mut figure_vertices);
+        }
+        // Cracks share the figures' buffer and draw: both are coloured,
+        // depth-tested triangles built on the CPU.
+        if let Some((block, progress)) = cracking {
+            crate::crack::crack_vertices(block, progress, &mut figure_vertices);
         }
         if figure_vertices.len() > self.figure_capacity {
             // More people came into view than the buffer holds. Grown rather
