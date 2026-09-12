@@ -1103,10 +1103,13 @@ impl Game {
         for e in effects {
             match e {
                 Effect::Edit { pos, block } => {
-                    let cc =
-                        Arc::make_mut(&mut self.world).set_block(pos[0], pos[1], pos[2], block);
-                    if !dirty.contains(&cc) {
-                        dirty.push(cc);
+                    Arc::make_mut(&mut self.world).set_block(pos[0], pos[1], pos[2], block);
+                    // Its neighbours too: a chunk hides border faces its
+                    // neighbour covers, so a change on the border changes both.
+                    for cc in cubara_world::mesh::chunks_affected_by_edit(pos) {
+                        if !dirty.contains(&cc) {
+                            dirty.push(cc);
+                        }
                     }
                 }
                 Effect::BlockEntity { pos, furnace } => {
@@ -4076,10 +4079,17 @@ mod tests {
                 .is_solid_at(ground[0], ground[1], ground[2], terrain),
             "the replica applied the edit"
         );
+        // Its own chunk, and -- this block sits on a chunk border -- the
+        // neighbours whose covered border faces now look into the hole.
         assert_eq!(
             dirty,
-            vec![ChunkCoord::from_block(ground[0], ground[1], ground[2])],
-            "and derived the stale chunk from its own world, not from the server"
+            cubara_world::mesh::chunks_affected_by_edit(ground),
+            "and derived the stale chunks from its own world, not from the server"
+        );
+        assert_eq!(
+            dirty[0],
+            ChunkCoord::from_block(ground[0], ground[1], ground[2]),
+            "its own chunk first"
         );
     }
 
@@ -4093,10 +4103,22 @@ mod tests {
             game.server_mut()
                 .set_block([ground[0], ground[1] - dy, ground[2]], BlockId::AIR);
         }
+        // However many edits, each chunk they touch is re-meshed once.
+        let mut expected: Vec<ChunkCoord> = Vec::new();
+        for dy in 0..4 {
+            for cc in
+                cubara_world::mesh::chunks_affected_by_edit([ground[0], ground[1] - dy, ground[2]])
+            {
+                if !expected.contains(&cc) {
+                    expected.push(cc);
+                }
+            }
+        }
+        let dirty = game.settle_dirty();
         assert_eq!(
-            game.settle_dirty().len(),
-            1,
-            "four edits, one chunk, one re-mesh"
+            dirty.len(),
+            expected.len(),
+            "four edits, each chunk once: {dirty:?}"
         );
     }
 

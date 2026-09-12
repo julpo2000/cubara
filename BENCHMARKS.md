@@ -50,6 +50,7 @@ frames after 200 warmup.
 | 2026-09-10 | Windows caught up to `main` — phase 2 complete, radius 64, band ±2⁴⁴ | 3,138 | 912,964 | ~2,506 | 0.136 ms | ~0.43 ms | `b82e051` |
 | 2026-09-11 | Gate re-run after six PRs, radius 64, band ±2⁴⁵ | 3,138 | 912,964 | ~2,774 | 0.124 ms | ~0.385 ms | `9dee4a6` |
 | 2026-09-13 | Seven play-test PRs (#240–#246), radius 64, band ±2⁴⁶ | 3,138 | 912,964 | ~2,674 | 0.131 ms | ~0.48 ms | `4002754` |
+| 2026-09-13 | **Covered border faces left out** — nodes meshed against their neighbours, radius 64, band ±2⁴⁷ | **1,969** | **674,484** | **~4,160** | **0.102 ms** | ~0.44 ms | *(this PR)* |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -1403,3 +1404,27 @@ The row records the last. Against `9dee4a6` that is +0.007 ms CPU/frame
 (+6%) and ~-100 FPS, still falling run over run -- inside the spread this
 machine has shown on unchanged geometry (0.124-0.136 ms across ⁴⁴ and ⁴⁵), and
 not attributable to code the bench executes. Read it as unchanged.
+
+⁴⁷ **The first optimisation from measuring where the triangles go, rather than
+from drawing less.** `crates/world/examples/geometry_census.rs` sorted every
+quad of this scene: **27.9% faced a solid cell** -- walls where two solid nodes
+meet, emitted because each node was meshed without looking at its neighbour --
+23.3% were cave walls, 48.8% surface. Nodes now leave out a border face when
+the outside cell is solid for every level of detail a neighbour could be drawn
+at (same, one coarser, one finer), so no neighbour can open a hole the face
+would have closed (`where_two_nodes_meet_every_visible_solid_cell_has_a_face`
+walks shared planes at every level pairing; removing either the coarser or the
+finer check makes it find a hole).
+
+```
+before  SUMMARY: 2674 FPS | CPU/frame avg 0.131 ms (p99 0.482) | 2730/3138 nodes   912,964 tris
+after   SUMMARY: 4160 FPS | CPU/frame avg 0.102 ms (p99 0.440) | 1671/1969 nodes   674,484 tris
+after, 3840x2160: 2726 FPS (was 1539)
+```
+
+Triangles -26%, and **1,169 nodes had nothing left to draw at all** (solid rock
+below the surface), so draws fell 37% too. FPS +56% at 1080p and +77% at 4K,
+where the removed faces had also been costing fill. Surface triangles are
+unchanged (445k before, 451k after), which is the check that nothing visible
+went. Meshing costs +19% single-threaded (1.38 s -> 1.64 s for the region), on
+the worker pool.
