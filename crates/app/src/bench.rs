@@ -5,7 +5,13 @@
 //! sustained throughput against the 1000-FPS goal. A fixed virtual time step keeps
 //! the camera orbit identical regardless of how fast the machine runs.
 //!
-//! Run with: `cargo run --release -- --bench`
+//! Run with: `cargo run --release -- --bench [radius] [--size WIDTHxHEIGHT]`
+//!
+//! **Resolution matters, and 1920x1080 is only the default.** Frame cost has a
+//! part that grows with pixels -- every covered pixel is shaded -- and a bench
+//! pinned to one size cannot see it. The owner noticed FPS dropping as the
+//! window grew; `--size` is how that is measured rather than guessed. The
+//! history in `BENCHMARKS.md` is all at the default, so rows stay comparable.
 
 use std::time::Instant;
 
@@ -20,8 +26,8 @@ use cubara_world::World;
 
 use crate::streaming::to_meshed_node;
 
-const WIDTH: u32 = 1920;
-const HEIGHT: u32 = 1080;
+/// The resolution every row in `BENCHMARKS.md` was measured at.
+pub const DEFAULT_SIZE: (u32, u32) = (1920, 1080);
 const WARMUP_FRAMES: u32 = 200;
 const MEASURE_FRAMES: u32 = 2000;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -33,7 +39,7 @@ const VIRTUAL_DT: f32 = 1.0 / 240.0;
 /// at their distance-based level (`cubara_world::mesh::mesh_region`,
 /// `schedule_for_radius`), so a larger radius shows how far render distance
 /// can grow without the draw/triangle cost exploding.
-pub fn run(radius: i32) {
+pub fn run(radius: i32, (width, height): (u32, u32)) {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         ..Default::default()
@@ -104,7 +110,7 @@ pub fn run(radius: i32) {
     ];
     let view_radius = (max[0] - min[0]).max(max[2] - min[2]) * 0.75;
     log::info!(
-        "rendering {WIDTH}x{HEIGHT}, {total_nodes} nodes via {}",
+        "rendering {width}x{height}, {total_nodes} nodes via {}",
         if multi_draw {
             "1 multi_draw_indirect"
         } else {
@@ -117,8 +123,8 @@ pub fn run(radius: i32) {
         &device,
         &queue,
         COLOR_FORMAT,
-        WIDTH,
-        HEIGHT,
+        width,
+        height,
         &tex_view,
         &tex_sampler,
     );
@@ -127,8 +133,8 @@ pub fn run(radius: i32) {
     let color = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("bench-color"),
         size: wgpu::Extent3d {
-            width: WIDTH,
-            height: HEIGHT,
+            width,
+            height,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -140,7 +146,7 @@ pub fn run(radius: i32) {
     });
     let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let aspect = WIDTH as f32 / HEIGHT as f32;
+    let aspect = width as f32 / height as f32;
     let mut virtual_t = 0.0f32;
 
     // Records one frame (camera upload + frustum cull + indirect-list upload +
@@ -245,4 +251,31 @@ fn report(frames: u32, wall_secs: f64, mut cpu_ms: Vec<f64>, avg_visible: f64, t
         "SUMMARY: {throughput:.0} FPS | CPU/frame avg {cpu_avg:.3} ms (p99 {cpu_p99:.3}) | \
          {avg_visible:.0}/{total_nodes} nodes | 1000-FPS gate {gate}"
     );
+}
+
+/// Parse a `--size` value: `WIDTHxHEIGHT`, both positive, e.g. `2560x1440`.
+pub fn parse_size(text: &str) -> Option<(u32, u32)> {
+    let (w, h) = text.split_once(['x', 'X'])?;
+    let (w, h) = (w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?);
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_size_is_width_x_height() {
+        assert_eq!(parse_size("2560x1440"), Some((2560, 1440)));
+        assert_eq!(parse_size("1280X720"), Some((1280, 720)));
+    }
+
+    #[test]
+    fn a_malformed_size_is_refused_rather_than_guessed() {
+        for bad in [
+            "", "1920", "x1080", "1920x", "0x1080", "1920x0", "-1x5", "wide",
+        ] {
+            assert_eq!(parse_size(bad), None, "{bad:?}");
+        }
+    }
 }
