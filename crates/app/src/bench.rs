@@ -180,6 +180,7 @@ pub fn run(radius: i32) {
                     // The bench measures the world, not a HUD.
                     hotbar: None,
                     panel: None,
+                    crosshair: false,
                 },
             );
             queue.submit(std::iter::once(encoder.finish()));

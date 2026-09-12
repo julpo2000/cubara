@@ -412,6 +412,8 @@ fn a_cave_mouth_is_visible() {
         hotbar: None,
         panel: None,
         health: None,
+        crosshair: false,
+        tooltip: None,
     };
     assert_golden("cave_mouth", &world, shot);
 }
@@ -447,6 +449,8 @@ fn iron_ore_is_visible_in_a_cave_wall() {
         hotbar: None,
         panel: None,
         health: None,
+        crosshair: false,
+        tooltip: None,
     };
     assert_golden("iron_ore", &world, shot);
 }
@@ -516,6 +520,8 @@ fn the_selected_block_shows_an_outline() {
         hotbar: None,
         panel: None,
         health: None,
+        crosshair: false,
+        tooltip: None,
     };
     assert_golden("outline", &world, shot);
 }
@@ -560,6 +566,8 @@ fn the_hotbar_shows_slots_counts_and_the_held_one() {
         hotbar: Some(hotbar),
         panel: None,
         health: None,
+        crosshair: false,
+        tooltip: None,
     };
     assert_golden("hotbar", &world, shot);
 }
@@ -608,6 +616,8 @@ fn the_inventory_screen_shows_slots_a_recipe_and_the_cursor() {
         highlighted_block: None,
         hotbar: None,
         health: None,
+        crosshair: false,
+        tooltip: None,
         panel: Some((
             PanelLayout::Grid(2),
             contents,
@@ -618,6 +628,92 @@ fn the_inventory_screen_shows_slots_a_recipe_and_the_cursor() {
         )),
     };
     assert_golden("inventory_screen", &world, shot);
+}
+
+#[test]
+fn an_item_name_shows_beside_the_cursor() {
+    // The owner asked for it: hovering an item says what it is. One filled
+    // slot with the cursor over it and a label, which has to sit beside the
+    // cursor and above the screen rather than under it.
+    let panel = InventoryPanel::layout(960, 540, 2);
+    let contents: Vec<Option<HotbarSlot>> = panel
+        .slots()
+        .iter()
+        .map(|s| match (s.kind, s.index) {
+            (PanelSlotKind::Inventory, 4) => Some(HotbarSlot {
+                color: [0.66, 0.50, 0.31],
+                count: 1,
+            }),
+            _ => None,
+        })
+        .collect();
+    let hovered = panel
+        .slots()
+        .iter()
+        .find(|s| s.kind == PanelSlotKind::Inventory && s.index == 4)
+        .expect("slot 4 exists");
+
+    let world = World::new();
+    let shot = Shot {
+        width: 960,
+        height: 540,
+        region_radius: 2,
+        orbit_t: 0.0,
+        camera: None,
+        players: Vec::new(),
+        highlighted_block: None,
+        hotbar: None,
+        health: None,
+        crosshair: false,
+        tooltip: Some("Wooden Pick".to_string()),
+        panel: Some((
+            PanelLayout::Grid(2),
+            contents,
+            None,
+            (hovered.x + 20.0, hovered.y + 20.0),
+        )),
+    };
+    assert_golden("item_tooltip", &world, shot);
+}
+
+#[test]
+fn the_crosshair_marks_the_centre_of_the_screen() {
+    // The owner asked for a mark in the middle: where a click lands. Over
+    // terrain rather than sky, so the golden shows it reads against both the
+    // rim and the ground behind it.
+    let world = World::new();
+    let shot = Shot {
+        width: 960,
+        height: 540,
+        region_radius: 2,
+        orbit_t: 0.0,
+        camera: None,
+        players: Vec::new(),
+        highlighted_block: None,
+        hotbar: None,
+        panel: None,
+        health: None,
+        crosshair: true,
+        tooltip: None,
+    };
+    // A crosshair is about 0.1% of the frame -- under the golden's 0.5%
+    // tolerance, so the image comparison alone passes with it missing (found
+    // by deleting the draw call). Look at the middle directly as well.
+    if let Some(frame) = render_world(&world, shot.clone()) {
+        let at = |x: u32, y: u32| {
+            let i = ((y * frame.width + x) * 4) as usize;
+            [frame.pixels[i], frame.pixels[i + 1], frame.pixels[i + 2]]
+        };
+        let (cx, cy) = (frame.width / 2, frame.height / 2);
+        for (x, y) in [(cx, cy), (cx + 6, cy), (cx, cy + 6)] {
+            let p = at(x, y);
+            assert!(
+                p.iter().all(|&c| c > 220),
+                "no crosshair at ({x}, {y}): {p:?}"
+            );
+        }
+    }
+    assert_golden("crosshair", &world, shot);
 }
 
 #[test]
@@ -639,6 +735,8 @@ fn hearts_show_health_including_a_half() {
         hotbar: Some([None; 9]),
         panel: None,
         health: Some((13, 20)),
+        crosshair: false,
+        tooltip: None,
     };
     assert_golden("hearts", &world, shot);
 }
@@ -684,6 +782,8 @@ fn the_furnace_screen_shows_input_fuel_and_output() {
         highlighted_block: None,
         hotbar: None,
         health: None,
+        crosshair: false,
+        tooltip: None,
         panel: Some((
             PanelLayout::Furnace,
             contents,
@@ -735,6 +835,8 @@ fn distinct_materials_render_with_distinct_textures() {
         hotbar: None,
         panel: None,
         health: None,
+        crosshair: false,
+        tooltip: None,
     };
 
     let Some(frame) = headless::render_chunks(&chunks, shot) else {
@@ -871,6 +973,8 @@ fn three_players_stand_in_front_of_the_camera() {
         hotbar: None,
         panel: None,
         health: None,
+        crosshair: false,
+        tooltip: None,
     };
     assert_golden("three_players", &world, shot);
 }
