@@ -104,6 +104,10 @@ pub struct Shot {
     pub panel: Option<PanelShot>,
     /// Hearts to draw, as `(points, max_points)`. `None` draws none.
     pub health: Option<(u8, u8)>,
+    /// Draw the centre crosshair.
+    pub crosshair: bool,
+    /// A tooltip beside the panel's cursor. Ignored without a `panel`.
+    pub tooltip: Option<String>,
 }
 
 impl Default for Shot {
@@ -119,6 +123,8 @@ impl Default for Shot {
             hotbar: None,
             panel: None,
             health: None,
+            crosshair: false,
+            tooltip: None,
         }
     }
 }
@@ -199,6 +205,8 @@ fn render_arena(
         hotbar,
         panel,
         health,
+        crosshair,
+        tooltip,
     } = shot;
     // Slot 0 held: a fixed choice, so a golden reference has a stable
     // selection highlight to compare against.
@@ -307,7 +315,9 @@ fn render_arena(
                     contents,
                     held: *held,
                     cursor: *cursor,
+                    tooltip: tooltip.as_deref(),
                 }),
+            crosshair,
         },
     );
     encoder.copy_texture_to_buffer(

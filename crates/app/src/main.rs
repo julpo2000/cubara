@@ -17,7 +17,7 @@ mod streaming;
 
 use std::sync::Arc;
 
-use cubara_render::{grab_cursor, HotbarView, PanelView, Profiler, Renderer};
+use cubara_render::{grab_cursor, HotbarView, Hud, PanelView, Profiler, Renderer};
 
 use crate::capture::CaptureEvent;
 use crate::game::{
@@ -366,20 +366,29 @@ impl ApplicationHandler for App {
                 });
                 let (w, h) = renderer.size();
                 let panel_data = self.game.panel_view(w, h);
+                let hovered = self
+                    .game
+                    .hovered_item_name(self.cursor.0, self.cursor.1, w, h);
                 let panel = panel_data.as_ref().map(|(p, contents, held)| PanelView {
                     panel: p,
                     contents,
                     held: *held,
                     cursor: self.cursor,
+                    tooltip: hovered.as_deref(),
                 });
                 let others = self.game.other_players();
                 renderer.render(
                     camera,
                     self.game.selected_block(),
                     &others,
-                    hotbar,
-                    panel,
-                    Some(self.game.health_view()),
+                    Hud {
+                        hotbar,
+                        panel,
+                        health: Some(self.game.health_view()),
+                        // Only while looking through the camera: over a
+                        // screen it would mark nothing.
+                        crosshair: self.cursor_captured && !self.game.inventory_open(),
+                    },
                 );
                 // Immediately queue the next frame — we render continuously.
                 renderer.window().request_redraw();

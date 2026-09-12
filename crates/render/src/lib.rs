@@ -35,5 +35,5 @@ pub use render::{
     load_mesh_assets, load_registry, CameraPose, CameraUniform, Renderer,
 };
 pub use scene::HealthView;
-pub use scene::{HotbarSlot, HotbarView, PanelView, SceneFrame, SceneRenderer};
+pub use scene::{HotbarSlot, HotbarView, Hud, PanelView, SceneFrame, SceneRenderer};
 pub use text::TextRenderer;

@@ -247,6 +247,29 @@ pub const MY_SHIRT: cubara_server::wire::Shirt = if cfg!(target_os = "linux") {
 /// indistinguishable from somebody else.
 const UNKNOWN_SHIRT: [f32; 3] = [0.55, 0.55, 0.55];
 
+/// What one slot of an open screen holds: an item and how many, or nothing.
+type SlotStack = Option<(cubara_voxel::ItemId, u8)>;
+
+/// What a player reads for an item id: `cubara:wooden_pick` is "Wooden Pick".
+///
+/// Derived rather than declared, because no item file carries a display name
+/// and inventing one per item would be content nobody asked for. The namespace
+/// is dropped, underscores become spaces, and each word is capitalised.
+pub fn display_name(id: &str) -> String {
+    let bare = id.rsplit(':').next().unwrap_or(id);
+    bare.split('_')
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                Some(first) => first.to_uppercase().chain(c).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The hotbar slot `steps` to the right of `current` (negative is left),
 /// wrapping around the ends.
 fn scrolled_slot(current: u8, steps: i32) -> u8 {
@@ -1290,6 +1313,50 @@ impl Game {
         width: u32,
         height: u32,
     ) -> Option<(InventoryPanel, Vec<Option<HotbarSlot>>, Option<HotbarSlot>)> {
+        let (panel, stacks) = self.panel_stacks(width, height)?;
+        let items = self.assets.as_ref().map(|a| &a.items)?;
+        let swatch = |(id, count): (cubara_voxel::ItemId, u8)| {
+            items.name_of(id).map(|name| HotbarSlot {
+                color: swatch_color(name),
+                count,
+            })
+        };
+        let contents = stacks.into_iter().map(|s| s.and_then(swatch)).collect();
+        let held = self
+            .me
+            .player()
+            .crafting
+            .held()
+            .and_then(|s| swatch((s.item(), s.count())));
+        Some((panel, contents, held))
+    }
+
+    /// The name to show for whatever is under the cursor on the open screen,
+    /// or `None` over an empty slot, open space, or while carrying something
+    /// (the carried stack sits exactly where the label would).
+    pub fn hovered_item_name(&self, x: f32, y: f32, width: u32, height: u32) -> Option<String> {
+        if self.me.player().crafting.held().is_some() {
+            return None;
+        }
+        let (panel, stacks) = self.panel_stacks(width, height)?;
+        let (kind, index) = panel.hit(x, y)?;
+        let at = panel
+            .slots()
+            .iter()
+            .position(|s| s.kind == kind && s.index == index)?;
+        let (id, _) = stacks[at]?;
+        let items = self.assets.as_ref().map(|a| &a.items)?;
+        items.name_of(id).map(display_name)
+    }
+
+    /// The open screen's layout, and what each of its slots holds, in
+    /// `panel.slots()` order.
+    ///
+    /// **The one answer to "what is in that slot"**, which drawing the screen
+    /// and naming what is under the cursor both read. Two copies of this match
+    /// would be two chances to label a slot with something other than what is
+    /// drawn in it.
+    fn panel_stacks(&self, width: u32, height: u32) -> Option<(InventoryPanel, Vec<SlotStack>)> {
         if !self.inventory_open {
             return None;
         }
@@ -1301,44 +1368,27 @@ impl Game {
             Some(_) => InventoryPanel::layout_furnace(width, height),
             None => InventoryPanel::layout(width, height, crafting.width()),
         };
+        let of = |stack: cubara_voxel::ItemStack| (stack.item(), stack.count());
 
-        let swatch = |stack: cubara_voxel::ItemStack| {
-            items.name_of(stack.item()).map(|name| HotbarSlot {
-                color: swatch_color(name),
-                count: stack.count(),
-            })
-        };
         // A furnace slot holds `(id, count)` rather than an `ItemStack`, since
         // nothing in a furnace has durability.
-        let furnace_swatch = |slot: Option<(cubara_voxel::ItemId, u8)>| {
-            slot.and_then(|(id, count)| {
-                items.name_of(id).map(|name| HotbarSlot {
-                    color: swatch_color(name),
-                    count,
-                })
-            })
-        };
-
-        let contents = panel
+        let stacks = panel
             .slots()
             .iter()
             .map(|s| match (s.kind, furnace) {
-                (PanelSlotKind::Inventory, _) => {
-                    self.me.player().inventory.slot(s.index).and_then(swatch)
+                (PanelSlotKind::Inventory, _) => self.me.player().inventory.slot(s.index).map(of),
+                (PanelSlotKind::Grid, Some(f)) => f.input,
+                (PanelSlotKind::Fuel, Some(f)) => f.fuel,
+                (PanelSlotKind::Result, Some(f)) => f.output,
+                (PanelSlotKind::Grid, None) => crafting.cell(s.index).map(of),
+                (PanelSlotKind::Result, None) => {
+                    book.and_then(|b| crafting.result(b, items)).map(of)
                 }
-                (PanelSlotKind::Grid, Some(f)) => furnace_swatch(f.input),
-                (PanelSlotKind::Fuel, Some(f)) => furnace_swatch(f.fuel),
-                (PanelSlotKind::Result, Some(f)) => furnace_swatch(f.output),
-                (PanelSlotKind::Grid, None) => crafting.cell(s.index).and_then(swatch),
-                (PanelSlotKind::Result, None) => book
-                    .and_then(|b| crafting.result(b, items))
-                    .and_then(swatch),
                 // Only a furnace layout produces a fuel slot.
                 (PanelSlotKind::Fuel, None) => None,
             })
             .collect();
-        let held = crafting.held().and_then(swatch);
-        Some((panel, contents, held))
+        Some((panel, stacks))
     }
 
     /// Which hotbar slot is held, for the renderer.
@@ -2835,6 +2885,77 @@ mod tests {
             "one ingot"
         );
         assert_eq!(f.input, None, "the raw iron was consumed");
+    }
+
+    #[test]
+    fn an_item_id_reads_as_capitalised_words() {
+        assert_eq!(display_name("cubara:wooden_pick"), "Wooden Pick");
+        assert_eq!(display_name("cubara:stick"), "Stick");
+        assert_eq!(display_name("iron_ingot"), "Iron Ingot", "no namespace");
+    }
+
+    /// Where on a 1280x720 screen the centre of `kind`/`index` is.
+    fn slot_centre(panel: &InventoryPanel, kind: PanelSlotKind, index: usize) -> (f32, f32) {
+        let s = panel
+            .slots()
+            .iter()
+            .find(|s| s.kind == kind && s.index == index)
+            .unwrap_or_else(|| panic!("no {kind:?} {index}"));
+        (s.x + s.size / 2.0, s.y + s.size / 2.0)
+    }
+
+    #[test]
+    fn hovering_a_slot_names_what_is_in_it_and_nothing_else() {
+        let mut game = game_with_assets();
+        let items = game.server().items.as_ref().unwrap().clone();
+        let stick = items.new_stack(item(&game, "cubara:stick"), 3).unwrap();
+        let plank = items.new_stack(item(&game, "cubara:plank"), 2).unwrap();
+        game.host_player_mut().inventory.set_slot(4, Some(stick));
+        game.host_player_mut().inventory.set_slot(5, Some(plank));
+        game.settle();
+        game.toggle_inventory();
+
+        let (w, h) = (1280, 720);
+        let panel = InventoryPanel::layout(w, h, 2);
+        let at = |kind, index| slot_centre(&panel, kind, index);
+        let name = |g: &Game, (x, y): (f32, f32)| g.hovered_item_name(x, y, w, h);
+
+        // Two different items side by side, so naming the neighbour is visible.
+        assert_eq!(
+            name(&game, at(PanelSlotKind::Inventory, 4)).as_deref(),
+            Some("Stick")
+        );
+        assert_eq!(
+            name(&game, at(PanelSlotKind::Inventory, 5)).as_deref(),
+            Some("Plank")
+        );
+        assert_eq!(
+            name(&game, at(PanelSlotKind::Inventory, 6)),
+            None,
+            "an empty slot"
+        );
+        assert_eq!(name(&game, (1.0, 1.0)), None, "open space");
+
+        // Carrying something: the carried stack is where the label would be.
+        game.click_panel(
+            at(PanelSlotKind::Inventory, 4).0,
+            at(PanelSlotKind::Inventory, 4).1,
+            false,
+            w,
+            h,
+        );
+        assert_eq!(
+            name(&game, at(PanelSlotKind::Inventory, 5)),
+            None,
+            "shown while carrying"
+        );
+
+        game.toggle_inventory();
+        assert_eq!(
+            name(&game, at(PanelSlotKind::Inventory, 5)),
+            None,
+            "shown with no screen"
+        );
     }
 
     #[test]

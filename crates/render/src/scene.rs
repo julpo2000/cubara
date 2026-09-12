@@ -65,6 +65,25 @@ pub struct SceneFrame<'a> {
     /// the app passes both numbers (`ARCHITECTURE.md` Rule 3, the same
     /// boundary [`HotbarView`] draws).
     pub health: Option<HealthView>,
+    /// Whether to draw the crosshair at the centre of the screen.
+    ///
+    /// The caller decides, because only it knows whether the player is looking
+    /// through the camera or at a screen: a crosshair over an inventory is a
+    /// mark on nothing.
+    pub crosshair: bool,
+}
+
+/// Everything drawn over the world in screen space, as the window hands it to
+/// [`crate::Renderer::render`]. Grouped because each is one more optional
+/// piece of HUD, and a new one should be a field here rather than another
+/// positional argument at every call site.
+#[derive(Clone, Copy, Debug)]
+pub struct Hud<'a> {
+    pub hotbar: Option<HotbarView<'a>>,
+    pub panel: Option<PanelView<'a>>,
+    pub health: Option<HealthView>,
+    /// See [`SceneFrame::crosshair`].
+    pub crosshair: bool,
 }
 
 /// What the renderer needs to draw hearts: two numbers.
@@ -87,6 +106,9 @@ pub struct PanelView<'a> {
     /// What the cursor is carrying, and where the cursor is in pixels.
     pub held: Option<HotbarSlot>,
     pub cursor: (f32, f32),
+    /// A label to show beside the cursor -- the name of the item under it --
+    /// or `None`. Already a string: this crate does not know what an item is.
+    pub tooltip: Option<&'a str>,
 }
 
 /// One hotbar slot's contents, already reduced to what drawing needs.
@@ -277,6 +299,7 @@ impl SceneRenderer {
             hotbar,
             panel,
             health,
+            crosshair,
         } = frame;
 
         // Build this frame's figures and upload them. Done before the pass so
@@ -367,8 +390,16 @@ impl SceneRenderer {
         // Overlay: a second pass over the same colour target (loaded, no depth).
         // Text and hotbar share it -- both are screen-space quads out of the
         // same vertex buffer, so drawing the HUD costs no extra pass.
-        if overlay.is_none() && hotbar.is_none() && panel.is_none() && health.is_none() {
+        if overlay.is_none()
+            && hotbar.is_none()
+            && panel.is_none()
+            && health.is_none()
+            && !crosshair
+        {
             return;
+        }
+        if crosshair {
+            self.queue_crosshair();
         }
         if let Some(text) = overlay {
             const SCALE: f32 = 2.0;
@@ -442,6 +473,61 @@ impl SceneRenderer {
             let (cx, cy) = view.cursor;
             let s = crate::panel::SLOT;
             self.queue_item(cx - s * 0.5, cy - s * 0.5, s, PAD, held);
+        }
+
+        if let Some(label) = view.tooltip {
+            self.queue_tooltip(label, view.cursor);
+        }
+    }
+
+    /// An item's name in a dark box just above and right of the cursor, kept
+    /// on screen at the edges.
+    fn queue_tooltip(&mut self, label: &str, (cx, cy): (f32, f32)) {
+        const SCALE: f32 = 2.0;
+        const PAD: f32 = 5.0;
+        const BACK: [f32; 3] = [0.05, 0.04, 0.08];
+        const EDGE: [f32; 3] = [0.30, 0.20, 0.50];
+        let glyph = font::GLYPH as f32 * SCALE;
+        let w = label.chars().count() as f32 * glyph + PAD * 2.0;
+        let h = glyph + PAD * 2.0;
+        let x = (cx + 14.0).min(self.width as f32 - w).max(0.0);
+        let y = (cy - h - 6.0).max(0.0);
+        self.text
+            .queue_rect(x - 1.0, y - 1.0, w + 2.0, h + 2.0, EDGE);
+        self.text.queue_rect_alpha(x, y, w, h, BACK, 0.94);
+        self.text
+            .queue(label, x + PAD, y + PAD, SCALE, [1.0, 1.0, 1.0]);
+    }
+
+    /// A small plus at the centre of the screen: where a click lands.
+    ///
+    /// White with a dark rim, so it reads against sky and against snow-pale
+    /// stone alike; the overlay pass has no blend mode that would invert what
+    /// is behind it, and adding one for four rectangles is not worth a second
+    /// 2D path.
+    fn queue_crosshair(&mut self) {
+        const ARM: f32 = 9.0;
+        const THICK: f32 = 2.0;
+        const RIM: [f32; 3] = [0.05, 0.05, 0.06];
+        const MARK: [f32; 3] = [0.95, 0.95, 0.95];
+        // Whole pixels, so a 2 px line is 2 px and not a blurred 3.
+        let cx = (self.width as f32 * 0.5).floor();
+        let cy = (self.height as f32 * 0.5).floor();
+        for (color, grow) in [(RIM, 1.0), (MARK, 0.0)] {
+            self.text.queue_rect(
+                cx - ARM - grow,
+                cy - THICK * 0.5 - grow,
+                ARM * 2.0 + grow * 2.0,
+                THICK + grow * 2.0,
+                color,
+            );
+            self.text.queue_rect(
+                cx - THICK * 0.5 - grow,
+                cy - ARM - grow,
+                THICK + grow * 2.0,
+                ARM * 2.0 + grow * 2.0,
+                color,
+            );
         }
     }
 

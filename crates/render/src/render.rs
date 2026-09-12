@@ -520,18 +520,21 @@ impl Renderer {
         }
     }
 
-    /// `hotbar` and `health` are plain data the caller reduces its state to --
-    /// this crate never learns what an item is, or what hurt the player
-    /// (Rule 3).
+    /// `hud` is plain data the caller reduces its state to -- this crate never
+    /// learns what an item is, or what hurt the player (Rule 3).
     pub fn render(
         &mut self,
         camera: CameraPose,
         selected_block: Option<[i32; 3]>,
         players: &[crate::figure::PlayerView],
-        hotbar: Option<crate::scene::HotbarView<'_>>,
-        panel: Option<crate::scene::PanelView<'_>>,
-        health: Option<crate::scene::HealthView>,
+        hud: crate::scene::Hud<'_>,
     ) {
+        let crate::scene::Hud {
+            hotbar,
+            panel,
+            health,
+            crosshair,
+        } = hud;
         crate::profiling::Profiler::new_frame();
         puffin::profile_function!();
         self.update(camera);
@@ -576,6 +579,7 @@ impl Renderer {
                     hotbar,
                     panel,
                     health,
+                    crosshair,
                 },
             );
         }
