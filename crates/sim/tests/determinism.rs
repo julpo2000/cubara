@@ -202,7 +202,13 @@ fn fixture_edits() -> Vec<(usize, [i32; 3], BlockId)> {
 /// fixture still drives exactly one player through exactly the same script, and
 /// that player ends in exactly the same condition; what moved is the frame
 /// around them.
-const KNOWN_FIXTURE_HASH: u64 = 0x3935_6967_c3f3_6b29;
+///
+/// **Moved again when step-up was removed** (`0x3935_6967_c3f3_6b29` before
+/// it). The fixture walks a player across real terrain, and without step-up a
+/// one-block rise stops them where it used to lift them, so they end somewhere
+/// else. The same script, a different gait -- which is exactly what the hash is
+/// for noticing.
+const KNOWN_FIXTURE_HASH: u64 = 0x3972_1613_3f68_ecc0;
 
 #[test]
 fn replay_of_the_same_seed_and_script_is_deterministic() {

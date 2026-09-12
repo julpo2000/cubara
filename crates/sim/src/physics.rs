@@ -1,4 +1,4 @@
-//! Walking physics: gravity, jump, step-up, and collision (`docs/PHASE1_ARCHITECTURE.md`
+//! Walking physics: gravity, jump, and collision (`docs/PHASE1_ARCHITECTURE.md`
 //! §10, issue #53).
 //!
 //! An axis-aligned box swept against solid voxels and resolved **axis by axis
@@ -43,8 +43,6 @@ pub const HEIGHT: Fixed = Fixed::from_raw(18 * ONE / 10);
 /// resting on a boundary arrives on the boundary rather than a few ULPs below
 /// it.
 pub const EYE_HEIGHT: Fixed = Fixed::from_raw(162 * ONE / 100);
-/// The tallest ledge walking climbs without a jump.
-const STEP_HEIGHT: Fixed = Fixed::ONE;
 /// Ticks per second -- what a per-second velocity is divided by.
 const TICKS_PER_SECOND: i64 = 60;
 /// Downward acceleration, in sub-units per second **added per tick**:
@@ -152,7 +150,6 @@ pub(crate) fn step(
     player.velocity.x = walk(wish.x);
     player.velocity.z = walk(wish.z);
 
-    let was_on_ground = player.on_ground;
     let feet = FixedVec3::new(player.pos.x, player.pos.y - EYE_HEIGHT, player.pos.z);
     let aabb = Aabb::from_feet(feet);
 
@@ -174,20 +171,11 @@ pub(crate) fn step(
     if !player.on_ground && dropped > Fixed::ZERO {
         player.fall_distance += dropped;
     }
-    let aabb = move_axis_with_step(
-        aabb,
-        0,
-        per_tick(player.velocity.x),
-        was_on_ground,
-        &is_solid,
-    );
-    let aabb = move_axis_with_step(
-        aabb,
-        2,
-        per_tick(player.velocity.z),
-        was_on_ground,
-        &is_solid,
-    );
+    // **No step-up.** Walking into a one-block rise stops you, and you jump
+    // onto it. It used to lift the player automatically; the owner asked for
+    // that off, because it reads as the game jumping for you.
+    let (aabb, _, _) = move_axis(aabb, 0, per_tick(player.velocity.x), &is_solid);
+    let (aabb, _, _) = move_axis(aabb, 2, per_tick(player.velocity.z), &is_solid);
 
     let feet = aabb.feet();
     player.pos = FixedVec3::new(feet.x, feet.y + EYE_HEIGHT, feet.z);
@@ -338,40 +326,6 @@ fn move_axis(
         layer += step;
     }
     (aabb.translated(axis_delta(axis, delta)), false, negative)
-}
-
-/// Like [`move_axis`], but if the direct move is blocked and `can_step` (the
-/// player was on the ground at the start of this tick), tries lifting the
-/// box by up to [`STEP_HEIGHT`], moving horizontally from there, then
-/// settling back down -- classic step-up-a-ledge assist, so walking over a
-/// one-block rise doesn't require a jump. Keeps whichever path made more
-/// horizontal progress.
-fn move_axis_with_step(
-    aabb: Aabb,
-    axis: usize,
-    delta: Fixed,
-    can_step: bool,
-    is_solid: &impl Fn(i32, i32, i32) -> bool,
-) -> Aabb {
-    let (flat, blocked, _) = move_axis(aabb, axis, delta, is_solid);
-    if delta == Fixed::ZERO || !blocked || !can_step {
-        return flat;
-    }
-
-    let (raised, _, _) = move_axis(aabb, 1, STEP_HEIGHT, is_solid);
-    let (stepped, stepped_blocked, _) = move_axis(raised, axis, delta, is_solid);
-    if stepped_blocked {
-        return flat;
-    }
-    let (settled, _, _) = move_axis(stepped, 1, -STEP_HEIGHT, is_solid);
-
-    let flat_progress = (flat.min[axis] - aabb.min[axis]).abs();
-    let stepped_progress = (settled.min[axis] - aabb.min[axis]).abs();
-    if stepped_progress > flat_progress {
-        settled
-    } else {
-        flat
-    }
 }
 
 /// Whether `player`'s collision box (derived from `pos` the same way
@@ -562,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn steps_up_a_one_block_ledge_while_walking_into_it() {
+    fn walking_into_a_one_block_ledge_stops_and_a_jump_climbs_it() {
         // Yaw 0 faces −Z (`Player::look_dir`); the ledge sits at z <= −2,
         // so walking forward with no turn walks straight into it.
         let mut player = Player::new(
@@ -590,11 +544,30 @@ mod tests {
                 "tunnelled into the step"
             );
         }
+        // No autojump: stopped at the foot of the ledge, still on the floor.
         assert!(
-            player.pos.z < Fixed::from_f32(-2.5),
-            "climbed onto the raised ledge: z = {:?}",
+            player.pos.z > Fixed::from_f32(-2.0),
+            "walked onto the ledge without jumping: z = {:?}",
             player.pos.z
         );
+        assert_eq!(player.pos.y, Fixed::ONE + EYE_HEIGHT, "was lifted");
+        assert!(player.on_ground);
+
+        // Jumping while pushing forward gets up there.
+        let jump_forward = InputFrame {
+            jump: true,
+            ..forward
+        };
+        step(&mut player, &jump_forward, floor_with_one_block_step);
+        for _ in 0..120 {
+            step(&mut player, &forward, floor_with_one_block_step);
+        }
+        assert!(
+            player.pos.z < Fixed::from_f32(-2.5),
+            "a jump did not climb the ledge: z = {:?}",
+            player.pos.z
+        );
+        assert_eq!(player.pos.y, Fixed::from_blocks(2) + EYE_HEIGHT);
         assert!(player.on_ground);
     }
 

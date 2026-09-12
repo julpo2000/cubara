@@ -26,6 +26,8 @@ pub struct CaptureOutcome {
     /// world. The click that brings you back into the game is not a click
     /// *in* the game -- otherwise returning to the window places a block.
     pub consumed: bool,
+    /// Whether the open screen (inventory, bench, furnace) should close.
+    pub close_screen: bool,
 }
 
 /// Apply `event` to a mouse that is `captured` or not, with an inventory-style
@@ -40,25 +42,57 @@ pub struct CaptureOutcome {
 /// **A click takes it back**, rather than regaining focus: focus also comes
 /// back when somebody clicks the title bar to move or maximise the window, and
 /// grabbing the cursor in the middle of that is hostile.
+///
+/// **Escape closes a screen before it does anything else.** With a bench open,
+/// "let go of the mouse" is meaningless -- the mouse is already free -- and
+/// what somebody pressing Escape there wants is out.
 pub fn apply(captured: bool, screen_open: bool, event: CaptureEvent) -> CaptureOutcome {
+    let keep = CaptureOutcome {
+        captured,
+        consumed: false,
+        close_screen: false,
+    };
     match event {
+        CaptureEvent::Escape if screen_open => CaptureOutcome {
+            consumed: true,
+            close_screen: true,
+            ..keep
+        },
         CaptureEvent::Escape => CaptureOutcome {
             captured: !captured,
             consumed: true,
+            ..keep
         },
         CaptureEvent::FocusLost => CaptureOutcome {
             captured: false,
-            consumed: false,
+            ..keep
         },
         // With a screen open the cursor is free on purpose, to click slots.
         CaptureEvent::Click if !captured && !screen_open => CaptureOutcome {
             captured: true,
             consumed: true,
+            ..keep
         },
-        CaptureEvent::Click => CaptureOutcome {
-            captured,
-            consumed: false,
-        },
+        CaptureEvent::Click => keep,
+    }
+}
+
+/// Whether the game should hold the mouse after a screen `was_open` and now
+/// `is_open`.
+///
+/// **Capture follows the screen, whatever opened it.** It used to be set only
+/// by the E key, so a bench or furnace opened by clicking it -- which reaches
+/// the client as a message, not a key -- left the mouse captured, and moving
+/// it to a slot turned the camera instead.
+///
+/// Only the *change* acts: a screen opening lets go, a screen closing takes
+/// the mouse back. Otherwise Escape and focus loss decide, and this must not
+/// undo them every frame.
+pub fn follow_screen(captured: bool, was_open: bool, is_open: bool) -> bool {
+    match (was_open, is_open) {
+        (false, true) => false,
+        (true, false) => true,
+        _ => captured,
     }
 }
 
@@ -77,13 +111,34 @@ mod tests {
 
     #[test]
     fn losing_focus_lets_go_of_the_mouse() {
-        assert_eq!(
-            apply(true, false, CaptureEvent::FocusLost),
-            CaptureOutcome {
-                captured: false,
-                consumed: false
-            }
+        let out = apply(true, false, CaptureEvent::FocusLost);
+        assert!(!out.captured && !out.consumed && !out.close_screen);
+    }
+
+    #[test]
+    fn escape_on_an_open_screen_closes_it_and_leaves_capture_alone() {
+        let out = apply(false, true, CaptureEvent::Escape);
+        assert!(out.close_screen, "escape did not close the screen");
+        assert!(!out.captured, "capture is follow_screen's to restore");
+        assert!(out.consumed);
+        assert!(!apply(true, false, CaptureEvent::Escape).close_screen);
+    }
+
+    /// The bench bug: opened by a click, the mouse stayed captured.
+    #[test]
+    fn a_screen_opening_lets_go_and_closing_takes_the_mouse_back() {
+        assert!(!follow_screen(true, false, true), "opening kept the mouse");
+        assert!(
+            follow_screen(false, true, false),
+            "closing did not take it back"
         );
+    }
+
+    #[test]
+    fn no_change_in_the_screen_leaves_capture_to_escape_and_focus() {
+        assert!(!follow_screen(false, false, false), "undid an escape");
+        assert!(follow_screen(true, false, false));
+        assert!(!follow_screen(false, true, true));
     }
 
     /// The bug: click out, maximise, click back in, and the mouse did nothing.
@@ -104,7 +159,8 @@ mod tests {
             apply(true, false, CaptureEvent::Click),
             CaptureOutcome {
                 captured: true,
-                consumed: false
+                consumed: false,
+                close_screen: false,
             }
         );
     }
@@ -115,7 +171,8 @@ mod tests {
             apply(false, true, CaptureEvent::Click),
             CaptureOutcome {
                 captured: false,
-                consumed: false
+                consumed: false,
+                close_screen: false,
             }
         );
     }

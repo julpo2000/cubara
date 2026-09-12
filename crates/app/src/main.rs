@@ -85,6 +85,9 @@ struct App {
     connect_to: Option<String>,
     /// Whether the mouse is captured for first-person look (toggled with Escape).
     cursor_captured: bool,
+    /// Whether a screen was open when capture last looked, so only a change
+    /// moves the mouse (`capture::follow_screen`).
+    screen_was_open: bool,
     /// Whether an Alt key is down, for Alt+Enter.
     alt_held: bool,
     /// Last known cursor position in window pixels. Only meaningful while the
@@ -95,6 +98,22 @@ struct App {
     /// When the last frame was drawn. The app loop owns the clock and hands `dt`
     /// to the game; the renderer keeps its own timing only for the FPS readout.
     last_frame: Option<std::time::Instant>,
+}
+
+impl App {
+    /// Let go of the mouse when a screen has opened, take it back when one has
+    /// closed -- see [`capture::follow_screen`].
+    fn follow_screen(&mut self) {
+        let open = self.game.inventory_open();
+        let want = capture::follow_screen(self.cursor_captured, self.screen_was_open, open);
+        self.screen_was_open = open;
+        if want != self.cursor_captured {
+            self.cursor_captured = want;
+            if let Some(renderer) = self.renderer.as_ref() {
+                grab_cursor(renderer.window(), want);
+            }
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -207,15 +226,22 @@ impl ApplicationHandler for App {
                         log::info!("fullscreen: {}", next.is_some());
                         window.set_fullscreen(next);
                     } else if code == KeyCode::Escape && pressed {
-                        // Escape toggles mouse capture so you can leave the window.
+                        // Out of a screen if one is open; otherwise let go of
+                        // (or take back) the mouse so you can leave the window.
                         let out = capture::apply(
                             self.cursor_captured,
                             self.game.inventory_open(),
                             CaptureEvent::Escape,
                         );
-                        log::info!("escape: mouse captured {}", out.captured);
-                        self.cursor_captured = out.captured;
-                        grab_cursor(renderer.window(), self.cursor_captured);
+                        if out.close_screen {
+                            // May be refused (a full inventory cannot take the
+                            // grid back); capture then stays with the screen.
+                            self.game.toggle_inventory();
+                        } else {
+                            log::info!("escape: mouse captured {}", out.captured);
+                            self.cursor_captured = out.captured;
+                            grab_cursor(renderer.window(), self.cursor_captured);
+                        }
                     } else if code == KeyCode::F3 && pressed {
                         renderer.toggle_debug();
                     } else if code == KeyCode::F5 && pressed {
@@ -223,14 +249,12 @@ impl ApplicationHandler for App {
                         // or a lost window should not have to cost the session.
                         self.game.save();
                     } else if code == KeyCode::KeyE && pressed {
-                        // The screen and the mouse are one thing: you cannot
-                        // click slots while the cursor is locked to look around.
                         // Toggling may be *refused* -- see
-                        // `Game::toggle_inventory` -- so capture follows what
-                        // the game decided, not what was asked for.
+                        // `Game::toggle_inventory` -- so the mouse follows what
+                        // the game decided, in `follow_screen` below, not what
+                        // was asked for.
                         self.game.toggle_inventory();
-                        self.cursor_captured = !self.game.inventory_open();
-                        grab_cursor(renderer.window(), self.cursor_captured);
+                        self.follow_screen();
                     } else {
                         self.game.key_input(code, pressed);
                     }
@@ -324,6 +348,15 @@ impl ApplicationHandler for App {
                 for cc in self.game.advance(dt) {
                     streaming.invalidate(self.game.world(), cc);
                 }
+                // A bench or furnace opens as a message from the server, which
+                // `advance` just applied -- so this is where the mouse learns.
+                self.follow_screen();
+                let Some(renderer) = self.renderer.as_mut() else {
+                    return;
+                };
+                let Some(streaming) = self.streaming.as_mut() else {
+                    return;
+                };
                 let camera = self.game.camera_pose();
                 streaming.update(renderer, self.game.world(), camera.eye.to_array());
                 let slots = self.game.hotbar_slots();
