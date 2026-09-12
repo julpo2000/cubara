@@ -592,6 +592,11 @@ impl Renderer {
         self.report_fps();
     }
 
+    /// Give the HUD its item icons; see [`crate::SceneRenderer::set_icons`].
+    pub fn set_icons(&mut self, icons: &[Option<Vec<u8>>]) {
+        self.scene.set_icons(&self.device, &self.queue, icons);
+    }
+
     /// Toggle the F3 debug overlay.
     pub fn toggle_debug(&mut self) {
         self.show_debug = !self.show_debug;

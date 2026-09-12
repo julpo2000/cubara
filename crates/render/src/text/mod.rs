@@ -33,10 +33,21 @@ struct TextVertex {
     /// so a modal screen can dim the world rather than replace it, which
     /// without blending is what an opaque rectangle does.
     color: [f32; 4],
+    /// Which atlas `uv` points into: 0 the font (and its solid cell), 1 the
+    /// item icons. A float rather than a second pipeline, so an icon is one
+    /// more quad in the same draw as the slot behind it (Rule 5).
+    mode: f32,
 }
 
-const TEXT_ATTRS: [wgpu::VertexAttribute; 3] =
-    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4];
+const TEXT_ATTRS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+    0 => Float32x2,
+    1 => Float32x2,
+    2 => Float32x4,
+    3 => Float32
+];
+
+/// Edge of one icon cell in pixels -- the 16x16 of the block and item art.
+const ICON: u32 = 16;
 
 /// Draws bitmap-font strings in screen space. Accumulate lines with
 /// [`queue`](Self::queue), then [`flush`](Self::flush) once per frame in a render
@@ -44,6 +55,13 @@ const TEXT_ATTRS: [wgpu::VertexAttribute; 3] =
 pub struct TextRenderer {
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
+    /// Kept so [`set_icons`](Self::set_icons) can rebuild the bind group
+    /// around a new icon atlas.
+    bgl: wgpu::BindGroupLayout,
+    atlas_view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+    /// How many icon cells the current icon atlas holds.
+    icon_count: u32,
     screen_buffer: wgpu::Buffer,
     vertex_buffer: wgpu::Buffer,
     verts: Vec<TextVertex>,
@@ -135,26 +153,29 @@ impl TextRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                     count: None,
                 },
-            ],
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("text-bind-group"),
-            layout: &bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: screen_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&atlas_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
             ],
         });
+        // No icons until someone sets them: one transparent cell, so the
+        // binding is always valid.
+        let icons_view = icon_atlas(device, queue, &[]);
+        let bind_group = text_bind_group(
+            device,
+            &bgl,
+            &screen_buffer,
+            &atlas_view,
+            &sampler,
+            &icons_view,
+        );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("text-shader"),
@@ -208,10 +229,52 @@ impl TextRenderer {
         Self {
             pipeline,
             bind_group,
+            bgl,
+            atlas_view,
+            sampler,
+            icon_count: 0,
             screen_buffer,
             vertex_buffer,
             verts: Vec::new(),
         }
+    }
+
+    /// Replace the item icons: one 16x16 RGBA tile per entry, `None` for an
+    /// item with no art. Entry `i` is what [`queue_icon`](Self::queue_icon)
+    /// draws for icon `i`.
+    ///
+    /// Called when the icons are known rather than at construction, because
+    /// this crate does not know what items exist -- the app does (Rule 3).
+    pub fn set_icons(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        icons: &[Option<Vec<u8>>],
+    ) {
+        let icons_view = icon_atlas(device, queue, icons);
+        self.bind_group = text_bind_group(
+            device,
+            &self.bgl,
+            &self.screen_buffer,
+            &self.atlas_view,
+            &self.sampler,
+            &icons_view,
+        );
+        self.icon_count = icons.len() as u32;
+    }
+
+    /// Draw icon `index` stretched over a rectangle. Returns `false`, drawing
+    /// nothing, for an index the atlas does not have -- so the caller can fall
+    /// back to something visible instead.
+    pub fn queue_icon(&mut self, index: u32, x: f32, y: f32, w: f32, h: f32) -> bool {
+        if index >= self.icon_count {
+            return false;
+        }
+        let cells = self.icon_count as f32;
+        let u0 = index as f32 / cells;
+        let u1 = (index + 1) as f32 / cells;
+        self.push_rect_mode(x, y, w, h, u0, u1, [1.0, 1.0, 1.0, 1.0], 1.0);
+        true
     }
 
     /// Queue a line of text with its top-left at (`x`, `y`) pixels, each glyph
@@ -282,6 +345,21 @@ impl TextRenderer {
     /// entry points funnel into, which is the shape Rule 5 wants.
     #[allow(clippy::too_many_arguments)]
     fn push_rect(&mut self, x: f32, y: f32, w: f32, h: f32, u0: f32, u1: f32, color: [f32; 4]) {
+        self.push_rect_mode(x, y, w, h, u0, u1, color, 0.0);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_rect_mode(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        u0: f32,
+        u1: f32,
+        color: [f32; 4],
+        mode: f32,
+    ) {
         if self.verts.len() + 6 > MAX_CHARS * 6 {
             return;
         }
@@ -290,6 +368,7 @@ impl TextRenderer {
             pos: [px, py],
             uv: [u, vv],
             color,
+            mode,
         };
         let tl = v(x, y, u0, 0.0);
         let tr = v(x1, y, u1, 0.0);
@@ -322,4 +401,84 @@ impl TextRenderer {
         pass.draw(0..self.verts.len() as u32, 0..1);
         self.verts.clear();
     }
+}
+
+/// Pack `icons` side by side into one RGBA texture, one 16x16 cell each. A
+/// `None` entry, and the empty list, become transparent cells: every icon
+/// index stays valid, and a missing icon draws nothing rather than garbage.
+fn icon_atlas(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    icons: &[Option<Vec<u8>>],
+) -> wgpu::TextureView {
+    let cells = icons.len().max(1) as u32;
+    let mut pixels = vec![0u8; (cells * ICON * ICON * 4) as usize];
+    for (i, icon) in icons.iter().enumerate() {
+        let Some(tile) = icon else { continue };
+        if tile.len() != (ICON * ICON * 4) as usize {
+            log::warn!("icon {i} is not a 16x16 RGBA tile; leaving it blank");
+            continue;
+        }
+        for y in 0..ICON as usize {
+            for x in 0..ICON as usize {
+                let src = (y * ICON as usize + x) * 4;
+                let dst = (y * (cells * ICON) as usize + i * ICON as usize + x) * 4;
+                pixels[dst..dst + 4].copy_from_slice(&tile[src..src + 4]);
+            }
+        }
+    }
+    let texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("icon-atlas"),
+            size: wgpu::Extent3d {
+                width: cells * ICON,
+                height: ICON,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // sRGB like the block textures, so the same art is the same colour
+            // in the world and in the hand.
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        &pixels,
+    );
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+fn text_bind_group(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+    screen: &wgpu::Buffer,
+    atlas: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+    icons: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("text-bind-group"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: screen.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(atlas),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(icons),
+            },
+        ],
+    })
 }

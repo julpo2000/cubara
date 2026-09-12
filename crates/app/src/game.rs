@@ -216,6 +216,10 @@ pub struct ClientAssets {
     /// Smelting recipes -- read for how long the item in a furnace takes, so
     /// the screen can show how far along it is.
     pub smelting: cubara_voxel::SmeltBook,
+    /// Each item's icon tile, indexed by `ItemId`, `None` where there is no
+    /// art -- see [`item_icon`]. Handed to the renderer once, and read to
+    /// decide whether a slot shows an icon or its swatch.
+    pub icons: Vec<Option<Vec<u8>>>,
     /// Which ids the terrain is made of. Derived from `blocks` once, here,
     /// rather than recomputed at each of the places that raycast.
     pub terrain: TerrainBlocks,
@@ -249,6 +253,37 @@ pub const MY_SHIRT: cubara_server::wire::Shirt = if cfg!(target_os = "linux") {
 /// guess: briefly drab is better than briefly wrong, because wrong is
 /// indistinguishable from somebody else.
 const UNKNOWN_SHIRT: [f32; 3] = [0.55, 0.55, 0.55];
+
+/// Every item's icon, indexed by `ItemId` (so index 0, "no item", is `None`).
+fn item_icons(items: &ItemRegistry, blocks: &BlockRegistry) -> Vec<Option<Vec<u8>>> {
+    let len = items.ids().map(|id| id.0 as usize + 1).max().unwrap_or(0);
+    let mut icons = vec![None; len];
+    for id in items.ids() {
+        if let Some(name) = items.name_of(id) {
+            icons[id.0 as usize] = item_icon(name, blocks);
+        }
+    }
+    icons
+}
+
+/// The art for the item called `name`.
+///
+/// **Its own drawing first** -- `item_<name>`, for things that are not blocks,
+/// like a pick. **Then the block it places**, by its side face: grass shows its
+/// grassy edge, a log its bark. `None` if neither exists,
+/// and the slot keeps its colour swatch.
+///
+/// Decided by name here rather than declared per item, because the rule is the
+/// same for every item and a field repeating it in sixteen files is sixteen
+/// chances to get it wrong.
+fn item_icon(name: &str, blocks: &BlockRegistry) -> Option<Vec<u8>> {
+    let bare = name.rsplit(':').next().unwrap_or(name);
+    cubara_render::load_icon(&format!("item_{bare}")).or_else(|| {
+        let block = blocks.id_of(name)?;
+        let face = blocks.texture_for_face(block, cubara_voxel::Face::PosZ)?;
+        cubara_render::load_icon(face)
+    })
+}
 
 /// What one slot of an open screen holds: an item and how many, or nothing.
 type SlotStack = Option<(cubara_voxel::ItemId, u8)>;
@@ -870,6 +905,7 @@ impl Game {
             terrain: TerrainBlocks::from_registry(&registry),
             blocks: Arc::clone(&registry),
             smelting: cubara_server::assets::load_smelt_book(&items),
+            icons: item_icons(&items, &registry),
             items: items.clone(),
             recipes: recipes.clone(),
         });
@@ -1171,6 +1207,7 @@ impl Game {
             *out_slot = Some(HotbarSlot {
                 color: swatch_color(name),
                 count: stack.count(),
+                icon: self.icon_of(stack.item()),
             });
         }
         Some(out)
@@ -1334,6 +1371,7 @@ impl Game {
             items.name_of(id).map(|name| HotbarSlot {
                 color: swatch_color(name),
                 count,
+                icon: self.icon_of(id),
             })
         };
         let contents = stacks.into_iter().map(|s| s.and_then(swatch)).collect();
@@ -1344,6 +1382,24 @@ impl Game {
             .held()
             .and_then(|s| swatch((s.item(), s.count())));
         Some((panel, contents, held))
+    }
+
+    /// The icon index for `id`, if it has art. The index *is* the id, which is
+    /// what [`item_icons`] lays the tiles out by.
+    fn icon_of(&self, id: cubara_voxel::ItemId) -> Option<u32> {
+        let icons = &self.assets.as_ref()?.icons;
+        icons
+            .get(id.0 as usize)
+            .and_then(|t| t.as_ref())
+            .map(|_| id.0 as u32)
+    }
+
+    /// Every item's icon tile, for the renderer. Empty before assets are set.
+    pub fn item_icons(&self) -> &[Option<Vec<u8>>] {
+        self.assets
+            .as_ref()
+            .map(|a| a.icons.as_slice())
+            .unwrap_or(&[])
     }
 
     /// The open furnace's flame and progress, as fractions, or `None` when no
@@ -3010,6 +3066,55 @@ mod tests {
         let placed = game.world().block_at(above[0], above[1], above[2], terrain);
         assert_eq!(registry.name_of(placed), Some("cubara:cobble"));
         assert_eq!(count_of(&game, "cubara:cobble"), 0, "the held one was used");
+    }
+
+    /// The owner asked for items to have pictures. Every shipped item does --
+    /// a new item without art fails here rather than quietly showing a swatch.
+    #[test]
+    fn every_shipped_item_has_an_icon() {
+        let game = game_with_assets();
+        let items = &game.assets.as_ref().unwrap().items;
+        let missing: Vec<&str> = items
+            .ids()
+            // Id 0 is "no item", which is never in a slot to be drawn.
+            .filter(|&id| id.0 != 0)
+            .filter(|&id| game.icon_of(id).is_none())
+            .filter_map(|id| items.name_of(id))
+            .collect();
+        assert!(missing.is_empty(), "items with no icon: {missing:?}");
+    }
+
+    #[test]
+    fn an_item_shows_its_own_art_before_its_blocks_and_a_block_item_its_side() {
+        let game = game_with_assets();
+        let assets = game.assets.as_ref().unwrap();
+        let tile = |name: &str| {
+            let id = assets.items.id_of(name).unwrap();
+            let index = game.icon_of(id).expect("an icon") as usize;
+            assets.icons[index].clone().unwrap()
+        };
+        assert_eq!(
+            tile("cubara:stick"),
+            cubara_render::load_icon("item_stick").unwrap()
+        );
+        assert_eq!(
+            tile("cubara:grass"),
+            cubara_render::load_icon("grass_side").unwrap(),
+            "grass by its side, not its top or bottom"
+        );
+        // Two different items get two different tiles: an index off by one
+        // would hand the stick the pick's picture.
+        assert_ne!(tile("cubara:stick"), tile("cubara:wooden_pick"));
+    }
+
+    #[test]
+    fn a_hotbar_slot_carries_the_icon_of_what_is_in_it() {
+        let mut game = game_with_assets();
+        hold(&mut game, "cubara:iron_ingot");
+        let slots = game.hotbar_slots().unwrap();
+        let held = game.selected_hotbar_slot() as usize;
+        let id = item(&game, "cubara:iron_ingot");
+        assert_eq!(slots[held].unwrap().icon, Some(id.0 as u32));
     }
 
     #[test]

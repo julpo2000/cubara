@@ -416,6 +416,7 @@ fn a_cave_mouth_is_visible() {
         crosshair: false,
         tooltip: None,
         gauges: None,
+        icons: Vec::new(),
     };
     assert_golden("cave_mouth", &world, shot);
 }
@@ -455,6 +456,7 @@ fn iron_ore_is_visible_in_a_cave_wall() {
         crosshair: false,
         tooltip: None,
         gauges: None,
+        icons: Vec::new(),
     };
     assert_golden("iron_ore", &world, shot);
 }
@@ -528,6 +530,7 @@ fn the_selected_block_shows_an_outline() {
         crosshair: false,
         tooltip: None,
         gauges: None,
+        icons: Vec::new(),
     };
     assert_golden("outline", &world, shot);
 }
@@ -567,6 +570,7 @@ fn a_block_being_dug_shows_cracks() {
         crosshair: false,
         tooltip: None,
         gauges: None,
+        icons: Vec::new(),
     };
     // Measured: the image comparison alone caught missing cracks at 0.53%
     // against a 0.5% threshold -- one driver's rounding from passing. So also
@@ -595,6 +599,82 @@ fn a_block_being_dug_shows_cracks() {
 }
 
 #[test]
+fn items_show_their_icons() {
+    // The owner asked for items to have pictures. Nine real icons from
+    // `assets/textures` -- block items by their side, and the drawn items --
+    // with counts on top, so the golden shows both are legible together.
+    let names = [
+        "grass_side",
+        "cobble",
+        "plank",
+        "oak_log_side",
+        "item_stick",
+        "item_wooden_pick",
+        "item_stone_pick",
+        "item_iron_ingot",
+        "item_raw_iron",
+    ];
+    let icons: Vec<Option<Vec<u8>>> = names
+        .iter()
+        .map(|n| Some(cubara_render::load_icon(n).unwrap_or_else(|| panic!("no art {n}"))))
+        .collect();
+    let mut hotbar = [None; 9];
+    for (i, slot) in hotbar.iter_mut().enumerate() {
+        *slot = Some(HotbarSlot {
+            // A swatch colour nothing in the art uses, so falling back to it
+            // would be obvious in the image.
+            color: [1.0, 0.0, 1.0],
+            count: [12, 64, 5, 1, 32, 1, 1, 3, 7][i],
+            icon: Some(i as u32),
+        });
+    }
+
+    let world = World::new();
+    let shot = Shot {
+        width: 960,
+        height: 540,
+        region_radius: 2,
+        orbit_t: 0.0,
+        camera: None,
+        players: Vec::new(),
+        highlighted_block: None,
+        cracking: None,
+        hotbar: Some(hotbar),
+        panel: None,
+        health: None,
+        crosshair: false,
+        tooltip: None,
+        gauges: None,
+        icons,
+    };
+    // Nine icons against nine magenta swatches differ in well under the
+    // golden's 0.5% of a 960x540 frame, so compare against the swatches on
+    // the same adapter as well: only the icons can make that pass or fail.
+    let with = render_world(&world, shot.clone());
+    let without = render_world(
+        &world,
+        Shot {
+            icons: Vec::new(),
+            ..shot.clone()
+        },
+    );
+    if let (Some(a), Some(b)) = (with, without) {
+        let magenta = |p: &[u8]| p[0] > 200 && p[1] < 60 && p[2] > 200;
+        let left = a.pixels.chunks(4).filter(|p| magenta(p)).count();
+        let before = b.pixels.chunks(4).filter(|p| magenta(p)).count();
+        assert!(
+            before > 5000,
+            "the swatch fallback drew no magenta ({before})"
+        );
+        assert_eq!(
+            left, 0,
+            "{left} magenta pixels: an icon fell back to its swatch"
+        );
+    }
+    assert_golden("item_icons", &world, shot);
+}
+
+#[test]
 fn the_hotbar_shows_slots_counts_and_the_held_one() {
     // Block 2.1e's own bar. Three things have to be visible, and a golden is
     // the only automated way to say so: nine slots along the bottom, the held
@@ -608,6 +688,7 @@ fn the_hotbar_shows_slots_counts_and_the_held_one() {
         Some(HotbarSlot {
             color: [r, g, b],
             count,
+            icon: None,
         })
     };
     let hotbar = [
@@ -638,6 +719,7 @@ fn the_hotbar_shows_slots_counts_and_the_held_one() {
         crosshair: false,
         tooltip: None,
         gauges: None,
+        icons: Vec::new(),
     };
     assert_golden("hotbar", &world, shot);
 }
@@ -656,6 +738,7 @@ fn the_inventory_screen_shows_slots_a_recipe_and_the_cursor() {
         Some(HotbarSlot {
             color: [r, g, b],
             count,
+            icon: None,
         })
     };
 
@@ -690,6 +773,7 @@ fn the_inventory_screen_shows_slots_a_recipe_and_the_cursor() {
         crosshair: false,
         tooltip: None,
         gauges: None,
+        icons: Vec::new(),
         panel: Some((
             PanelLayout::Grid(2),
             contents,
@@ -715,6 +799,7 @@ fn an_item_name_shows_beside_the_cursor() {
             (PanelSlotKind::Inventory, 4) => Some(HotbarSlot {
                 color: [0.66, 0.50, 0.31],
                 count: 1,
+                icon: None,
             }),
             _ => None,
         })
@@ -740,6 +825,7 @@ fn an_item_name_shows_beside_the_cursor() {
         crosshair: false,
         tooltip: Some("Wooden Pick".to_string()),
         gauges: None,
+        icons: Vec::new(),
         panel: Some((
             PanelLayout::Grid(2),
             contents,
@@ -771,6 +857,7 @@ fn the_crosshair_marks_the_centre_of_the_screen() {
         crosshair: true,
         tooltip: None,
         gauges: None,
+        icons: Vec::new(),
     };
     // A crosshair is about 0.1% of the frame -- under the golden's 0.5%
     // tolerance, so the image comparison alone passes with it missing (found
@@ -815,6 +902,7 @@ fn hearts_show_health_including_a_half() {
         crosshair: false,
         tooltip: None,
         gauges: None,
+        icons: Vec::new(),
     };
     assert_golden("hearts", &world, shot);
 }
@@ -833,6 +921,7 @@ fn the_furnace_screen_shows_input_fuel_and_output() {
         Some(HotbarSlot {
             color: [r, g, b],
             count,
+            icon: None,
         })
     };
 
@@ -864,6 +953,7 @@ fn the_furnace_screen_shows_input_fuel_and_output() {
         crosshair: false,
         tooltip: None,
         gauges: None,
+        icons: Vec::new(),
         panel: Some((
             PanelLayout::Furnace,
             contents,
@@ -888,10 +978,12 @@ fn a_furnace_shows_its_flame_and_progress() {
             PanelSlotKind::Grid => Some(HotbarSlot {
                 color: [0.70, 0.35, 0.25],
                 count: 3,
+                icon: None,
             }),
             PanelSlotKind::Fuel => Some(HotbarSlot {
                 color: [0.66, 0.50, 0.31],
                 count: 6,
+                icon: None,
             }),
             _ => None,
         })
@@ -912,6 +1004,7 @@ fn a_furnace_shows_its_flame_and_progress() {
         crosshair: false,
         tooltip: None,
         gauges: Some((0.25, 0.75)),
+        icons: Vec::new(),
         panel: Some((PanelLayout::Furnace, contents, None, (10.0, 10.0))),
     };
     // Both meters together are well under the golden's 0.5% tolerance, so a
@@ -999,6 +1092,7 @@ fn distinct_materials_render_with_distinct_textures() {
         crosshair: false,
         tooltip: None,
         gauges: None,
+        icons: Vec::new(),
     };
 
     let Some(frame) = headless::render_chunks(&chunks, shot) else {
@@ -1139,6 +1233,7 @@ fn three_players_stand_in_front_of_the_camera() {
         crosshair: false,
         tooltip: None,
         gauges: None,
+        icons: Vec::new(),
     };
     assert_golden("three_players", &world, shot);
 }

@@ -177,6 +177,20 @@ fn mip_chain(base: Vec<u8>) -> Vec<Vec<u8>> {
     levels
 }
 
+/// `assets/textures/{name}.png` as a 16x16 RGBA tile, for the HUD's item icons,
+/// or `None` if there is no such file.
+///
+/// Quiet about a missing file, unlike [`load_tile`]: a block with no art is a
+/// gap worth a warning, but most items are *expected* to have no icon of their
+/// own and to borrow their block's instead, so the caller tries several names.
+pub fn load_icon(name: &str) -> Option<Vec<u8>> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/textures");
+    if !dir.join(format!("{name}.png")).exists() {
+        return None;
+    }
+    load_tile(&dir, name)
+}
+
 /// `{textures_dir}/{name}.png` as raw RGBA8 tile bytes, or `None` if the file
 /// doesn't exist or isn't exactly [`TILE_SIZE`]-square -- either way, the
 /// caller falls back to a placeholder rather than failing to start, since a
