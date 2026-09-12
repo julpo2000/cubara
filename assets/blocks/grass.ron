@@ -3,6 +3,9 @@ Material(
     solid:  true,
     faces:  Sided(top: "grass_top", side: "grass_side", bottom: "soil"),
     shapes: [Full],
+    // Dug grass comes up as soil -- the owner's call. The grass is the top
+    // of the block, and it does not survive being dug.
+    drops:  Item((item: "cubara:soil", count: 1)),
     // Ticks of work at speed 1 (PHASE2_ARCHITECTURE.md 4.3), at 60 tps:
     // 0.75 s bare-handed. Absent would mean unbreakable, so every shipped
     // block declares one.
