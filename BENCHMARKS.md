@@ -118,6 +118,12 @@ frames after 200 warmup.
 | 2026-09-07 | Prediction, untrusted clients, server-side mining, persistence, sharding [#207, #211, #212, #216, #217, #218], radius 64, band ±2⁴³ | 3,138 | 912,964 | ~1,109 | 0.623 ms | ~1.19 ms | `397a653` |
 | 2026-09-11 | Multiplayer played: --connect, player figures, per-machine shirts, mining retuned, radius 64, band ±2⁴⁵ | 3,138 | 912,964 | ~1,112 | 0.611 ms | ~1.08 ms | `b5dcfec` |
 
+### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
+
+| Date | Milestone / feature | Chunks | Tris | FPS | CPU/frame avg | CPU/frame p99 | Commit |
+|---|---|---|---|---|---|---|---|
+| 2026-09-11 | **Linux (Vulkan) baseline — first measured** [#36], radius 64, band ±2⁴⁵ | 3,138 | 912,964 | ~1,474 | 0.214 ms | 0.883 ms | `2ab5fb6` |
+
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
 scatter but CPU/GPU clock ramp: the 200-frame warmup (~20 ms at these rates) ends
@@ -1355,3 +1361,23 @@ slower than a hardware-assisted `sin`. It very well might be, per call — and i
 does not matter, because this is not a hot path. What it buys is that two
 machines cannot disagree about where a player is looking, which is not a
 performance property at all.
+
+⁴⁵ **The first Linux measurement — a third data point on the same scene
+Windows and macOS already have (3,138 nodes, 912,964 triangles, radius 64,
+band ±2, `2ab5fb6`).** This is issue #36's completion criterion: a Linux +
+Vulkan benchmark baseline in this file, mirroring the existing Windows/Vulkan
+and macOS/Metal rows. The machine is a laptop discrete GPU one tier below the
+Windows RTX 4060 (a GTX 1060 Max-Q), on the same native-Linux Vulkan backend.
+
+```
+GPU: AdapterInfo { name: "NVIDIA GeForce GTX 1060 with Max-Q Design", vendor: 4318, device: 7200, device_type: DiscreteGpu, driver: "NVIDIA", driver_info: "580.178.04", backend: Vulkan }
+SUMMARY: 1474 FPS | CPU/frame avg 0.214 ms (p99 0.883) | 2730/3138 nodes | 1000-FPS gate MET
+```
+
+Sitting between the two existing rows on the same scene — macOS/M3 ~1,109 FPS
+/ 0.623 ms, this GTX 1060 ~1,474 FPS / 0.214 ms, Windows/RTX 4060 ~2,469 FPS /
+0.136 ms — is the expected shape: a mid-tier discrete GPU between an
+integrated one and a newer discrete one, all three clearing the 1,000-FPS gate
+on the same, unchanged geometry. Nothing about the engine is being measured
+here; the point of this row is that a third machine now exists to catch a
+Vulkan-specific regression Windows alone would not.

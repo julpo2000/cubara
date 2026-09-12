@@ -53,10 +53,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [macos-latest, windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # winit needs the X11/Wayland client libraries to link its windowing
+      # backends, and wgpu needs a Vulkan ICD to find an adapter at all. The
+      # runner has no GPU, so `mesa-vulkan-drivers` is what supplies one
+      # (lavapipe, a software Vulkan implementation) -- without it
+      # `request_adapter` returns None and every wgpu-touching test fails to
+      # even start, not just runs slow.
+      - name: Linux windowing + Vulkan dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev \
+            libxi-dev libxcursor-dev \
+            mesa-vulkan-drivers vulkan-tools
       # `@stable` is deliberate, and `rust-toolchain.toml` is what actually
       # decides the version. The action installs stable; rustup then honours the
       # file when cargo runs in this directory, so both runners end up on the
