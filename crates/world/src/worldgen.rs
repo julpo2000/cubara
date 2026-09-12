@@ -373,7 +373,7 @@ impl WorldGen {
     /// The terrain height field in blocks: a fractal noise surface that
     /// [`density`](Self::density)'s solid/air split (before caves) is
     /// measured against. A pure function of `(seed, x, z)` alone (§8.1).
-    fn surface_height(&self, x: i32, z: i32) -> i32 {
+    pub fn surface_height(&self, x: i32, z: i32) -> i32 {
         let n = fbm2(
             self.seed,
             x as f32 * TERRAIN_FREQ,

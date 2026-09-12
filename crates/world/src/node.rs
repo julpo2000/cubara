@@ -189,7 +189,37 @@ pub fn plan_node_updates(
     y_range: RangeInclusive<i32>,
     schedule: &RingSchedule,
 ) -> NodeStreamUpdates {
-    let desired = desired_nodes(center, y_range, schedule);
+    plan_node_updates_in_bands(resident, center, &[y_range], schedule)
+}
+
+/// Every node [`desired_nodes`] wants for *any* of `bands`, each once.
+///
+/// Several bands rather than one tall range because the gap between them is
+/// the point: a player far above the ground needs the ground and the air
+/// around themselves, not every empty chunk-layer in between (see
+/// `cubara-app`'s `vertical_bands`). Coarse nodes tall enough to overlap two
+/// bands come out of both and are kept once.
+pub fn desired_nodes_in_bands(
+    center: ChunkCoord,
+    bands: &[RangeInclusive<i32>],
+    schedule: &RingSchedule,
+) -> Vec<NodeKey> {
+    let mut seen = HashSet::new();
+    bands
+        .iter()
+        .flat_map(|band| desired_nodes(center, band.clone(), schedule))
+        .filter(|n| seen.insert(*n))
+        .collect()
+}
+
+/// [`plan_node_updates`] over several vertical bands at once.
+pub fn plan_node_updates_in_bands(
+    resident: &HashSet<NodeKey>,
+    center: ChunkCoord,
+    bands: &[RangeInclusive<i32>],
+    schedule: &RingSchedule,
+) -> NodeStreamUpdates {
+    let desired = desired_nodes_in_bands(center, bands, schedule);
     let desired_set: HashSet<NodeKey> = desired.iter().copied().collect();
 
     let mut to_load: Vec<NodeKey> = desired
@@ -254,6 +284,35 @@ fn node_dist_sq(node: NodeKey, center: ChunkCoord) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn several_bands_want_the_union_of_their_nodes_each_once() {
+        let center = ChunkCoord::new(3, 10, -2);
+        // Close enough that a level-3 node (8 layers tall) spans both, which is
+        // exactly when a node would be wanted twice.
+        let (low, high) = (-1..=3, 6..=10);
+        let bands =
+            desired_nodes_in_bands(center, &[low.clone(), high.clone()], DEFAULT_RING_SCHEDULE);
+
+        let unique: HashSet<NodeKey> = bands.iter().copied().collect();
+        assert_eq!(unique.len(), bands.len(), "a node wanted twice");
+        let low_alone: HashSet<NodeKey> = desired_nodes(center, -1..=3, DEFAULT_RING_SCHEDULE)
+            .into_iter()
+            .collect();
+        let high_alone = desired_nodes(center, 6..=10, DEFAULT_RING_SCHEDULE);
+        assert!(
+            high_alone.iter().any(|n| low_alone.contains(n)),
+            "the bands share no node, so this cannot see a duplicate"
+        );
+
+        let mut expected: HashSet<NodeKey> = desired_nodes(center, low, DEFAULT_RING_SCHEDULE)
+            .into_iter()
+            .collect();
+        expected.extend(desired_nodes(center, high, DEFAULT_RING_SCHEDULE));
+        assert_eq!(unique, expected);
+        // And the gap is really a gap: nothing wanted for layer 5 at level 0.
+        assert!(!unique.iter().any(|n| n.level == 0 && n.pos[1] == 5));
+    }
 
     #[test]
     fn extent_chunks_doubles_per_level() {

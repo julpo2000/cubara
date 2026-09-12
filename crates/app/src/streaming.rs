@@ -39,6 +39,39 @@ use cubara_world::World;
 /// with you rather than running out of world.
 const VERTICAL_CHUNK_RADIUS: i32 = 2;
 
+/// Which chunk-layers to stream, for a camera in chunk-layer `camera` over
+/// ground whose surface is in chunk-layer `surface`.
+///
+/// **The band used to follow only the camera**, which is what broke when the
+/// owner built high: once the camera is more than [`VERTICAL_CHUNK_RADIUS`]
+/// layers above the ground, the ground leaves the band and stops being drawn --
+/// the world became a floating slab, and caves showed sky through where their
+/// floors should be.
+///
+/// - **On or below the surface:** exactly the old band around the camera, so
+///   the measured cost at ground level and underground does not move.
+/// - **A little above:** one band from below the surface to above the camera.
+///   Everything added is on the air side, which meshes to nothing.
+/// - **Far above:** two bands, one around the ground and one around the camera,
+///   so a player a kilometre up does not stream a kilometre of empty chunks.
+///
+/// The ground band is the *same size* as the band a player standing on the
+/// ground gets, so being high never costs more than standing on the ground.
+pub(crate) fn vertical_bands(camera: i32, surface: i32) -> Vec<std::ops::RangeInclusive<i32>> {
+    let r = VERTICAL_CHUNK_RADIUS;
+    let around_camera = (camera - r)..=(camera + r);
+    if camera <= surface {
+        return vec![around_camera];
+    }
+    let around_ground = (surface - r)..=(surface + r);
+    if around_camera.start() > &(around_ground.end() + 1) {
+        vec![around_ground, around_camera]
+    } else {
+        let merged = (surface - r)..=(camera + r);
+        vec![merged]
+    }
+}
+
 pub(crate) fn to_node_id(node: NodeKey) -> NodeId {
     NodeId {
         level: node.level,
@@ -139,7 +172,14 @@ impl NodeStreaming {
     pub fn update(&mut self, renderer: &mut Renderer, world: &Arc<World>, eye: [f32; 3]) {
         let center = ChunkCoord::from_world_pos(eye);
         if self.center != Some(center) {
-            self.stream_around(renderer, world, center);
+            // The ground under the camera, as a chunk-layer. One column is
+            // enough: the height field spans a few layers at most (base 24,
+            // amplitude 14), and the band around it is two layers each way.
+            // Converted the way the camera's own chunk is, so the two can
+            // never disagree about which layer is which.
+            let ground = world.surface_height(eye[0].floor() as i32, eye[2].floor() as i32);
+            let surface = ChunkCoord::from_world_pos([eye[0], ground as f32, eye[2]]).y;
+            self.stream_around(renderer, world, center, surface);
         }
         self.drain_meshes(renderer);
     }
@@ -175,10 +215,16 @@ impl NodeStreaming {
     /// ready. A momentary gap at a ring boundary is an accepted, known
     /// limitation (see issue #107) -- the same category as the
     /// LOD-boundary cracks skirts (#108) fix, not a correctness bug.
-    fn stream_around(&mut self, renderer: &mut Renderer, world: &Arc<World>, center: ChunkCoord) {
-        let y_range = (center.y - VERTICAL_CHUNK_RADIUS)..=(center.y + VERTICAL_CHUNK_RADIUS);
+    fn stream_around(
+        &mut self,
+        renderer: &mut Renderer,
+        world: &Arc<World>,
+        center: ChunkCoord,
+        surface: i32,
+    ) {
+        let bands = vertical_bands(center.y, surface);
         let desired_set: HashSet<NodeKey> =
-            node::desired_nodes(center, y_range.clone(), node::DEFAULT_RING_SCHEDULE)
+            node::desired_nodes_in_bands(center, &bands, node::DEFAULT_RING_SCHEDULE)
                 .into_iter()
                 .collect();
 
@@ -200,8 +246,12 @@ impl NodeStreaming {
         // Request whatever's desired but not yet resident, nearest first --
         // reuses `plan_node_updates`'s tested nearest-first ordering rather
         // than a second distance sort here.
-        let updates =
-            node::plan_node_updates(&self.resident, center, y_range, node::DEFAULT_RING_SCHEDULE);
+        let updates = node::plan_node_updates_in_bands(
+            &self.resident,
+            center,
+            &bands,
+            node::DEFAULT_RING_SCHEDULE,
+        );
         for node in updates.to_load {
             if self.mesh_pool.is_in_flight(node) {
                 continue;
@@ -253,6 +303,59 @@ impl NodeStreaming {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const R: i32 = VERTICAL_CHUNK_RADIUS;
+
+    fn covers(bands: &[std::ops::RangeInclusive<i32>], layer: i32) -> bool {
+        bands.iter().any(|b| b.contains(&layer))
+    }
+
+    /// The cost the perf gate measured must not move where it was measured.
+    #[test]
+    fn on_the_ground_and_underground_the_band_is_unchanged() {
+        for camera in -40..=1 {
+            let old = (camera - R)..=(camera + R);
+            assert_eq!(vertical_bands(camera, 1), vec![old], "camera {camera}");
+        }
+    }
+
+    /// The owner's screenshots: built up high, the ground stopped being drawn.
+    #[test]
+    fn the_ground_stays_streamed_however_high_the_camera_is() {
+        for camera in 1..200 {
+            let bands = vertical_bands(camera, 1);
+            for layer in (1 - R)..=(1 + R) {
+                assert!(
+                    covers(&bands, layer),
+                    "camera {camera}: ground layer {layer} dropped"
+                );
+            }
+            for layer in (camera - R)..=(camera + R) {
+                assert!(
+                    covers(&bands, layer),
+                    "camera {camera}: its own layer {layer} dropped"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn far_above_the_ground_the_empty_layers_between_are_not_streamed() {
+        let bands = vertical_bands(40, 1);
+        assert_eq!(bands, vec![(1 - R)..=(1 + R), (40 - R)..=(40 + R)]);
+        assert!(!covers(&bands, 20), "streamed the air half way up");
+        // However high: never more layers than a ground band and a camera band.
+        for camera in -50..500 {
+            let layers: i32 = vertical_bands(camera, 1)
+                .iter()
+                .map(|b| b.end() - b.start() + 1)
+                .sum();
+            assert!(
+                layers <= 2 * (2 * R + 1),
+                "camera {camera}: {layers} layers"
+            );
+        }
+    }
 
     /// The rendering lifecycle is a *different* lifecycle from the simulation's
     /// (§11.1), and this is where that is asserted rather than only written

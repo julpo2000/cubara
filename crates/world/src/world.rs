@@ -85,6 +85,13 @@ impl World {
         }
     }
 
+    /// The generated ground's height at a column, in blocks -- before caves,
+    /// trees and edits. For deciding *where the ground is* (what to stream),
+    /// not what is solid.
+    pub fn surface_height(&self, x: i32, z: i32) -> i32 {
+        self.worldgen.surface_height(x, z)
+    }
+
     /// The seed this world's terrain is generated from.
     pub fn seed(&self) -> u64 {
         self.worldgen.seed()
