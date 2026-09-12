@@ -173,6 +173,7 @@ pub fn run(radius: i32) {
                     arena,
                     draw_count,
                     selected_block: None,
+                    cracking: None,
                     players: &[],
                     overlay: None,
                     // The benchmark measures the scene, not the HUD.

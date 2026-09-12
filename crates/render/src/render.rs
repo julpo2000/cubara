@@ -526,6 +526,7 @@ impl Renderer {
         &mut self,
         camera: CameraPose,
         selected_block: Option<[i32; 3]>,
+        cracking: Option<([i32; 3], f32)>,
         players: &[crate::figure::PlayerView],
         hud: crate::scene::Hud<'_>,
     ) {
@@ -574,6 +575,7 @@ impl Renderer {
                     arena: &self.arena,
                     draw_count,
                     selected_block,
+                    cracking,
                     players,
                     overlay: overlay.as_deref(),
                     hotbar,

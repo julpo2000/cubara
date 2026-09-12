@@ -409,6 +409,7 @@ fn a_cave_mouth_is_visible() {
         camera: Some((eye, target - eye)),
         players: Vec::new(),
         highlighted_block: None,
+        cracking: None,
         hotbar: None,
         panel: None,
         health: None,
@@ -447,6 +448,7 @@ fn iron_ore_is_visible_in_a_cave_wall() {
         camera: Some((eye, target - eye)),
         players: Vec::new(),
         highlighted_block: None,
+        cracking: None,
         hotbar: None,
         panel: None,
         health: None,
@@ -519,6 +521,7 @@ fn the_selected_block_shows_an_outline() {
         camera: Some((eye, target - eye)),
         players: Vec::new(),
         highlighted_block: Some(hit.block),
+        cracking: None,
         hotbar: None,
         panel: None,
         health: None,
@@ -527,6 +530,68 @@ fn the_selected_block_shows_an_outline() {
         gauges: None,
     };
     assert_golden("outline", &world, shot);
+}
+
+#[test]
+fn a_block_being_dug_shows_cracks() {
+    // The owner asked to see a block take damage before it goes. The same
+    // close camera as the outline shot, three quarters of the way through a
+    // dig, so the crack is well grown and the face it sits on is in view.
+    let world = World::new();
+    let ground = world
+        .raycast([5.5, 200.0, 5.5], [0.0, -1.0, 0.0], 400.0, real_blocks())
+        .expect("ground below");
+    let eye = glam::vec3(4.2, ground.block[1] as f32 + 2.0, 4.2);
+    let target = glam::vec3(5.5, ground.block[1] as f32 + 0.5, 5.5);
+    let hit = world
+        .raycast(
+            eye.to_array(),
+            (target - eye).to_array(),
+            30.0,
+            real_blocks(),
+        )
+        .expect("the block this shot is framed around");
+
+    let shot = Shot {
+        width: 960,
+        height: 540,
+        region_radius: 3,
+        orbit_t: 0.0,
+        camera: Some((eye, target - eye)),
+        players: Vec::new(),
+        highlighted_block: Some(hit.block),
+        cracking: Some((hit.block, 0.75)),
+        hotbar: None,
+        panel: None,
+        health: None,
+        crosshair: false,
+        tooltip: None,
+        gauges: None,
+    };
+    // Measured: the image comparison alone caught missing cracks at 0.53%
+    // against a 0.5% threshold -- one driver's rounding from passing. So also
+    // render the same shot without cracks, on the same adapter, and require
+    // the two to differ by a clear margin: a backend difference cannot make
+    // that pass or fail, only the cracks can.
+    let with = render_world(&world, shot.clone());
+    let without = render_world(
+        &world,
+        Shot {
+            cracking: None,
+            ..shot.clone()
+        },
+    );
+    if let (Some(a), Some(b)) = (with, without) {
+        let changed = a
+            .pixels
+            .chunks(4)
+            .zip(b.pixels.chunks(4))
+            .filter(|(p, q)| (0..3).any(|c| p[c].abs_diff(q[c]) > 60))
+            .count();
+        eprintln!("pixels the cracks changed: {changed}");
+        assert!(changed > 1500, "cracks changed only {changed} pixels");
+    }
+    assert_golden("cracks", &world, shot);
 }
 
 #[test]
@@ -566,6 +631,7 @@ fn the_hotbar_shows_slots_counts_and_the_held_one() {
         camera: None,
         players: Vec::new(),
         highlighted_block: None,
+        cracking: None,
         hotbar: Some(hotbar),
         panel: None,
         health: None,
@@ -618,6 +684,7 @@ fn the_inventory_screen_shows_slots_a_recipe_and_the_cursor() {
         camera: None,
         players: Vec::new(),
         highlighted_block: None,
+        cracking: None,
         hotbar: None,
         health: None,
         crosshair: false,
@@ -667,6 +734,7 @@ fn an_item_name_shows_beside_the_cursor() {
         camera: None,
         players: Vec::new(),
         highlighted_block: None,
+        cracking: None,
         hotbar: None,
         health: None,
         crosshair: false,
@@ -696,6 +764,7 @@ fn the_crosshair_marks_the_centre_of_the_screen() {
         camera: None,
         players: Vec::new(),
         highlighted_block: None,
+        cracking: None,
         hotbar: None,
         panel: None,
         health: None,
@@ -739,6 +808,7 @@ fn hearts_show_health_including_a_half() {
         camera: None,
         players: Vec::new(),
         highlighted_block: None,
+        cracking: None,
         hotbar: Some([None; 9]),
         panel: None,
         health: Some((13, 20)),
@@ -788,6 +858,7 @@ fn the_furnace_screen_shows_input_fuel_and_output() {
         camera: None,
         players: Vec::new(),
         highlighted_block: None,
+        cracking: None,
         hotbar: None,
         health: None,
         crosshair: false,
@@ -835,6 +906,7 @@ fn a_furnace_shows_its_flame_and_progress() {
         camera: None,
         players: Vec::new(),
         highlighted_block: None,
+        cracking: None,
         hotbar: None,
         health: None,
         crosshair: false,
@@ -920,6 +992,7 @@ fn distinct_materials_render_with_distinct_textures() {
         camera: None,
         players: Vec::new(),
         highlighted_block: None,
+        cracking: None,
         hotbar: None,
         panel: None,
         health: None,
@@ -1059,6 +1132,7 @@ fn three_players_stand_in_front_of_the_camera() {
             },
         ],
         highlighted_block: None,
+        cracking: None,
         hotbar: None,
         panel: None,
         health: None,
