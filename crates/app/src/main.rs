@@ -443,10 +443,23 @@ fn main() {
         return;
     }
 
-    // Headless benchmark mode: `cargo run --release -- --bench [radius]`.
+    // Headless benchmark mode:
+    // `cargo run --release -- --bench [radius] [--size WIDTHxHEIGHT]`.
     if let Some(i) = args.iter().position(|a| a == "--bench") {
         let radius = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(12);
-        bench::run(radius);
+        let size = match args.iter().position(|a| a == "--size") {
+            // Refused rather than defaulted: a typo silently measuring 1080p
+            // would be recorded as the size that was asked for.
+            Some(j) => match args.get(j + 1).and_then(|s| bench::parse_size(s)) {
+                Some(size) => size,
+                None => {
+                    eprintln!("--size needs WIDTHxHEIGHT, e.g. --size 2560x1440");
+                    std::process::exit(2);
+                }
+            },
+            None => bench::DEFAULT_SIZE,
+        };
+        bench::run(radius, size);
         return;
     }
 
