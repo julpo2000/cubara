@@ -885,7 +885,23 @@ impl Server {
             return false;
         }
         match cubara_sim::load_world(dir, registry, items, blocks) {
-            Ok((sim, world)) => {
+            Ok((mut sim, world)) => {
+                // **Whoever is watching keeps a body.** A load replaces every
+                // player with the save's, and a client already seated here --
+                // the window's own, which attaches before it loads -- would
+                // otherwise drive an id the new `Sim` has never heard of, and
+                // its first click panics. Players the save *does* have win:
+                // that is "you come back where you quit" (#179).
+                //
+                // Which saved player a newly-connected client *is* is a
+                // separate question, and not answered here: a saved player
+                // with no client simply stays in the world, as on a dedicated
+                // server that restarts.
+                for &who in self.views.keys() {
+                    if let Some(p) = self.sim.get(who) {
+                        sim.keep(who, *p);
+                    }
+                }
                 self.sim = sim;
                 self.world = Arc::new(world);
                 // The simulation radius is recomputed from scratch: the saved
