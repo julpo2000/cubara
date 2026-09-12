@@ -126,6 +126,21 @@ impl Sim {
         id
     }
 
+    /// Put a player back under an id they already had.
+    ///
+    /// For a player who exists outside this `Sim` -- someone connected while
+    /// the world was swapped out from under them by a load. `next_player` moves
+    /// past the id, so [`join`](Sim::join) can never hand it out a second time.
+    /// Returns `false`, and changes nothing, when the id is already taken.
+    pub fn keep(&mut self, id: PlayerId, player: Player) -> bool {
+        if self.players.contains_key(&id) {
+            return false;
+        }
+        self.players.insert(id, player);
+        self.next_player = self.next_player.max(id.0 + 1);
+        true
+    }
+
     /// Remove a player, returning what they were carrying so the caller can
     /// decide where it goes. Ids are never reused, so the slot does not come
     /// back.

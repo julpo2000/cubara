@@ -3489,6 +3489,61 @@ mod tests {
     }
 
     #[test]
+    fn loading_a_save_without_this_client_in_it_does_not_unseat_it() {
+        // **The crash `run.bat` hit on the first click.** The window hosts its
+        // own world and attaches to it, so this client is not
+        // `PlayerId::LOCAL` -- and then it loads `saves/world`, which replaced
+        // every player with the save's. A save written before the client was
+        // attached holds only player 0, so afterwards this client drove a
+        // player that did not exist, and the first action on it panicked.
+        let dir = std::env::temp_dir().join(format!(
+            "cubara-app-unseated-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            // A world played by its local player only: the save has player 0.
+            let mut old = cubara_server::Server::new();
+            let items = load_item_registry();
+            let recipes = load_recipe_book(&items);
+            old.set_assets(
+                std::sync::Arc::new(cubara_render::load_registry()),
+                items,
+                recipes,
+            );
+            old.save_to(&dir);
+        }
+
+        let mut game = game_with_assets();
+        assert_ne!(
+            game.me_id,
+            PlayerId::LOCAL,
+            "this client is player 0, so the save would contain it by coincidence \
+             and the test would not be testing anything"
+        );
+        assert!(game.load_from(&dir), "the save did not load");
+
+        assert!(
+            game.server().sim.get(game.me_id).is_some(),
+            "loading removed the player this client is driving"
+        );
+        // And the things that crashed: a click, and holding the button.
+        game.place_block();
+        game.set_breaking(true);
+        for _ in 0..30 {
+            game.advance(TICK_DT);
+        }
+        // A player joining after the load must not be handed this client's id.
+        let body = *game.me.player();
+        let next = game.server_mut().sim.join(body);
+        assert_ne!(next, game.me_id, "an id was handed out twice");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_missing_save_is_a_normal_first_run() {
         let mut game = game_with_assets();
         let empty = std::env::temp_dir().join("cubara-no-such-world-12345");
