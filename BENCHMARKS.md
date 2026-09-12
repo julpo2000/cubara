@@ -49,6 +49,7 @@ frames after 200 warmup.
 | 2026-08-24 | Texture mip chain [#128], radius 64³⁴ | 1,585 | 758,754 | ~3,990 | 0.100 ms | ~0.38 ms | *(this PR)* |
 | 2026-09-10 | Windows caught up to `main` — phase 2 complete, radius 64, band ±2⁴⁴ | 3,138 | 912,964 | ~2,506 | 0.136 ms | ~0.43 ms | `b82e051` |
 | 2026-09-11 | Gate re-run after six PRs, radius 64, band ±2⁴⁵ | 3,138 | 912,964 | ~2,774 | 0.124 ms | ~0.385 ms | `9dee4a6` |
+| 2026-09-13 | Seven play-test PRs (#240–#246), radius 64, band ±2⁴⁶ | 3,138 | 912,964 | ~2,674 | 0.131 ms | ~0.48 ms | `4002754` |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -1381,3 +1382,24 @@ integrated one and a newer discrete one, all three clearing the 1,000-FPS gate
 on the same, unchanged geometry. Nothing about the engine is being measured
 here; the point of this row is that a third machine now exists to catch a
 Vulkan-specific regression Windows alone would not.
+
+⁴⁶ **Seven PRs from the owner's first long play session, and the measured path
+did not change.** Upright side textures (#240), grass drops soil and wheel
+scrolling (#241), screens release the mouse and no autojump (#242), crosshair
+and item names (#243), a cobble block and tenfold fuel (#244), crack overlay
+(#245), item icons (#246). The bench passes no HUD, no cracks and no icons, and
+#240 changes only which corner of a quad gets which texture coordinate -- same
+vertex count, same geometry (3,138 nodes, 912,964 triangles, identical to the
+row above). Three back-to-back runs, showing the usual warm-up ramp this file
+warns about:
+
+```
+SUMMARY: 2466 FPS | CPU/frame avg 0.145 ms (p99 0.522) | 2730/3138 nodes | 1000-FPS gate MET
+SUMMARY: 2637 FPS | CPU/frame avg 0.137 ms (p99 0.482) | 2730/3138 nodes | 1000-FPS gate MET
+SUMMARY: 2674 FPS | CPU/frame avg 0.131 ms (p99 0.482) | 2730/3138 nodes | 1000-FPS gate MET
+```
+
+The row records the last. Against `9dee4a6` that is +0.007 ms CPU/frame
+(+6%) and ~-100 FPS, still falling run over run -- inside the spread this
+machine has shown on unchanged geometry (0.124-0.136 ms across ⁴⁴ and ⁴⁵), and
+not attributable to code the bench executes. Read it as unchanged.
