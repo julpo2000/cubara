@@ -2,7 +2,8 @@
 //!
 //! Owns the window and event loop; all GPU work lives in `cubara_render`. Forwards
 //! keyboard + mouse input to [`Game`] (WASD to move, Space to jump, mouse to look,
-//! F4 toggles the free-fly debug mode, Esc releases the cursor, a click takes it
+//! F4 toggles the free-fly debug mode, 1-9 or the wheel pick a hotbar slot,
+//! Esc releases the cursor, a click takes it
 //! back, F11 or Alt+Enter toggles fullscreen). Walking under
 //! gravity is the default; free-fly (Space/Shift up/down, no collision) is a
 //! debug mode inside the same sim (`docs/PHASE1_ARCHITECTURE.md` §10).
@@ -25,7 +26,12 @@ use crate::game::{
 use crate::streaming::NodeStreaming;
 
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
+use winit::event::{
+    DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent,
+};
+
+/// Touchpad scroll distance, in pixels, that counts as one wheel notch.
+const PIXELS_PER_NOTCH: f32 = 40.0;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
@@ -228,6 +234,19 @@ impl ApplicationHandler for App {
                     } else {
                         self.game.key_input(code, pressed);
                     }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Only while playing: with a screen open the wheel is not
+                // aimed at the hotbar.
+                if self.cursor_captured && !self.game.inventory_open() {
+                    let lines = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y,
+                        // A touchpad reports pixels. About one notch's worth of
+                        // finger travel per slot.
+                        MouseScrollDelta::PixelDelta(p) => p.y as f32 / PIXELS_PER_NOTCH,
+                    };
+                    self.game.scroll_hotbar(lines);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {

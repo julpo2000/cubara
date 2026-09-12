@@ -195,6 +195,8 @@ pub struct Game {
     /// wire is a float. Sensitivity is a setting on the machine holding the
     /// mouse, so this is also where it belongs.
     look_delta: (Angle, Angle),
+    /// Wheel notches not yet turned into a hotbar step (see `scroll_hotbar`).
+    scroll_pending: f32,
 }
 
 /// The definitions a client needs, held by the client.
@@ -244,6 +246,12 @@ pub const MY_SHIRT: cubara_server::wire::Shirt = if cfg!(target_os = "linux") {
 /// guess: briefly drab is better than briefly wrong, because wrong is
 /// indistinguishable from somebody else.
 const UNKNOWN_SHIRT: [f32; 3] = [0.55, 0.55, 0.55];
+
+/// The hotbar slot `steps` to the right of `current` (negative is left),
+/// wrapping around the ends.
+fn scrolled_slot(current: u8, steps: i32) -> u8 {
+    (current as i32 + steps).rem_euclid(HOTBAR_WIDTH as i32) as u8
+}
 
 impl Game {
     /// Start above the terrain near the origin, looking out over it and slightly
@@ -310,6 +318,7 @@ impl Game {
             jump_pending: false,
             fly_toggle_pending: false,
             look_delta: (Angle::ZERO, Angle::ZERO),
+            scroll_pending: 0.0,
         }
     }
 
@@ -1337,6 +1346,24 @@ impl Game {
         self.me.player().inventory.selected_slot()
     }
 
+    /// Turn the mouse wheel by `lines` notches: positive is away from you
+    /// (winit's "up"), which moves the selection **left**; toward you moves it
+    /// right. Wraps at both ends.
+    ///
+    /// Fractions are kept rather than rounded: a touchpad reports a flick as
+    /// many small deltas, and rounding each one would either never move or
+    /// move once per event.
+    pub fn scroll_hotbar(&mut self, lines: f32) {
+        self.scroll_pending += lines;
+        let steps = self.scroll_pending.trunc();
+        if steps == 0.0 {
+            return;
+        }
+        self.scroll_pending -= steps;
+        let next = scrolled_slot(self.selected_hotbar_slot(), -(steps as i32));
+        self.select_hotbar(next);
+    }
+
     /// Select a hotbar slot (number keys 1-9, passed as 0-8).
     pub fn select_hotbar(&mut self, index: u8) {
         // Predicted, then sent -- a hotbar that only lit up after a round trip
@@ -1666,7 +1693,10 @@ mod tests {
 
     #[test]
     fn breaking_a_block_puts_its_item_in_the_inventory() {
-        let (mut game, block) = game_looking_at_ground();
+        // Soil rather than whatever the surface is: grass drops soil, and this
+        // test is about the same-name rule, not about grass.
+        let (mut game, _) = game_looking_at_ground();
+        let block = stand_over(&mut game, "cubara:soil");
         let terrain = game.server().terrain.expect("assets are set");
         let broken = game.world().block_at(block[0], block[1], block[2], terrain);
         let name = game
@@ -1677,6 +1707,7 @@ mod tests {
             .name_of(broken)
             .expect("the block has a name")
             .to_string();
+        assert_eq!(name, "cubara:soil");
 
         game.break_block();
 
@@ -1693,6 +1724,68 @@ mod tests {
             "breaking {name} must yield the item of the same name"
         );
         assert_eq!(stack.count(), 1);
+    }
+
+    #[test]
+    fn scrolling_toward_you_moves_right_and_wraps() {
+        assert_eq!(scrolled_slot(0, 1), 1);
+        assert_eq!(
+            scrolled_slot(0, -1),
+            HOTBAR_WIDTH as u8 - 1,
+            "left of the first wraps"
+        );
+        assert_eq!(
+            scrolled_slot(HOTBAR_WIDTH as u8 - 1, 1),
+            0,
+            "right of the last wraps"
+        );
+        assert_eq!(scrolled_slot(3, -2), 1);
+    }
+
+    #[test]
+    fn the_wheel_selects_the_hotbar_one_notch_per_slot() {
+        let mut game = game_with_assets();
+        assert_eq!(game.selected_hotbar_slot(), 0);
+        // One notch toward you (winit reports it as negative).
+        game.scroll_hotbar(-1.0);
+        assert_eq!(game.selected_hotbar_slot(), 1);
+        game.scroll_hotbar(1.0);
+        game.scroll_hotbar(1.0);
+        assert_eq!(game.selected_hotbar_slot(), HOTBAR_WIDTH as u8 - 1);
+        // The server hears about it, not only the client's own copy.
+        game.settle();
+        assert_eq!(
+            game.host_player().inventory.selected_slot(),
+            HOTBAR_WIDTH as u8 - 1
+        );
+    }
+
+    #[test]
+    fn a_touchpad_scroll_steps_only_once_it_adds_up_to_a_notch() {
+        // Quarters, so the arithmetic is exact and the test is about the rule.
+        let mut game = game_with_assets();
+        game.scroll_hotbar(-0.75);
+        assert_eq!(game.selected_hotbar_slot(), 0, "3/4 of a notch moved it");
+        game.scroll_hotbar(-0.75);
+        assert_eq!(game.selected_hotbar_slot(), 1, "1.5 notches did not");
+        // The half left over counts toward the next one.
+        game.scroll_hotbar(-0.5);
+        assert_eq!(
+            game.selected_hotbar_slot(),
+            2,
+            "the remainder was thrown away"
+        );
+    }
+
+    /// The owner asked for it: digging grass gives soil, not grass.
+    #[test]
+    fn breaking_grass_yields_soil() {
+        let (mut game, _) = game_looking_at_ground();
+        stand_over(&mut game, "cubara:grass");
+        game.break_block();
+        game.settle();
+        assert_eq!(count_of(&game, "cubara:soil"), 1, "grass did not drop soil");
+        assert_eq!(count_of(&game, "cubara:grass"), 0, "grass dropped itself");
     }
 
     #[test]
