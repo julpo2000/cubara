@@ -492,13 +492,29 @@ fn push_quad(
     ];
     let c3 = [base[0] + dv[0], base[1] + dv[1], base[2] + dv[2]];
 
-    // Each corner's own texel-tile coordinate: (0,0) at the origin corner,
-    // stepping to (w,h) at the far corner -- one tile per grid cell, tiling
+    // Each corner's own texel-tile coordinate, one tile per grid cell, tiling
     // the texture across the merged quad.
-    let uv0 = (0, 0);
-    let uv1 = (w, 0);
-    let uv2 = (w, h);
-    let uv3 = (0, h);
+    //
+    // Floors and ceilings take the sweep axes as they come. **Walls do not:**
+    // the sweep axes are (y, z) for an x wall and (x, y) for a z wall, so
+    // following them lays a texture on its side on one and upside down on the
+    // other -- grass hanging off the left edge of a block. A wall's texture
+    // row 0 is its top, so v is measured down from the quad's top edge, and u
+    // runs along the horizontal axis toward the right of someone looking at
+    // the face from outside (so lettering on a furnace would read correctly).
+    let tile = |a: i32, b: i32| -> (i32, i32) {
+        match d {
+            // x wall: u axis is y, v axis is z. Right is -z for +x, +z for -x.
+            0 => (if sign == 1 { h - b } else { b }, w - a),
+            // z wall: u axis is x, v axis is y. Right is +x for +z, -x for -z.
+            2 => (if sign == 1 { a } else { w - a }, h - b),
+            _ => (a, b),
+        }
+    };
+    let uv0 = tile(0, 0);
+    let uv1 = tile(w, 0);
+    let uv2 = tile(w, h);
+    let uv3 = tile(0, h);
 
     // (du × dv) points toward +d, so keep that order for +d faces and reverse for -d
     // faces to stay outward/CCW for back-face culling. AO and UV follow the same reorder.
@@ -712,6 +728,56 @@ mod tests {
 
     fn position(v: Vertex) -> [f32; 3] {
         [v.x() as f32, v.y() as f32, v.z() as f32]
+    }
+
+    /// **Side textures stand upright, unmirrored, on all four sides.** A
+    /// texture's row 0 is its top, so on a wall the highest corners take
+    /// `v = 0`; and seen from outside, `u` grows to the viewer's right.
+    ///
+    /// The owner's screenshot: grass sides had their green edge on the left
+    /// of X-facing walls and along the bottom of Z-facing ones, because the
+    /// texture axes followed the mesher's sweep axes rather than "up".
+    #[test]
+    fn side_faces_are_textured_upright_and_unmirrored() {
+        // 1 wide in x, 3 tall, 2 deep -- merged quads, so tiling is covered too.
+        let mut chunk = empty();
+        for y in 5..8 {
+            for z in 5..7 {
+                set(&mut chunk, 5, y, z);
+            }
+        }
+        let registry = registry();
+        let mesh = chunk.build_mesh(&ctx(&registry));
+        let top = 8u32;
+
+        let mut sides = 0;
+        for quad in mesh.vertices.chunks(4) {
+            let face = quad[0].face();
+            let n = face.normal();
+            if n[1] != 0.0 {
+                continue;
+            }
+            sides += 1;
+            // Looking at the face from outside: forward is -n, up is +y.
+            let right = cross([-n[0], -n[1], -n[2]], [0.0, 1.0, 0.0]);
+            for a in quad {
+                assert_eq!(
+                    a.v(),
+                    top - a.y(),
+                    "{face:?}: v is not measured down from the top"
+                );
+                for b in quad {
+                    let along = sub(position(*b), position(*a));
+                    let dist = along[0] * right[0] + along[2] * right[2];
+                    assert_eq!(
+                        b.u() as f32 - a.u() as f32,
+                        dist,
+                        "{face:?}: u does not grow to the viewer's right"
+                    );
+                }
+            }
+        }
+        assert_eq!(sides, 4, "expected one merged quad per side");
     }
 
     #[test]
