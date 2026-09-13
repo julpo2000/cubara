@@ -269,8 +269,8 @@ mod tests {
         None
     }
 
-    /// **Nothing a straight line of sight reaches is left out.** Thousands of
-    /// rays from a camera above the ground, one inside a cave and one high in
+    /// **Nothing a straight line of sight reaches is left out.** About 1,200
+    /// rays each from a camera above the ground, one inside a cave and one high in
     /// the air, through a real world with caves and levels of detail.
     #[test]
     fn every_node_a_line_of_sight_hits_is_visible() {
@@ -303,17 +303,21 @@ mod tests {
             let visible = visible_nodes(camera, &scene.nodes, |n| scene.links.get(&n).copied());
             culled_something |= visible.len() < scene.nodes.len();
 
-            // Directions on a spiral over the sphere, none axis-aligned.
-            let rays = 3000;
-            for i in 0..rays {
-                let t = (i as f32 + 0.5) / rays as f32;
-                let polar = (1.0 - 2.0 * t).acos();
-                let azimuth = i as f32 * 2.399_963_2 + 0.137;
-                let dir = [
-                    polar.sin() * azimuth.cos(),
-                    polar.cos(),
-                    polar.sin() * azimuth.sin(),
-                ];
+            // Every direction on a lattice, nudged off it so no ray runs exactly
+            // along an axis or through an edge. The walk does not need them
+            // normalised, and this crate keeps floating-point trigonometry out
+            // of simulation code (`scripts/check-architecture.sh`, Rule 1).
+            let mut dirs = Vec::new();
+            for x in -7i32..=7 {
+                for y in -7i32..=7 {
+                    for z in -7i32..=7 {
+                        if x.abs().max(y.abs()).max(z.abs()) == 7 {
+                            dirs.push([x as f32 + 0.137, y as f32 + 0.071, z as f32 + 0.229]);
+                        }
+                    }
+                }
+            }
+            for dir in dirs {
                 if let Some(hit) = first_hit(&scene, eye, dir) {
                     assert!(
                         visible.contains(&hit),
