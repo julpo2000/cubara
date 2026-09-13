@@ -369,6 +369,23 @@ third full `u32`, i.e. 12 bytes, not 10. See §2's revised vertex-memory budget.
 
 **This is the block that decides whether radius 64 is reachable.**
 
+> **Revised 2026-09 — the tree is an octree in three dimensions, with no
+> vertical band.** Two things changed, both measured (`BENCHMARKS.md` ⁴⁷–⁴⁹):
+>
+> - **The rings are built by splitting.** Resolving each ring on its own grid
+>   left 603 chunks within radius 60 covered by no node and 148 by two. Coarse
+>   nodes are now split into eight children while they reach inside the finer
+>   ring, so every chunk belongs to exactly one node, and face-neighbours never
+>   differ by more than one level (both are tests in `node.rs`).
+> - **What is drawn is a cube; how finely is squashed vertically.** The ±2
+>   chunk-layer band around the camera (chosen to pass the gate by drawing less)
+>   made the ground disappear once a player built 40 blocks up. The outer radius
+>   is now the same in every direction, and detail coarsens `VERTICAL_LOD_SQUASH`
+>   (2) times faster with height than with horizontal distance. It is
+>   affordable because a node leaves out border faces its neighbour covers —
+>   28% of all triangles faced solid rock — and a node wholly above the tallest
+>   generated block is skipped without generating it.
+
 ### 6.1 The change in kind
 
 `build_mesh_lod` today downsamples voxels *within* one chunk: fewer triangles,

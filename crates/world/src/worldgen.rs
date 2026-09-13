@@ -667,6 +667,26 @@ impl WorldGen {
         self.density_at(x, y, z, surface, step == 1) > 0.0
     }
 
+    /// No block the generator places is ever higher than this: the tallest
+    /// surface the height field can produce, plus the tallest tree on it.
+    ///
+    /// What lets a render distance with no height limit skip the sky: a node
+    /// wholly above this, with no edits in it, is air without generating a
+    /// single cell. Derived from the constants and the tree data rather than
+    /// written down, so tuning either moves it; `nothing_generates_above_the_highest_y`
+    /// holds it to the truth.
+    pub fn highest_generated_y(blocks: TerrainBlocks) -> i32 {
+        // The height field is `base + fbm * amplitude`, and fbm is normalised
+        // into [-1, 1].
+        let surface = TERRAIN_BASE_HEIGHT + TERRAIN_AMPLITUDE.ceil() as i32;
+        match blocks.oak {
+            // A trunk starts one above the surface; the canopy reaches one
+            // above the trunk's top. One more for good measure.
+            Some(oak) => surface + 1 + oak.height.1 + oak.canopy_radius + 2,
+            None => surface,
+        }
+    }
+
     pub fn terrain_block_at(
         &self,
         x: i32,
@@ -843,6 +863,33 @@ mod tests {
         assert_ne!(
             a, b,
             "two different seeds landed on the same height by coincidence"
+        );
+    }
+
+    /// The sky shortcut skips generating anything above this, so it has to be
+    /// true: over a wide area with trees, nothing solid is ever above it --
+    /// and the tallest thing found is close to it, or the bound is so loose it
+    /// saves nothing.
+    #[test]
+    fn nothing_generates_above_the_highest_y() {
+        let gen = WorldGen::new(0x5EED);
+        let blocks = tree_blocks();
+        let top = WorldGen::highest_generated_y(blocks);
+        let mut tallest = i32::MIN;
+        for x in (-400..400).step_by(3) {
+            for z in (-400..400).step_by(3) {
+                let surface = gen.surface_height(x, z);
+                for y in (surface - 2)..=(top + 4) {
+                    if gen.block_at(x, y, z, blocks).is_some() {
+                        assert!(y <= top, "solid at ({x}, {y}, {z}), above {top}");
+                        tallest = tallest.max(y);
+                    }
+                }
+            }
+        }
+        assert!(
+            top - tallest <= 12,
+            "tallest {tallest} but the bound is {top}: too loose"
         );
     }
 

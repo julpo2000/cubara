@@ -137,6 +137,37 @@ pub fn desired_nodes(
     y_range: RangeInclusive<i32>,
     schedule: &RingSchedule,
 ) -> Vec<NodeKey> {
+    select_nodes(center, Vertical::Band(y_range), schedule)
+}
+
+/// Every node that should be resident around `center`, **in all three
+/// dimensions**: no vertical band, and detail falling off with height and
+/// depth the way it does with horizontal distance.
+///
+/// **How far is the same in every direction**: the outer radius is a cube, so
+/// a player 300 blocks up still sees the ground below them as far as they see
+/// it ahead. **How detailed falls off faster vertically**: a node is split
+/// towards level 0 by `max(|dx|, |dz|, squash * |dy|)`, so `squash` says how
+/// many times sooner detail coarsens with height and depth than with
+/// horizontal distance.
+///
+/// Both halves matter. Squashing the radius as well was measured first, and at
+/// `squash` 8 a camera 300 blocks up drew nothing at all -- the render distance
+/// straight down had become 128 blocks.
+pub fn desired_nodes_3d(center: ChunkCoord, squash: i32, schedule: &RingSchedule) -> Vec<NodeKey> {
+    select_nodes(center, Vertical::Squash(squash.max(1)), schedule)
+}
+
+/// How [`select_nodes`] treats the vertical axis.
+enum Vertical {
+    /// Only nodes overlapping these chunk-layers, at any height distance.
+    Band(RangeInclusive<i32>),
+    /// Vertical distance counts this many times horizontal distance.
+    Squash(i32),
+}
+
+/// The octree both selections share -- one implementation (Rule 5).
+fn select_nodes(center: ChunkCoord, vertical: Vertical, schedule: &RingSchedule) -> Vec<NodeKey> {
     let Some(&(top, top_radius)) = schedule.last() else {
         return Vec::new();
     };
@@ -144,7 +175,14 @@ pub fn desired_nodes(
     // radius of the level below it, or none for the finest ring.
     let radius_of = |level: u32| schedule.iter().find(|&&(l, _)| l == level).map(|&(_, r)| r);
     let finest = schedule[0].0;
-    let (y_lo, y_hi) = (*y_range.start(), *y_range.end());
+    let (y_lo, y_hi, squash) = match &vertical {
+        Vertical::Band(r) => (*r.start(), *r.end(), 0),
+        Vertical::Squash(k) => (center.y - top_radius, center.y + top_radius, *k),
+    };
+    // What is drawn at all is a cube in 3D (vertical distance counted once);
+    // how finely it is drawn uses the squash.
+    let reach = |node: NodeKey| node_distance(node, center, squash.min(1));
+    let distance = |node: NodeKey| node_distance(node, center, squash);
 
     let extent = 1i32 << top;
     let first = |c: i32| (c - top_radius).div_euclid(extent);
@@ -154,7 +192,7 @@ pub fn desired_nodes(
         for nz in first(center.z)..=last(center.z) {
             for ny in y_lo.div_euclid(extent)..=y_hi.div_euclid(extent) {
                 let node = NodeKey::new(top, [nx, ny, nz]);
-                if horizontal_distance(node, center) <= top_radius {
+                if reach(node) <= top_radius {
                     pending.push(node);
                 }
             }
@@ -166,7 +204,7 @@ pub fn desired_nodes(
         let finer = node.level.checked_sub(1).filter(|&l| l >= finest);
         let split = finer
             .and_then(radius_of)
-            .is_some_and(|r| horizontal_distance(node, center) <= r);
+            .is_some_and(|r| distance(node) <= r);
         if !split {
             nodes.push(node);
             continue;
@@ -183,8 +221,12 @@ pub fn desired_nodes(
                             node.pos[2] * 2 + dz,
                         ],
                     );
+                    // A band keeps only children overlapping it. In 3D the
+                    // parent was already inside the render distance, so all
+                    // eight fill it -- dropping one would be a gap.
                     let o = child.chunk_origin().y;
-                    if o + child.extent_chunks() > y_lo && o <= y_hi {
+                    let in_band = o + child.extent_chunks() > y_lo && o <= y_hi;
+                    if squash > 0 || in_band {
                         pending.push(child);
                     }
                 }
@@ -195,13 +237,16 @@ pub fn desired_nodes(
     nodes
 }
 
-/// Chebyshev distance in chunks, horizontally, from `center` to the nearest
-/// chunk of `node` -- zero when the node contains the centre's column.
-fn horizontal_distance(node: NodeKey, center: ChunkCoord) -> i32 {
+/// Chebyshev distance in chunks from `center` to the nearest chunk of `node`,
+/// with vertical distance counted `squash` times -- `0` ignores height, which
+/// is what a band selection wants.
+fn node_distance(node: NodeKey, center: ChunkCoord, squash: i32) -> i32 {
     let o = node.chunk_origin();
     let e = node.extent_chunks();
     let axis = |c: i32, lo: i32| (lo - c).max(c - (lo + e - 1)).max(0);
-    axis(center.x, o.x).max(axis(center.z, o.z))
+    axis(center.x, o.x)
+        .max(axis(center.z, o.z))
+        .max(axis(center.y, o.y) * squash)
 }
 
 /// Compute the [`NodeStreamUpdates`] that move `resident` to exactly the
@@ -215,7 +260,26 @@ pub fn plan_node_updates(
     y_range: RangeInclusive<i32>,
     schedule: &RingSchedule,
 ) -> NodeStreamUpdates {
-    let desired = desired_nodes(center, y_range, schedule);
+    plan_updates_to(resident, center, desired_nodes(center, y_range, schedule))
+}
+
+/// [`plan_node_updates`] for a 3D selection ([`desired_nodes_3d`]).
+pub fn plan_node_updates_3d(
+    resident: &HashSet<NodeKey>,
+    center: ChunkCoord,
+    squash: i32,
+    schedule: &RingSchedule,
+) -> NodeStreamUpdates {
+    plan_updates_to(resident, center, desired_nodes_3d(center, squash, schedule))
+}
+
+/// The updates that turn `resident` into exactly `desired`, loading nearest
+/// first.
+fn plan_updates_to(
+    resident: &HashSet<NodeKey>,
+    center: ChunkCoord,
+    desired: Vec<NodeKey>,
+) -> NodeStreamUpdates {
     let desired_set: HashSet<NodeKey> = desired.iter().copied().collect();
 
     let mut to_load: Vec<NodeKey> = desired
@@ -269,12 +333,17 @@ fn node_dist_sq(node: NodeKey, center: ChunkCoord) -> i64 {
     let extent = node.extent_chunks() as i64;
     let origin = node.chunk_origin();
     let node_center_x = origin.x as i64 * 2 + extent;
+    let node_center_y = origin.y as i64 * 2 + extent;
     let node_center_z = origin.z as i64 * 2 + extent;
     let center_x = center.x as i64 * 2 + 1;
+    let center_y = center.y as i64 * 2 + 1;
     let center_z = center.z as i64 * 2 + 1;
     let dx = node_center_x - center_x;
+    let dy = node_center_y - center_y;
     let dz = node_center_z - center_z;
-    dx * dx + dz * dz
+    // Height counts too: with nothing limiting the render distance vertically,
+    // the ground under a player flying high must not wait behind sky.
+    dx * dx + dy * dy + dz * dz
 }
 
 #[cfg(test)]
@@ -425,6 +494,49 @@ mod tests {
                             "centre {centre:?}: chunk ({x},{y},{z}) level {here} beside level {}",
                             there[0].level
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The same two properties with no band: every chunk within the 3D render
+    /// distance exactly once, and face-neighbours at most one level apart --
+    /// for every vertical squash worth using.
+    #[test]
+    fn in_three_dimensions_the_rings_still_tile_and_stay_balanced() {
+        let schedule = &[(0u32, 6), (1, 12), (2, 24), (3, 40)];
+        for squash in 1..=4 {
+            for centre in [ChunkCoord::new(0, 0, 0), ChunkCoord::new(-9, 13, 4)] {
+                let nodes = desired_nodes_3d(centre, squash, schedule);
+                let map = coverage(&nodes);
+                let r = 40;
+                for x in (centre.x - r)..=(centre.x + r) {
+                    for z in (centre.z - r)..=(centre.z + r) {
+                        for y in (centre.y - r)..=(centre.y + r) {
+                            let n = map.get(&(x, y, z)).map_or(0, Vec::len);
+                            assert_eq!(n, 1, "squash {squash}, centre {centre:?}: ({x},{y},{z}) covered {n} times");
+                        }
+                    }
+                }
+                for (&(x, y, z), here) in &map {
+                    for d in [
+                        (1, 0, 0),
+                        (-1, 0, 0),
+                        (0, 1, 0),
+                        (0, -1, 0),
+                        (0, 0, 1),
+                        (0, 0, -1),
+                    ] {
+                        if let Some(there) = map.get(&(x + d.0, y + d.1, z + d.2)) {
+                            let gap = (here[0].level as i32 - there[0].level as i32).abs();
+                            assert!(
+                                gap <= 1,
+                                "squash {squash}: ({x},{y},{z}) level {} beside {}",
+                                here[0].level,
+                                there[0].level
+                            );
+                        }
                     }
                 }
             }

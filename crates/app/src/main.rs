@@ -459,7 +459,31 @@ fn main() {
             },
             None => bench::DEFAULT_SIZE,
         };
-        bench::run(radius, size);
+        let flag = |name: &str| {
+            args.iter()
+                .position(|a| a == name)
+                .and_then(|j| args.get(j + 1))
+        };
+        let eye = flag("--eye").map(|text| {
+            bench::parse_eye(text).unwrap_or_else(|| {
+                eprintln!("--eye needs X,Y,Z in blocks, e.g. --eye 8,40,8");
+                std::process::exit(2);
+            })
+        });
+        let squash = match flag("--squash") {
+            Some(text) => match text.parse::<i32>() {
+                Ok(k) if k >= 1 => Some(k),
+                _ => {
+                    eprintln!("--squash needs a whole number of at least 1");
+                    std::process::exit(2);
+                }
+            },
+            // The old band, for comparing against rows measured before it went.
+            None if args.iter().any(|a| a == "--band") => None,
+            // What the game streams with.
+            None => Some(streaming::VERTICAL_LOD_SQUASH),
+        };
+        bench::run(radius, size, bench::View { eye, squash });
         return;
     }
 
