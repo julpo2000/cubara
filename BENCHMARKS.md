@@ -51,6 +51,7 @@ frames after 200 warmup.
 | 2026-09-11 | Gate re-run after six PRs, radius 64, band ±2⁴⁵ | 3,138 | 912,964 | ~2,774 | 0.124 ms | ~0.385 ms | `9dee4a6` |
 | 2026-09-13 | Seven play-test PRs (#240–#246), radius 64, band ±2⁴⁶ | 3,138 | 912,964 | ~2,674 | 0.131 ms | ~0.48 ms | `4002754` |
 | 2026-09-13 | **Covered border faces left out** — nodes meshed against their neighbours, radius 64, band ±2⁴⁷ | **1,969** | **674,484** | **~4,160** | **0.102 ms** | ~0.44 ms | *(this PR)* |
+| 2026-09-13 | LOD rings tile exactly (octree) — the gaps are drawn now, radius 64, band ±2⁴⁸ | 2,174 | 738,078 | ~3,890 | 0.107 ms | ~0.35 ms | *(this PR)* |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -1428,3 +1429,20 @@ where the removed faces had also been costing fill. Surface triangles are
 unchanged (445k before, 451k after), which is the check that nothing visible
 went. Meshing costs +19% single-threaded (1.38 s -> 1.64 s for the region), on
 the worker pool.
+
+⁴⁸ **Slower, because it draws terrain that was missing.** The level rings were
+resolved each on its own grid, excluding the finer ring by a rounded-down node
+radius: 603 of the 14,641 chunks within 60 of the player belonged to no node
+(chunk 11 and chunks 36-39 out, all the way round) and 148 to two. The
+`lod_boundary` golden had shown the gap for as long as it existed, as a trench
+with grey walls; once covered border faces were left out (⁴⁷) it became a hole
+through the ground. The rings are now an octree -- coarse nodes split into
+eight children while they reach inside the finer ring -- so every chunk
+belongs to exactly one node, and a test says so at four positions.
+
+```
+before  SUMMARY: 4160 FPS | CPU/frame avg 0.102 ms | 1671/1969 nodes   674,484 tris
+after   SUMMARY: 3885 FPS | CPU/frame avg 0.107 ms | 1831/2174 nodes   738,078 tris
+```
+
++9% triangles and +10% nodes are the filled gaps, less the removed overlaps.
