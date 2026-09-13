@@ -13,8 +13,9 @@
 
 use glam::Mat4;
 
-use crate::arena::ChunkArena;
+use crate::arena::{ChunkArena, Draws};
 use crate::materials;
+use crate::occlusion::Occlusion;
 use crate::panel::{InventoryPanel, PanelSlotKind};
 use crate::render::{
     build_figure_pipeline, build_outline_pipeline, build_pipeline, camera_bind_group_layout,
@@ -39,11 +40,12 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
 /// documents for headless rendering: what a frame *is* should be small and
 /// explicit at the call site.
 pub struct SceneFrame<'a> {
-    /// All resident chunk geometry, drawn with one indirect submit.
-    pub arena: &'a ChunkArena,
+    /// All resident chunk geometry, drawn with one indirect submit. Mutable:
+    /// the frame hands it its occlusion results to read back.
+    pub arena: &'a mut ChunkArena,
     /// From [`ChunkArena::prepare`], which the caller runs first so it can
     /// also report how many chunks survived the cull.
-    pub draw_count: u32,
+    pub draws: Draws,
     /// A block to draw the selection outline around (issue #52), or `None`.
     pub selected_block: Option<[i32; 3]>,
     /// A block being dug and how far along, `0.0..1.0`, to draw cracks on
@@ -185,6 +187,11 @@ pub struct SceneRenderer {
     outline_uniform_buffer: wgpu::Buffer,
     outline_bind_group: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
+    /// Tests what the first pass hid ([`crate::occlusion`]).
+    occlusion: Occlusion,
+    /// The camera [`set_camera`](Self::set_camera) last uploaded, which the
+    /// occlusion test projects with.
+    view_proj: Mat4,
     text: TextRenderer,
     width: u32,
     height: u32,
@@ -261,6 +268,7 @@ impl SceneRenderer {
             }],
         });
 
+        let depth_view = create_depth_view(device, width, height);
         Self {
             pipeline: build_pipeline(device, format, &camera_bgl, &origins_bgl, &textures_bgl),
             camera_buffer,
@@ -273,7 +281,9 @@ impl SceneRenderer {
             outline_vertex_buffer,
             outline_uniform_buffer,
             outline_bind_group,
-            depth_view: create_depth_view(device, width, height),
+            occlusion: Occlusion::new(device, &depth_view, width, height),
+            depth_view,
+            view_proj: Mat4::IDENTITY,
             text: TextRenderer::new(device, queue, format),
             width,
             height,
@@ -297,6 +307,8 @@ impl SceneRenderer {
             self.width = width;
             self.height = height;
             self.depth_view = create_depth_view(device, width, height);
+            self.occlusion
+                .resize(device, &self.depth_view, width, height);
         }
     }
 
@@ -305,7 +317,8 @@ impl SceneRenderer {
     }
 
     /// Upload the view-projection matrix this frame draws with.
-    pub fn set_camera(&self, queue: &wgpu::Queue, view_proj: Mat4) {
+    pub fn set_camera(&mut self, queue: &wgpu::Queue, view_proj: Mat4) {
+        self.view_proj = view_proj;
         let uniform = CameraUniform::from_matrix(view_proj);
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
     }
@@ -325,7 +338,7 @@ impl SceneRenderer {
     ) {
         let SceneFrame {
             arena,
-            draw_count,
+            draws,
             selected_block,
             cracking,
             players,
@@ -378,6 +391,8 @@ impl SceneRenderer {
                 bytemuck::bytes_of(&OutlineUniform::new(origin)),
             );
         }
+        // The first pass: the nodes seen last time (all of them, with
+        // occlusion culling off).
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main-pass"),
@@ -400,14 +415,56 @@ impl SceneRenderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             pass.set_bind_group(1, arena.origins_bind_group(), &[]);
             pass.set_bind_group(2, &self.texture_bind_group, &[]);
-            arena.encode(&mut pass, draw_count);
+            arena.encode_first(&mut pass, draws);
+        }
 
-            // Other players, same pass so a figure behind a hill is behind it.
+        // What the first pass hid: test every listed node against its depth,
+        // switching the candidates' draws on or off.
+        if arena.occlusion() && draws.total() > 0 {
+            self.occlusion
+                .encode(device, queue, encoder, arena, self.view_proj, draws);
+            arena.encode_readback(encoder);
+        }
+
+        // The second pass, over what the first left: the candidates the test
+        // let through, then everything that is not terrain.
+        if draws.candidates > 0 || figure_vertices_count > 0 || selected_block.is_some() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("second-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: color,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            if draws.candidates > 0 {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(1, arena.origins_bind_group(), &[]);
+                pass.set_bind_group(2, &self.texture_bind_group, &[]);
+                arena.encode_candidates(&mut pass, draws);
+            }
+
+            // Other players, after the terrain so a figure behind a hill is
+            // behind it.
             if figure_vertices_count > 0 {
                 pass.set_pipeline(&self.figure_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
@@ -415,8 +472,8 @@ impl SceneRenderer {
                 pass.draw(0..figure_vertices_count as u32, 0..1);
             }
 
-            // The selected-block outline, same pass so it's depth-tested
-            // against the geometry just drawn (issue #52).
+            // The selected-block outline, depth-tested against the geometry
+            // just drawn (issue #52).
             if selected_block.is_some() {
                 pass.set_pipeline(&self.outline_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
@@ -723,4 +780,84 @@ impl SceneRenderer {
             self.queue_item(x, y, SLOT, PAD, *item);
         }
     }
+}
+
+/// A depth buffer of `width` x `height` with every pixel set to `fill`, a WGSL
+/// expression of the pixel `p: vec2<u32>` -- a fixture for the occlusion
+/// shaders' tests (`occlusion.rs`), which need depth no scene would draw.
+///
+/// Here rather than beside those tests because this file is where render passes
+/// are begun (`scripts/check-single-render-path.sh`). It draws no scene: one
+/// triangle, depth only.
+#[cfg(test)]
+pub(crate) fn fill_depth_for_test(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    width: u32,
+    height: u32,
+    fill: &str,
+) -> wgpu::TextureView {
+    let view = create_depth_view(device, width, height);
+    let source = format!(
+        "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {{
+                let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+                return vec4<f32>(uv * 4.0 - 1.0, 0.5, 1.0);
+            }}
+            @fragment fn fs(@builtin(position) pos: vec4<f32>) -> @builtin(frag_depth) f32 {{
+                let p = vec2<u32>(pos.xy);
+                return {fill};
+            }}"
+    );
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("test-depth-fill"),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("test-depth-fill"),
+        layout: None,
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets: &[],
+        }),
+        primitive: Default::default(),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Always,
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        multiview: None,
+        cache: None,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("test-depth-fill"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.draw(0..3, 0..1);
+    }
+    queue.submit([encoder.finish()]);
+    view
 }

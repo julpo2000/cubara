@@ -307,6 +307,69 @@ fn the_same_scene_renders_byte_identically() {
     );
 }
 
+#[test]
+fn occlusion_culling_never_changes_the_image() {
+    // The rule occlusion culling lives under: whatever can be seen is drawn.
+    // Culling may only ever leave out what no pixel shows, so the image with it
+    // must be the image without it -- to the same rounding bounds two renders
+    // of one scene are held to above, not to a golden's tolerance, because
+    // there is no backend difference to allow for: same adapter, same scene.
+    //
+    // At ground level, looking across the hills, where much of what is in view
+    // is behind something. The frames before were looking at the ground at
+    // the player's feet, so what culling has seen is nearly nothing of this
+    // view: most of it is candidates, some hidden and some not. That is the
+    // case that can go wrong -- a still camera only ever tests candidates that
+    // really are hidden, and a test that culled *everything* passed there.
+    let world = World::new();
+    let ground = world.surface_height(8, 8) as f32;
+    let eye = glam::vec3(8.5, ground + 2.5, 8.5);
+    let shot = Shot {
+        width: 960,
+        height: 540,
+        region_radius: 6,
+        camera: Some((eye, glam::vec3(1.0, -0.08, 0.35))),
+        earlier_camera: Some((eye, glam::vec3(0.05, -1.0, 0.05))),
+        ..Shot::default()
+    };
+    let Some(with) = render_world(&world, shot.clone()) else {
+        eprintln!("SKIP occlusion_culling_never_changes_the_image: no GPU adapter");
+        return;
+    };
+    let without = render_world(
+        &world,
+        Shot {
+            occlusion: false,
+            ..shot
+        },
+    )
+    .expect("adapter was available a moment ago");
+
+    // Not a test of anything unless the compared frame both left candidates
+    // out and had to draw some of them.
+    let stats = with.occlusion;
+    eprintln!("occlusion: {stats:?}");
+    assert!(
+        stats.hidden_candidates > 0,
+        "nothing was culled, so the comparison below proves nothing: {stats:?}"
+    );
+    assert!(
+        stats.candidates > stats.hidden_candidates,
+        "no candidate was visible, so nothing could go missing: {stats:?}"
+    );
+
+    let differing = differing_pixels(&with, &without);
+    let fraction = differing.len() as f64 / (with.width as f64 * with.height as f64);
+    let max_delta = differing.iter().map(|p| p.delta).max().unwrap_or(0);
+    assert!(
+        max_delta <= 1 && fraction < 0.0001,
+        "occlusion culling changed the image: {:.6}% of pixels, max delta {max_delta} \
+         -- it left out something that shows.\n{}",
+        fraction * 100.0,
+        describe(&differing)
+    );
+}
+
 /// One pixel that came out differently between two renders of the same scene.
 struct DifferingPixel {
     x: usize,
@@ -417,6 +480,8 @@ fn a_cave_mouth_is_visible() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        occlusion: true,
+        earlier_camera: None,
     };
     assert_golden("cave_mouth", &world, shot);
 }
@@ -457,6 +522,8 @@ fn iron_ore_is_visible_in_a_cave_wall() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        occlusion: true,
+        earlier_camera: None,
     };
     assert_golden("iron_ore", &world, shot);
 }
@@ -531,6 +598,8 @@ fn the_selected_block_shows_an_outline() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        occlusion: true,
+        earlier_camera: None,
     };
     assert_golden("outline", &world, shot);
 }
@@ -571,6 +640,8 @@ fn a_block_being_dug_shows_cracks() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        occlusion: true,
+        earlier_camera: None,
     };
     // Measured: the image comparison alone caught missing cracks at 0.53%
     // against a 0.5% threshold -- one driver's rounding from passing. So also
@@ -645,6 +716,8 @@ fn items_show_their_icons() {
         crosshair: false,
         tooltip: None,
         gauges: None,
+        occlusion: true,
+        earlier_camera: None,
         icons,
     };
     // Nine icons against nine magenta swatches differ in well under the
@@ -720,6 +793,8 @@ fn the_hotbar_shows_slots_counts_and_the_held_one() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        occlusion: true,
+        earlier_camera: None,
     };
     assert_golden("hotbar", &world, shot);
 }
@@ -773,6 +848,8 @@ fn the_inventory_screen_shows_slots_a_recipe_and_the_cursor() {
         crosshair: false,
         tooltip: None,
         gauges: None,
+        occlusion: true,
+        earlier_camera: None,
         icons: Vec::new(),
         panel: Some((
             PanelLayout::Grid(2),
@@ -825,6 +902,8 @@ fn an_item_name_shows_beside_the_cursor() {
         crosshair: false,
         tooltip: Some("Wooden Pick".to_string()),
         gauges: None,
+        occlusion: true,
+        earlier_camera: None,
         icons: Vec::new(),
         panel: Some((
             PanelLayout::Grid(2),
@@ -858,6 +937,8 @@ fn the_crosshair_marks_the_centre_of_the_screen() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        occlusion: true,
+        earlier_camera: None,
     };
     // A crosshair is about 0.1% of the frame -- under the golden's 0.5%
     // tolerance, so the image comparison alone passes with it missing (found
@@ -903,6 +984,8 @@ fn hearts_show_health_including_a_half() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        occlusion: true,
+        earlier_camera: None,
     };
     assert_golden("hearts", &world, shot);
 }
@@ -953,6 +1036,8 @@ fn the_furnace_screen_shows_input_fuel_and_output() {
         crosshair: false,
         tooltip: None,
         gauges: None,
+        occlusion: true,
+        earlier_camera: None,
         icons: Vec::new(),
         panel: Some((
             PanelLayout::Furnace,
@@ -1004,6 +1089,8 @@ fn a_furnace_shows_its_flame_and_progress() {
         crosshair: false,
         tooltip: None,
         gauges: Some((0.25, 0.75)),
+        occlusion: true,
+        earlier_camera: None,
         icons: Vec::new(),
         panel: Some((PanelLayout::Furnace, contents, None, (10.0, 10.0))),
     };
@@ -1093,6 +1180,8 @@ fn distinct_materials_render_with_distinct_textures() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        occlusion: true,
+        earlier_camera: None,
     };
 
     let Some(frame) = headless::render_chunks(&chunks, shot) else {
@@ -1234,6 +1323,8 @@ fn three_players_stand_in_front_of_the_camera() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        occlusion: true,
+        earlier_camera: None,
     };
     assert_golden("three_players", &world, shot);
 }

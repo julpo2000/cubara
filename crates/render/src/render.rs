@@ -561,7 +561,7 @@ impl Renderer {
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         // CPU frustum-cull + upload the indirect draw list before the pass begins.
-        let draw_count = self.arena.prepare(&self.queue, &self.frustum);
+        let draws = self.arena.prepare(&self.queue, &self.frustum);
         self.visible_chunks = self.arena.visible_nodes() as usize;
 
         let mut encoder = self
@@ -579,8 +579,8 @@ impl Renderer {
                 &mut encoder,
                 &view,
                 SceneFrame {
-                    arena: &self.arena,
-                    draw_count,
+                    arena: &mut self.arena,
+                    draws,
                     selected_block,
                     cracking,
                     players,
@@ -595,6 +595,8 @@ impl Renderer {
 
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
+        // Lets the occlusion results that are ready be mapped, without waiting.
+        let _ = self.device.poll(wgpu::Maintain::Poll);
 
         self.report_fps();
     }
@@ -637,7 +639,8 @@ impl Renderer {
              xyz  {x:.1} / {y:.1} / {z:.1}\n\
              chunk  {cx} {cy} {cz}\n\
              facing  {facing}\n\
-             nodes  {vis} drawn / {res} resident",
+             nodes  {vis} in view / {res} resident
+             seen  {seen} nodes, {tris}k triangles",
             ms = self.frame_ms,
             x = p.x,
             y = p.y,
@@ -647,6 +650,8 @@ impl Renderer {
             cz = c.z,
             vis = self.visible_chunks,
             res = self.arena.len(),
+            seen = self.arena.occlusion_stats().visible,
+            tris = self.arena.occlusion_stats().triangles_drawn / 1000,
         )
     }
 
@@ -776,7 +781,8 @@ pub fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        // TEXTURE_BINDING: occlusion culling builds its depth pyramid from it.
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     texture.create_view(&wgpu::TextureViewDescriptor::default())
