@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use cubara_render::{MeshedNode, NodeId, Renderer};
-use cubara_voxel::{BlockRegistry, ChunkCoord, FaceLinks};
+use cubara_voxel::{BlockRegistry, ChunkCoord};
 use cubara_world::mesh::{sort_batch, BuiltNode, MeshPool};
 use cubara_world::node::{self, NodeKey};
 use cubara_world::visibility;
@@ -99,27 +99,99 @@ pub struct NodeStreaming {
     /// call; `None` before the first one, so it always streams in the
     /// initial region rather than needing a separate priming call.
     center: Option<ChunkCoord>,
-    /// Every node the octree wants around the camera: the whole render
-    /// distance, seen or not.
-    desired: HashSet<NodeKey>,
     /// What joins what inside each node generated so far -- kept after a node's
     /// mesh is dropped for being out of sight, so the search can still pass
-    /// through it without generating it again.
-    links: HashMap<NodeKey, FaceLinks>,
+    /// through it without generating it again. Behind an [`Arc`] so a search
+    /// can take a snapshot without copying it; a write while a search holds
+    /// one copies once.
+    links: Arc<HashMap<NodeKey, visibility::NodeLinks>>,
     /// The nodes the camera could see ([`visibility::visible_nodes`]); the only
     /// ones meshed and drawn.
     visible: HashSet<NodeKey>,
-    /// New links arrived since the visible set was worked out.
+    /// New links arrived since the last search was started.
     visibility_stale: bool,
-    /// Frames since the visible set was last worked out, to spread the search
-    /// over a burst of arriving meshes instead of running it every frame.
+    /// Frames since the last search was started, to spread searches over a
+    /// burst of arriving meshes.
     frames_since_visibility: u32,
+    /// Searches run here, off the frame: over a full render distance one takes
+    /// tens of milliseconds, which on the main thread would be a hitch every
+    /// time the camera crossed a chunk.
+    searcher: Searcher,
+    /// The newest search started, so an older answer arriving late is ignored.
+    generation: u64,
+    /// A search is running that has not answered yet.
+    searching: bool,
 }
 
-/// How many frames arriving meshes may wait before the visible set is worked
-/// out again. The search is a few milliseconds over a full render distance;
-/// every frame during a load would be most of a frame budget, and ten frames
-/// is still far quicker than a person notices a node appear.
+/// One search to run: the camera's chunk and a snapshot of what is known.
+struct SearchJob {
+    generation: u64,
+    center: ChunkCoord,
+    links: Arc<HashMap<NodeKey, visibility::NodeLinks>>,
+}
+
+/// A search's answer: the whole render distance around `center`, and what of it
+/// can be seen.
+struct SearchDone {
+    generation: u64,
+    center: ChunkCoord,
+    desired: HashSet<NodeKey>,
+    visible: HashSet<NodeKey>,
+}
+
+/// A thread that works out the render distance and what of it is visible.
+struct Searcher {
+    jobs: std::sync::mpsc::Sender<SearchJob>,
+    done: std::sync::mpsc::Receiver<SearchDone>,
+    _thread: std::thread::JoinHandle<()>,
+}
+
+impl Searcher {
+    fn new() -> Self {
+        let (jobs, job_rx) = std::sync::mpsc::channel::<SearchJob>();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("cubara-visibility".into())
+            .spawn(move || {
+                while let Ok(mut job) = job_rx.recv() {
+                    // Only the newest matters; skip any that queued behind it.
+                    while let Ok(newer) = job_rx.try_recv() {
+                        job = newer;
+                    }
+                    let desired: HashSet<NodeKey> = node::desired_nodes_3d(
+                        job.center,
+                        VERTICAL_LOD_SQUASH,
+                        node::DEFAULT_RING_SCHEDULE,
+                    )
+                    .into_iter()
+                    .collect();
+                    let links = &job.links;
+                    let visible =
+                        visibility::visible_nodes(job.center, &desired, |n| links.get(&n).copied());
+                    let answer = SearchDone {
+                        generation: job.generation,
+                        center: job.center,
+                        desired,
+                        visible,
+                    };
+                    if done_tx.send(answer).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn visibility thread");
+        Self {
+            jobs,
+            done,
+            _thread: thread,
+        }
+    }
+}
+
+/// How many frames arriving meshes may wait before another search is started.
+/// Searches run on their own thread, but each takes tens of milliseconds, so
+/// starting one every frame during a load would only queue answers nobody
+/// waits for.
 const VISIBILITY_EVERY_FRAMES: u32 = 10;
 
 impl NodeStreaming {
@@ -146,11 +218,13 @@ impl NodeStreaming {
             mesh_pool: MeshPool::new(),
             resident: HashSet::new(),
             center: None,
-            desired: HashSet::new(),
-            links: HashMap::new(),
+            links: Arc::new(HashMap::new()),
             visible: HashSet::new(),
             visibility_stale: false,
             frames_since_visibility: 0,
+            searcher: Searcher::new(),
+            generation: 0,
+            searching: false,
         }
     }
 
@@ -162,9 +236,19 @@ impl NodeStreaming {
         let center = ChunkCoord::from_world_pos(eye);
         self.frames_since_visibility += 1;
         if self.center != Some(center) {
-            self.stream_around(renderer, world, center);
-        } else if self.visibility_stale && self.frames_since_visibility >= VISIBILITY_EVERY_FRAMES {
-            self.follow_visibility(renderer, world, center);
+            self.center = Some(center);
+            self.start_search(center);
+        } else if self.visibility_stale
+            && !self.searching
+            && self.frames_since_visibility >= VISIBILITY_EVERY_FRAMES
+        {
+            self.start_search(center);
+        }
+        while let Ok(done) = self.searcher.done.try_recv() {
+            if done.generation == self.generation {
+                self.searching = false;
+                self.follow_visibility(renderer, world, done);
+            }
         }
         self.drain_meshes(renderer);
     }
@@ -186,51 +270,36 @@ impl NodeStreaming {
             .request(world, &self.registry, &self.layer_of, node, self.blocks);
     }
 
-    /// Drop nodes that fell outside the ring schedule, and *request* each
-    /// desired node that isn't already resident or in flight, nearest first.
-    /// Meshing happens on the worker pool; results are applied in
-    /// [`drain_meshes`](Self::drain_meshes), so this never meshes on the
-    /// caller's thread.
-    ///
-    /// A boundary crossing typically unloads some nodes and loads others at
-    /// a *different* level for the same area (a coarse node splitting into
-    /// finer ones, or the reverse) -- unlike a same-key LOD change, this
-    /// isn't a same-key swap, so the outgoing node's geometry disappears
-    /// immediately rather than staying drawn until the replacement is
-    /// ready. A momentary gap at a ring boundary is an accepted, known
-    /// limitation (see issue #107) -- the same category as the
-    /// LOD-boundary cracks skirts (#108) fix, not a correctness bug.
-    fn stream_around(&mut self, renderer: &mut Renderer, world: &Arc<World>, center: ChunkCoord) {
-        self.desired =
-            node::desired_nodes_3d(center, VERTICAL_LOD_SQUASH, node::DEFAULT_RING_SCHEDULE)
-                .into_iter()
-                .collect();
-        // What a node joins does not depend on where the camera is, but a node
-        // outside the render distance is not worth remembering.
-        let desired = &self.desired;
-        self.links.retain(|n, _| desired.contains(n));
-        self.center = Some(center);
-        self.follow_visibility(renderer, world, center);
+    /// Hand the search thread the camera's chunk and what is known now.
+    fn start_search(&mut self, center: ChunkCoord) {
+        self.generation += 1;
+        self.searching = true;
+        self.visibility_stale = false;
+        self.frames_since_visibility = 0;
+        let job = SearchJob {
+            generation: self.generation,
+            center,
+            links: Arc::clone(&self.links),
+        };
+        // A closed channel means the thread died with a panic, which it
+        // reports itself; drawing what is already loaded is the best left.
+        let _ = self.searcher.jobs.send(job);
     }
 
-    /// Work out what the camera could see, drop what it cannot, and ask for
-    /// what it can and is not here yet, nearest first.
+    /// Apply a search's answer: drop what cannot be seen, and ask for what can
+    /// and is not here yet, nearest first.
     ///
     /// **Unseen nodes are not meshed, not uploaded and not drawn** -- and a
     /// node the search has not been able to reach is never even generated. A
     /// node not yet generated counts as seen but is not searched through until
     /// its links arrive, so the visible set grows outward along what can be
     /// seen as meshes come in.
-    fn follow_visibility(
-        &mut self,
-        renderer: &mut Renderer,
-        world: &Arc<World>,
-        center: ChunkCoord,
-    ) {
-        let links = &self.links;
-        self.visible = visibility::visible_nodes(center, &self.desired, |n| links.get(&n).copied());
-        self.visibility_stale = false;
-        self.frames_since_visibility = 0;
+    fn follow_visibility(&mut self, renderer: &mut Renderer, world: &Arc<World>, done: SearchDone) {
+        // What a node joins does not depend on where the camera is, but a node
+        // outside the render distance is not worth remembering.
+        let desired = done.desired;
+        Arc::make_mut(&mut self.links).retain(|n, _| desired.contains(n));
+        self.visible = done.visible;
 
         let stale: Vec<NodeKey> = self
             .resident
@@ -252,7 +321,7 @@ impl NodeStreaming {
             .filter(|n| !self.resident.contains(n) && !self.mesh_pool.is_in_flight(**n))
             .copied()
             .collect();
-        node::sort_nearest_first(&mut to_load, center);
+        node::sort_nearest_first(&mut to_load, done.center);
         for node in to_load {
             self.mesh_pool
                 .request(world, &self.registry, &self.layer_of, node, self.blocks);
@@ -289,7 +358,8 @@ impl NodeStreaming {
         let meshed: Vec<MeshedNode> = sort_batch(self.mesh_pool.poll())
             .into_iter()
             .filter_map(|built| {
-                if self.links.insert(built.node, built.links) != Some(built.links) {
+                if self.links.get(&built.node) != Some(&built.links) {
+                    Arc::make_mut(&mut self.links).insert(built.node, built.links);
                     self.visibility_stale = true;
                 }
                 // Went out of sight while it was being meshed: remember what it

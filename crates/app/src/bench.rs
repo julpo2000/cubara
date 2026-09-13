@@ -130,10 +130,16 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View) {
             let desired: std::collections::HashSet<_> = meshed.iter().map(|b| b.node).collect();
             let links: std::collections::HashMap<_, _> =
                 meshed.iter().map(|b| (b.node, b.links)).collect();
+            let searching = Instant::now();
             let visible = cubara_world::visibility::visible_nodes(center, &desired, |n| {
                 links.get(&n).copied()
             });
-            log::info!("visible: {} of {} nodes", visible.len(), built_nodes);
+            log::info!(
+                "visible: {} of {} nodes, searched in {:.1} ms",
+                visible.len(),
+                built_nodes,
+                searching.elapsed().as_secs_f64() * 1000.0
+            );
             meshed
                 .into_iter()
                 .filter(|b| visible.contains(&b.node))
