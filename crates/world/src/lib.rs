@@ -23,6 +23,7 @@ mod noise;
 pub mod raycast;
 pub mod region;
 pub mod streaming;
+pub mod visibility;
 mod world;
 mod worldgen;
 

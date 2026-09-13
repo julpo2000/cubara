@@ -53,6 +53,7 @@ frames after 200 warmup.
 | 2026-09-13 | **Covered border faces left out** — nodes meshed against their neighbours, radius 64, band ±2⁴⁷ | **1,969** | **674,484** | **~4,160** | **0.102 ms** | ~0.44 ms | *(this PR)* |
 | 2026-09-13 | LOD rings tile exactly (octree) — the gaps are drawn now, radius 64, band ±2⁴⁸ | 2,174 | 738,078 | ~3,890 | 0.107 ms | ~0.35 ms | *(this PR)* |
 | 2026-09-13 | **No vertical band** — 3D octree, vertical LOD squash 2, radius 64 (orbit)⁴⁹ | 4,377 | 1,015,554 | ~2,950 | 0.125 ms | ~0.41 ms | *(this PR)* |
+| 2026-09-13 | **Visibility culling** — only what a line of sight can reach is generated, meshed and drawn; eye at y=40⁵⁰ | 1,555 | 615,408 | ~7,310 | 0.069 ms | — | *(this PR)* |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -1483,3 +1484,24 @@ drew nothing -- what is drawn is a cube, only how finely is squashed.
 Meshing the whole default region single-threaded: 1.85 s with the band, 4.96 s
 now, most of it rock that meshes to nothing; nodes wholly above the tallest
 generated block are skipped without generating.
+
+⁵⁰ **What cannot be seen is not generated, meshed, uploaded or drawn.** A
+search outward from the camera's node crosses from node to node only where air
+inside joins the faces (`FaceLinks`), and never steps against a direction it
+has already taken -- which no straight line of sight does, so nothing visible
+is lost (`every_node_a_line_of_sight_hits_is_visible`: ~1,200 rays each from three
+cameras through a world with caves and levels of detail). Radius 64, first-person
+views, squash 2:
+
+```
+view            before (no culling)                 after
+eye y=40        6138 FPS, 877,392 tris              7310 FPS, 615,408 tris   9,593 of 16,330 nodes reachable (most are sky)
+eye y=300       12860 FPS, 237,844 tris             12848 FPS, 237,844 tris  nothing below to hide
+eye in a cave   --                                  6732 FPS, 1,524 tris     11 of 16,330 nodes
+eye in rock     7473 FPS, 972,218 tris              12985 FPS, 28 tris       7 of 16,330 -- nothing to see
+```
+
+The orbit view sits outside the region, where there is no node to search from,
+and draws everything as before. The bench generates every node to measure; the
+game generates only the ones the search reaches, which is the part that makes
+caves at every level of detail affordable next.
