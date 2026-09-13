@@ -1489,7 +1489,7 @@ generated block are skipped without generating.
 search outward from the camera's node crosses from node to node only where air
 inside joins the faces (`FaceLinks`), and never steps against a direction it
 has already taken -- which no straight line of sight does, so nothing visible
-is lost (`every_node_a_line_of_sight_hits_is_visible`: 3,000 rays from three
+is lost (`every_node_a_line_of_sight_hits_is_visible`: ~1,200 rays each from three
 cameras through a world with caves and levels of detail). Radius 64, first-person
 views, squash 2:
 
