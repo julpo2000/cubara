@@ -918,14 +918,40 @@ impl Server {
                 true
             }
             Err(e) => {
-                log::error!(
-                    "could not load {}: {e} -- starting a fresh world",
-                    dir.display()
-                );
+                // Moved out of the way before anything can write over it: the
+                // fresh world is saved to `dir` when the game closes, and a
+                // world someone played must never be lost to a generator
+                // change -- it can be loaded again by a build that reads it.
+                match set_aside(dir) {
+                    Ok(kept) => log::error!(
+                        "could not load {}: {e} -- kept it as {} and starting a fresh world",
+                        dir.display(),
+                        kept.display()
+                    ),
+                    Err(io) => log::error!(
+                        "could not load {}: {e}, nor move it aside ({io}) -- starting a fresh world",
+                        dir.display()
+                    ),
+                }
                 false
             }
         }
     }
+}
+
+/// Rename a save that could not be loaded to the first free
+/// `<name>-unloaded-<n>` beside it, and return where it went.
+fn set_aside(dir: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "world".to_string());
+    let kept = (1..)
+        .map(|n| dir.with_file_name(format!("{name}-unloaded-{n}")))
+        .find(|p| !p.exists())
+        .expect("some suffix is free");
+    std::fs::rename(dir, &kept)?;
+    Ok(kept)
 }
 
 impl Default for Server {
