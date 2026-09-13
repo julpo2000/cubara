@@ -254,7 +254,7 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View) {
             queue.submit(std::iter::once(encoder.finish()));
             (
                 cpu_start.elapsed().as_secs_f64() * 1000.0,
-                draw_count as usize,
+                arena.visible_nodes() as usize,
             )
         };
 
@@ -270,18 +270,24 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View) {
     // Measure sustained throughput over wall-clock time, plus per-frame CPU cost.
     let mut cpu_ms: Vec<f64> = Vec::with_capacity(MEASURE_FRAMES as usize);
     let mut visible_sum = 0u64;
+    let mut triangles_sum = 0u64;
     let wall_start = Instant::now();
     for _ in 0..MEASURE_FRAMES {
         cubara_render::Profiler::new_frame();
         let (ms, visible) = submit_frame(&mut arena, &mut scene, virtual_t);
         cpu_ms.push(ms);
         visible_sum += visible as u64;
+        triangles_sum += arena.visible_triangles();
         let _ = device.poll(wgpu::Maintain::Poll);
         virtual_t += VIRTUAL_DT;
     }
     let _ = device.poll(wgpu::Maintain::Wait);
     let wall_secs = wall_start.elapsed().as_secs_f64();
     let avg_visible = visible_sum as f64 / MEASURE_FRAMES as f64;
+    log::info!(
+        "triangles drawn: avg {:.0} (faces turned away from the camera left out)",
+        triangles_sum as f64 / MEASURE_FRAMES as f64
+    );
 
     report(MEASURE_FRAMES, wall_secs, cpu_ms, avg_visible, total_nodes);
 }

@@ -54,6 +54,7 @@ frames after 200 warmup.
 | 2026-09-13 | LOD rings tile exactly (octree) — the gaps are drawn now, radius 64, band ±2⁴⁸ | 2,174 | 738,078 | ~3,890 | 0.107 ms | ~0.35 ms | *(this PR)* |
 | 2026-09-13 | **No vertical band** — 3D octree, vertical LOD squash 2, radius 64 (orbit)⁴⁹ | 4,377 | 1,015,554 | ~2,950 | 0.125 ms | ~0.41 ms | *(this PR)* |
 | 2026-09-13 | **Visibility culling** — only what a line of sight can reach is generated, meshed and drawn; eye at y=40⁵⁰ | 1,555 | 615,408 | ~7,310 | 0.069 ms | — | *(this PR)* |
+| 2026-09-13 | **Faces turned away from the camera left out** — meshes grouped by direction, radius 64 (orbit)⁵² | 4,377 | 1,015,554 (573,298 drawn) | ~3,592 | 0.168 ms | ~0.48 ms | *(this PR)* |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -1505,3 +1506,25 @@ The orbit view sits outside the region, where there is no node to search from,
 and draws everything as before. The bench generates every node to measure; the
 game generates only the ones the search reaches, which is the part that makes
 caves at every level of detail affordable next.
+
+⁵² **A face pointing away from the camera is no longer sent to the GPU at all.**
+Back-face culling already kept those triangles off the screen, but only after
+every one of their vertices had been through the vertex shader. Meshes now come
+grouped by face direction (`Mesh::group_by_face`), and a node draws only the
+directions the camera could be in front of (`arena::faces_facing`): one of each
+opposite pair for a node the camera is outside of. The same technique Sodium
+calls block face culling; Nick McDonald measured 22% with it.
+
+Five alternating runs of `main` and this branch, median FPS:
+
+```
+view               main     this     triangles drawn (orbit)
+orbit              2991     3592     1,015,554 -> 573,298
+eye y=40           4893     4881
+eye y=300          12923    13002
+eye y=40, 4K       3244     3231
+```
+
++20% where the GPU's vertex work is the limit (the gate's orbit, and on the
+M3 more of the frame is), and no change where the CPU is. CPU per frame rises
+0.122 -> 0.168 ms: the per-direction draw list. It is still not the limit.

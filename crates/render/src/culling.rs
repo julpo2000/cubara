@@ -19,6 +19,9 @@ use glam::{Mat4, Vec3, Vec4};
 /// extracted from a view*projection matrix.
 pub struct Frustum {
     planes: [Vec4; 6],
+    /// Where the camera is: the one point the projection sends to `x = y = w
+    /// = 0`. Worked out here so it can never disagree with the planes.
+    eye: Vec3,
 }
 
 impl Frustum {
@@ -41,7 +44,17 @@ impl Frustum {
             let len = Vec3::new(p.x, p.y, p.z).length();
             *p /= len;
         }
-        Self { planes }
+        // `m * eye = (0, 0, c, 0)` for a perspective camera, so the eye is
+        // `m⁻¹ * (0, 0, 1, 0)`, divided through. In f64: world coordinates run
+        // to thousands and the far plane is 20,000 near planes away.
+        let h = m.as_dmat4().inverse() * glam::DVec4::new(0.0, 0.0, 1.0, 0.0);
+        let eye = (h.truncate() / h.w).as_vec3();
+        Self { planes, eye }
+    }
+
+    /// The camera's position.
+    pub fn eye(&self) -> Vec3 {
+        self.eye
     }
 
     /// Conservative test: `false` only when `aabb` is fully outside at least one
@@ -185,5 +198,19 @@ mod tests {
             "far plane should be depth 0, got {}",
             depth_of(-100.0)
         );
+    }
+
+    #[test]
+    fn the_frustum_knows_where_the_camera_is() {
+        // Far from the origin, as a player is, and looking every which way.
+        for (eye, dir) in [
+            (Vec3::new(1234.5, 67.25, -890.75), Vec3::new(0.3, -0.2, 1.0)),
+            (Vec3::new(-3.0, 300.0, 5.0), Vec3::new(0.0, -1.0, 0.01)),
+            (Vec3::new(0.5, 0.5, 0.5), Vec3::new(-1.0, 0.0, 0.0)),
+        ] {
+            let vp = crate::render::CameraUniform::look_view_proj(16.0 / 9.0, eye, dir);
+            let got = Frustum::from_view_proj(vp).eye();
+            assert!((got - eye).length() < 1e-3, "eye {eye} came back as {got}");
+        }
     }
 }
