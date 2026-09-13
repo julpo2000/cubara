@@ -6,37 +6,69 @@
 //! rendering of its own; when it did, it drifted from the game and stopped proving
 //! anything.
 //!
-//! Run with: `cargo run --release -- --screenshot out.png`
+//! Run with: `cargo run --release -- --screenshot out.png`, or from a place:
+//! `--screenshot out.png --eye X,Y,Z --look DX,DY,DZ [--radius N] [--size WxH]`.
 
 use cubara_render::materials::TextureLayers;
 use cubara_render::{headless, load_registry, Shot};
 use cubara_voxel::ChunkCoord;
-use cubara_world::mesh::mesh_region;
-use cubara_world::node::schedule_for_radius;
+use cubara_world::mesh::{mesh_nodes, mesh_region};
+use cubara_world::node::{desired_nodes_3d, schedule_for_radius};
 use cubara_world::World;
 
-use crate::streaming::to_meshed_node;
+use crate::streaming::{to_meshed_node, VERTICAL_LOD_SQUASH};
 
-pub fn run(path: &str) {
-    let shot = Shot::default();
+/// Where a screenshot looks from. `None` is the default shot: the orbit over
+/// the old three-layer slab around the origin, as it always was.
+#[derive(Clone, Copy, Debug)]
+pub struct View {
+    pub eye: [f32; 3],
+    pub look: [f32; 3],
+    /// Render distance in chunks.
+    pub radius: i32,
+    pub size: (u32, u32),
+}
+
+pub fn run(path: &str, view: Option<View>) {
     let world = World::new();
     let registry = load_registry();
     let layers = TextureLayers::from_registry(&registry);
     let layer_of = |name: &str| layers.layer_of(name);
-    let schedule = schedule_for_radius(shot.region_radius);
-    let meshed = mesh_region(
-        &world,
-        &registry,
-        &layer_of,
-        ChunkCoord::new(0, 0, 0),
-        0..=2,
-        &schedule,
-        cubara_world::TerrainBlocks::from_registry(&registry)
-            .with_oak(&crate::game::load_structure_registry(), &registry)
-            .with_ores(&crate::game::load_ore_registry(), &registry),
-    )
-    .into_iter()
-    .filter_map(to_meshed_node);
+    let blocks = cubara_world::TerrainBlocks::from_registry(&registry)
+        .with_oak(&crate::game::load_structure_registry(), &registry)
+        .with_ores(&crate::game::load_ore_registry(), &registry);
+    let (shot, built) = match view {
+        None => {
+            let shot = Shot::default();
+            let schedule = schedule_for_radius(shot.region_radius);
+            let built = mesh_region(
+                &world,
+                &registry,
+                &layer_of,
+                ChunkCoord::new(0, 0, 0),
+                0..=2,
+                &schedule,
+                blocks,
+            );
+            (shot, built)
+        }
+        // The nodes the game streams around a player standing at `eye`.
+        Some(v) => {
+            let centre = ChunkCoord::from_world_pos(v.eye);
+            let nodes =
+                desired_nodes_3d(centre, VERTICAL_LOD_SQUASH, &schedule_for_radius(v.radius));
+            let built = mesh_nodes(&world, &registry, &layer_of, nodes, blocks);
+            let shot = Shot {
+                width: v.size.0,
+                height: v.size.1,
+                region_radius: v.radius,
+                camera: Some((glam::Vec3::from(v.eye), glam::Vec3::from(v.look))),
+                ..Shot::default()
+            };
+            (shot, built)
+        }
+    };
+    let meshed = built.into_iter().filter_map(to_meshed_node);
     let Some(frame) = headless::render(meshed, shot) else {
         log::error!("no suitable GPU adapter — cannot render a screenshot");
         return;

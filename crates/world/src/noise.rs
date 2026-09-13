@@ -105,6 +105,29 @@ pub fn fbm2(seed: u64, x: f32, z: f32, octaves: u32, lacunarity: f32, gain: f32)
     sum / norm
 }
 
+/// Ridged multifractal noise in `[0, 1]`: sharp crests where [`value2`]
+/// crosses zero, each octave's detail weighted by how high the octaves above
+/// it already put the point -- so peaks and ridge lines are rough and valleys
+/// stay smooth, the shape of real ranges rather than of rolling hills.
+pub fn ridged2(seed: u64, x: f32, z: f32, octaves: u32, lacunarity: f32, gain: f32) -> f32 {
+    let mut freq = 1.0;
+    let mut amp = 1.0;
+    let mut weight = 1.0f32;
+    let mut sum = 0.0;
+    let mut norm = 0.0;
+    for o in 0..octaves {
+        let octave_seed = seed.wrapping_add((o as u64).wrapping_mul(0x9E3779B97F4A7C15));
+        let ridge = 1.0 - value2(octave_seed, x * freq, z * freq).abs();
+        let ridge = ridge * ridge * weight;
+        weight = (ridge * 2.0).clamp(0.0, 1.0);
+        sum += ridge * amp;
+        norm += amp;
+        freq *= lacunarity;
+        amp *= gain;
+    }
+    sum / norm
+}
+
 /// The 3D counterpart of [`fbm2`], layering [`value3`] instead.
 pub fn fbm3(seed: u64, x: f32, y: f32, z: f32, octaves: u32, lacunarity: f32, gain: f32) -> f32 {
     let mut freq = 1.0;

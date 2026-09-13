@@ -344,6 +344,36 @@ impl Fixture {
         self.server.break_at(target);
     }
 
+    /// Every block of `name` in the shaft straight down from the player: within
+    /// `radius` sideways, from the player's feet to `depth` below, nearest
+    /// first. Where a player who wants ore digs -- and on a mountain that is a
+    /// long way down, which a cube around the player would never reach.
+    fn find_below(&self, name: &str, radius: i32, depth: i32) -> Vec<[i32; 3]> {
+        let p = self
+            .server
+            .sim
+            .player(self.server.local.expect("a local client"))
+            .pos
+            .to_f32();
+        let (cx, cy, cz) = (p[0] as i32, p[1] as i32, p[2] as i32);
+        let mut found = Vec::new();
+        for dy in 0..=depth {
+            for dx in -radius..=radius {
+                for dz in -radius..=radius {
+                    let b = [cx + dx, cy - dy, cz + dz];
+                    if self.is(b, name) {
+                        found.push((dx.abs() + dy + dz.abs(), b));
+                    }
+                }
+            }
+            if !found.is_empty() {
+                break;
+            }
+        }
+        found.sort();
+        found.into_iter().map(|(_, b)| b).collect()
+    }
+
     /// Every block of `name` within `radius` of the player, nearest first.
     ///
     /// Sorted by `(distance, x, y, z)` — a total order, so *which* log the
@@ -685,10 +715,10 @@ fn run_survival_script() -> Fixture {
 
     // --- Mine iron ore, which needs the stone pick ------------------------
     f.equip("cubara:stone_pick");
-    let ore = f.find("cubara:iron_ore", 30);
+    let ore = f.find_below("cubara:iron_ore", 16, 256);
     let vein = *ore
         .first()
-        .expect("iron ore within 30 blocks of spawn; the ladder ends at iron");
+        .expect("iron ore below spawn; the ladder ends at iron");
     f.dig(vein);
     assert_eq!(
         f.carrying("cubara:raw_iron"),

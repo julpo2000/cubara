@@ -10,7 +10,7 @@
 
 use cubara_voxel::{BlockId, BlockRegistry, Chunk, OreRegistry, StructureRegistry};
 
-use crate::noise::{fbm2, fbm3};
+use crate::noise::{fbm2, fbm3, ridged2};
 
 /// The three block ids unedited terrain is layered with by depth below the
 /// surface -- resolved by the caller from its own loaded registry by name
@@ -250,6 +250,31 @@ const TERRAIN_GAIN: f32 = 0.5;
 const TERRAIN_AMPLITUDE: f32 = 14.0;
 const TERRAIN_BASE_HEIGHT: i32 = 24;
 
+// Mountains: ranges rising out of the hills above. A broad, slow noise
+// decides *where* a range is (`MOUNTAIN_REGION_*`, hundreds of blocks
+// across); inside one, ridged noise decides the peaks and the valleys between
+// them. The edge of a range is a smooth ramp from nothing to full height, so
+// hills turn into foothills rather than meeting a wall.
+const MOUNTAIN_REGION_FREQ: f32 = 0.0012;
+const MOUNTAIN_REGION_OCTAVES: u32 = 3;
+/// Where the region noise starts and finishes raising a range.
+const MOUNTAIN_EDGE: (f32, f32) = (0.05, 0.35);
+const MOUNTAIN_RIDGE_FREQ: f32 = 0.005;
+const MOUNTAIN_RIDGE_OCTAVES: u32 = 5;
+/// How far a whole range is lifted, before any peak.
+const MOUNTAIN_UPLIFT: f32 = 30.0;
+/// The most a ridge adds on top of that.
+const MOUNTAIN_PEAK: f32 = 190.0;
+/// Arbitrary, as every mix constant is -- but picked, from 3,000 candidates,
+/// as one that keeps the origin in the hills for the default seed (nothing
+/// above y = 40 within 320 blocks) and for every seed a test or golden image
+/// frames the origin with (within 128). The default seed's nearest range then
+/// rises ~370 blocks from spawn, peaking ~220 up. So a new world starts where
+/// iron is within reach and mountains are in view, and every test built around
+/// the origin's terrain still shows the terrain it was built around.
+const MOUNTAIN_SEED_MIX: u64 = 0x74D8_B1DA_9810_93EC;
+const RIDGE_SEED_MIX: u64 = 0x5851_F42D_4C95_7F2D;
+
 // Cave shape. `CAVE_FREQ` sets tunnel scale; `CAVE_THRESHOLD` sets how much
 // of the noise field's ~[-1,1] range counts as "inside a tunnel" -- higher
 // means rarer, narrower caves. `CAVE_SEED_MIX` keeps cave noise from being
@@ -299,7 +324,7 @@ fn ore_seed_mix(name: &str) -> u64 {
 /// old save's *unedited* chunks are regenerated on load (§7.4), so a
 /// changed generator would silently reshape the world around the player's
 /// edits if this weren't checked -- the failure mode §7.4 names directly.
-pub const WORLDGEN_VERSION: u32 = 2;
+pub const WORLDGEN_VERSION: u32 = 3;
 
 /// Seeded terrain + cave generator. See the module docs and
 /// `docs/PHASE1_ARCHITECTURE.md` §8 for the contract this must hold to.
@@ -382,7 +407,37 @@ impl WorldGen {
             TERRAIN_LACUNARITY,
             TERRAIN_GAIN,
         );
-        (TERRAIN_BASE_HEIGHT as f32 + n * TERRAIN_AMPLITUDE).round() as i32
+        (TERRAIN_BASE_HEIGHT as f32 + n * TERRAIN_AMPLITUDE + self.mountains(x, z)).round() as i32
+    }
+
+    /// How much a mountain range raises the column at `(x, z)`: zero outside
+    /// every range, up to `MOUNTAIN_UPLIFT + MOUNTAIN_PEAK` on the highest
+    /// peak.
+    fn mountains(&self, x: i32, z: i32) -> f32 {
+        let region = fbm2(
+            self.seed ^ MOUNTAIN_SEED_MIX,
+            x as f32 * MOUNTAIN_REGION_FREQ,
+            z as f32 * MOUNTAIN_REGION_FREQ,
+            MOUNTAIN_REGION_OCTAVES,
+            2.0,
+            0.5,
+        );
+        let (low, high) = MOUNTAIN_EDGE;
+        let t = ((region - low) / (high - low)).clamp(0.0, 1.0);
+        if t == 0.0 {
+            // Most of the world: the ridged noise is not worth sampling.
+            return 0.0;
+        }
+        let rise = t * t * (3.0 - 2.0 * t);
+        let ridges = ridged2(
+            self.seed ^ RIDGE_SEED_MIX,
+            x as f32 * MOUNTAIN_RIDGE_FREQ,
+            z as f32 * MOUNTAIN_RIDGE_FREQ,
+            MOUNTAIN_RIDGE_OCTAVES,
+            2.0,
+            0.5,
+        );
+        rise * (MOUNTAIN_UPLIFT + ridges * MOUNTAIN_PEAK)
     }
 
     /// [`density`](Self::density), given an already-known `surface_height(x,
@@ -678,7 +733,10 @@ impl WorldGen {
     pub fn highest_generated_y(blocks: TerrainBlocks) -> i32 {
         // The height field is `base + fbm * amplitude`, and fbm is normalised
         // into [-1, 1].
-        let surface = TERRAIN_BASE_HEIGHT + TERRAIN_AMPLITUDE.ceil() as i32;
+        let surface = TERRAIN_BASE_HEIGHT
+            + TERRAIN_AMPLITUDE.ceil() as i32
+            + (MOUNTAIN_UPLIFT + MOUNTAIN_PEAK).ceil() as i32
+            + 1;
         match blocks.oak {
             // A trunk starts one above the surface; the canopy reaches one
             // above the trunk's top. One more for good measure.
@@ -790,6 +848,9 @@ impl WorldGen {
 mod tests {
     use super::*;
 
+    /// `World::new`'s seed: the one a player gets.
+    const DEFAULT_TEST_SEED: u64 = 0x005E_ED00_00C0_FFEE;
+
     fn test_blocks() -> TerrainBlocks {
         TerrainBlocks {
             oak: None,
@@ -856,6 +917,88 @@ mod tests {
         );
     }
 
+    /// Surface heights over an 8,192-block square, every 32 blocks.
+    fn surface_sample(gen: WorldGen) -> Vec<i32> {
+        (-4096..4096)
+            .step_by(32)
+            .flat_map(|x| {
+                (-4096..4096)
+                    .step_by(32)
+                    .map(move |z| gen.surface_height(x, z))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mountains_rise_in_ranges_with_hills_between() {
+        // The owner asked for serious mountains, and to see them at scale:
+        // peaks far above the hills, but as ranges -- most of the world is
+        // still hills, and a range is a region, not noise on every column.
+        for seed in [DEFAULT_TEST_SEED, 0x5EED, 119] {
+            let heights = surface_sample(WorldGen::new(seed));
+            let share = |f: &dyn Fn(i32) -> bool| {
+                heights.iter().filter(|&&h| f(h)).count() as f64 / heights.len() as f64
+            };
+            let tallest = *heights.iter().max().unwrap();
+            let hills = share(&|h| h <= TERRAIN_BASE_HEIGHT + TERRAIN_AMPLITUDE as i32);
+            let high = share(&|h| h > 100);
+            assert!(
+                tallest > 180,
+                "seed {seed}: the tallest peak is only {tallest}"
+            );
+            assert!(
+                hills > 0.5,
+                "seed {seed}: only {:.0}% is hills",
+                hills * 100.0
+            );
+            assert!(
+                (0.03..0.3).contains(&high),
+                "seed {seed}: {:.1}% of the world is above y = 100",
+                high * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn mountains_have_cliffs() {
+        // Ridged, not rolling: somewhere a single step sideways climbs several
+        // blocks at once.
+        let gen = WorldGen::new(DEFAULT_TEST_SEED);
+        let steepest = (-2048..2048)
+            .step_by(4)
+            .flat_map(|x| (-2048..2048).step_by(4).map(move |z| (x, z)))
+            .map(|(x, z)| (gen.surface_height(x + 1, z) - gen.surface_height(x, z)).abs())
+            .max()
+            .unwrap();
+        assert!(steepest >= 5, "the steepest step is {steepest} blocks");
+    }
+
+    #[test]
+    fn a_new_world_starts_in_the_hills_with_mountains_in_view() {
+        // What `MOUNTAIN_SEED_MIX` was picked for: the default seed's spawn is
+        // not on a peak (iron, which lies below y = 40, stays within reach, and
+        // the tests framed on the origin keep their terrain), and a range is
+        // close enough to see.
+        let gen = WorldGen::new(DEFAULT_TEST_SEED);
+        let mut nearest_peak = f64::MAX;
+        for x in (-640..=640).step_by(8) {
+            for z in (-640..=640).step_by(8) {
+                let h = gen.surface_height(x, z);
+                let d = ((x * x + z * z) as f64).sqrt();
+                if d <= 320.0 {
+                    assert!(h <= 40, "a mountain at ({x}, {z}), {d:.0} from spawn: {h}");
+                }
+                if h > 120 {
+                    nearest_peak = nearest_peak.min(d);
+                }
+            }
+        }
+        assert!(
+            nearest_peak < 600.0,
+            "the nearest range is {nearest_peak:.0} blocks off"
+        );
+    }
+
     #[test]
     fn different_seeds_produce_different_terrain() {
         let a = WorldGen::new(1).surface_height(0, 0);
@@ -876,19 +1019,41 @@ mod tests {
         let blocks = tree_blocks();
         let top = WorldGen::highest_generated_y(blocks);
         let mut tallest = i32::MIN;
+        let check_column = |x: i32, z: i32, tallest: &mut i32| {
+            let surface = gen.surface_height(x, z);
+            for y in (surface - 2)..=(top + 4) {
+                if gen.block_at(x, y, z, blocks).is_some() {
+                    assert!(y <= top, "solid at ({x}, {y}, {z}), above {top}");
+                    *tallest = (*tallest).max(y);
+                }
+            }
+        };
         for x in (-400..400).step_by(3) {
             for z in (-400..400).step_by(3) {
-                let surface = gen.surface_height(x, z);
-                for y in (surface - 2)..=(top + 4) {
-                    if gen.block_at(x, y, z, blocks).is_some() {
-                        assert!(y <= top, "solid at ({x}, {y}, {z}), above {top}");
-                        tallest = tallest.max(y);
-                    }
+                check_column(x, z, &mut tallest);
+            }
+        }
+        // Mountains are hundreds of blocks apart, so the peaks have to be
+        // looked for over a wider area: the tallest columns of it, and the
+        // trees that may stand on them.
+        let mut peaks: Vec<(i32, i32, i32)> = (-4096..4096)
+            .step_by(16)
+            .flat_map(|x| (-4096..4096).step_by(16).map(move |z| (x, z)))
+            .map(|(x, z)| (gen.surface_height(x, z), x, z))
+            .collect();
+        peaks.sort_unstable_by(|a, b| b.cmp(a));
+        for &(_, px, pz) in peaks.iter().take(8) {
+            for x in (px - 16)..=(px + 16) {
+                for z in (pz - 16)..=(pz + 16) {
+                    check_column(x, z, &mut tallest);
                 }
             }
         }
+        // Looser than it was before mountains (12): the ridged noise reaches
+        // its maximum only where every octave crests at once, which a
+        // 8,192-block square measured 19 short of (239 against 258).
         assert!(
-            top - tallest <= 12,
+            top - tallest <= 40,
             "tallest {tallest} but the bound is {top}: too loose"
         );
     }
