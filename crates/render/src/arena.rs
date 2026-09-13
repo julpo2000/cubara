@@ -53,21 +53,11 @@ pub struct NodeId {
 /// picked early and left to absorb terrain growth since; measured against
 /// the real worst case for the first time here, it's still comfortably
 /// covered without needing to move.
-///
-/// **Doubled to 8,000,000 when caves came to every level of detail** (96 MiB).
-/// The bench's orbit, which looks at the region from outside and so sees every
-/// cave the cut edges of the region open up, measured 3,976,684 vertices --
-/// 0.6% under the old capacity, which is no headroom at all. Twice the measured
-/// peak again; a player's view inside the world uses far less (1.25M triangles
-/// at the surface).
-const VERTEX_CAPACITY: u32 = 8_000_000;
+const VERTEX_CAPACITY: u32 = 4_000_000;
 /// Index-arena capacity, in indices (4 bytes/index). Same story as
 /// `VERTEX_CAPACITY`: measured radius-64 peak is 2,488,824 indices used, so
 /// 6,000,000 is ~2.4× headroom, unchanged from #89.
-///
-/// Doubled to 12,000,000 (46 MiB) with `VERTEX_CAPACITY`, for the same reason:
-/// the orbit with caves at every level measured 5,965,026.
-const INDEX_CAPACITY: u32 = 12_000_000;
+const INDEX_CAPACITY: u32 = 6_000_000;
 /// Max nodes the indirect-args buffer can hold (upper bound on *visible*
 /// nodes in one frame). Node-based streaming (§6.1) is what finally lets
 /// this shrink: the tuned ring schedule (#109) measured 1,341 of 1,585

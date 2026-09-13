@@ -284,6 +284,14 @@ const CAVE_OCTAVES: u32 = 1;
 const CAVE_LACUNARITY: f32 = 2.0;
 const CAVE_GAIN: f32 = 0.5;
 const CAVE_THRESHOLD: f32 = 0.6;
+/// How far below the surface caves reach in a coarse node -- one farther
+/// away than the finest detail ring. Nearby, caves are carved at every depth;
+/// far off, only where they could be seen from above: the mouth and the start
+/// of the passage, from a mountain or in flight. The rest of a distant cave
+/// network is rock until the player comes close, where it has always been
+/// hidden anyway, and it was most of what caves at every level cost to draw
+/// (the owner: "in de verte niet super gedetailleerd en tot heel diep").
+const DISTANT_CAVE_DEPTH: i32 = 24;
 /// Large enough to flip `density` negative regardless of how far below the
 /// surface a cell is -- `density`'s terrain term never approaches this
 /// magnitude within any loaded region.
@@ -513,7 +521,9 @@ impl WorldGen {
             // surface-amortization above it together fix.
             return terrain;
         }
-        let carved = if self.cave_at(x, y, z, step) {
+        // A coarse cell wholly deeper than `DISTANT_CAVE_DEPTH` is not carved.
+        let shallow = step <= 1 || y + step > surface - DISTANT_CAVE_DEPTH;
+        let carved = if shallow && self.cave_at(x, y, z, step) {
             CAVE_CARVE_AMOUNT
         } else {
             0.0
@@ -792,8 +802,11 @@ impl WorldGen {
         blocks: TerrainBlocks,
         step: i32,
     ) -> Option<BlockId> {
+        // A coarse cell wears what the top block inside it would: the one
+        // holding the surface is grass, not the soil or stone at its corner.
+        // Judged at its corner, every distant field turned brown and grey.
         (self.density_at(x, y, z, surface, step) > 0.0)
-            .then(|| self.material_at(x, y, z, surface, blocks))
+            .then(|| self.material_at(x, y + step - 1, z, surface, blocks))
     }
 
     /// The block at a world position, or `None` for air. Exposed for
@@ -1358,11 +1371,14 @@ mod tests {
                 (256, -16 * step, -200),
                 (40, 32 - 8 * step, -90),
                 (-300, 32 - 8 * step, 170),
+                (500, 16 - 8 * step, 20),
+                (-700, 16 - 8 * step, -640),
             ] {
                 let origin = [ox, oy, oz];
                 // Judged per region: a surface error averaged in with deep
                 // rock, where there is none, would hide under the bound.
                 let (mut decisive, mut wrong) = (0u32, 0u32);
+                let (mut deep, mut deep_air) = (0u32, 0u32);
                 let coarse = gen.generate(origin, step, blocks);
                 for lz in 0..Chunk::SIZE {
                     for ly in 0..Chunk::SIZE {
@@ -1384,6 +1400,16 @@ mod tests {
                                 }
                             }
                             let cells = step * step * step;
+                            // Deeper than distant caves reach, a coarse cell
+                            // is rock whatever its blocks are.
+                            let surface = gen.cell_surface_height(x0, z0, step);
+                            if y0 + step - 1 < surface - DISTANT_CAVE_DEPTH {
+                                deep += 1;
+                                if coarse.get(lx, ly, lz) == BlockId::AIR {
+                                    deep_air += 1;
+                                }
+                                continue;
+                            }
                             let majority = if solid * 4 >= cells * 3 {
                                 true
                             } else if solid * 4 <= cells {
@@ -1397,6 +1423,14 @@ mod tests {
                             }
                         }
                     }
+                }
+                assert_eq!(
+                    deep_air, 0,
+                    "step {step} at {origin:?}: a distant cave below its depth"
+                );
+                if decisive == 0 {
+                    assert!(deep > 0, "step {step} at {origin:?}: nothing was judged");
+                    continue;
                 }
                 let rate = wrong as f64 / decisive as f64;
                 assert!(
