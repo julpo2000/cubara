@@ -121,46 +121,73 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View) {
         "meshed in {:.2} s (single thread)",
         meshing.elapsed().as_secs_f64()
     );
-    // A camera inside the world draws only what it could see, the way the game
-    // does (`cubara_world::visibility`). The orbit is outside the region
-    // looking in, where there is no node to search from, so it draws all.
+    // Every camera draws only what it could see, the way the game does
+    // (`cubara_world::visibility`). The orbit's path is fixed by the whole
+    // region's bounds -- worked out before culling, so what is culled cannot
+    // move the camera -- and it moves, so it draws the union of what is visible
+    // from points along the arc it covers.
     let built_nodes = meshed.len();
-    let meshed: Vec<_> = match view.eye {
-        Some(_) => {
-            let desired: std::collections::HashSet<_> = meshed.iter().map(|b| b.node).collect();
-            let links: std::collections::HashMap<_, _> =
-                meshed.iter().map(|b| (b.node, b.links)).collect();
-            let searching = Instant::now();
-            let visible = cubara_world::visibility::visible_nodes(center, &desired, |n| {
-                links.get(&n).copied()
-            });
-            log::info!(
-                "visible: {} of {} nodes, searched in {:.1} ms",
-                visible.len(),
-                built_nodes,
-                searching.elapsed().as_secs_f64() * 1000.0
-            );
-            meshed
-                .into_iter()
-                .filter(|b| visible.contains(&b.node))
+    let mut lo = glam::Vec3::splat(f32::MAX);
+    let mut hi = glam::Vec3::splat(f32::MIN);
+    for g in meshed.iter().filter_map(|b| b.geometry.as_ref()) {
+        lo = lo.min(g.aabb.min);
+        hi = hi.max(g.aabb.max);
+    }
+    let look_target = ((lo + hi) * 0.5).to_array();
+    let view_radius = (hi.x - lo.x).max(hi.z - lo.z) * 0.75;
+    let eyes: Vec<[f32; 3]> = match view.eye {
+        Some(eye) => vec![eye],
+        None => {
+            let frames = (WARMUP_FRAMES + MEASURE_FRAMES) as f32;
+            let samples = 64;
+            (0..=samples)
+                .map(|i| {
+                    let t = frames * VIRTUAL_DT * i as f32 / samples as f32;
+                    orbit_eye(t, look_target, view_radius)
+                })
                 .collect()
         }
-        None => meshed,
     };
+    let desired: std::collections::HashSet<_> = meshed.iter().map(|b| b.node).collect();
+    let links: std::collections::HashMap<_, _> = meshed.iter().map(|b| (b.node, b.links)).collect();
+    let searching = Instant::now();
+    let mut visible = std::collections::HashSet::new();
+    for eye in &eyes {
+        visible.extend(cubara_world::visibility::visible_nodes(
+            ChunkCoord::from_world_pos(*eye),
+            &desired,
+            |n| links.get(&n).copied(),
+        ));
+    }
+    log::info!(
+        "visible: {} of {} nodes from {} camera position(s), searched in {:.1} ms",
+        visible.len(),
+        built_nodes,
+        eyes.len(),
+        searching.elapsed().as_secs_f64() * 1000.0
+    );
     let mut arena = ChunkArena::from_meshed(
         &device,
         &queue,
         multi_draw,
-        meshed.into_iter().filter_map(to_meshed_node),
+        meshed
+            .into_iter()
+            .filter(|b| visible.contains(&b.node))
+            .filter_map(to_meshed_node),
     );
     let total_nodes = arena.len();
-    let (min, max) = arena.bounds().expect("bench region produced no geometry");
-    let look_target = [
-        (min[0] + max[0]) * 0.5,
-        (min[1] + max[1]) * 0.5,
-        (min[2] + max[2]) * 0.5,
-    ];
-    let view_radius = (max[0] - min[0]).max(max[2] - min[2]) * 0.75;
+    // A scene with nothing in it renders very fast, and would pass the gate.
+    assert!(
+        total_nodes > 0,
+        "the bench scene drew nothing -- the measurement would mean nothing"
+    );
+    // Nor would a scene the arena could not hold: it skips what does not fit,
+    // and the frame rate of a world with holes in it is not the one asked for.
+    let full = arena.usage().exhausted();
+    assert!(
+        full.is_empty(),
+        "the arena ran out of {full:?} -- the bench would measure a world with parts missing"
+    );
     log::info!(
         "rendering {width}x{height}, {total_nodes} nodes via {}",
         if multi_draw {
@@ -325,6 +352,12 @@ pub fn parse_size(text: &str) -> Option<(u32, u32)> {
     let (w, h) = text.split_once(['x', 'X'])?;
     let (w, h) = (w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?);
     (w > 0 && h > 0).then_some((w, h))
+}
+
+/// Where the orbit camera is at virtual time `t` -- the same path
+/// `CameraUniform::view_proj_matrix` draws from.
+fn orbit_eye(t: f32, center: [f32; 3], radius: f32) -> [f32; 3] {
+    CameraUniform::orbit_eye(t, center, radius)
 }
 
 /// Parse a `--eye` value: `X,Y,Z` in blocks, e.g. `8,40,8`.

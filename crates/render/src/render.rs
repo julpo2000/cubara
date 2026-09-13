@@ -144,10 +144,17 @@ impl CameraUniform {
     /// The raw orbit view*projection matrix, exposed so callers can also build a
     /// [`Frustum`] from the exact same camera used for the uniform.
     pub fn view_proj_matrix(aspect: f32, t: f32, center: [f32; 3], radius: f32) -> glam::Mat4 {
+        let eye = glam::Vec3::from(Self::orbit_eye(t, center, radius));
+        Self::look_view_proj(aspect, eye, glam::Vec3::from(center) - eye)
+    }
+
+    /// Where the orbit camera [`view_proj_matrix`](Self::view_proj_matrix)
+    /// looks from at time `t` -- one definition, for anything that needs to
+    /// know where that camera is.
+    pub fn orbit_eye(t: f32, center: [f32; 3], radius: f32) -> [f32; 3] {
         let center = glam::Vec3::from(center);
         let angle = t * 0.15;
-        let eye = center + glam::vec3(radius * angle.cos(), radius * 0.45, radius * angle.sin());
-        Self::look_view_proj(aspect, eye, center - eye)
+        (center + glam::vec3(radius * angle.cos(), radius * 0.45, radius * angle.sin())).to_array()
     }
 
     /// View*projection for a camera at `eye` looking along `look_dir`, with

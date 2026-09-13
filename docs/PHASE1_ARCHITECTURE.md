@@ -692,6 +692,28 @@ exists to answer, checked on every push rather than assumed.
 
 ## §8.6 Caves are carved at level 0 only
 
+> **Superseded (2026-09) — caves exist at every level of detail, near the surface.**
+> The owner plans ravines and large caves, and wants a cave mouth to be visible
+> from a mountain or in flight -- but not "super gedetailleerd en tot heel diep"
+> far away, and not at a large cost.
+>
+> The rule now: `density_at` takes the size of the cell being asked about, and a
+> coarse cell is what **most of its blocks** are — caves by the majority of eight
+> samples through the cell, the height field at the middle of the cell's column
+> (four columns averaged, rounded down), the material of the cell's top block.
+> The single-point sampling this section rejected was the problem, not caves at a
+> distance: measured against the blocks each cell stands for, one corner sample
+> is wrong for up to 2.0% of clearly-decided cells, the majority for 0.00%.
+>
+> **Only down to `DISTANT_CAVE_DEPTH` (24 blocks) below the surface in a coarse
+> node.** Carving caves at every depth everywhere halved the benchmark's orbit;
+> the deep network is invisible from afar and appears at full detail when the
+> player comes close. `a_coarse_cell_is_what_most_of_its_blocks_are` holds both
+> halves: shallow cells follow their blocks, deeper coarse cells are rock.
+>
+> The text below is kept as the reasoning it was.
+
+
 **Added when the world lost its height limit (phase 2).** The cave field is
 carved only when `generate` is called with `step == 1`. Coarser LOD nodes get the
 height field alone: solid rock below the surface, air above.
