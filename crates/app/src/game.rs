@@ -3521,7 +3521,20 @@ mod tests {
         game.advance(TICK_DT);
         let after_one = game.world().furnace_at(pos).copied().unwrap();
 
-        game.host_player_mut().pos += FixedVec3::from_f32([4000.0, 0.0, 0.0]);
+        // Far away, and standing on the ground there: the terrain is not the
+        // same height 4,000 blocks off, and a player left falling is a
+        // different test.
+        let far = game
+            .world()
+            .raycast(
+                [4000.5, 400.0, 0.5],
+                [0.0, -1.0, 0.0],
+                800.0,
+                game.terrain(),
+            )
+            .expect("ground far away")
+            .block;
+        game.host_player_mut().pos = FixedVec3::from_f32([4000.5, far[1] as f32 + 1.0, 0.5]);
         for _ in 0..500 {
             game.advance(TICK_DT);
         }
@@ -3747,7 +3760,9 @@ mod tests {
     fn there_is_open_sky_however_far_up_you_go() {
         let (game, _) = game_looking_at_ground();
         let terrain = game.server().terrain.expect("assets are set");
-        for y in [100, 5_000, 100_000] {
+        // From just above the tallest thing the generator can make.
+        let top = cubara_world::WorldGen::highest_generated_y(terrain) + 1;
+        for y in [top, 5_000, 100_000] {
             assert!(
                 !game.world().is_solid_at(0, y, 0, terrain),
                 "expected air at y = {y}"
@@ -4121,7 +4136,8 @@ mod tests {
     fn an_edit_that_skips_the_journal_never_reaches_the_client() {
         let (mut game, _) = game_looking_at_ground();
         let terrain = game.server().terrain.expect("assets are set");
-        let at = [11, 30, 11];
+        // In the air above the ground, wherever the ground is.
+        let at = [11, game.world().surface_height(11, 11) + 5, 11];
         let stone = game
             .server_mut()
             .blocks_registry

@@ -55,6 +55,7 @@ frames after 200 warmup.
 | 2026-09-13 | **No vertical band** — 3D octree, vertical LOD squash 2, radius 64 (orbit)⁴⁹ | 4,377 | 1,015,554 | ~2,950 | 0.125 ms | ~0.41 ms | *(this PR)* |
 | 2026-09-13 | **Visibility culling** — only what a line of sight can reach is generated, meshed and drawn; eye at y=40⁵⁰ | 1,555 | 615,408 | ~7,310 | 0.069 ms | — | *(this PR)* |
 | 2026-09-13 | **Faces turned away from the camera left out** — meshes grouped by direction, radius 64 (orbit)⁵² | 4,377 | 1,015,554 (573,298 drawn) | ~3,592 | 0.168 ms | ~0.48 ms | *(this PR)* |
+| 2026-09-13 | **Mountains** — ridged ranges up to ~y 240, radius 64 (orbit)⁵³ | 4,506 | 1,110,830 (592,540 drawn) | ~3,451 | 0.169 ms | ~0.43 ms | *(this PR)* |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -1528,3 +1529,21 @@ eye y=40, 4K       3244     3231
 +20% where the GPU's vertex work is the limit (the gate's orbit, and on the
 M3 more of the frame is), and no change where the CPU is. CPU per frame rises
 0.122 -> 0.168 ms: the per-direction draw list. It is still not the limit.
+
+⁵³ **Mountain ranges in the height field.** Ranges hundreds of blocks across rise
+out of the hills (ridged noise under a broad region mask), peaking around y = 240
+with cliff steps of up to 7 blocks; ~20% of the world is raised, ~4% above
+y = 150 (`mountain_census` example). The default seed's spawn stays in the hills
+and the nearest range starts ~370 blocks off, which keeps every test framed on
+the origin unchanged -- no golden image or pinned hash moved.
+
+Three alternating runs against `main`, median FPS:
+
+```
+view               main     mountains
+orbit              3721     3451     (1,015,554 -> 1,110,830 triangles; 4,377 -> 4,506 nodes)
+eye y=40           5009     5859     (noisy, CPU-bound)
+eye y=300          12907    7949     there is now something to see from up there: 55k -> 90k triangles drawn
+```
+
+`radius_64_smoke` settles in 20.6 s locally.

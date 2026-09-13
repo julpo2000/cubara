@@ -489,8 +489,30 @@ fn main() {
 
     // Headless screenshot mode: `cargo run --release -- --screenshot [path]`.
     if let Some(i) = args.iter().position(|a| a == "--screenshot") {
-        let path = args.get(i + 1).map(String::as_str).unwrap_or("cubara.png");
-        screenshot::run(path);
+        let path = args
+            .get(i + 1)
+            .filter(|p| !p.starts_with("--"))
+            .map(String::as_str)
+            .unwrap_or("cubara.png");
+        let value = |name: &str| {
+            args.iter()
+                .position(|a| a == name)
+                .and_then(|i| args.get(i + 1))
+                .map(String::as_str)
+        };
+        let view = value("--eye")
+            .and_then(bench::parse_eye)
+            .map(|eye| screenshot::View {
+                eye,
+                look: value("--look")
+                    .and_then(bench::parse_eye)
+                    .unwrap_or([1.0, -0.2, 0.0]),
+                radius: value("--radius").and_then(|r| r.parse().ok()).unwrap_or(32),
+                size: value("--size")
+                    .and_then(bench::parse_size)
+                    .unwrap_or((1920, 1080)),
+            });
+        screenshot::run(path, view);
         return;
     }
 
