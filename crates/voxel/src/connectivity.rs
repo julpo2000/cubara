@@ -52,13 +52,27 @@ impl FaceLinks {
     }
 
     /// Worked out from `chunk`'s blocks at the chunk's own resolution.
+    pub fn of_chunk(chunk: &Chunk, registry: &BlockRegistry) -> Self {
+        Self::of_region(chunk, registry, [0, 0, 0], Chunk::SIZE)
+    }
+
+    /// The same, for the cube of cells `size` wide starting at `min` -- its
+    /// faces are that cube's faces, not the chunk's.
     ///
     /// Flood-fills each separate pocket of air once and records every face
     /// that pocket touches; any two of those are joined. Linear in the number
-    /// of cells, so it costs about as much as meshing the chunk once did.
-    pub fn of_chunk(chunk: &Chunk, registry: &BlockRegistry) -> Self {
-        let n = Chunk::SIZE;
-        let open = |id: BlockId| !registry.is_solid(id);
+    /// of cells.
+    pub fn of_region(
+        chunk: &Chunk,
+        registry: &BlockRegistry,
+        min: [usize; 3],
+        size: usize,
+    ) -> Self {
+        let n = size;
+        let open = |x: usize, y: usize, z: usize| {
+            let id: BlockId = chunk.get(min[0] + x, min[1] + y, min[2] + z);
+            !registry.is_solid(id)
+        };
         let index = |x: usize, y: usize, z: usize| (z * n + y) * n + x;
 
         let mut seen = vec![false; n * n * n];
@@ -68,7 +82,7 @@ impl FaceLinks {
         for z in 0..n {
             for y in 0..n {
                 for x in 0..n {
-                    if seen[index(x, y, z)] || !open(chunk.get(x, y, z)) {
+                    if seen[index(x, y, z)] || !open(x, y, z) {
                         continue;
                     }
                     seen[index(x, y, z)] = true;
@@ -84,7 +98,7 @@ impl FaceLinks {
                             | ((z == 0) as u8) << 5;
                         let mut visit = |x: usize, y: usize, z: usize| {
                             let i = index(x, y, z);
-                            if !seen[i] && open(chunk.get(x, y, z)) {
+                            if !seen[i] && open(x, y, z) {
                                 seen[i] = true;
                                 stack.push((x, y, z));
                             }
@@ -216,6 +230,29 @@ mod tests {
         assert!(!links.joins(Face::NegY, Face::PosY), "joined through rock");
         // Both pockets run the full depth, so each joins the z faces.
         assert!(links.joins(Face::PosZ, Face::NegZ));
+    }
+
+    /// A region's faces are its own: a tunnel through one octant joins that
+    /// octant's two ends, and the octant beside it, all rock, joins nothing.
+    #[test]
+    fn a_region_is_judged_by_its_own_faces() {
+        let r = registry();
+        let tunnel = Chunk::from_fn(|_, y, z| {
+            if (2..4).contains(&y) && (2..4).contains(&z) {
+                BlockId::AIR
+            } else {
+                BlockId::STONE
+            }
+        });
+        let low = FaceLinks::of_region(&tunnel, &r, [0, 0, 0], 8);
+        assert!(low.joins(Face::PosX, Face::NegX));
+        assert!(!low.joins(Face::PosY, Face::NegY));
+        let high = FaceLinks::of_region(&tunnel, &r, [0, 8, 0], 8);
+        assert_eq!(high, FaceLinks::NONE, "rock above the tunnel");
+        assert_eq!(
+            FaceLinks::of_region(&tunnel, &r, [0, 0, 0], 16),
+            FaceLinks::of_chunk(&tunnel, &r)
+        );
     }
 
     /// A pocket wholly inside touches no face, so it joins nothing.

@@ -22,8 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use cubara_voxel::{
-    build_mesh_bounded_occluded, Aabb, BlockRegistry, Chunk, ChunkCoord, FaceLinks, Mesh,
-    MeshContext,
+    build_mesh_bounded_occluded, Aabb, BlockRegistry, Chunk, ChunkCoord, Mesh, MeshContext,
 };
 
 use crate::node::{desired_nodes, NodeKey, RingSchedule};
@@ -45,11 +44,11 @@ pub struct NodeGeometry {
 pub struct BuiltNode {
     pub node: NodeKey,
     pub geometry: Option<NodeGeometry>,
-    /// Which faces of the node air inside it joins, for visibility culling
-    /// ([`crate::visibility`]). Worked out from the same blocks the mesh was,
-    /// in the same job, so the two can never describe different contents. An
-    /// empty node joins everything.
-    pub links: FaceLinks,
+    /// What air joins inside each of the node's sub-blocks, for visibility
+    /// culling ([`crate::visibility`]). Worked out from the same blocks the mesh
+    /// was, in the same job, so the two can never describe different contents.
+    /// An empty node joins everything.
+    pub links: crate::visibility::NodeLinks,
 }
 
 /// Generate `node` once, and both mesh it and work out what it joins -- what a
@@ -64,9 +63,7 @@ pub fn build_node(
     let chunk = world.node_at(node, blocks);
     BuiltNode {
         node,
-        links: chunk
-            .as_ref()
-            .map_or(FaceLinks::ALL, |c| FaceLinks::of_chunk(c, registry)),
+        links: crate::visibility::node_links(chunk.as_ref(), registry),
         geometry: chunk.and_then(|c| mesh_chunk(world, registry, layer_of, node, &c)),
     }
 }

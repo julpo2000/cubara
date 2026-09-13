@@ -34,9 +34,37 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use cubara_voxel::{ChunkCoord, Face, FaceLinks};
+use cubara_voxel::{BlockRegistry, Chunk, ChunkCoord, Face, FaceLinks};
 
 use crate::node::NodeKey;
+
+/// Sub-blocks per node along each axis. The search runs over these rather
+/// than over whole nodes: a far node is 128 blocks wide, and one cave touching
+/// two of its faces used to make all of it see-through. Measured on the radius-64
+/// scene with caves at every level of detail: 1.74M triangles reachable at
+/// grain 1, 1.25M at grain 2, 1.12M at grain 4 -- which also searched nine
+/// times longer, for a tenth of the gain.
+pub const GRAIN: usize = 2;
+
+/// What joins what inside each of a node's `GRAIN`³ sub-blocks, indexed
+/// `(z * GRAIN + y) * GRAIN + x`.
+pub type NodeLinks = [FaceLinks; GRAIN * GRAIN * GRAIN];
+
+/// Every sub-block of an empty node is open.
+pub const OPEN: NodeLinks = [FaceLinks::ALL; GRAIN * GRAIN * GRAIN];
+
+/// The sub-block links of a generated node; `None` (nothing generated, it is
+/// empty) is [`OPEN`].
+pub fn node_links(chunk: Option<&Chunk>, registry: &BlockRegistry) -> NodeLinks {
+    let Some(chunk) = chunk else {
+        return OPEN;
+    };
+    let size = Chunk::SIZE / GRAIN;
+    std::array::from_fn(|i| {
+        let (x, y, z) = (i % GRAIN, i / GRAIN % GRAIN, i / GRAIN / GRAIN);
+        FaceLinks::of_region(chunk, registry, [x * size, y * size, z * size], size)
+    })
+}
 
 const FACES: [Face; 6] = [
     Face::PosX,
@@ -63,38 +91,81 @@ fn step_of(face: Face) -> [i32; 3] {
     [n[0] as i32, n[1] as i32, n[2] as i32]
 }
 
-/// The node of `nodes` across `face` of `node`: the one beside it at the same
-/// level, or the coarser one containing that space.
-///
-/// **Never a finer one**, and not because it cannot exist. Detail is chosen by
-/// distance from the camera, and along a straight line from the camera that
-/// distance only grows -- so a line of sight never passes from a coarser node
-/// into a finer one. Stepping into finer nodes would only let the search wander
-/// back towards the camera, which can only add nodes nobody sees (measured: the
-/// line-of-sight test passes without it).
-fn neighbour(node: NodeKey, face: Face, nodes: &HashSet<NodeKey>) -> Option<NodeKey> {
-    let d = step_of(face);
-    let same = NodeKey::new(
-        node.level,
-        [node.pos[0] + d[0], node.pos[1] + d[1], node.pos[2] + d[2]],
-    );
-    if nodes.contains(&same) {
-        return Some(same);
-    }
-    let coarser = NodeKey::containing(same.chunk_origin(), node.level + 1);
-    nodes.contains(&coarser).then_some(coarser)
+/// The nodes being searched, numbered, so per-sub-block state is a flat array.
+struct Index<'a> {
+    nodes: Vec<NodeKey>,
+    of: HashMap<NodeKey, u32>,
+    set: &'a HashSet<NodeKey>,
 }
 
-/// Every node in `nodes` a line of sight from `camera` could reach.
+impl<'a> Index<'a> {
+    fn new(set: &'a HashSet<NodeKey>) -> Self {
+        let mut nodes: Vec<NodeKey> = set.iter().copied().collect();
+        nodes.sort();
+        let of = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (*n, i as u32))
+            .collect();
+        Self { nodes, of, set }
+    }
+
+    /// The sub-block containing world block `p`, looked for in a node of
+    /// `level` or the one coarser -- the only neighbours a line of sight can
+    /// step into.
+    fn locate(&self, p: [i32; 3], level: u32) -> Option<(u32, usize)> {
+        let chunk = ChunkCoord::from_block(p[0], p[1], p[2]);
+        let node = [level, level + 1]
+            .into_iter()
+            .map(|l| NodeKey::containing(chunk, l))
+            .find(|n| self.set.contains(n))?;
+        let origin = node.world_origin();
+        let size = (Chunk::SIZE / GRAIN) as i32 * node.extent_chunks();
+        let i = |k: usize| ((p[k] - origin[k]) / size) as usize;
+        Some((self.of[&node], (i(2) * GRAIN + i(1)) * GRAIN + i(0)))
+    }
+
+    /// The sub-block across `face` of sub-block `sub` of node `n`.
+    fn neighbour(&self, n: u32, sub: usize, face: Face) -> Option<(u32, usize)> {
+        let node = self.nodes[n as usize];
+        let c = [sub % GRAIN, sub / GRAIN % GRAIN, sub / GRAIN / GRAIN];
+        let d = step_of(face);
+        let inside = (0..3).all(|k| (0..GRAIN as i32).contains(&(c[k] as i32 + d[k])));
+        if inside {
+            let m = [0, 1, 2].map(|k| (c[k] as i32 + d[k]) as usize);
+            return Some((n, (m[2] * GRAIN + m[1]) * GRAIN + m[0]));
+        }
+        // A block just outside the middle of that face.
+        let origin = node.world_origin();
+        let size = (Chunk::SIZE / GRAIN) as i32 * node.extent_chunks();
+        let p = [0, 1, 2].map(|k| {
+            let min = origin[k] + c[k] as i32 * size;
+            match d[k] {
+                1 => min + size,
+                -1 => min - 1,
+                _ => min + size / 2,
+            }
+        });
+        self.locate(p, node.level)
+    }
+}
+
+/// Every node in `nodes` a line of sight from anywhere in `camera`'s node could
+/// reach.
 ///
-/// `links(node)` is what joins what inside a node; `None` means not known yet
-/// (not generated). An unknown node is included -- it may well be seen -- but
-/// not searched through until it is known, which is what lets a caller generate
-/// outward along what can be seen instead of generating everything.
+/// `links(node)` is what joins what inside each of a node's sub-blocks; `None`
+/// means not known yet (not generated). An unknown node is included -- it may
+/// well be seen -- but not searched through until it is known, which is what
+/// lets a caller generate outward along what can be seen instead of generating
+/// everything.
+///
+/// The search starts from **every** sub-block of the camera's node, not only
+/// the one the camera is in, so the result holds for any position in that
+/// node and only needs working out again when the camera changes node.
 pub fn visible_nodes(
     camera: ChunkCoord,
     nodes: &HashSet<NodeKey>,
-    links: impl Fn(NodeKey) -> Option<FaceLinks>,
+    links: impl Fn(NodeKey) -> Option<NodeLinks>,
 ) -> HashSet<NodeKey> {
     let mut visible = HashSet::new();
     let Some(start) = (0..=8)
@@ -103,48 +174,53 @@ pub fn visible_nodes(
     else {
         return visible;
     };
-    visible.insert(start);
-
-    // For each (node, face it was entered by): the directions taken to get
+    let index = Index::new(nodes);
+    let subs = GRAIN * GRAIN * GRAIN;
+    let known: Vec<Option<NodeLinks>> = index.nodes.iter().map(|&n| links(n)).collect();
+    let mut seen = vec![false; index.nodes.len()];
+    // For each (node, sub-block, face entered by): the directions taken to get
     // there, kept as the intersection over every path that has arrived.
-    let mut arrived: HashMap<(NodeKey, Face), u8> = HashMap::new();
-    let mut queue: VecDeque<(NodeKey, Face, u8)> = VecDeque::new();
+    // `NONE_YET` is a value no set of six directions can be.
+    const NONE_YET: u8 = 0xFF;
+    let mut arrived = vec![NONE_YET; index.nodes.len() * subs * 6];
+    let mut queue: VecDeque<(u32, usize, Face, u8)> = VecDeque::new();
     let bit = |f: Face| 1u8 << f as u8;
 
-    let mut enqueue = |queue: &mut VecDeque<(NodeKey, Face, u8)>,
-                       visible: &mut HashSet<NodeKey>,
-                       node: NodeKey,
-                       entered_by: Face,
-                       taken: u8| {
-        visible.insert(node);
-        let merged = match arrived.get(&(node, entered_by)) {
-            // Nothing new: an earlier path already forbids no more than this.
-            Some(&before) if before & !taken == 0 => return,
-            Some(&before) => before & taken,
-            None => taken,
-        };
-        arrived.insert((node, entered_by), merged);
-        queue.push_back((node, entered_by, merged));
-    };
-
-    // From inside the camera's node, any face may be the way out.
-    for face in FACES {
-        if let Some(n) = neighbour(start, face, nodes) {
-            enqueue(&mut queue, &mut visible, n, opposite(face), bit(face));
+    let start_n = index.of[&start];
+    seen[start_n as usize] = true;
+    for sub in 0..subs {
+        for face in FACES {
+            if let Some((n, s)) = index.neighbour(start_n, sub, face) {
+                queue.push_back((n, s, opposite(face), bit(face)));
+            }
         }
     }
 
-    while let Some((node, entered_by, taken)) = queue.pop_front() {
-        let Some(inside) = links(node) else {
+    while let Some((n, sub, entered_by, taken)) = queue.pop_front() {
+        seen[n as usize] = true;
+        let slot = &mut arrived[(n as usize * subs + sub) * 6 + entered_by as usize];
+        let taken = match *slot {
+            // Nothing new: an earlier path already forbids no more than this.
+            before if before != NONE_YET && before & !taken == 0 => continue,
+            before if before != NONE_YET => before & taken,
+            _ => taken,
+        };
+        *slot = taken;
+        let Some(inside) = known[n as usize] else {
             continue;
         };
         for out in FACES {
-            if taken & bit(opposite(out)) != 0 || !inside.joins(entered_by, out) {
+            if taken & bit(opposite(out)) != 0 || !inside[sub].joins(entered_by, out) {
                 continue;
             }
-            if let Some(n) = neighbour(node, out, nodes) {
-                enqueue(&mut queue, &mut visible, n, opposite(out), taken | bit(out));
+            if let Some((m, s)) = index.neighbour(n, sub, out) {
+                queue.push_back((m, s, opposite(out), taken | bit(out)));
             }
+        }
+    }
+    for (i, was) in seen.into_iter().enumerate() {
+        if was {
+            visible.insert(index.nodes[i]);
         }
     }
     visible
@@ -185,7 +261,7 @@ mod tests {
     struct Scene {
         nodes: HashSet<NodeKey>,
         chunks: HashMap<NodeKey, Option<Chunk>>,
-        links: HashMap<NodeKey, FaceLinks>,
+        links: HashMap<NodeKey, NodeLinks>,
     }
 
     impl Scene {
@@ -198,12 +274,7 @@ mod tests {
             let mut links = HashMap::new();
             for &n in &nodes {
                 let chunk = world.node_at(n, blocks);
-                links.insert(
-                    n,
-                    chunk
-                        .as_ref()
-                        .map_or(FaceLinks::ALL, |c| FaceLinks::of_chunk(c, registry)),
-                );
+                links.insert(n, node_links(chunk.as_ref(), registry));
                 chunks.insert(n, chunk);
             }
             Self {
