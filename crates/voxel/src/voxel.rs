@@ -228,11 +228,31 @@ impl Chunk {
         ctx: &MeshContext,
         occluded: impl Fn(i32, i32, i32) -> bool,
     ) -> Mesh {
+        self.build_mesh_with_neighbours(ctx, occluded, |_, _, _| true)
+    }
+
+    /// [`build_mesh_occluded`](Self::build_mesh_occluded), also told where a
+    /// neighbour **may be solid** -- `may_be_solid(x, y, z)` for a cell one step
+    /// outside, like `occluded`.
+    ///
+    /// A skirt hangs one cell below a border wall to close the crack a
+    /// neighbour at a different level of detail can leave. Where the cell
+    /// beside it is air for every neighbour this chunk could have, there is no
+    /// crack to close, and the skirt is just a strip hanging in the air -- over
+    /// a cave, a grass-edged slab in the ceiling. So it is laid only where the
+    /// neighbour may be solid.
+    pub fn build_mesh_with_neighbours(
+        &self,
+        ctx: &MeshContext,
+        occluded: impl Fn(i32, i32, i32) -> bool,
+        may_be_solid: impl Fn(i32, i32, i32) -> bool,
+    ) -> Mesh {
         greedy_mesh(
             Self::SIZE as i32,
             1,
             |x, y, z| self.block_at(x, y, z),
             occluded,
+            may_be_solid,
             ctx,
         )
     }
@@ -263,6 +283,7 @@ impl Chunk {
                 }
             },
             |_, _, _| false,
+            |_, _, _| true,
             ctx,
         )
     }
@@ -325,6 +346,7 @@ fn greedy_mesh(
     scale: i32,
     block_at: impl Fn(i32, i32, i32) -> BlockId,
     occluded: impl Fn(i32, i32, i32) -> bool,
+    may_be_solid: impl Fn(i32, i32, i32) -> bool,
     ctx: &MeshContext,
 ) -> Mesh {
     let mut mesh = Mesh::default();
@@ -447,6 +469,7 @@ fn greedy_mesh(
                         ctx,
                         scale,
                         &has_own_face,
+                        &may_be_solid,
                     );
 
                     // Consume the merged cells.
@@ -665,6 +688,7 @@ fn push_skirt(
     ctx: &MeshContext,
     scale: i32,
     has_own_face: &[bool],
+    may_be_solid: &impl Fn(i32, i32, i32) -> bool,
 ) {
     if d == 1 || (plane != 0 && plane != n) {
         return;
@@ -685,15 +709,34 @@ fn push_skirt(
         }
     };
 
-    // Emit only over contiguous runs of cells that own no face of their own.
+    // The cell one step outside the chunk beside skirt cell `k`.
+    let outside = |k: i32| {
+        let mut g = [0i32; 3];
+        g[d] = if plane == 0 { -1 } else { n };
+        if d == 0 {
+            g[u] = i - 1;
+            g[v] = j + k;
+        } else {
+            g[u] = i + k;
+            g[v] = j - 1;
+        }
+        g
+    };
+    let wanted = |k: i32| {
+        let g = outside(k);
+        !has_own_face[cell(k)] && may_be_solid(g[0], g[1], g[2])
+    };
+
+    // Emit only over contiguous runs of cells that own no face of their own
+    // and sit beside a neighbour that may be solid.
     let mut k = 0i32;
     while k < span {
-        if has_own_face[cell(k)] {
+        if !wanted(k) {
             k += 1;
             continue;
         }
         let start = k;
-        while k < span && !has_own_face[cell(k)] {
+        while k < span && wanted(k) {
             k += 1;
         }
         let run = k - start;
@@ -884,6 +927,46 @@ mod tests {
         assert!(skirted(&open) > 0, "the fixture has no skirt to test");
         let covered = chunk.build_mesh_occluded(&ctx(&registry), |x, _, _| x == -1);
         assert_eq!(skirted(&covered), 0, "a skirt over a covered wall");
+    }
+
+    /// A skirt closes a crack against a neighbour that might be solid beside
+    /// it. Beside a neighbour that is air whatever its level of detail, there
+    /// is nothing to close, and the skirt would hang in the open -- over a cave,
+    /// a strip in the ceiling.
+    #[test]
+    fn a_skirt_is_laid_only_beside_a_neighbour_that_may_be_solid() {
+        let registry = registry();
+        let chunk = Chunk::from_fn(|x, y, _| {
+            if x == 0 && y >= 8 {
+                BlockId::STONE
+            } else {
+                BlockId::AIR
+            }
+        });
+        let skirted = |m: &Mesh| {
+            m.vertices
+                .iter()
+                .filter(|v| v.face() == Face::NegX && v.y() < 8)
+                .count()
+        };
+        let beside_rock =
+            chunk.build_mesh_with_neighbours(&ctx(&registry), |_, _, _| false, |_, _, _| true);
+        assert!(
+            skirted(&beside_rock) > 0,
+            "no skirt where the neighbour may be solid"
+        );
+        let beside_air =
+            chunk.build_mesh_with_neighbours(&ctx(&registry), |_, _, _| false, |_, _, _| false);
+        assert_eq!(skirted(&beside_air), 0, "a skirt hanging beside open air");
+        // Only the row it is asked about: solid beside rows 0..4 alone still
+        // gets a skirt, since the skirt row below the wall is row 7.
+        let only_low =
+            chunk.build_mesh_with_neighbours(&ctx(&registry), |_, _, _| false, |_, y, _| y < 4);
+        assert_eq!(
+            skirted(&only_low),
+            0,
+            "a skirt laid on another row's answer"
+        );
     }
 
     /// **Side textures stand upright, unmirrored, on all four sides.** A

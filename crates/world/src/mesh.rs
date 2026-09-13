@@ -83,8 +83,12 @@ pub fn mesh_node(
     ];
     let scale = node.extent_chunks() as f32;
     let surfaces = std::cell::RefCell::new(HashMap::new());
-    let covered = |gx, gy, gz| border_covered(world, node, &surfaces, [gx, gy, gz]);
-    let (mesh, aabb) = build_mesh_bounded_occluded(&chunk, &ctx, origin, scale, covered)?;
+    let covered =
+        |gx, gy, gz| border_samples(world, node, blocks, &surfaces, [gx, gy, gz], Want::All);
+    let may_be_solid =
+        |gx, gy, gz| border_samples(world, node, blocks, &surfaces, [gx, gy, gz], Want::Any);
+    let (mesh, aabb) =
+        build_mesh_bounded_occluded(&chunk, &ctx, origin, scale, covered, may_be_solid)?;
     Some(NodeGeometry {
         mesh,
         aabb,
@@ -121,9 +125,19 @@ pub fn chunks_affected_by_edit(pos: [i32; 3]) -> Vec<ChunkCoord> {
     out
 }
 
-/// Whether a border face of `node` against its outside cell `g` -- grid
-/// coordinates with exactly one axis at `-1` or `16` -- can be left out,
-/// because whatever is drawn next to it covers it completely.
+/// Which answer [`border_samples`] gives over the cells it looks at.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Want {
+    /// Solid for every neighbour: the face may be left out.
+    All,
+    /// Solid for some neighbour: a skirt may be needed.
+    Any,
+}
+
+/// What `node`'s neighbours draw at its outside cell `g` -- grid coordinates
+/// with exactly one axis at `-1` or `16`: whether every neighbour draws it solid
+/// ([`Want::All`], so a border face against it can be left out) or some
+/// neighbour might ([`Want::Any`], so a skirt beside it may be needed).
 ///
 /// **The neighbour may be drawn at a different level of detail**, and which one
 /// depends on where the camera is, which a node's mesh cannot know: it is built
@@ -142,11 +156,13 @@ pub fn chunks_affected_by_edit(pos: [i32; 3]) -> Vec<ChunkCoord> {
 /// **At the edge of the render distance the walls go too**: the outside is not
 /// drawn, but it is solid ground. What used to be a grey cliff where the drawn
 /// world stopped is now the terrain simply ending -- which is what it is.
-fn border_covered(
+fn border_samples(
     world: &World,
     node: NodeKey,
-    surfaces: &std::cell::RefCell<HashMap<(i32, i32), i32>>,
+    blocks: TerrainBlocks,
+    surfaces: &std::cell::RefCell<HashMap<(i32, i32, i32), i32>>,
     g: [i32; 3],
+    want: Want,
 ) -> bool {
     let level = node.level;
     let step = node.extent_chunks();
@@ -159,15 +175,27 @@ fn border_covered(
     // Surface heights are the expensive part of a sample, and one node's
     // border touches few columns, so each is computed once per node.
     let solid = |q: [i32; 3], at: u32| {
+        if want == Want::Any && at == 0 {
+            // Trees count here: leaving one out could drop a skirt a trunk at
+            // the border needs, where for covering it can only keep a face.
+            return world.is_solid_at(q[0], q[1], q[2], blocks);
+        }
+        let step = 1 << at;
         let surface = *surfaces
             .borrow_mut()
-            .entry((q[0], q[2]))
-            .or_insert_with(|| world.surface_height(q[0], q[2]));
+            .entry((q[0], q[2], step))
+            .or_insert_with(|| world.cell_surface_height(q[0], q[2], step));
         world.certainly_solid_at(q[0], q[1], q[2], at, surface)
     };
+    // `All` stops at the first air, `Any` at the first solid.
+    let decided = |is_solid: bool| match want {
+        Want::All => !is_solid,
+        Want::Any => is_solid,
+    };
+    let answer_if_decided = want == Want::Any;
 
-    if !solid(p, level) {
-        return false;
+    if decided(solid(p, level)) {
+        return answer_if_decided;
     }
     let coarse = 2 * step;
     let q = [
@@ -175,34 +203,33 @@ fn border_covered(
         p[1].div_euclid(coarse) * coarse,
         p[2].div_euclid(coarse) * coarse,
     ];
-    if !solid(q, level + 1) {
-        return false;
+    if decided(solid(q, level + 1)) {
+        return answer_if_decided;
     }
-    if level == 0 {
-        return true;
-    }
-    // The finer layer that touches this face: the near half of the outside
-    // cell along the face's axis, and both halves across it.
-    let half = step / 2;
-    let axis = (0..3)
-        .find(|&k| g[k] == -1 || g[k] == 16)
-        .expect("a border cell");
-    let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);
-    let mut f = p;
-    if g[axis] == -1 {
-        f[axis] += half;
-    }
-    for da in [0, half] {
-        for db in [0, half] {
-            let mut r = f;
-            r[a] += da;
-            r[b] += db;
-            if !solid(r, level - 1) {
-                return false;
+    if level > 0 {
+        // The finer layer that touches this face: the near half of the outside
+        // cell along the face's axis, and both halves across it.
+        let half = step / 2;
+        let axis = (0..3)
+            .find(|&k| g[k] == -1 || g[k] == 16)
+            .expect("a border cell");
+        let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);
+        let mut f = p;
+        if g[axis] == -1 {
+            f[axis] += half;
+        }
+        for da in [0, half] {
+            for db in [0, half] {
+                let mut r = f;
+                r[a] += da;
+                r[b] += db;
+                if decided(solid(r, level - 1)) {
+                    return answer_if_decided;
+                }
             }
         }
     }
-    true
+    !answer_if_decided
 }
 
 /// Mesh every node [`desired_nodes`] wants for `schedule` around `center`,

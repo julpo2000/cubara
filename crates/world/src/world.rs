@@ -91,6 +91,12 @@ impl World {
         self.worldgen.surface_height(x, z)
     }
 
+    /// [`WorldGen::cell_surface_height`]: the ground height a cell of `step`
+    /// blocks is judged against.
+    pub fn cell_surface_height(&self, x: i32, z: i32, step: i32) -> i32 {
+        self.worldgen.cell_surface_height(x, z, step)
+    }
+
     /// The seed this world's terrain is generated from.
     pub fn seed(&self) -> u64 {
         self.worldgen.seed()

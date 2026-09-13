@@ -21,7 +21,7 @@ use std::path::Path;
 
 use cubara_voxel::{BlockRegistry, ChunkCoord, Face, MeshContext, OreRegistry, StructureRegistry};
 use cubara_world::mesh::mesh_node;
-use cubara_world::node::{desired_nodes, schedule_for_radius};
+use cubara_world::node::{desired_nodes, desired_nodes_3d, schedule_for_radius};
 use cubara_world::{TerrainBlocks, World};
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -64,7 +64,12 @@ fn main() {
     };
 
     let schedule = schedule_for_radius(radius);
-    let nodes = desired_nodes(ChunkCoord::new(0, 0, 0), ymin..=ymax, &schedule);
+    // `CENSUS_SQUASH=k` selects in 3D around chunk (0, ymin, 0) the way the
+    // game does, instead of the band ymin..=ymax.
+    let nodes = match std::env::var("CENSUS_SQUASH").ok().and_then(|k| k.parse().ok()) {
+        Some(k) => desired_nodes_3d(ChunkCoord::new(0, ymin, 0), k, &schedule),
+        None => desired_nodes(ChunkCoord::new(0, 0, 0), ymin..=ymax, &schedule),
+    };
     let mut per_level = [Tally::default(); 8];
 
     let covered = std::env::var_os("CENSUS_OPEN").is_none();
