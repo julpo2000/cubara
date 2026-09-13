@@ -54,6 +54,18 @@ pub use cubara_server::assets::{
     load_item_registry, load_ore_registry, load_recipe_book, load_structure_registry, world_dir,
 };
 
+/// Where [`Game::save`] and [`Game::load`] keep the world: the player's
+/// `saves/world` -- except under `cargo test`, which gets a directory of its
+/// own. A test that called `save()` once wrote a fresh world over the owner's
+/// real save, player and inventory included; a test can no longer reach it.
+fn save_dir() -> std::path::PathBuf {
+    if cfg!(test) {
+        std::env::temp_dir().join("cubara-test-saves-world")
+    } else {
+        world_dir()
+    }
+}
+
 pub struct Game {
     /// The authoritative half (`docs/RESEARCH_MULTIPLAYER.md` §8): the world,
     /// the simulation and the registries.
@@ -339,7 +351,7 @@ impl Game {
         // client would be. The world it hosts is empty until `set_assets`, which
         // is the same moment the old code stood the player on the ground.
         let cfg = Config {
-            world: world_dir(),
+            world: save_dir(),
             autosave_ticks: 0,
             ..Config::default()
         };
@@ -829,12 +841,12 @@ impl Game {
     /// Write the world to disk (#179). The server owns the world, so it owns
     /// the save; this is the client's shutdown reaching for it.
     pub fn save(&self) {
-        self.server().save_to(&world_dir());
+        self.server().save_to(&save_dir());
     }
 
     /// Replace this game's world with the one on disk, if there is one (#179).
     pub fn load(&mut self) -> bool {
-        self.load_from(&world_dir())
+        self.load_from(&save_dir())
     }
 
     /// [`load`](Self::load) from a specific directory.
@@ -3988,6 +4000,76 @@ mod tests {
         let next = game.server_mut().sim.join(body);
         assert_ne!(next, game.me_id, "an id was handed out twice");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_save_that_cannot_be_loaded_is_kept_not_overwritten() {
+        // Changing the world generator makes every older save refuse to load,
+        // and the game then starts a fresh world -- which it saves to the same
+        // place on the way out. Without this, a world someone had played
+        // was quietly replaced the first time they closed the new build.
+        let dir = std::env::temp_dir().join("cubara-unloadable-world");
+        let root = dir.parent().unwrap().to_path_buf();
+        for entry in std::fs::read_dir(&root).unwrap().flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("cubara-unloadable-world")
+            {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+        let old = game_with_assets();
+        old.server().save_to(&dir);
+        let level = dir.join("level.ron");
+        let text = std::fs::read_to_string(&level).unwrap();
+        let version = format!("worldgen_version: {}", cubara_world::WORLDGEN_VERSION);
+        assert!(
+            text.contains(&version),
+            "level.ron:
+{text}"
+        );
+        std::fs::write(
+            &level,
+            text.replacen(&version, "worldgen_version: 999999", 1),
+        )
+        .unwrap();
+        let saved = std::fs::read_to_string(&level).unwrap();
+
+        let mut game = game_with_assets();
+        assert!(!game.load_from(&dir), "a mismatched save loaded");
+        let kept = root.join("cubara-unloadable-world-unloaded-1");
+        assert_eq!(
+            std::fs::read_to_string(kept.join("level.ron"))
+                .ok()
+                .as_deref(),
+            Some(saved.as_str()),
+            "the save was not kept aside intact"
+        );
+        // The fresh world's save goes where the old one was, and touches the
+        // kept one not at all.
+        game.server().save_to(&dir);
+        assert!(dir.join("level.ron").exists());
+        assert_eq!(
+            std::fs::read_to_string(kept.join("level.ron")).unwrap(),
+            saved
+        );
+
+        // A second failure does not overwrite the first one kept.
+        std::fs::write(dir.join("level.ron"), saved.clone()).unwrap();
+        assert!(!game.load_from(&dir));
+        assert!(root
+            .join("cubara-unloadable-world-unloaded-2")
+            .join("level.ron")
+            .exists());
+        assert_eq!(
+            std::fs::read_to_string(kept.join("level.ron")).unwrap(),
+            saved
+        );
+
+        for n in ["", "-unloaded-1", "-unloaded-2"] {
+            let _ = std::fs::remove_dir_all(root.join(format!("cubara-unloadable-world{n}")));
+        }
     }
 
     #[test]
