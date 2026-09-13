@@ -483,7 +483,16 @@ fn main() {
             // What the game streams with.
             None => Some(streaming::VERTICAL_LOD_SQUASH),
         };
-        bench::run(radius, size, bench::View { eye, squash });
+        let occlusion = !args.iter().any(|a| a == "--no-occlusion");
+        bench::run(
+            radius,
+            size,
+            bench::View {
+                eye,
+                squash,
+                occlusion,
+            },
+        );
         return;
     }
 

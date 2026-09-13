@@ -18,13 +18,14 @@ pub mod culling;
 pub mod figure;
 pub mod headless;
 pub mod materials;
+mod occlusion;
 pub mod panel;
 pub mod profiling;
 mod render;
 mod scene;
 mod text;
 
-pub use arena::{ArenaUsage, ChunkArena, MeshedNode, NodeId};
+pub use arena::{ArenaUsage, ChunkArena, Draws, MeshedNode, NodeId, OcclusionStats};
 pub use culling::{Aabb, Frustum};
 pub use figure::{figure_vertices, FigureVertex, PlayerView};
 pub use headless::{Frame, PanelLayout, Shot};

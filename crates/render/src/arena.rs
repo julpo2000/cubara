@@ -21,6 +21,8 @@
 //! moves from CPU to GPU. No throwaway work.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 use cubara_voxel::{build_mesh_bounded, Chunk, Mesh, MeshContext, Vertex};
 
@@ -174,6 +176,74 @@ struct DrawIndexedIndirect {
     first_instance: u32,
 }
 
+/// `Bounds` in `cull.wgsl`: a node's box, padded to storage alignment.
+#[repr(C)]
+#[derive(Copy, Clone, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct Bounds {
+    lo: [f32; 3],
+    _pad0: f32,
+    hi: [f32; 3],
+    _pad1: f32,
+}
+
+/// How one frame's draw list is split between the two passes
+/// ([`crate::occlusion`]): the first `first` entries are drawn outright, the
+/// `candidates` after them only where the occlusion test lets them through.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Draws {
+    pub first: u32,
+    pub candidates: u32,
+}
+
+impl Draws {
+    /// Every node that survived the frustum cull.
+    pub fn total(self) -> u32 {
+        self.first + self.candidates
+    }
+}
+
+/// What the latest occlusion results said, for a frame some frames back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OcclusionStats {
+    /// Nodes in that frame's list, after the frustum cull.
+    pub tested: u32,
+    /// Of those, the ones the test found visible.
+    pub visible: u32,
+    /// Of those tested, the ones drawn only if visible (the second pass).
+    pub candidates: u32,
+    /// Of the candidates, the ones found hidden -- and so not drawn at all.
+    pub hidden_candidates: u32,
+    /// Triangles that frame drew: the whole first pass, and the candidates
+    /// found visible.
+    pub triangles_drawn: u64,
+}
+
+/// A buffer the occlusion results are copied into, to be read on the CPU.
+struct Readback {
+    buffer: wgpu::Buffer,
+    state: ReadState,
+}
+
+enum ReadState {
+    Idle,
+    /// Copied into by a frame, which may not have been submitted yet.
+    Copied(FrameList),
+    /// Asked to map: 0 while pending, 1 mapped, 2 failed.
+    Mapping(FrameList, Arc<AtomicU8>),
+}
+
+/// Which nodes one frame's list held, in order, to put its results against.
+struct FrameList {
+    frame: u64,
+    first: u32,
+    /// Each entry's node index and triangle count.
+    entries: Vec<(u32, u32)>,
+}
+
+/// Copies in flight at once. A result is a frame or two old by the time it can
+/// be read; beyond a few, a frame just goes without a copy.
+const READBACKS: usize = 3;
+
 /// Where one node's geometry lives inside the shared arenas, plus its world-space
 /// bounds for culling. This is the per-node metadata the GPU compute cull (#28)
 /// will read straight from a storage buffer.
@@ -321,9 +391,34 @@ pub struct ChunkArena {
     multi_draw: bool,
     /// Per-frame scratch: the visible draw list built by [`prepare`](Self::prepare).
     visible: Vec<DrawIndexedIndirect>,
-    /// What the last [`prepare`](Self::prepare) drew: nodes, and triangles.
+    /// What the last [`prepare`](Self::prepare) queued: nodes, and triangles.
     visible_nodes: u32,
     visible_triangles: u64,
+    /// Occlusion culling ([`crate::occlusion`]): each listed node's box, the
+    /// test's verdict per entry, and the copies being read back.
+    bounds_buffer: wgpu::Buffer,
+    seen_buffer: wgpu::Buffer,
+    readbacks: Vec<Readback>,
+    /// Whether to split the list at all. Off, every node is drawn in the first
+    /// pass and nothing is tested -- the image must be the same either way.
+    occlusion: bool,
+    /// The nodes the newest results found visible: next frame's first pass.
+    /// The frame each node index was last found visible in; a node counts as
+    /// seen when that is the frame of the newest results. By index rather than
+    /// by `NodeId`, because this is looked up for every node every frame: a
+    /// node that reuses a removed one's index may start out drawn in the first
+    /// pass for a frame, which costs nothing but time.
+    seen_in: Vec<u64>,
+    /// Frame counter, and the frame the newest results came from.
+    frame: u64,
+    seen_frame: u64,
+    stats: OcclusionStats,
+    /// This frame's list, waiting for [`encode_readback`](Self::encode_readback).
+    frame_list: Vec<(u32, u32)>,
+    draws: Draws,
+    /// Per-frame scratch: the candidates, before they join the list.
+    candidates: Vec<(u32, DrawIndexedIndirect, Bounds)>,
+    bounds: Vec<Bounds>,
     /// Per-insert scratch: this node's vertices with `node_index` stamped in.
     /// Reused across inserts so streaming churn doesn't allocate and free a
     /// whole mesh's worth of vertices per node ([`insert`](Self::insert)).
@@ -355,9 +450,35 @@ impl ChunkArena {
         let indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk-arena-indirect"),
             size: MAX_DRAWS as u64 * std::mem::size_of::<DrawIndexedIndirect>() as u64,
-            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            // STORAGE: the occlusion test switches candidates' draws on and off.
+            usage: wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let bounds_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chunk-arena-bounds"),
+            size: MAX_DRAWS as u64 * std::mem::size_of::<Bounds>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let seen_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chunk-arena-seen"),
+            size: MAX_DRAWS as u64 * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readbacks = (0..READBACKS)
+            .map(|_| Readback {
+                buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("chunk-arena-seen-readback"),
+                    size: MAX_DRAWS as u64 * 4,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                state: ReadState::Idle,
+            })
+            .collect();
         // vec4 (16 bytes) per node: storage buffers want their elements
         // aligned to 16 bytes anyway, and it leaves a spare float per entry
         // (unused today) rather than fighting alignment padding.
@@ -391,6 +512,18 @@ impl ChunkArena {
             visible: Vec::new(),
             visible_nodes: 0,
             visible_triangles: 0,
+            bounds_buffer,
+            seen_buffer,
+            readbacks,
+            occlusion: true,
+            seen_in: vec![0; MAX_NODES as usize],
+            frame: 0,
+            seen_frame: 0,
+            stats: OcclusionStats::default(),
+            frame_list: Vec::new(),
+            draws: Draws::default(),
+            candidates: Vec::new(),
+            bounds: Vec::new(),
             stamped: Vec::new(),
             warned_full: false,
         }
@@ -598,17 +731,59 @@ impl ChunkArena {
         Some((min.to_array(), max.to_array()))
     }
 
-    /// CPU frustum-cull the resident nodes and upload the visible set's indirect
-    /// draw args: for each node in view, one draw per run of face directions
-    /// that can face the camera ([`faces_facing`]). Returns the number of draws.
-    /// Call once per frame, before beginning the render pass; then
-    /// [`encode`](Self::encode).
-    pub fn prepare(&mut self, queue: &wgpu::Queue, frustum: &Frustum) -> u32 {
+    /// Turn occlusion culling on or off ([`crate::occlusion`]). On by default.
+    /// Off, every node the frustum lets through is drawn in the first pass --
+    /// which must give exactly the same image, only slower.
+    pub fn set_occlusion(&mut self, on: bool) {
+        self.occlusion = on;
+    }
+
+    pub(crate) fn occlusion(&self) -> bool {
+        self.occlusion
+    }
+
+    /// Whether the newest occlusion results found `id` visible.
+    #[cfg(test)]
+    pub(crate) fn was_seen(&self, id: NodeId) -> bool {
+        self.slots
+            .get(&id)
+            .is_some_and(|slot| self.seen_in[slot.node_index as usize] == self.seen_frame)
+    }
+
+    /// Nodes the last [`prepare`](Self::prepare) found in view with a face
+    /// that could face the camera.
+    pub fn visible_nodes(&self) -> u32 {
+        self.visible_nodes
+    }
+
+    /// Triangles the last [`prepare`](Self::prepare) queued, before
+    /// occlusion culling.
+    pub fn visible_triangles(&self) -> u64 {
+        self.visible_triangles
+    }
+
+    /// What the newest occlusion results that have been read back said.
+    pub fn occlusion_stats(&self) -> OcclusionStats {
+        self.stats
+    }
+
+    /// Frustum-cull the resident nodes, split the survivors between the two
+    /// passes, and upload the list. Returns the split, for
+    /// [`SceneFrame::draws`](crate::SceneFrame). Call once per frame, before
+    /// encoding it.
+    ///
+    /// Nodes the newest occlusion results saw go first and are drawn outright;
+    /// the rest follow as candidates, drawn only where the GPU's test finds
+    /// them visible. Also takes in any results that have come back since the
+    /// last call, and asks for the ones copied since to be mapped.
+    pub fn prepare(&mut self, queue: &wgpu::Queue, frustum: &Frustum) -> Draws {
         puffin::profile_function!();
+        self.collect_readbacks();
+        self.frame += 1;
         self.visible.clear();
-        self.visible_nodes = 0;
-        self.visible_triangles = 0;
-        let eye = frustum.eye();
+        self.bounds.clear();
+        self.candidates.clear();
+        self.frame_list.clear();
         // `slots` is a BTreeMap, so this iterates in `NodeId` order every frame,
         // regardless of the order workers finished meshing in. That makes the draw
         // list — and therefore the rendered frame — deterministic (issue #81), and
@@ -624,16 +799,21 @@ impl ChunkArena {
         // derived `Ord`, so it is pinned by
         // `node_ids_sort_by_level_first_so_truncation_drops_the_coarsest` rather
         // than by this comment.
+        self.visible_nodes = 0;
+        self.visible_triangles = 0;
+        let eye = frustum.eye();
+        // A node's draws: one per run of face directions that can face the
+        // camera ([`faces_facing`]), at most three.
+        let mut node_draws: Vec<DrawIndexedIndirect> = Vec::with_capacity(3);
         'nodes: for slot in self.slots.values() {
             if !frustum.intersects_aabb(&slot.aabb) {
                 continue;
             }
             // A node is drawn whole or not at all: never half its faces
             // because the draw list ran out part-way through it.
-            if self.visible.len() as u32 + 3 > MAX_DRAWS {
+            if (self.visible.len() + self.candidates.len()) as u32 + 3 > MAX_DRAWS {
                 break 'nodes;
             }
-            self.visible_nodes += 1;
             let draw = |first_index: u32, index_count: u32| DrawIndexedIndirect {
                 index_count,
                 instance_count: 1,
@@ -644,35 +824,61 @@ impl ChunkArena {
                 // always the default single-instance draw.
                 first_instance: 0,
             };
-            let Some(counts) = slot.face_indices else {
-                self.visible.push(draw(slot.first_index, slot.index_count));
-                self.visible_triangles += slot.index_count as u64 / 3;
-                continue;
-            };
-            // Adjacent directions that are both drawn share one draw. At most
-            // three runs: of each opposite pair (adjacent in `Face` order) a
-            // camera outside the box sees one.
-            let facing = faces_facing(&slot.aabb, eye);
-            let mut start = slot.first_index;
-            let mut run: Option<(u32, u32)> = None;
-            for (count, facing) in counts.into_iter().zip(facing) {
-                if count > 0 {
-                    if facing {
-                        run = Some(match run {
-                            Some((first, n)) => (first, n + count),
-                            None => (start, count),
-                        });
-                    } else if let Some((first, n)) = run.take() {
-                        self.visible.push(draw(first, n));
-                        self.visible_triangles += n as u64 / 3;
+            node_draws.clear();
+            match slot.face_indices {
+                None => node_draws.push(draw(slot.first_index, slot.index_count)),
+                Some(counts) => {
+                    // Adjacent directions that are both drawn share one draw. At
+                    // most three runs: of each opposite pair (adjacent in `Face`
+                    // order) a camera outside the box sees one.
+                    let facing = faces_facing(&slot.aabb, eye);
+                    let mut start = slot.first_index;
+                    let mut run: Option<(u32, u32)> = None;
+                    for (count, facing) in counts.into_iter().zip(facing) {
+                        if count > 0 {
+                            if facing {
+                                run = Some(match run {
+                                    Some((first, n)) => (first, n + count),
+                                    None => (start, count),
+                                });
+                            } else if let Some((first, n)) = run.take() {
+                                node_draws.push(draw(first, n));
+                            }
+                        }
+                        start += count;
+                    }
+                    if let Some((first, n)) = run {
+                        node_draws.push(draw(first, n));
                     }
                 }
-                start += count;
             }
-            if let Some((first, n)) = run {
-                self.visible.push(draw(first, n));
-                self.visible_triangles += n as u64 / 3;
+            if node_draws.is_empty() {
+                continue;
             }
+            self.visible_nodes += 1;
+            let bounds = Bounds {
+                lo: slot.aabb.min.to_array(),
+                hi: slot.aabb.max.to_array(),
+                ..Default::default()
+            };
+            let first_pass =
+                !self.occlusion || self.seen_in[slot.node_index as usize] == self.seen_frame;
+            for &d in &node_draws {
+                self.visible_triangles += d.index_count as u64 / 3;
+                if first_pass {
+                    self.visible.push(d);
+                    self.bounds.push(bounds);
+                    self.frame_list.push((slot.node_index, d.index_count / 3));
+                } else {
+                    self.candidates.push((slot.node_index, d, bounds));
+                }
+            }
+        }
+        let first = self.visible.len() as u32;
+        for &(node, draw, bounds) in &self.candidates {
+            self.visible.push(draw);
+            self.bounds.push(bounds);
+            self.frame_list.push((node, draw.index_count / 3));
         }
         if !self.visible.is_empty() {
             queue.write_buffer(
@@ -680,33 +886,120 @@ impl ChunkArena {
                 0,
                 bytemuck::cast_slice(&self.visible),
             );
+            queue.write_buffer(&self.bounds_buffer, 0, bytemuck::cast_slice(&self.bounds));
         }
-        self.visible.len() as u32
+        self.draws = Draws {
+            first,
+            candidates: self.visible.len() as u32 - first,
+        };
+        self.draws
     }
 
-    /// Nodes the last [`prepare`](Self::prepare) found in view.
-    pub fn visible_nodes(&self) -> u32 {
-        self.visible_nodes
+    /// The buffers the occlusion test reads and writes: every listed node's
+    /// box, the indirect draw list, and one result per entry.
+    pub(crate) fn occlusion_buffers(&self) -> (&wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer) {
+        (
+            &self.bounds_buffer,
+            &self.indirect_buffer,
+            &self.seen_buffer,
+        )
     }
 
-    /// Triangles the last [`prepare`](Self::prepare) queued to draw.
-    pub fn visible_triangles(&self) -> u64 {
-        self.visible_triangles
-    }
-
-    /// Bind the shared buffers and issue the draws for the `count` visible chunks
-    /// prepared this frame — one `multi_draw_indexed_indirect` on MDI backends, or a
-    /// `draw_indexed` loop over the same buffers otherwise.
-    pub fn encode(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {
+    /// Copy this frame's occlusion results out to be read back, if a readback
+    /// buffer is free. Encode after the test.
+    pub(crate) fn encode_readback(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        let count = self.draws.total();
         if count == 0 {
             return;
         }
-        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        let Some(readback) = self
+            .readbacks
+            .iter_mut()
+            .find(|r| matches!(r.state, ReadState::Idle))
+        else {
+            return;
+        };
+        encoder.copy_buffer_to_buffer(&self.seen_buffer, 0, &readback.buffer, 0, count as u64 * 4);
+        readback.state = ReadState::Copied(FrameList {
+            frame: self.frame,
+            first: self.draws.first,
+            entries: std::mem::take(&mut self.frame_list),
+        });
+    }
+
+    /// Take in results that have been mapped, and ask for the ones copied by
+    /// earlier frames -- submitted by now -- to be mapped.
+    fn collect_readbacks(&mut self) {
+        for readback in &mut self.readbacks {
+            let state = std::mem::replace(&mut readback.state, ReadState::Idle);
+            readback.state = match state {
+                ReadState::Idle => ReadState::Idle,
+                ReadState::Copied(list) => {
+                    let status = Arc::new(AtomicU8::new(0));
+                    let done = Arc::clone(&status);
+                    let bytes = list.entries.len() as u64 * 4;
+                    if bytes == 0 {
+                        ReadState::Idle
+                    } else {
+                        readback.buffer.slice(..bytes).map_async(
+                            wgpu::MapMode::Read,
+                            move |result| {
+                                done.store(if result.is_ok() { 1 } else { 2 }, Ordering::Relaxed);
+                            },
+                        );
+                        ReadState::Mapping(list, status)
+                    }
+                }
+                ReadState::Mapping(list, status) => match status.load(Ordering::Relaxed) {
+                    0 => ReadState::Mapping(list, status),
+                    1 => {
+                        let bytes = list.entries.len() as u64 * 4;
+                        if list.frame > self.seen_frame {
+                            let data = readback.buffer.slice(..bytes).get_mapped_range();
+                            let verdicts: &[u32] = bytemuck::cast_slice(&data);
+                            let mut stats = OcclusionStats {
+                                tested: verdicts.len() as u32,
+                                candidates: verdicts.len() as u32 - list.first,
+                                ..Default::default()
+                            };
+                            for (i, (&(node, triangles), &verdict)) in
+                                list.entries.iter().zip(verdicts).enumerate()
+                            {
+                                let first_pass = (i as u32) < list.first;
+                                if verdict != 0 {
+                                    self.seen_in[node as usize] = list.frame;
+                                    stats.visible += 1;
+                                }
+                                if !first_pass && verdict == 0 {
+                                    stats.hidden_candidates += 1;
+                                }
+                                if first_pass || verdict != 0 {
+                                    stats.triangles_drawn += triangles as u64;
+                                }
+                            }
+                            drop(data);
+                            self.stats = stats;
+                            self.seen_frame = list.frame;
+                        }
+                        readback.buffer.unmap();
+                        ReadState::Idle
+                    }
+                    _ => ReadState::Idle,
+                },
+            };
+        }
+    }
+
+    /// The first pass: the nodes drawn outright.
+    pub fn encode_first(&self, pass: &mut wgpu::RenderPass<'_>, draws: Draws) {
+        if draws.first == 0 {
+            return;
+        }
+        self.bind(pass);
         if self.multi_draw {
-            pass.multi_draw_indexed_indirect(&self.indirect_buffer, 0, count);
+            pass.multi_draw_indexed_indirect(&self.indirect_buffer, 0, draws.first);
         } else {
-            for draw in &self.visible[..count as usize] {
+            for draw in &self.visible[..draws.first as usize] {
                 pass.draw_indexed(
                     draw.first_index..draw.first_index + draw.index_count,
                     draw.base_vertex,
@@ -714,6 +1007,30 @@ impl ChunkArena {
                 );
             }
         }
+    }
+
+    /// The second pass: the candidates, each drawn with the instance count the
+    /// occlusion test wrote -- one if visible, none if not. Without
+    /// occlusion there are none.
+    pub fn encode_candidates(&self, pass: &mut wgpu::RenderPass<'_>, draws: Draws) {
+        if draws.candidates == 0 {
+            return;
+        }
+        self.bind(pass);
+        let size = std::mem::size_of::<DrawIndexedIndirect>() as u64;
+        let offset = draws.first as u64 * size;
+        if self.multi_draw {
+            pass.multi_draw_indexed_indirect(&self.indirect_buffer, offset, draws.candidates);
+        } else {
+            for i in 0..draws.candidates as u64 {
+                pass.draw_indexed_indirect(&self.indirect_buffer, offset + i * size);
+            }
+        }
+    }
+
+    fn bind(&self, pass: &mut wgpu::RenderPass<'_>) {
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
     }
 
     /// Build and upload every node in `meshed` into a fresh arena — the

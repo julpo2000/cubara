@@ -51,6 +51,9 @@ pub struct View {
     /// streams with. `None` is the old ±2-layer band, kept so the rows measured
     /// with it can still be compared against (`--band`).
     pub squash: Option<i32>,
+    /// Occlusion culling (`cubara_render`'s `occlusion`), on as in the game;
+    /// `--no-occlusion` turns it off to compare.
+    pub occlusion: bool,
 }
 
 pub fn run(radius: i32, (width, height): (u32, u32), view: View) {
@@ -175,6 +178,7 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View) {
             .filter(|b| visible.contains(&b.node))
             .filter_map(to_meshed_node),
     );
+    arena.set_occlusion(view.occlusion);
     let total_nodes = arena.len();
     // A scene with nothing in it renders very fast, and would pass the gate.
     assert!(
@@ -252,7 +256,7 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View) {
 
             let cpu_start = Instant::now();
             // CPU cull + indirect-list upload — the per-frame work we're measuring.
-            let draw_count = arena.prepare(&queue, &frustum);
+            let draws = arena.prepare(&queue, &frustum);
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("bench-encoder"),
             });
@@ -265,7 +269,7 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View) {
                 &color_view,
                 SceneFrame {
                     arena,
-                    draw_count,
+                    draws,
                     selected_block: None,
                     cracking: None,
                     players: &[],
@@ -297,6 +301,8 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View) {
     // Measure sustained throughput over wall-clock time, plus per-frame CPU cost.
     let mut cpu_ms: Vec<f64> = Vec::with_capacity(MEASURE_FRAMES as usize);
     let mut visible_sum = 0u64;
+    let mut seen_sum = 0u64;
+    let mut drawn_sum = 0u64;
     let mut triangles_sum = 0u64;
     let wall_start = Instant::now();
     for _ in 0..MEASURE_FRAMES {
@@ -305,6 +311,9 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View) {
         cpu_ms.push(ms);
         visible_sum += visible as u64;
         triangles_sum += arena.visible_triangles();
+        let stats = arena.occlusion_stats();
+        seen_sum += stats.visible as u64;
+        drawn_sum += stats.triangles_drawn;
         let _ = device.poll(wgpu::Maintain::Poll);
         virtual_t += VIRTUAL_DT;
     }
@@ -315,6 +324,13 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View) {
         "triangles drawn: avg {:.0} (faces turned away from the camera left out)",
         triangles_sum as f64 / MEASURE_FRAMES as f64
     );
+    if view.occlusion {
+        log::info!(
+            "occlusion: avg {:.0} draws seen, {:.0} triangles drawn",
+            seen_sum as f64 / MEASURE_FRAMES as f64,
+            drawn_sum as f64 / MEASURE_FRAMES as f64,
+        );
+    }
 
     report(MEASURE_FRAMES, wall_secs, cpu_ms, avg_visible, total_nodes);
 }

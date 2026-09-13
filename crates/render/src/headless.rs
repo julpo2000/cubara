@@ -7,7 +7,7 @@
 
 use cubara_voxel::{Chunk, ChunkCoord, MeshContext};
 
-use crate::arena::{ChunkArena, MeshedNode, NodeId};
+use crate::arena::{ChunkArena, MeshedNode, NodeId, OcclusionStats};
 use crate::culling::Frustum;
 use crate::render::{gpu_driven_features, load_mesh_assets, CameraUniform};
 use crate::scene::{SceneFrame, SceneRenderer};
@@ -17,6 +17,8 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+    /// What occlusion culling found in the kept frame.
+    pub occlusion: OcclusionStats,
 }
 
 /// What to render. Deliberately small and explicit: a golden test's scene must be
@@ -114,7 +116,23 @@ pub struct Shot {
     pub gauges: Option<(f32, f32)>,
     /// Item icons that [`crate::HotbarSlot::icon`] indexes into.
     pub icons: Vec<Option<Vec<u8>>>,
+    /// Occlusion culling ([`crate::occlusion`]), on as in the game. A shot
+    /// renders [`FRAMES`] frames of the same view and keeps the last, so the
+    /// culling has results to act on by then.
+    pub occlusion: bool,
+    /// Where the camera is for every frame but the kept one, when that should
+    /// differ from `camera`: what occlusion culling has seen by the kept frame
+    /// is then what *this* camera saw, and whatever the kept camera shows that
+    /// this one did not has to come through the second pass. `None` keeps the
+    /// view still.
+    pub earlier_camera: Option<(glam::Vec3, glam::Vec3)>,
 }
+
+/// Frames a shot renders, keeping the last. A frame's occlusion results are
+/// taken in two frames later: the first frame draws everything in its first
+/// pass and learns what is really seen; the third draws only that first, and
+/// tests the rest as candidates; the fifth is the same again, and is kept.
+pub const FRAMES: u32 = 5;
 
 impl Default for Shot {
     fn default() -> Self {
@@ -134,6 +152,8 @@ impl Default for Shot {
             tooltip: None,
             gauges: None,
             icons: Vec::new(),
+            occlusion: true,
+            earlier_camera: None,
         }
     }
 }
@@ -219,6 +239,8 @@ fn render_arena(
         tooltip,
         gauges,
         icons,
+        occlusion,
+        earlier_camera,
     } = shot;
     // Slot 0 held: a fixed choice, so a golden reference has a stable
     // selection highlight to compare against.
@@ -238,6 +260,9 @@ fn render_arena(
     let mut arena = build_arena(&device, &queue, multi_draw, &ctx);
     let (min, max) = arena.bounds()?;
 
+    let aspect = width as f32 / height as f32;
+    let earlier_vp =
+        earlier_camera.map(|(eye, dir)| CameraUniform::look_view_proj(aspect, eye, dir));
     let vp = match camera {
         Some((eye, look_dir)) => {
             CameraUniform::look_view_proj(width as f32 / height as f32, eye, look_dir)
@@ -257,7 +282,7 @@ fn render_arena(
             )
         }
     };
-    let draw_count = arena.prepare(&queue, &Frustum::from_view_proj(vp));
+    arena.set_occlusion(occlusion);
 
     let mut scene = SceneRenderer::new(
         &device,
@@ -268,7 +293,6 @@ fn render_arena(
         &tex_view,
         &tex_sampler,
     );
-    scene.set_camera(&queue, vp);
     if !icons.is_empty() {
         scene.set_icons(&device, &queue, &icons);
     }
@@ -300,66 +324,86 @@ fn render_arena(
         mapped_at_creation: false,
     });
 
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("headless-encoder"),
-    });
-    // No overlay: the debug HUD shows live FPS, which would make any golden
-    // reference differ on every run. `highlighted_block` does go through --
-    // a golden test needs to be able to show the outline.
-    scene.encode_scene(
-        &device,
-        &queue,
-        &mut encoder,
-        &color_view,
-        SceneFrame {
-            arena: &arena,
-            draw_count,
-            selected_block: highlighted_block,
-            cracking,
-            players: &players,
-            overlay: None,
-            hotbar: hotbar.as_ref().map(|slots| crate::scene::HotbarView {
-                slots: slots.as_slice(),
-                selected: hotbar_selected,
-            }),
-            health: health
-                .map(|(points, max_points)| crate::scene::HealthView { points, max_points }),
-            panel: panel_view
-                .as_ref()
-                .map(|(p, contents, held, cursor)| crate::scene::PanelView {
-                    panel: p,
-                    contents,
-                    held: *held,
-                    cursor: *cursor,
-                    tooltip: tooltip.as_deref(),
-                    gauges: gauges
-                        .map(|(burn, progress)| crate::scene::FurnaceGauges { burn, progress }),
+    for frame in 1..=FRAMES {
+        let vp = match earlier_vp {
+            Some(earlier) if frame < FRAMES => earlier,
+            _ => vp,
+        };
+        scene.set_camera(&queue, vp);
+        let draws = arena.prepare(&queue, &Frustum::from_view_proj(vp));
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("headless-encoder"),
+        });
+        // No overlay: the debug HUD shows live FPS, which would make any golden
+        // reference differ on every run. `highlighted_block` does go through --
+        // a golden test needs to be able to show the outline.
+        scene.encode_scene(
+            &device,
+            &queue,
+            &mut encoder,
+            &color_view,
+            SceneFrame {
+                arena: &mut arena,
+                draws,
+                selected_block: highlighted_block,
+                cracking,
+                players: &players,
+                overlay: None,
+                hotbar: hotbar.as_ref().map(|slots| crate::scene::HotbarView {
+                    slots: slots.as_slice(),
+                    selected: hotbar_selected,
                 }),
-            crosshair,
-        },
-    );
-    encoder.copy_texture_to_buffer(
-        wgpu::TexelCopyTextureInfo {
-            texture: &color,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::TexelCopyBufferInfo {
-            buffer: &readback,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(padded_bpr),
-                rows_per_image: Some(height),
+                health: health
+                    .map(|(points, max_points)| crate::scene::HealthView { points, max_points }),
+                panel: panel_view.as_ref().map(|(p, contents, held, cursor)| {
+                    crate::scene::PanelView {
+                        panel: p,
+                        contents,
+                        held: *held,
+                        cursor: *cursor,
+                        tooltip: tooltip.as_deref(),
+                        gauges: gauges
+                            .map(|(burn, progress)| crate::scene::FurnaceGauges { burn, progress }),
+                    }
+                }),
+                crosshair,
             },
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
-    queue.submit(std::iter::once(encoder.finish()));
+        );
+        if frame == FRAMES {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &color,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_bpr),
+                        rows_per_image: Some(height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+        // Every frame waits, so its occlusion results are ready for the next.
+        let _ = device.poll(wgpu::Maintain::Wait);
+    }
+
+    // The kept frame's own occlusion results: mapped by one more prepare, read
+    // by the next.
+    let frustum = Frustum::from_view_proj(vp);
+    arena.prepare(&queue, &frustum);
+    let _ = device.poll(wgpu::Maintain::Wait);
+    arena.prepare(&queue, &frustum);
+    let occlusion_stats: OcclusionStats = arena.occlusion_stats();
 
     let slice = readback.slice(..);
     slice.map_async(wgpu::MapMode::Read, |r| r.expect("map readback"));
@@ -378,6 +422,7 @@ fn render_arena(
         width,
         height,
         pixels,
+        occlusion: occlusion_stats,
     })
 }
 
