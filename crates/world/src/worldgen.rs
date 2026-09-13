@@ -265,6 +265,25 @@ const CAVE_THRESHOLD: f32 = 0.6;
 const CAVE_CARVE_AMOUNT: f32 = 1_000_000.0;
 const CAVE_SEED_MIX: u64 = 0xD6E8_FEB8_6659_FD93;
 
+/// The most the cave noise can change per block along one axis.
+///
+/// One octave of value noise moves at most 3 per lattice unit per axis (a
+/// smoothstep's slope peaks at 1.5, across values that differ by at most 2);
+/// octaves scale that by their frequency and weight, and the sum is normalised
+/// the way `fbm3` normalises. Used only to skip samples that cannot disagree,
+/// so an overestimate costs speed and an underestimate would cost correctness
+/// -- `the_cave_slope_bound_holds` checks it against the noise itself.
+fn cave_noise_slope() -> f32 {
+    let (mut freq, mut amp, mut sum, mut norm) = (CAVE_FREQ, 1.0f32, 0.0f32, 0.0f32);
+    for _ in 0..CAVE_OCTAVES {
+        sum += 3.0 * freq * amp;
+        norm += amp;
+        freq *= CAVE_LACUNARITY;
+        amp *= CAVE_GAIN;
+    }
+    sum / norm
+}
+
 // Ore shape. Each ore carries its own frequency and threshold from its data
 // file (`assets/ores/*.ron`); what is fixed here is the *kind* of noise, which
 // is an algorithm rather than a number to tune. One octave, like caves: ore
@@ -373,6 +392,25 @@ impl WorldGen {
     /// The terrain height field in blocks: a fractal noise surface that
     /// [`density`](Self::density)'s solid/air split (before caves) is
     /// measured against. A pure function of `(seed, x, z)` alone (§8.1).
+    /// The surface height a cell of `step` blocks at column `(x, z)` is judged
+    /// against: the average of four columns spread around the middle of the
+    /// cell -- all four of its columns at `step` 2, which has no middle column.
+    /// At `step` 1 it is the block's own column.
+    pub fn cell_surface_height(&self, x: i32, z: i32, step: i32) -> i32 {
+        if step <= 1 {
+            return self.surface_height(x, z);
+        }
+        let (near, far) = (step / 4, (3 * step) / 4);
+        let sum: i32 = [(near, near), (far, near), (near, far), (far, far)]
+            .iter()
+            .map(|&(dx, dz)| self.surface_height(x + dx, z + dz))
+            .sum();
+        // Rounded down. Columns of 28, 28, 27 and 27 hold 2 of the 8 blocks in
+        // a cell at 28-29: clearly air. Rounding their 27.5 to nearest said 28,
+        // and solid -- measured, it was the whole of the remaining error.
+        sum.div_euclid(4)
+    }
+
     pub fn surface_height(&self, x: i32, z: i32) -> i32 {
         let n = fbm2(
             self.seed,
@@ -391,8 +429,21 @@ impl WorldGen {
     /// of hashing) is computed by the caller once per column and passed in,
     /// not recomputed per voxel. See [`generate`](Self::generate)'s doc
     /// comment for why that matters.
-    fn density_at(&self, x: i32, y: i32, z: i32, surface: i32, caves: bool) -> f32 {
-        let terrain = (surface - y + 1) as f32;
+    ///
+    /// **`step` is the size of the cell being asked about**, in blocks: 1 for a
+    /// block, 2^L for a cell of a level-L node. Every feature answers for the
+    /// whole cell, not for its corner -- that is the contract that lets any
+    /// feature, present or future, be drawn at a distance without the renderer
+    /// knowing it exists. Coarse nodes are this same function at a larger
+    /// `step`; there is no second, feature-less path for them.
+    ///
+    /// `surface` must be [`cell_surface_height`](Self::cell_surface_height) for
+    /// the same cell: the height field is judged at the middle of the cell's
+    /// column, against the middle of the cell, for the same reason caves are --
+    /// a steep slope sampled at one corner of an 8-block cell is a step in the
+    /// wrong place.
+    fn density_at(&self, x: i32, y: i32, z: i32, surface: i32, step: i32) -> f32 {
+        let terrain = (surface - (y + (step - 1) / 2) + 1) as f32;
         if terrain <= 0.0 {
             // Already air from the height field alone. `carved` below is
             // always >= 0 (it's either 0 or CAVE_CARVE_AMOUNT), so caves can
@@ -407,24 +458,68 @@ impl WorldGen {
             // surface-amortization above it together fix.
             return terrain;
         }
-        if !caves {
-            return terrain;
-        }
-        let carve = fbm3(
-            self.seed ^ CAVE_SEED_MIX,
-            x as f32 * CAVE_FREQ,
-            y as f32 * CAVE_FREQ,
-            z as f32 * CAVE_FREQ,
-            CAVE_OCTAVES,
-            CAVE_LACUNARITY,
-            CAVE_GAIN,
-        );
-        let carved = if carve > CAVE_THRESHOLD {
+        let carved = if self.cave_at(x, y, z, step) {
             CAVE_CARVE_AMOUNT
         } else {
             0.0
         };
         terrain - carved
+    }
+
+    /// Whether the cell of `step` blocks at `(x, y, z)` is cave.
+    ///
+    /// A block is cave where the cave noise crosses the threshold. A larger
+    /// cell is cave where **most of it** is: eight samples spread through the
+    /// cell, carved on four or more. Sampling a coarse cell at a single point
+    /// is what made distant caves look like noise punched through the ground
+    /// (`PHASE1_ARCHITECTURE.md` §8.6) -- a cave narrower than the cell hit or
+    /// missed by luck. Taking the majority keeps what is really there at that
+    /// size and drops what is smaller than a cell, so a ravine or a cavern is
+    /// still a ravine or a cavern from a kilometre away.
+    ///
+    /// Eight samples per cell would make coarse nodes expensive, so the centre
+    /// is sampled first: the noise cannot change faster than
+    /// [`cave_noise_slope`], so when the centre is further from the threshold
+    /// than the samples are from the centre, all eight agree with it.
+    fn cave_at(&self, x: i32, y: i32, z: i32, step: i32) -> bool {
+        let noise = |px: f32, py: f32, pz: f32| {
+            fbm3(
+                self.seed ^ CAVE_SEED_MIX,
+                px * CAVE_FREQ,
+                py * CAVE_FREQ,
+                pz * CAVE_FREQ,
+                CAVE_OCTAVES,
+                CAVE_LACUNARITY,
+                CAVE_GAIN,
+            )
+        };
+        if step <= 1 {
+            return noise(x as f32, y as f32, z as f32) > CAVE_THRESHOLD;
+        }
+        // A block samples the noise at its own integer coordinate, so a cell of
+        // blocks x..x+step-1 is centred on x + (step-1)/2.
+        let span = (step - 1) as f32;
+        let (cx, cy, cz) = (
+            x as f32 + span * 0.5,
+            y as f32 + span * 0.5,
+            z as f32 + span * 0.5,
+        );
+        let centre = noise(cx, cy, cz);
+        let reach = span * 0.25;
+        if (centre - CAVE_THRESHOLD).abs() > cave_noise_slope() * reach * 3.0 {
+            return centre > CAVE_THRESHOLD;
+        }
+        let mut caves = 0;
+        for dx in [-reach, reach] {
+            for dy in [-reach, reach] {
+                for dz in [-reach, reach] {
+                    if noise(cx + dx, cy + dy, cz + dz) > CAVE_THRESHOLD {
+                        caves += 1;
+                    }
+                }
+            }
+        }
+        caves >= 4
     }
 
     /// Terrain density at a world position: positive means solid. The
@@ -441,7 +536,7 @@ impl WorldGen {
     /// solid" and "the surface block is solid" contradict each other by
     /// exactly one block.
     pub fn density(&self, x: i32, y: i32, z: i32) -> f32 {
-        self.density_at(x, y, z, self.surface_height(x, z), true)
+        self.density_at(x, y, z, self.surface_height(x, z), 1)
     }
 
     /// Shorthand for `density(x, y, z) > 0.0` -- what a single-block
@@ -579,7 +674,7 @@ impl WorldGen {
         // The density check is the second half: a cave can carve the ground
         // out from under a surface height, and a tree must not grow on air.
         if self.material_at(x, surface, z, surface, blocks) != oak.grows_on
-            || self.density_at(x, surface, z, surface, true) <= 0.0
+            || self.density_at(x, surface, z, surface, 1) <= 0.0
         {
             return None;
         }
@@ -640,9 +735,9 @@ impl WorldGen {
         z: i32,
         surface: i32,
         blocks: TerrainBlocks,
-        caves: bool,
+        step: i32,
     ) -> Option<BlockId> {
-        (self.density_at(x, y, z, surface, caves) > 0.0)
+        (self.density_at(x, y, z, surface, step) > 0.0)
             .then(|| self.material_at(x, y, z, surface, blocks))
     }
 
@@ -658,13 +753,13 @@ impl WorldGen {
     /// correctness bug, it is a 5x frame-time regression, which is how it was
     /// found.
     /// Whether the cell a node with cells `step` blocks wide generates at
-    /// corner `(x, y, z)` is solid, given that column's `surface` height -- the
-    /// same answer [`generate`](Self::generate) gives, one cell at a time:
-    /// sampled at the corner, carved by caves only at full resolution. For
+    /// corner `(x, y, z)` is solid, given that cell's
+    /// [`cell_surface_height`](Self::cell_surface_height) -- the
+    /// same answer [`generate`](Self::generate) gives, one cell at a time. For
     /// judging what a neighbouring node of another level of detail draws,
     /// without generating it.
     pub fn solid_at_step_on(&self, x: i32, y: i32, z: i32, step: i32, surface: i32) -> bool {
-        self.density_at(x, y, z, surface, step == 1) > 0.0
+        self.density_at(x, y, z, surface, step) > 0.0
     }
 
     /// No block the generator places is ever higher than this: the tallest
@@ -694,7 +789,7 @@ impl WorldGen {
         z: i32,
         blocks: TerrainBlocks,
     ) -> Option<BlockId> {
-        self.block_at_on_surface(x, y, z, self.surface_height(x, z), blocks, true)
+        self.block_at_on_surface(x, y, z, self.surface_height(x, z), blocks, 1)
     }
 
     pub fn block_at(&self, x: i32, y: i32, z: i32, blocks: TerrainBlocks) -> Option<BlockId> {
@@ -708,7 +803,7 @@ impl WorldGen {
                 return Some(block);
             }
         }
-        self.block_at_on_surface(x, y, z, self.surface_height(x, z), blocks, true)
+        self.block_at_on_surface(x, y, z, self.surface_height(x, z), blocks, 1)
     }
 
     /// Whether `(x, y, z)` is solid **including trees**, given the ids that
@@ -773,14 +868,14 @@ impl WorldGen {
             let z = origin[2] + lz as i32 * step;
             for (lx, cell) in row.iter_mut().enumerate() {
                 let x = origin[0] + lx as i32 * step;
-                *cell = self.surface_height(x, z);
+                *cell = self.cell_surface_height(x, z, step);
             }
         }
         Chunk::from_fn(|lx, ly, lz| {
             let x = origin[0] + lx as i32 * step;
             let y = origin[1] + ly as i32 * step;
             let z = origin[2] + lz as i32 * step;
-            self.block_at_on_surface(x, y, z, surfaces[lz][lx], blocks, step == 1)
+            self.block_at_on_surface(x, y, z, surfaces[lz][lx], blocks, step)
                 .unwrap_or(BlockId::AIR)
         })
     }
@@ -1055,75 +1150,177 @@ mod tests {
     }
 
     #[test]
-    fn step_samples_a_coarser_lattice_at_the_same_origin() {
-        // `generate()` must sample the same functions on a coarser lattice, not
-        // generate full-resolution and downsample (§2's "factor of 65").
-        //
-        // **At step 1 that means exact agreement with `block_at`.** Above it,
-        // the two deliberately differ -- §8.6 carves caves at level 0 only, the
-        // same decision §8.4 made for trees and for the same reason: a feature
-        // sampled every 8 blocks is noise, not the feature. So a coarse node is
-        // the *height field alone*, which is what the second half asserts.
+    fn step_one_is_exactly_block_at() {
+        // `generate()` samples the same functions a block query does; at step
+        // 1 that means exact agreement.
         let gen = WorldGen::new(99);
         let blocks = test_blocks();
-        let origin = [0, 0, 0];
-
-        let fine = gen.generate(origin, 1, blocks);
+        let fine = gen.generate([0, -8, 0], 1, blocks);
         for lz in 0..Chunk::SIZE {
             for ly in 0..Chunk::SIZE {
                 for lx in 0..Chunk::SIZE {
-                    let (x, y, z) = (lx as i32, ly as i32, lz as i32);
+                    let (x, y, z) = (lx as i32, ly as i32 - 8, lz as i32);
                     let expected = gen.block_at(x, y, z, blocks).unwrap_or(BlockId::AIR);
                     assert_eq!(fine.get(lx, ly, lz), expected, "step 1 ({lx},{ly},{lz})");
                 }
             }
         }
+    }
 
-        let step = 4;
-        let coarse = gen.generate(origin, step, blocks);
-        for lz in 0..Chunk::SIZE {
-            for ly in 0..Chunk::SIZE {
-                for lx in 0..Chunk::SIZE {
-                    let x = origin[0] + lx as i32 * step;
-                    let y = origin[1] + ly as i32 * step;
-                    let z = origin[2] + lz as i32 * step;
-                    // The height field alone: solid at or below the surface.
-                    let want_solid = y <= gen.surface_height(x, z);
-                    assert_eq!(
-                        coarse.get(lx, ly, lz) != BlockId::AIR,
-                        want_solid,
-                        "step {step} ({lx},{ly},{lz}) at world ({x},{y},{z})"
-                    );
+    /// **The contract that keeps distance rendering independent of what the
+    /// world contains**: a coarse cell is solid where most of the blocks it
+    /// stands for are, and air where most are air.
+    ///
+    /// Checked only where the blocks agree clearly (at least three quarters one
+    /// way) -- a cell half cave and half rock can honestly go either way. The
+    /// bound is set from measurement: taking the majority is 0.00% for caves and
+    /// at most 0.23% at the surface; sampling one corner of each cell, which
+    /// §8.6 tried and rejected, is up to 2.0%, and generating no caves at all
+    /// 4.0%. A
+    /// feature that is only generated at full detail fails this the moment it is
+    /// big enough to matter: caves did, before they were generated at every
+    /// scale, and so will a ravine or a cavern added without its coarse form.
+    #[test]
+    fn a_coarse_cell_is_what_most_of_its_blocks_are() {
+        let gen = WorldGen::new(0xCAFE);
+        let blocks = test_blocks();
+        for step in [2, 4, 8] {
+            // Deep, where the caves are, and across the surface, where the
+            // height field is -- a future ravine lives in one or the other.
+            for (ox, oy, oz) in [
+                (0, -16 * step, 0),
+                (-128, -16 * step, 64),
+                (256, -16 * step, -200),
+                (40, 32 - 8 * step, -90),
+                (-300, 32 - 8 * step, 170),
+            ] {
+                let origin = [ox, oy, oz];
+                // Judged per region: a surface error averaged in with deep
+                // rock, where there is none, would hide under the bound.
+                let (mut decisive, mut wrong) = (0u32, 0u32);
+                let coarse = gen.generate(origin, step, blocks);
+                for lz in 0..Chunk::SIZE {
+                    for ly in 0..Chunk::SIZE {
+                        for lx in 0..Chunk::SIZE {
+                            let (x0, y0, z0) = (
+                                origin[0] + lx as i32 * step,
+                                origin[1] + ly as i32 * step,
+                                origin[2] + lz as i32 * step,
+                            );
+                            let mut solid = 0;
+                            for dx in 0..step {
+                                for dy in 0..step {
+                                    for dz in 0..step {
+                                        if gen.block_at(x0 + dx, y0 + dy, z0 + dz, blocks).is_some()
+                                        {
+                                            solid += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            let cells = step * step * step;
+                            let majority = if solid * 4 >= cells * 3 {
+                                true
+                            } else if solid * 4 <= cells {
+                                false
+                            } else {
+                                continue;
+                            };
+                            decisive += 1;
+                            if (coarse.get(lx, ly, lz) != BlockId::AIR) != majority {
+                                wrong += 1;
+                            }
+                        }
+                    }
                 }
+                let rate = wrong as f64 / decisive as f64;
+                assert!(
+                    rate < 0.005,
+                    "step {step} at {origin:?}: {wrong} of {decisive} clear cells ({:.1}%) disagree with their blocks",
+                    rate * 100.0
+                );
+            }
+        }
+    }
+
+    /// Skipping the eight samples when the centre is far from the threshold is
+    /// only an optimisation: it must never change an answer.
+    #[test]
+    fn skipping_cave_samples_never_changes_a_cell() {
+        let gen = WorldGen::new(7);
+        for step in [2, 4, 8, 16] {
+            for i in 0..4000 {
+                let (x, y, z) = (i * 37 % 911 - 450, i * 53 % 613 - 300, i * 71 % 787 - 390);
+                let span = (step - 1) as f32;
+                let (cx, cy, cz) = (
+                    x as f32 + span * 0.5,
+                    y as f32 + span * 0.5,
+                    z as f32 + span * 0.5,
+                );
+                let r = span * 0.25;
+                let noise = |px: f32, py: f32, pz: f32| {
+                    fbm3(
+                        gen.seed ^ CAVE_SEED_MIX,
+                        px * CAVE_FREQ,
+                        py * CAVE_FREQ,
+                        pz * CAVE_FREQ,
+                        CAVE_OCTAVES,
+                        CAVE_LACUNARITY,
+                        CAVE_GAIN,
+                    )
+                };
+                let mut n = 0;
+                for dx in [-r, r] {
+                    for dy in [-r, r] {
+                        for dz in [-r, r] {
+                            n += (noise(cx + dx, cy + dy, cz + dz) > CAVE_THRESHOLD) as i32;
+                        }
+                    }
+                }
+                assert_eq!(
+                    gen.cave_at(x, y, z, step),
+                    n >= 4,
+                    "step {step} at ({x},{y},{z})"
+                );
             }
         }
     }
 
     #[test]
-    fn coarse_nodes_have_no_caves_carved_into_them() {
-        // §8.6, stated as its own property rather than left implicit in the
-        // sampling test: this is what makes an underground world affordable,
-        // and what a future change would have to break knowingly.
-        let gen = WorldGen::new(0x5EED);
-        let blocks = test_blocks();
-        // A position the cave field actually carves at full resolution.
-        let carved = (0..2_000)
-            .map(|i| [i % 64, 4, i / 64])
-            .find(|p| {
-                let surface = gen.surface_height(p[0], p[2]);
-                p[1] < surface && !gen.is_solid(p[0], p[1], p[2])
-            })
-            .expect("the seed carves a cave somewhere in the probed volume");
-
+    fn the_cave_slope_bound_holds() {
+        let gen = WorldGen::new(3);
+        let slope = cave_noise_slope();
+        let noise = |x: f32, y: f32, z: f32| {
+            fbm3(
+                gen.seed ^ CAVE_SEED_MIX,
+                x * CAVE_FREQ,
+                y * CAVE_FREQ,
+                z * CAVE_FREQ,
+                CAVE_OCTAVES,
+                CAVE_LACUNARITY,
+                CAVE_GAIN,
+            )
+        };
+        let mut steepest = 0.0f32;
+        for i in 0..200_000 {
+            let (x, y, z) = (
+                (i % 997) as f32 * 0.31,
+                (i % 499) as f32 * 0.47,
+                (i % 331) as f32 * 0.73,
+            );
+            let here = noise(x, y, z);
+            for (dx, dy, dz) in [(0.05, 0.0, 0.0), (0.0, 0.05, 0.0), (0.0, 0.0, 0.05)] {
+                let rate = (noise(x + dx, y + dy, z + dz) - here).abs() / 0.05;
+                steepest = steepest.max(rate);
+            }
+        }
         assert!(
-            !gen.is_solid(carved[0], carved[1], carved[2]),
-            "level 0 has the cave"
+            steepest <= slope * 1.001,
+            "noise moved {steepest} per block, bound is {slope}"
         );
-        let coarse = gen.generate([carved[0], carved[1], carved[2]], 4, blocks);
-        assert_ne!(
-            coarse.get(0, 0, 0),
-            BlockId::AIR,
-            "a coarse node fills that cave in with rock"
+        assert!(
+            steepest > slope * 0.3,
+            "bound {slope} is far above the steepest {steepest}: skipping would never happen"
         );
     }
 

@@ -96,10 +96,15 @@ struct Index<'a> {
     nodes: Vec<NodeKey>,
     of: HashMap<NodeKey, u32>,
     set: &'a HashSet<NodeKey>,
+    /// Whether a step may go into finer nodes. From a camera inside the
+    /// region it never needs to: distance from the camera only grows along a
+    /// line from it. From outside, a line enters through the coarse outer
+    /// nodes and travels towards finer ones, so it must.
+    finer: bool,
 }
 
 impl<'a> Index<'a> {
-    fn new(set: &'a HashSet<NodeKey>) -> Self {
+    fn new(set: &'a HashSet<NodeKey>, finer: bool) -> Self {
         let mut nodes: Vec<NodeKey> = set.iter().copied().collect();
         nodes.sort();
         let of = nodes
@@ -107,17 +112,22 @@ impl<'a> Index<'a> {
             .enumerate()
             .map(|(i, n)| (*n, i as u32))
             .collect();
-        Self { nodes, of, set }
+        Self {
+            nodes,
+            of,
+            set,
+            finer,
+        }
     }
 
     /// The sub-block containing world block `p`, looked for in a node of
     /// `level` or the one coarser -- the only neighbours a line of sight can
     /// step into.
-    fn locate(&self, p: [i32; 3], level: u32) -> Option<(u32, usize)> {
+    fn locate(&self, p: [i32; 3], levels: &[u32]) -> Option<(u32, usize)> {
         let chunk = ChunkCoord::from_block(p[0], p[1], p[2]);
-        let node = [level, level + 1]
-            .into_iter()
-            .map(|l| NodeKey::containing(chunk, l))
+        let node = levels
+            .iter()
+            .map(|&l| NodeKey::containing(chunk, l))
             .find(|n| self.set.contains(n))?;
         let origin = node.world_origin();
         let size = (Chunk::SIZE / GRAIN) as i32 * node.extent_chunks();
@@ -125,28 +135,52 @@ impl<'a> Index<'a> {
         Some((self.of[&node], (i(2) * GRAIN + i(1)) * GRAIN + i(0)))
     }
 
-    /// The sub-block across `face` of sub-block `sub` of node `n`.
-    fn neighbour(&self, n: u32, sub: usize, face: Face) -> Option<(u32, usize)> {
+    /// The sub-blocks across `face` of sub-block `sub` of node `n`: its
+    /// sibling, or the same-level or one-coarser sub-block beyond the face --
+    /// or, when [`finer`](Self::finer) steps are allowed and neither exists,
+    /// the finer sub-blocks touching it.
+    fn neighbours(&self, n: u32, sub: usize, face: Face) -> Vec<(u32, usize)> {
         let node = self.nodes[n as usize];
         let c = [sub % GRAIN, sub / GRAIN % GRAIN, sub / GRAIN / GRAIN];
         let d = step_of(face);
         let inside = (0..3).all(|k| (0..GRAIN as i32).contains(&(c[k] as i32 + d[k])));
         if inside {
             let m = [0, 1, 2].map(|k| (c[k] as i32 + d[k]) as usize);
-            return Some((n, (m[2] * GRAIN + m[1]) * GRAIN + m[0]));
+            return vec![(n, (m[2] * GRAIN + m[1]) * GRAIN + m[0])];
         }
-        // A block just outside the middle of that face.
         let origin = node.world_origin();
         let size = (Chunk::SIZE / GRAIN) as i32 * node.extent_chunks();
-        let p = [0, 1, 2].map(|k| {
-            let min = origin[k] + c[k] as i32 * size;
-            match d[k] {
-                1 => min + size,
-                -1 => min - 1,
-                _ => min + size / 2,
+        // A block just outside the face, `along` of the way across it.
+        let beyond = |along: [i32; 2]| {
+            let mut t = 0;
+            [0, 1, 2].map(|k| {
+                let min = origin[k] + c[k] as i32 * size;
+                match d[k] {
+                    1 => min + size,
+                    -1 => min - 1,
+                    _ => {
+                        let at = min + size * along[t] / 4;
+                        t += 1;
+                        at
+                    }
+                }
+            })
+        };
+        if let Some(found) = self.locate(beyond([2, 2]), &[node.level, node.level + 1]) {
+            return vec![found];
+        }
+        if !self.finer || node.level == 0 {
+            return Vec::new();
+        }
+        let mut found = Vec::with_capacity(4);
+        for along in [[1, 1], [3, 1], [1, 3], [3, 3]] {
+            if let Some(v) = self.locate(beyond(along), &[node.level - 1]) {
+                if !found.contains(&v) {
+                    found.push(v);
+                }
             }
-        });
-        self.locate(p, node.level)
+        }
+        found
     }
 }
 
@@ -168,13 +202,13 @@ pub fn visible_nodes(
     links: impl Fn(NodeKey) -> Option<NodeLinks>,
 ) -> HashSet<NodeKey> {
     let mut visible = HashSet::new();
-    let Some(start) = (0..=8)
+    let start = (0..=8)
         .map(|level| NodeKey::containing(camera, level))
-        .find(|n| nodes.contains(n))
-    else {
+        .find(|n| nodes.contains(n));
+    if nodes.is_empty() {
         return visible;
-    };
-    let index = Index::new(nodes);
+    }
+    let index = Index::new(nodes, start.is_none());
     let subs = GRAIN * GRAIN * GRAIN;
     let known: Vec<Option<NodeLinks>> = index.nodes.iter().map(|&n| links(n)).collect();
     let mut seen = vec![false; index.nodes.len()];
@@ -186,12 +220,45 @@ pub fn visible_nodes(
     let mut queue: VecDeque<(u32, usize, Face, u8)> = VecDeque::new();
     let bit = |f: Face| 1u8 << f as u8;
 
-    let start_n = index.of[&start];
-    seen[start_n as usize] = true;
-    for sub in 0..subs {
-        for face in FACES {
-            if let Some((n, s)) = index.neighbour(start_n, sub, face) {
-                queue.push_back((n, s, opposite(face), bit(face)));
+    match start {
+        Some(start) => {
+            let start_n = index.of[&start];
+            seen[start_n as usize] = true;
+            for sub in 0..subs {
+                for face in FACES {
+                    for (n, s) in index.neighbours(start_n, sub, face) {
+                        queue.push_back((n, s, opposite(face), bit(face)));
+                    }
+                }
+            }
+        }
+        // **A camera outside the region altogether.** A line of sight from
+        // there enters through an outer face on the camera's side of it, moving
+        // inward; which other ways it is moving is unknown, so only inward is
+        // taken. Every such face is a place to start.
+        None => {
+            for (n, node) in index.nodes.iter().enumerate() {
+                let origin = node.chunk_origin();
+                let extent = node.extent_chunks();
+                let o = [origin.x, origin.y, origin.z];
+                let c = [camera.x, camera.y, camera.z];
+                for sub in 0..subs {
+                    for face in FACES {
+                        if !index.neighbours(n as u32, sub, face).is_empty() {
+                            continue;
+                        }
+                        let d = step_of(face);
+                        let k = (0..3).find(|&k| d[k] != 0).expect("an axis");
+                        let facing_camera = if d[k] > 0 {
+                            c[k] >= o[k] + extent
+                        } else {
+                            c[k] < o[k]
+                        };
+                        if facing_camera {
+                            queue.push_back((n as u32, sub, face, bit(opposite(face))));
+                        }
+                    }
+                }
             }
         }
     }
@@ -213,7 +280,7 @@ pub fn visible_nodes(
             if taken & bit(opposite(out)) != 0 || !inside[sub].joins(entered_by, out) {
                 continue;
             }
-            if let Some((m, s)) = index.neighbour(n, sub, out) {
+            for (m, s) in index.neighbours(n, sub, out) {
                 queue.push_back((m, s, opposite(out), taken | bit(out)));
             }
         }
@@ -322,8 +389,26 @@ mod tests {
                 t_delta[k] = 1.0 / -dir[k];
             }
         }
-        for _ in 0..2000 {
-            let (node, solid) = scene.at(cell)?;
+        let mut entered = false;
+        for _ in 0..4000 {
+            let Some((node, solid)) = scene.at(cell) else {
+                // Outside the scene: before entering, keep going; after
+                // leaving, the ray is done.
+                if entered {
+                    return None;
+                }
+                let k = if t_max[0] < t_max[1] && t_max[0] < t_max[2] {
+                    0
+                } else if t_max[1] < t_max[2] {
+                    1
+                } else {
+                    2
+                };
+                cell[k] += step[k];
+                t_max[k] += t_delta[k];
+                continue;
+            };
+            entered = true;
             if solid {
                 return Some(node);
             }
@@ -357,20 +442,26 @@ mod tests {
             })
             .find(|p| !world.is_solid_at(p[0], p[1], p[2], blocks))
             .expect("a cave below the origin");
-        let eyes = [
-            [8.3, surface as f32 + 6.7, 8.1],
-            [
-                cave[0] as f32 + 0.37,
-                cave[1] as f32 + 0.41,
-                cave[2] as f32 + 0.53,
-            ],
-            [5.2, 190.6, -3.3],
+        // Each camera with the centre of the region it looks at. The last is
+        // far outside its region, the way the bench's orbit is.
+        let cases = [
+            ([8.3, surface as f32 + 6.7, 8.1], None),
+            (
+                [
+                    cave[0] as f32 + 0.37,
+                    cave[1] as f32 + 0.41,
+                    cave[2] as f32 + 0.53,
+                ],
+                None,
+            ),
+            ([5.2, 190.6, -3.3], None),
+            ([350.4, 420.3, -280.7], Some(ChunkCoord::new(0, 1, 0))),
         ];
 
         let mut culled_something = false;
-        for eye in eyes {
+        for (eye, around) in cases {
             let camera = ChunkCoord::from_world_pos(eye);
-            let scene = Scene::around(&world, camera, &registry);
+            let scene = Scene::around(&world, around.unwrap_or(camera), &registry);
             let visible = visible_nodes(camera, &scene.nodes, |n| scene.links.get(&n).copied());
             culled_something |= visible.len() < scene.nodes.len();
 

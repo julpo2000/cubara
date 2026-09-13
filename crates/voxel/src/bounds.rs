@@ -66,18 +66,20 @@ pub fn build_mesh_bounded(
     origin: [f32; 3],
     scale: f32,
 ) -> Option<(Mesh, Aabb)> {
-    build_mesh_bounded_occluded(chunk, ctx, origin, scale, |_, _, _| false)
+    build_mesh_bounded_occluded(chunk, ctx, origin, scale, |_, _, _| false, |_, _, _| true)
 }
 
-/// [`build_mesh_bounded`] with [`Chunk::build_mesh_occluded`]'s covered border.
+/// [`build_mesh_bounded`] with [`Chunk::build_mesh_with_neighbours`]'s view of
+/// the neighbours: covered border faces left out, skirts only where needed.
 pub fn build_mesh_bounded_occluded(
     chunk: &Chunk,
     ctx: &MeshContext,
     origin: [f32; 3],
     scale: f32,
     occluded: impl Fn(i32, i32, i32) -> bool,
+    may_be_solid: impl Fn(i32, i32, i32) -> bool,
 ) -> Option<(Mesh, Aabb)> {
-    let mesh = chunk.build_mesh_occluded(ctx, occluded);
+    let mesh = chunk.build_mesh_with_neighbours(ctx, occluded, may_be_solid);
     if mesh.indices.is_empty() {
         return None;
     }
