@@ -555,7 +555,7 @@ impl Renderer {
 
         // CPU frustum-cull + upload the indirect draw list before the pass begins.
         let draw_count = self.arena.prepare(&self.queue, &self.frustum);
-        self.visible_chunks = draw_count as usize;
+        self.visible_chunks = self.arena.visible_nodes() as usize;
 
         let mut encoder = self
             .device

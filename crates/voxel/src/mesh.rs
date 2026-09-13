@@ -199,11 +199,42 @@ impl Vertex {
 pub struct Mesh {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
+    /// How many of `indices` face each way, in [`Face`] order, once
+    /// [`group_by_face`](Self::group_by_face) has put them in that order: the
+    /// first `face_indices[0]` indices are `PosX` quads, and so on.
+    ///
+    /// What lets a renderer skip every face pointing away from the camera
+    /// without running a vertex of it. All zero for a mesh that was never
+    /// grouped, which a renderer must then draw whole.
+    pub face_indices: [u32; 6],
 }
 
 impl Mesh {
     pub fn triangle_count(&self) -> usize {
         self.indices.len() / 3
+    }
+
+    /// Reorder the quads so all of one [`Face`] direction come together, in
+    /// `Face` order, and record the counts in `face_indices`. Every quad is
+    /// six indices into four vertices of one face (what the greedy mesher
+    /// emits); the order within a direction is kept.
+    pub fn group_by_face(&mut self) {
+        debug_assert_eq!(self.indices.len() % 6, 0, "a mesh of whole quads");
+        let mut groups: [Vec<u32>; 6] = Default::default();
+        for quad in self.indices.chunks(6) {
+            let face = self.vertices[quad[0] as usize].face() as usize;
+            groups[face].extend_from_slice(quad);
+        }
+        self.indices.clear();
+        for (face, group) in groups.iter().enumerate() {
+            self.face_indices[face] = group.len() as u32;
+            self.indices.extend_from_slice(group);
+        }
+    }
+
+    /// Whether `face_indices` accounts for every index.
+    pub fn is_grouped_by_face(&self) -> bool {
+        self.face_indices.iter().map(|&n| n as usize).sum::<usize>() == self.indices.len()
     }
 }
 

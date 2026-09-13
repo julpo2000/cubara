@@ -190,6 +190,36 @@ struct NodeSlot {
     /// vertex of this node's mesh at insert time ([`Vertex::with_node_index`]),
     /// so `mesh.wgsl` reads it from vertex data rather than an instance index.
     node_index: u32,
+    /// Indices per face direction, in [`Face`](cubara_voxel::Face) order
+    /// ([`Mesh::group_by_face`](cubara_voxel::Mesh::group_by_face)), or `None`
+    /// for a mesh that was not grouped and is always drawn whole.
+    face_indices: Option<[u32; 6]>,
+}
+
+/// How far behind a face's plane the camera may be and still have the face
+/// drawn. The planes are exact; the eye is recovered from the view-projection
+/// matrix (`Frustum::eye`), good to about a thousandth of a block.
+const FACING_MARGIN: f32 = 0.05;
+
+/// Which face directions of a node bounded by `aabb` can face a camera at
+/// `eye`, in [`Face`](cubara_voxel::Face) order.
+///
+/// A `PosX` face on the plane `x = p` is seen only from `x > p`, from behind
+/// it is back-face culled; and every face of the node lies within its box, so
+/// if the camera is not past the box's low x, no `PosX` face of it can show.
+/// About half of what a node draws points away from any one camera -- and
+/// without this each of those vertices is still run through the vertex shader,
+/// only for the triangle to be thrown away after.
+pub fn faces_facing(aabb: &Aabb, eye: glam::Vec3) -> [bool; 6] {
+    let (lo, hi) = (aabb.min, aabb.max);
+    [
+        eye.x > lo.x - FACING_MARGIN,
+        eye.x < hi.x + FACING_MARGIN,
+        eye.y > lo.y - FACING_MARGIN,
+        eye.y < hi.y + FACING_MARGIN,
+        eye.z > lo.z - FACING_MARGIN,
+        eye.z < hi.z + FACING_MARGIN,
+    ]
 }
 
 /// First-fit free-list suballocator over a fixed capacity of fixed-size units
@@ -291,6 +321,9 @@ pub struct ChunkArena {
     multi_draw: bool,
     /// Per-frame scratch: the visible draw list built by [`prepare`](Self::prepare).
     visible: Vec<DrawIndexedIndirect>,
+    /// What the last [`prepare`](Self::prepare) drew: nodes, and triangles.
+    visible_nodes: u32,
+    visible_triangles: u64,
     /// Per-insert scratch: this node's vertices with `node_index` stamped in.
     /// Reused across inserts so streaming churn doesn't allocate and free a
     /// whole mesh's worth of vertices per node ([`insert`](Self::insert)).
@@ -356,6 +389,8 @@ impl ChunkArena {
             slots: BTreeMap::new(),
             multi_draw,
             visible: Vec::new(),
+            visible_nodes: 0,
+            visible_triangles: 0,
             stamped: Vec::new(),
             warned_full: false,
         }
@@ -491,6 +526,7 @@ impl ChunkArena {
                 index_count,
                 aabb,
                 node_index,
+                face_indices: mesh.is_grouped_by_face().then_some(mesh.face_indices),
             },
         );
         true
@@ -563,11 +599,16 @@ impl ChunkArena {
     }
 
     /// CPU frustum-cull the resident nodes and upload the visible set's indirect
-    /// draw args. Returns the number of visible nodes (the draw count). Call once
-    /// per frame, before beginning the render pass; then [`encode`](Self::encode).
+    /// draw args: for each node in view, one draw per run of face directions
+    /// that can face the camera ([`faces_facing`]). Returns the number of draws.
+    /// Call once per frame, before beginning the render pass; then
+    /// [`encode`](Self::encode).
     pub fn prepare(&mut self, queue: &wgpu::Queue, frustum: &Frustum) -> u32 {
         puffin::profile_function!();
         self.visible.clear();
+        self.visible_nodes = 0;
+        self.visible_triangles = 0;
+        let eye = frustum.eye();
         // `slots` is a BTreeMap, so this iterates in `NodeId` order every frame,
         // regardless of the order workers finished meshing in. That makes the draw
         // list — and therefore the rendered frame — deterministic (issue #81), and
@@ -583,21 +624,54 @@ impl ChunkArena {
         // derived `Ord`, so it is pinned by
         // `node_ids_sort_by_level_first_so_truncation_drops_the_coarsest` rather
         // than by this comment.
-        for slot in self.slots.values() {
-            if self.visible.len() as u32 >= MAX_DRAWS {
-                break;
+        'nodes: for slot in self.slots.values() {
+            if !frustum.intersects_aabb(&slot.aabb) {
+                continue;
             }
-            if frustum.intersects_aabb(&slot.aabb) {
-                self.visible.push(DrawIndexedIndirect {
-                    index_count: slot.index_count,
-                    instance_count: 1,
-                    first_index: slot.first_index,
-                    base_vertex: slot.base_vertex as i32,
-                    // Not used to look up the node origin -- that index is
-                    // baked into vertex data instead (§5.3) -- so this is
-                    // always the default single-instance draw.
-                    first_instance: 0,
-                });
+            // A node is drawn whole or not at all: never half its faces
+            // because the draw list ran out part-way through it.
+            if self.visible.len() as u32 + 3 > MAX_DRAWS {
+                break 'nodes;
+            }
+            self.visible_nodes += 1;
+            let draw = |first_index: u32, index_count: u32| DrawIndexedIndirect {
+                index_count,
+                instance_count: 1,
+                first_index,
+                base_vertex: slot.base_vertex as i32,
+                // Not used to look up the node origin -- that index is
+                // baked into vertex data instead (§5.3) -- so this is
+                // always the default single-instance draw.
+                first_instance: 0,
+            };
+            let Some(counts) = slot.face_indices else {
+                self.visible.push(draw(slot.first_index, slot.index_count));
+                self.visible_triangles += slot.index_count as u64 / 3;
+                continue;
+            };
+            // Adjacent directions that are both drawn share one draw. At most
+            // three runs: of each opposite pair (adjacent in `Face` order) a
+            // camera outside the box sees one.
+            let facing = faces_facing(&slot.aabb, eye);
+            let mut start = slot.first_index;
+            let mut run: Option<(u32, u32)> = None;
+            for (count, facing) in counts.into_iter().zip(facing) {
+                if count > 0 {
+                    if facing {
+                        run = Some(match run {
+                            Some((first, n)) => (first, n + count),
+                            None => (start, count),
+                        });
+                    } else if let Some((first, n)) = run.take() {
+                        self.visible.push(draw(first, n));
+                        self.visible_triangles += n as u64 / 3;
+                    }
+                }
+                start += count;
+            }
+            if let Some((first, n)) = run {
+                self.visible.push(draw(first, n));
+                self.visible_triangles += n as u64 / 3;
             }
         }
         if !self.visible.is_empty() {
@@ -608,6 +682,16 @@ impl ChunkArena {
             );
         }
         self.visible.len() as u32
+    }
+
+    /// Nodes the last [`prepare`](Self::prepare) found in view.
+    pub fn visible_nodes(&self) -> u32 {
+        self.visible_nodes
+    }
+
+    /// Triangles the last [`prepare`](Self::prepare) queued to draw.
+    pub fn visible_triangles(&self) -> u64 {
+        self.visible_triangles
     }
 
     /// Bind the shared buffers and issue the draws for the `count` visible chunks
@@ -815,6 +899,55 @@ mod tests {
             kept.iter().all(|n| n.level <= 1),
             "a truncated draw list must keep the finest levels, got {kept:?}"
         );
+    }
+
+    #[test]
+    fn a_direction_is_left_out_only_when_no_face_of_it_could_face_the_camera() {
+        // Faces on planes anywhere inside the box, cameras all around it: a
+        // face the camera is in front of must never have its direction left
+        // out, and a direction left out must be one no plane in the box could
+        // show -- so the test cannot pass by drawing everything either.
+        let aabb = Aabb::new(glam::vec3(16.0, -32.0, 48.0), glam::vec3(32.0, 0.0, 80.0));
+        let normals = [
+            glam::Vec3::X,
+            -glam::Vec3::X,
+            glam::Vec3::Y,
+            -glam::Vec3::Y,
+            glam::Vec3::Z,
+            -glam::Vec3::Z,
+        ];
+        let mut left_out = 0;
+        let steps = [
+            -40.0, 0.0, 15.9, 16.0, 16.1, 24.0, 31.9, 32.0, 32.1, 60.0, 90.0,
+        ];
+        for &ex in &steps {
+            for &ey in &steps {
+                for &ez in &steps {
+                    let eye = glam::vec3(ex, ey - 32.0, ez + 32.0);
+                    let facing = faces_facing(&aabb, eye);
+                    for (k, normal) in normals.iter().enumerate() {
+                        // A face on each plane through the box along this axis.
+                        let axis = k / 2;
+                        let (lo, hi) = (aabb.min[axis], aabb.max[axis]);
+                        let seen_on_some_plane = (0..=16).any(|i| {
+                            let mut on_plane = aabb.min;
+                            on_plane[axis] = lo + (hi - lo) * i as f32 / 16.0;
+                            (eye - on_plane).dot(*normal) > 0.0
+                        });
+                        if seen_on_some_plane {
+                            assert!(
+                                facing[k],
+                                "eye {eye}: direction {k} left out but a face shows"
+                            );
+                        }
+                        if !facing[k] {
+                            left_out += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(left_out > 0, "nothing was ever left out");
     }
 
     #[test]

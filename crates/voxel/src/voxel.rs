@@ -461,6 +461,7 @@ fn greedy_mesh(
             }
         }
     }
+    mesh.group_by_face();
     mesh
 }
 
@@ -800,6 +801,56 @@ mod tests {
             }
         }
         count
+    }
+
+    #[test]
+    fn a_mesh_comes_grouped_by_the_way_its_faces_point() {
+        // A renderer skips a whole direction's index range when the camera is
+        // behind it, trusting two things: that the range holds only faces of
+        // that direction, and that each one really is turned that way -- its
+        // winding, which back-face culling goes by, agreeing with its label.
+        let registry = registry();
+        let mut chunk = empty();
+        for x in 0..16 {
+            for z in 0..16 {
+                for y in 0..16 {
+                    if (x * 7 + y * 3 + z * 5) % 11 < 4 || y < (x + z) % 5 {
+                        set(&mut chunk, x, y, z);
+                    }
+                }
+            }
+        }
+        for mesh in [
+            chunk.build_mesh(&ctx(&registry)),
+            chunk.build_mesh_lod(&ctx(&registry), 1),
+        ] {
+            assert!(mesh.is_grouped_by_face(), "{:?}", mesh.face_indices);
+            assert!(
+                mesh.face_indices.iter().all(|&n| n > 0),
+                "the fixture should have faces every way: {:?}",
+                mesh.face_indices
+            );
+            let mut start = 0usize;
+            for (k, &count) in mesh.face_indices.iter().enumerate() {
+                let face = [
+                    Face::PosX,
+                    Face::NegX,
+                    Face::PosY,
+                    Face::NegY,
+                    Face::PosZ,
+                    Face::NegZ,
+                ][k];
+                for tri in mesh.indices[start..start + count as usize].chunks(3) {
+                    let [a, b, c] = [0, 1, 2].map(|i| mesh.vertices[tri[i] as usize]);
+                    assert!([a, b, c].iter().all(|v| v.face() == face));
+                    let normal =
+                        cross(sub(position(b), position(a)), sub(position(c), position(a)));
+                    let along: f32 = normal.iter().zip(face.normal()).map(|(n, f)| n * f).sum();
+                    assert!(along > 0.0, "a {face:?} triangle wound the other way");
+                }
+                start += count as usize;
+            }
+        }
     }
 
     #[test]
