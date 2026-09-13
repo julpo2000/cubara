@@ -18,26 +18,21 @@ use cubara_world::node::{self, NodeKey};
 use cubara_world::TerrainBlocks;
 use cubara_world::World;
 
-/// How many chunk-layers above and below the player to stream.
+/// How many times sooner detail coarsens with height and depth than with
+/// horizontal distance (`cubara_world::node::desired_nodes_3d`).
 ///
-/// **The world has no height limit** (`docs/PROPOSAL_VERTICAL_WORLD.md`): this
-/// band follows the player rather than sitting at a fixed `y`, so digging down
-/// or building up simply streams more world. Below the surface generation is
-/// solid stone at any depth, and above it air at any height -- `WorldGen`'s
-/// density has never had `y` bounds, so nothing there had to change.
+/// **There is no vertical band any more.** It used to stream only ±2
+/// chunk-layers around the camera, chosen to pass the perf gate by drawing
+/// less: build 40 blocks up and the ground stopped existing. The render
+/// distance is now the same in every direction, paid for by leaving out
+/// covered faces, and only the *detail* falls off faster vertically.
 ///
-/// **Two, chosen by measurement against the perf gate, not by preference.** At
-/// radius 64 the honest figures are ±1 → 1,260 FPS, ±2 → 1,113, ±3 → 994, ±4 →
-/// 923. The gate is 1,000, so ±2 is the largest that passes with real headroom.
-///
-/// Going *down* is what costs: air meshes to nothing, but rock is full of caves,
-/// and cave surfaces are real geometry. Going up is free.
-///
-/// This is full-detail range. Coarser rings cover far more: at level 3 one node
-/// spans 8 chunks, so the same band reaches ~256 blocks vertically at distance.
-/// And it *follows the player*, so digging is unbounded -- you carry the window
-/// with you rather than running out of world.
-const VERTICAL_CHUNK_RADIUS: i32 = 2;
+/// **Two, measured** (radius 64, `--bench 64 --eye … --squash k`, Windows /
+/// RTX 4060; `BENCHMARKS.md`): at the surface 5,603 FPS with `2` against 6,293
+/// with `4`, deep underground 5,096 against 6,985. `4` is faster, but caves
+/// exist only at full detail and it keeps that only 40 blocks up and down, so
+/// the bottom of a shaft you look into turns to solid rock. `2` keeps 80.
+pub(crate) const VERTICAL_LOD_SQUASH: i32 = 2;
 
 pub(crate) fn to_node_id(node: NodeKey) -> NodeId {
     NodeId {
@@ -176,9 +171,8 @@ impl NodeStreaming {
     /// limitation (see issue #107) -- the same category as the
     /// LOD-boundary cracks skirts (#108) fix, not a correctness bug.
     fn stream_around(&mut self, renderer: &mut Renderer, world: &Arc<World>, center: ChunkCoord) {
-        let y_range = (center.y - VERTICAL_CHUNK_RADIUS)..=(center.y + VERTICAL_CHUNK_RADIUS);
         let desired_set: HashSet<NodeKey> =
-            node::desired_nodes(center, y_range.clone(), node::DEFAULT_RING_SCHEDULE)
+            node::desired_nodes_3d(center, VERTICAL_LOD_SQUASH, node::DEFAULT_RING_SCHEDULE)
                 .into_iter()
                 .collect();
 
@@ -200,8 +194,12 @@ impl NodeStreaming {
         // Request whatever's desired but not yet resident, nearest first --
         // reuses `plan_node_updates`'s tested nearest-first ordering rather
         // than a second distance sort here.
-        let updates =
-            node::plan_node_updates(&self.resident, center, y_range, node::DEFAULT_RING_SCHEDULE);
+        let updates = node::plan_node_updates_3d(
+            &self.resident,
+            center,
+            VERTICAL_LOD_SQUASH,
+            node::DEFAULT_RING_SCHEDULE,
+        );
         for node in updates.to_load {
             if self.mesh_pool.is_in_flight(node) {
                 continue;

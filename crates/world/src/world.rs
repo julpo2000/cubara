@@ -347,6 +347,9 @@ impl World {
     /// to disk). A player's edit is only ever visible in the always-present
     /// full-resolution near field the ring schedule keeps around them.
     pub fn node_at(&self, node: NodeKey, blocks: TerrainBlocks) -> Option<Chunk> {
+        if self.is_certainly_sky(node, blocks) {
+            return None;
+        }
         if node.level == 0 {
             return self.chunk_at(node.chunk_origin(), blocks);
         }
@@ -354,6 +357,24 @@ impl World {
             .worldgen
             .generate(node.world_origin(), node.extent_chunks(), blocks);
         (!chunk.is_empty()).then_some(chunk)
+    }
+
+    /// Whether `node` lies wholly above anything the generator places and no
+    /// edit is inside it -- in which case it is air, and generating 4,096 cells
+    /// to find that out is the cost of having no height limit on what is drawn.
+    fn is_certainly_sky(&self, node: NodeKey, blocks: TerrainBlocks) -> bool {
+        let o = node.world_origin();
+        if o[1] <= WorldGen::highest_generated_y(blocks) {
+            return false;
+        }
+        let size = Chunk::SIZE as i32 * node.extent_chunks();
+        // Edits are ordered by x first, so the x span is one range scan.
+        !self
+            .edits
+            .range([o[0], i32::MIN, i32::MIN]..[o[0] + size, i32::MIN, i32::MIN])
+            .any(|(p, _)| {
+                (o[1]..o[1] + size).contains(&p[1]) && (o[2]..o[2] + size).contains(&p[2])
+            })
     }
 
     fn build_chunk(&self, coord: ChunkCoord, blocks: TerrainBlocks) -> Chunk {
@@ -478,6 +499,31 @@ mod tests {
     /// solid-vs-air, not texturing, so `layer_of` is a constant stub -- the
     /// real registry (from RON) and texture layers (from the block registry's
     /// texture names) both live with the app, in `cubara-render`.
+    /// Skipping the sky must not skip what a player built in it.
+    #[test]
+    fn a_block_placed_high_in_the_sky_is_still_in_its_node() {
+        let blocks = stone_blocks();
+        let mut world = World::new();
+        let high = [5, 700, -3];
+        let node =
+            |level| NodeKey::containing(ChunkCoord::from_block(high[0], high[1], high[2]), level);
+        assert!(
+            world.node_at(node(0), blocks).is_none(),
+            "empty sky is skipped"
+        );
+
+        world.set_block(high[0], high[1], high[2], blocks.stone);
+        assert!(
+            world.node_at(node(0), blocks).is_some(),
+            "the placed block's chunk came back empty"
+        );
+        let beside = NodeKey::new(0, [node(0).pos[0] + 1, node(0).pos[1], node(0).pos[2]]);
+        assert!(
+            world.node_at(beside, blocks).is_none(),
+            "the empty chunk beside it"
+        );
+    }
+
     fn test_registry() -> BlockRegistry {
         BlockRegistry::from_materials(vec![(
             std::path::PathBuf::from("test-fixture.ron"),

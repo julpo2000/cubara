@@ -52,6 +52,7 @@ frames after 200 warmup.
 | 2026-09-13 | Seven play-test PRs (#240–#246), radius 64, band ±2⁴⁶ | 3,138 | 912,964 | ~2,674 | 0.131 ms | ~0.48 ms | `4002754` |
 | 2026-09-13 | **Covered border faces left out** — nodes meshed against their neighbours, radius 64, band ±2⁴⁷ | **1,969** | **674,484** | **~4,160** | **0.102 ms** | ~0.44 ms | *(this PR)* |
 | 2026-09-13 | LOD rings tile exactly (octree) — the gaps are drawn now, radius 64, band ±2⁴⁸ | 2,174 | 738,078 | ~3,890 | 0.107 ms | ~0.35 ms | *(this PR)* |
+| 2026-09-13 | **No vertical band** — 3D octree, vertical LOD squash 2, radius 64 (orbit)⁴⁹ | 4,377 | 1,015,554 | ~2,950 | 0.125 ms | ~0.41 ms | *(this PR)* |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -1446,3 +1447,39 @@ after   SUMMARY: 3885 FPS | CPU/frame avg 0.107 ms | 1831/2174 nodes   738,078 t
 ```
 
 +9% triangles and +10% nodes are the filled gaps, less the removed overlaps.
+
+⁴⁹ **The world is drawn in every direction now, and the default bench measures
+that.** The ±2 chunk-layer band is gone: the outer radius is a cube, and detail
+coarsens twice as fast vertically as horizontally (`VERTICAL_LOD_SQUASH`). The
+bench's default follows the game; `--band` reproduces the rows above. New
+`--eye X,Y,Z` puts a first-person camera somewhere real, turning on the spot,
+because the orbit above the region is a view no player has.
+
+```
+default (orbit, 3D)   SUMMARY: 2964 FPS | CPU/frame avg 0.128 ms | 3684/4377 nodes   1,015,554 tris
+--band  (orbit)       SUMMARY: 4121 FPS | CPU/frame avg 0.104 ms | 1831/2174 nodes     738,078 tris
+--eye 8,40,8          SUMMARY: 6138 FPS | CPU/frame avg 0.085 ms                       877,392 tris
+--eye 8,300,8         SUMMARY: 12860 FPS | CPU/frame avg 0.051 ms                      237,844 tris
+--eye 8,-150,8        SUMMARY: 7473 FPS | CPU/frame avg 0.086 ms                       972,218 tris
+--band --eye 8,300,8  0 nodes -- the bug: 300 blocks up, nothing drawn at all
+```
+
+The orbit sees the whole region at once and is the worst case; it pays ~28%
+over the band for drawing what the band left out. How the squash was chosen,
+same four views (FPS / triangles):
+
+| view | squash 2 | squash 4 | squash 8 |
+|---|---|---|---|
+| orbit | 2,894 / 1.02M | 3,760 / 747k | 3,364 / 744k |
+| eye at y=40 | 5,603 / 877k | 6,293 / 611k | 5,497 / 594k |
+| eye at y=300 | 12,541 / 238k | 15,289 / 129k | 15,654 / 129k |
+| eye at y=-150 | 5,096 / 972k | 6,985 / 487k | 6,203 / 352k |
+
+4 is faster, but caves exist only at full detail and it keeps that only 40
+blocks up and down, so the bottom of a shaft turns to solid rock; 2 keeps 80.
+An earlier version squashed the *radius* too, and at squash 8 a camera 300 up
+drew nothing -- what is drawn is a cube, only how finely is squashed.
+
+Meshing the whole default region single-threaded: 1.85 s with the band, 4.96 s
+now, most of it rock that meshes to nothing; nodes wholly above the tallest
+generated block are skipped without generating.

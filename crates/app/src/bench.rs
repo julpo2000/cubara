@@ -20,8 +20,8 @@ use cubara_render::{
     SceneRenderer,
 };
 use cubara_voxel::ChunkCoord;
-use cubara_world::mesh::mesh_region;
-use cubara_world::node::schedule_for_radius;
+use cubara_world::mesh::mesh_nodes;
+use cubara_world::node::{desired_nodes, desired_nodes_3d, schedule_for_radius};
 use cubara_world::World;
 
 use crate::streaming::to_meshed_node;
@@ -39,7 +39,21 @@ const VIRTUAL_DT: f32 = 1.0 / 240.0;
 /// at their distance-based level (`cubara_world::mesh::mesh_region`,
 /// `schedule_for_radius`), so a larger radius shows how far render distance
 /// can grow without the draw/triangle cost exploding.
-pub fn run(radius: i32, (width, height): (u32, u32)) {
+/// Where the camera is, for [`run`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct View {
+    /// A first-person camera at this eye position, turning slowly on the spot
+    /// and looking a little down. `None` is the orbit above the whole region
+    /// every earlier row was measured with.
+    pub eye: Option<[f32; 3]>,
+    /// Select nodes in three dimensions with this vertical squash
+    /// (`cubara_world::node::desired_nodes_3d`) -- by default the one the game
+    /// streams with. `None` is the old ±2-layer band, kept so the rows measured
+    /// with it can still be compared against (`--band`).
+    pub squash: Option<i32>,
+}
+
+pub fn run(radius: i32, (width, height): (u32, u32), view: View) {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         ..Default::default()
@@ -79,18 +93,23 @@ pub fn run(radius: i32, (width, height): (u32, u32)) {
     let (mesh_assets, tex_view, tex_sampler) = load_mesh_assets(&device, &queue);
     let layer_of = |name: &str| mesh_assets.layers.layer_of(name);
     let schedule = schedule_for_radius(radius);
-    let meshed = mesh_region(
+    let center = match view.eye {
+        Some(eye) => ChunkCoord::from_world_pos(eye),
+        None => ChunkCoord::new(0, 0, 0),
+    };
+    let nodes = match view.squash {
+        Some(k) => desired_nodes_3d(center, k, &schedule),
+        // The same player-relative band the live game streamed, centred on the
+        // bench origin. Measuring the old fixed 0..=2 slab would measure a
+        // world the game no longer builds.
+        None => desired_nodes(center, (center.y - 2)..=(center.y + 2), &schedule),
+    };
+    let meshing = Instant::now();
+    let meshed = mesh_nodes(
         &world,
         &mesh_assets.registry,
         &layer_of,
-        ChunkCoord::new(0, 0, 0),
-        // The same player-relative band the live game streams (± the
-        // streaming module's VERTICAL_CHUNK_RADIUS), centred on the bench
-        // origin. Measuring the old fixed 0..=2 slab would measure a world the
-        // game no longer builds -- and would let the gate pass while the real
-        // thing failed it.
-        -2..=2,
-        &schedule,
+        nodes,
         cubara_world::TerrainBlocks::from_registry(&mesh_assets.registry)
             .with_oak(
                 &crate::game::load_structure_registry(),
@@ -101,6 +120,10 @@ pub fn run(radius: i32, (width, height): (u32, u32)) {
     .into_iter()
     .filter_map(to_meshed_node);
     let mut arena = ChunkArena::from_meshed(&device, &queue, multi_draw, meshed);
+    log::info!(
+        "meshed in {:.2} s (single thread)",
+        meshing.elapsed().as_secs_f64()
+    );
     let total_nodes = arena.len();
     let (min, max) = arena.bounds().expect("bench region produced no geometry");
     let look_target = [
@@ -158,7 +181,16 @@ pub fn run(radius: i32, (width, height): (u32, u32)) {
     let submit_frame =
         |arena: &mut ChunkArena, scene: &mut SceneRenderer, vt: f32| -> (f64, usize) {
             puffin::profile_scope!("frame");
-            let vp = CameraUniform::view_proj_matrix(aspect, vt, look_target, view_radius);
+            let vp = match view.eye {
+                Some(eye) => {
+                    // A full turn every ~20 virtual seconds, pitched down a
+                    // little: what a player looking around sees.
+                    let yaw = vt * 0.3;
+                    let dir = glam::vec3(yaw.cos(), -0.25, yaw.sin());
+                    CameraUniform::look_view_proj(aspect, glam::Vec3::from(eye), dir)
+                }
+                None => CameraUniform::view_proj_matrix(aspect, vt, look_target, view_radius),
+            };
             scene.set_camera(&queue, vp);
             let frustum = Frustum::from_view_proj(vp);
 
@@ -260,9 +292,26 @@ pub fn parse_size(text: &str) -> Option<(u32, u32)> {
     (w > 0 && h > 0).then_some((w, h))
 }
 
+/// Parse a `--eye` value: `X,Y,Z` in blocks, e.g. `8,40,8`.
+pub fn parse_eye(text: &str) -> Option<[f32; 3]> {
+    let parts: Vec<f32> = text
+        .split(',')
+        .map(|p| p.trim().parse().ok())
+        .collect::<Option<_>>()?;
+    <[f32; 3]>::try_from(parts).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_eye_is_three_numbers() {
+        assert_eq!(parse_eye("8,40.5,-3"), Some([8.0, 40.5, -3.0]));
+        for bad in ["", "1,2", "1,2,3,4", "a,b,c"] {
+            assert_eq!(parse_eye(bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn a_size_is_width_x_height() {

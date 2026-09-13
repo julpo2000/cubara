@@ -219,7 +219,25 @@ pub fn mesh_region(
     schedule: &RingSchedule,
     blocks: TerrainBlocks,
 ) -> Vec<BuiltNode> {
-    let mut nodes = desired_nodes(center, y_range, schedule);
+    mesh_nodes(
+        world,
+        registry,
+        layer_of,
+        desired_nodes(center, y_range, schedule),
+        blocks,
+    )
+}
+
+/// Mesh exactly `nodes`, synchronously, in ascending [`NodeKey`] order -- what
+/// [`mesh_region`] does for its band, for a caller that chose the nodes some
+/// other way (a 3D selection).
+pub fn mesh_nodes(
+    world: &World,
+    registry: &BlockRegistry,
+    layer_of: &dyn Fn(&str) -> u32,
+    mut nodes: Vec<NodeKey>,
+    blocks: TerrainBlocks,
+) -> Vec<BuiltNode> {
     nodes.sort();
     nodes
         .into_iter()
