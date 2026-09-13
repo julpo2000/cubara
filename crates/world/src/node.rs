@@ -117,65 +117,91 @@ pub const DEFAULT_RING_SCHEDULE: &[(u32, i32)] = &[(0, 10), (1, 18), (2, 32), (3
 /// band `y_range` (in chunks, same convention as
 /// [`crate::streaming::desired_chunks`]'s own `y_range`), per `schedule`.
 ///
-/// Each ring is resolved on **its own level's node grid**, snapped to a
-/// center node via [`NodeKey::containing`] — not by testing a node's raw
-/// chunk-space footprint against the ring boundary directly. A moving
-/// `center` is essentially never grid-aligned to every level's `2^L`
-/// spacing at once, so a footprint-based test would let some nodes straddle
-/// a ring boundary; resolving in node-grid units keeps each level's own
-/// node set simple and self-consistent, at the cost of ring boundaries
-/// being approximate (within about one node width) rather than an exact
-/// chunk-radius circle — acceptable here since `schedule` is a hand-tuned
-/// constant table (§6.3), not a promise of a precise geometric radius.
+/// **Built as an octree, so the rings tile space exactly.** Start from the
+/// coarsest level's nodes within its radius, and split any node that reaches
+/// inside the next finer ring's radius into its eight children, down to level
+/// 0. Every chunk inside the outer radius then belongs to exactly one node.
+///
+/// It used to resolve each ring on its own grid and exclude the finer ring by
+/// a rounded-down node radius, which left chunks no ring covered -- chunk 11
+/// and 36-39 out from the player, 603 of the 14,641 chunks within 60 -- and
+/// others two rings both drew. The gaps looked like trenches while every node
+/// walled its borders; once covered border faces were left out they became
+/// holes straight through the ground.
+///
+/// **Neighbours differ by at most one level** wherever rings are far enough
+/// apart for it, which the default schedule is -- and which leaving covered
+/// border faces out relies on (`crate::mesh`). A test holds both properties.
 pub fn desired_nodes(
     center: ChunkCoord,
     y_range: RangeInclusive<i32>,
     schedule: &RingSchedule,
 ) -> Vec<NodeKey> {
-    let mut nodes = Vec::new();
-    // `None` until the first ring has run: there is no "already covered by
-    // a finer ring" yet, so the very first ring (typically level 0) must
-    // exclude nothing, including the center node itself at distance 0 --
-    // not the same thing as "covered out to radius 0."
-    let mut inner_radius_chunks: Option<i32> = None;
+    let Some(&(top, top_radius)) = schedule.last() else {
+        return Vec::new();
+    };
+    // The finest level a node at `level` must be split down towards: the ring
+    // radius of the level below it, or none for the finest ring.
+    let radius_of = |level: u32| schedule.iter().find(|&&(l, _)| l == level).map(|&(_, r)| r);
+    let finest = schedule[0].0;
+    let (y_lo, y_hi) = (*y_range.start(), *y_range.end());
 
-    for &(level, outer_radius_chunks) in schedule {
-        let extent = 1i32 << level;
-        let center_node = NodeKey::containing(center, level);
-        // Non-negative `i32::div_ceil` isn't stable on this toolchain --
-        // `outer_radius_chunks` is always >= 0 by construction, so the
-        // plain unsigned-style formula is safe here.
-        let outer_node_radius = ((outer_radius_chunks + extent - 1) / extent).max(0);
-        // The previous (finer) ring's coverage, expressed in *this* level's
-        // node units -- nodes within it are already resident at finer
-        // detail and are skipped here.
-        let inner_node_radius = inner_radius_chunks.map(|r| r / extent);
-
-        let y_min_node = (*y_range.start()).div_euclid(extent);
-        let y_max_node = (*y_range.end()).div_euclid(extent);
-
-        for nx in
-            (center_node.pos[0] - outer_node_radius)..=(center_node.pos[0] + outer_node_radius)
-        {
-            for nz in
-                (center_node.pos[2] - outer_node_radius)..=(center_node.pos[2] + outer_node_radius)
-            {
-                let dist = (nx - center_node.pos[0])
-                    .abs()
-                    .max((nz - center_node.pos[2]).abs());
-                if inner_node_radius.is_some_and(|inner| dist <= inner) {
-                    continue; // already covered by a finer, inner ring
-                }
-                for ny in y_min_node..=y_max_node {
-                    nodes.push(NodeKey::new(level, [nx, ny, nz]));
+    let extent = 1i32 << top;
+    let first = |c: i32| (c - top_radius).div_euclid(extent);
+    let last = |c: i32| (c + top_radius).div_euclid(extent);
+    let mut pending: Vec<NodeKey> = Vec::new();
+    for nx in first(center.x)..=last(center.x) {
+        for nz in first(center.z)..=last(center.z) {
+            for ny in y_lo.div_euclid(extent)..=y_hi.div_euclid(extent) {
+                let node = NodeKey::new(top, [nx, ny, nz]);
+                if horizontal_distance(node, center) <= top_radius {
+                    pending.push(node);
                 }
             }
         }
-
-        inner_radius_chunks = Some(outer_radius_chunks);
     }
 
+    let mut nodes = Vec::new();
+    while let Some(node) = pending.pop() {
+        let finer = node.level.checked_sub(1).filter(|&l| l >= finest);
+        let split = finer
+            .and_then(radius_of)
+            .is_some_and(|r| horizontal_distance(node, center) <= r);
+        if !split {
+            nodes.push(node);
+            continue;
+        }
+        let level = node.level - 1;
+        for dx in 0..2 {
+            for dy in 0..2 {
+                for dz in 0..2 {
+                    let child = NodeKey::new(
+                        level,
+                        [
+                            node.pos[0] * 2 + dx,
+                            node.pos[1] * 2 + dy,
+                            node.pos[2] * 2 + dz,
+                        ],
+                    );
+                    let o = child.chunk_origin().y;
+                    if o + child.extent_chunks() > y_lo && o <= y_hi {
+                        pending.push(child);
+                    }
+                }
+            }
+        }
+    }
+    nodes.sort();
     nodes
+}
+
+/// Chebyshev distance in chunks, horizontally, from `center` to the nearest
+/// chunk of `node` -- zero when the node contains the centre's column.
+fn horizontal_distance(node: NodeKey, center: ChunkCoord) -> i32 {
+    let o = node.chunk_origin();
+    let e = node.extent_chunks();
+    let axis = |c: i32, lo: i32| (lo - c).max(c - (lo + e - 1)).max(0);
+    axis(center.x, o.x).max(axis(center.z, o.z))
 }
 
 /// Compute the [`NodeStreamUpdates`] that move `resident` to exactly the
@@ -325,6 +351,83 @@ mod tests {
         assert_eq!(nodes.len(), 5 * 5 * 2, "(2*2+1)^2 columns * 2 y layers");
         for n in &nodes {
             assert_eq!(n.level, 0);
+        }
+    }
+
+    /// Which node covers each chunk, for chunks within the band.
+    fn coverage(nodes: &[NodeKey]) -> std::collections::HashMap<(i32, i32, i32), Vec<NodeKey>> {
+        let mut map: std::collections::HashMap<(i32, i32, i32), Vec<NodeKey>> = Default::default();
+        for &n in nodes {
+            let (o, e) = (n.chunk_origin(), n.extent_chunks());
+            for x in o.x..o.x + e {
+                for y in o.y..o.y + e {
+                    for z in o.z..o.z + e {
+                        map.entry((x, y, z)).or_default().push(n);
+                    }
+                }
+            }
+        }
+        map
+    }
+
+    const CENTRES: [ChunkCoord; 4] = [
+        ChunkCoord::new(0, 0, 0),
+        ChunkCoord::new(3, 1, -5),
+        ChunkCoord::new(-17, -2, 29),
+        ChunkCoord::new(7, 0, 7),
+    ];
+
+    /// **No chunk twice, no chunk missing** anywhere inside the render
+    /// distance. A gap is a hole through the ground; an overlap is two levels
+    /// of the same terrain fighting for the same pixels.
+    #[test]
+    fn the_rings_tile_every_chunk_within_the_radius_exactly_once() {
+        let outer = DEFAULT_RING_SCHEDULE.last().unwrap().1;
+        for centre in CENTRES {
+            let band = (centre.y - 2)..=(centre.y + 2);
+            let map = coverage(&desired_nodes(centre, band.clone(), DEFAULT_RING_SCHEDULE));
+            for x in (centre.x - outer)..=(centre.x + outer) {
+                for z in (centre.z - outer)..=(centre.z + outer) {
+                    for y in band.clone() {
+                        let n = map.get(&(x, y, z)).map_or(0, Vec::len);
+                        assert_eq!(
+                            n, 1,
+                            "centre {centre:?}: chunk ({x}, {y}, {z}) covered {n} times"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Leaving out a border face its neighbour covers is only safe against a
+    /// neighbour at most one level coarser or finer (`crate::mesh`).
+    #[test]
+    fn nodes_that_share_a_face_differ_by_at_most_one_level() {
+        for centre in CENTRES {
+            let band = (centre.y - 2)..=(centre.y + 2);
+            let nodes = desired_nodes(centre, band, DEFAULT_RING_SCHEDULE);
+            let map = coverage(&nodes);
+            for &(x, y, z) in map.keys() {
+                let here = map[&(x, y, z)][0].level as i32;
+                for d in [
+                    (1, 0, 0),
+                    (-1, 0, 0),
+                    (0, 1, 0),
+                    (0, -1, 0),
+                    (0, 0, 1),
+                    (0, 0, -1),
+                ] {
+                    if let Some(there) = map.get(&(x + d.0, y + d.1, z + d.2)) {
+                        let gap = (here - there[0].level as i32).abs();
+                        assert!(
+                            gap <= 1,
+                            "centre {centre:?}: chunk ({x},{y},{z}) level {here} beside level {}",
+                            there[0].level
+                        );
+                    }
+                }
+            }
         }
     }
 
