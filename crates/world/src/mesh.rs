@@ -22,7 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use cubara_voxel::{
-    build_mesh_bounded_occluded, Aabb, BlockRegistry, ChunkCoord, Mesh, MeshContext,
+    build_mesh_bounded_occluded, Aabb, BlockRegistry, Chunk, ChunkCoord, FaceLinks, Mesh,
+    MeshContext,
 };
 
 use crate::node::{desired_nodes, NodeKey, RingSchedule};
@@ -44,6 +45,30 @@ pub struct NodeGeometry {
 pub struct BuiltNode {
     pub node: NodeKey,
     pub geometry: Option<NodeGeometry>,
+    /// Which faces of the node air inside it joins, for visibility culling
+    /// ([`crate::visibility`]). Worked out from the same blocks the mesh was,
+    /// in the same job, so the two can never describe different contents. An
+    /// empty node joins everything.
+    pub links: FaceLinks,
+}
+
+/// Generate `node` once, and both mesh it and work out what it joins -- what a
+/// meshing job produces.
+pub fn build_node(
+    world: &World,
+    registry: &BlockRegistry,
+    layer_of: &dyn Fn(&str) -> u32,
+    node: NodeKey,
+    blocks: TerrainBlocks,
+) -> BuiltNode {
+    let chunk = world.node_at(node, blocks);
+    BuiltNode {
+        node,
+        links: chunk
+            .as_ref()
+            .map_or(FaceLinks::ALL, |c| FaceLinks::of_chunk(c, registry)),
+        geometry: chunk.and_then(|c| mesh_chunk(world, registry, layer_of, node, &c)),
+    }
 }
 
 /// Put a batch of finished mesh jobs into a fixed order — ascending
@@ -73,8 +98,19 @@ pub fn mesh_node(
     node: NodeKey,
     blocks: TerrainBlocks,
 ) -> Option<NodeGeometry> {
-    let ctx = MeshContext { registry, layer_of };
     let chunk = world.node_at(node, blocks)?;
+    mesh_chunk(world, registry, layer_of, node, &chunk)
+}
+
+/// Mesh `node` from its already generated blocks.
+fn mesh_chunk(
+    world: &World,
+    registry: &BlockRegistry,
+    layer_of: &dyn Fn(&str) -> u32,
+    node: NodeKey,
+    chunk: &Chunk,
+) -> Option<NodeGeometry> {
+    let ctx = MeshContext { registry, layer_of };
     let world_origin = node.world_origin();
     let origin = [
         world_origin[0] as f32,
@@ -84,7 +120,7 @@ pub fn mesh_node(
     let scale = node.extent_chunks() as f32;
     let surfaces = std::cell::RefCell::new(HashMap::new());
     let covered = |gx, gy, gz| border_covered(world, node, &surfaces, [gx, gy, gz]);
-    let (mesh, aabb) = build_mesh_bounded_occluded(&chunk, &ctx, origin, scale, covered)?;
+    let (mesh, aabb) = build_mesh_bounded_occluded(chunk, &ctx, origin, scale, covered)?;
     Some(NodeGeometry {
         mesh,
         aabb,
@@ -241,10 +277,7 @@ pub fn mesh_nodes(
     nodes.sort();
     nodes
         .into_iter()
-        .map(|node| BuiltNode {
-            node,
-            geometry: mesh_node(world, registry, layer_of, node, blocks),
-        })
+        .map(|node| build_node(world, registry, layer_of, node, blocks))
         .collect()
 }
 
@@ -317,10 +350,7 @@ impl MeshPool {
                                 Err(_) => break,
                             }
                         };
-                        let built = BuiltNode {
-                            node,
-                            geometry: mesh_node(&world, &registry, &*layer_of, node, blocks),
-                        };
+                        let built = build_node(&world, &registry, &*layer_of, node, blocks);
                         if results.send(built).is_err() {
                             break; // caller gone
                         }

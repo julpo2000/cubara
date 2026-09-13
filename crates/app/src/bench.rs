@@ -116,13 +116,36 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View) {
                 &mesh_assets.registry,
             )
             .with_ores(&crate::game::load_ore_registry(), &mesh_assets.registry),
-    )
-    .into_iter()
-    .filter_map(to_meshed_node);
-    let mut arena = ChunkArena::from_meshed(&device, &queue, multi_draw, meshed);
+    );
     log::info!(
         "meshed in {:.2} s (single thread)",
         meshing.elapsed().as_secs_f64()
+    );
+    // A camera inside the world draws only what it could see, the way the game
+    // does (`cubara_world::visibility`). The orbit is outside the region
+    // looking in, where there is no node to search from, so it draws all.
+    let built_nodes = meshed.len();
+    let meshed: Vec<_> = match view.eye {
+        Some(_) => {
+            let desired: std::collections::HashSet<_> = meshed.iter().map(|b| b.node).collect();
+            let links: std::collections::HashMap<_, _> =
+                meshed.iter().map(|b| (b.node, b.links)).collect();
+            let visible = cubara_world::visibility::visible_nodes(center, &desired, |n| {
+                links.get(&n).copied()
+            });
+            log::info!("visible: {} of {} nodes", visible.len(), built_nodes);
+            meshed
+                .into_iter()
+                .filter(|b| visible.contains(&b.node))
+                .collect()
+        }
+        None => meshed,
+    };
+    let mut arena = ChunkArena::from_meshed(
+        &device,
+        &queue,
+        multi_draw,
+        meshed.into_iter().filter_map(to_meshed_node),
     );
     let total_nodes = arena.len();
     let (min, max) = arena.bounds().expect("bench region produced no geometry");

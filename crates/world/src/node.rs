@@ -322,6 +322,12 @@ pub fn schedule_for_radius(radius: i32) -> Vec<(u32, i32)> {
     schedule
 }
 
+/// Sort `nodes` so the ones nearest `center` come first -- the order to load
+/// them in, so what is around the camera arrives before the fringe.
+pub fn sort_nearest_first(nodes: &mut [NodeKey], center: ChunkCoord) {
+    nodes.sort_by_key(|n| (node_dist_sq(*n, center), *n));
+}
+
 /// Squared horizontal chunk-space distance from a node's own center to the
 /// center of `center` (the player's chunk, not its minimum corner) -- the
 /// sort key [`plan_node_updates`] loads nearest-first by. Both centers are

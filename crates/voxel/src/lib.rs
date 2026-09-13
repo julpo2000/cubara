@@ -8,6 +8,7 @@
 pub mod angle;
 pub mod block;
 pub mod bounds;
+pub mod connectivity;
 pub mod coord;
 pub mod fingerprint;
 pub mod fixed;
@@ -24,6 +25,7 @@ pub mod voxel;
 pub use angle::Angle;
 pub use block::BlockId;
 pub use bounds::{build_mesh_bounded, build_mesh_bounded_occluded, Aabb};
+pub use connectivity::FaceLinks;
 pub use coord::ChunkCoord;
 pub use fixed::{Fixed, FixedVec3, FRAC_BITS};
 pub use item::{

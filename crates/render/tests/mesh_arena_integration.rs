@@ -8,7 +8,7 @@
 
 use cubara_render::ChunkArena;
 use cubara_voxel::{BlockRegistry, ChunkCoord, DropRule, Faces, Interact, Material, Shape};
-use cubara_world::mesh::{mesh_node, sort_batch, BuiltNode};
+use cubara_world::mesh::{sort_batch, BuiltNode};
 use cubara_world::node::desired_nodes;
 use cubara_world::{TerrainBlocks, World};
 
@@ -105,15 +105,14 @@ fn sorted_batch_gives_the_same_arena_layout_regardless_of_arrival_order() {
     for order in &orderings {
         let batch: Vec<BuiltNode> = order
             .iter()
-            .map(|&node| BuiltNode {
-                node,
-                geometry: mesh_node(
+            .map(|&node| {
+                cubara_world::mesh::build_node(
                     &world,
                     &registry,
                     &layer_of,
                     node,
                     TerrainBlocks::from_registry(&registry),
-                ),
+                )
             })
             .collect();
 
