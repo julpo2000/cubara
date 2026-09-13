@@ -54,6 +54,7 @@ frames after 200 warmup.
 | 2026-09-13 | LOD rings tile exactly (octree) — the gaps are drawn now, radius 64, band ±2⁴⁸ | 2,174 | 738,078 | ~3,890 | 0.107 ms | ~0.35 ms | *(this PR)* |
 | 2026-09-13 | **No vertical band** — 3D octree, vertical LOD squash 2, radius 64 (orbit)⁴⁹ | 4,377 | 1,015,554 | ~2,950 | 0.125 ms | ~0.41 ms | *(this PR)* |
 | 2026-09-13 | **Visibility culling** — only what a line of sight can reach is generated, meshed and drawn; eye at y=40⁵⁰ | 1,555 | 615,408 | ~7,310 | 0.069 ms | — | *(this PR)* |
+| 2026-09-13 | **Caves and terrain at every level of detail**; visibility in sub-blocks, off-thread; radius 64 (orbit)⁵¹ | 2,941 | 1,988,342 | ~1,465 | 0.132 ms | ~0.37 ms | *(this PR)* |
 | 2026-09-13 | **Faces turned away from the camera left out** — meshes grouped by direction, radius 64 (orbit)⁵² | 4,377 | 1,015,554 (573,298 drawn) | ~3,592 | 0.168 ms | ~0.48 ms | *(this PR)* |
 | 2026-09-13 | **Mountains** — ridged ranges up to ~y 240, radius 64 (orbit)⁵³ | 4,506 | 1,110,830 (592,540 drawn) | ~3,451 | 0.169 ms | ~0.43 ms | *(this PR)* |
 
@@ -1508,6 +1509,27 @@ and draws everything as before. The bench generates every node to measure; the
 game generates only the ones the search reaches, which is the part that makes
 caves at every level of detail affordable next.
 
+⁵¹ **Every feature is drawn at every distance, and that has a price.** Coarse
+cells now take the majority of their blocks, so caves exist in far nodes (and
+ravines will, when they are added) instead of far nodes being solid rock. The
+bench's orbit views the region from outside, and through its cut edges sees the
+caves of the whole volume; a player's view is far lighter:
+
+```
+view            main (#254)                      this
+orbit           2964 FPS, 1,015,554 tris         1465 FPS, 1,988,342 tris
+eye y=40        7420 FPS, 609,788 tris           5457 FPS, 1,252,422 tris
+eye y=300       12713 FPS, 237,844 tris          4831 FPS, 789,684 tris
+eye in a cave   6045 FPS                          11648 FPS
+```
+
+Every view stays above the 1,000 gate; the orbit halves. It also filled the
+arena: 3,976,684 of 4,000,000 vertices, so the capacities are doubled
+(8M vertices / 12M indices, 142 MiB), and the bench now fails outright on an
+exhausted arena or an empty scene instead of reporting the frame rate of a
+world with parts missing. How far culling still is from what is really seen
+(`visibility_grain` example, surface view): sub-block search 1.25M, nodes hit
+by ~39k actual rays 326k -- the gap screen-space occlusion would close.
 ⁵² **A face pointing away from the camera is no longer sent to the GPU at all.**
 Back-face culling already kept those triangles off the screen, but only after
 every one of their vertices had been through the vertex shader. Meshes now come
