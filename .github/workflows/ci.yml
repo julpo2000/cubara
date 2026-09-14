@@ -47,6 +47,8 @@ jobs:
         run: ./scripts/check-architecture.sh
       - name: Single scene-render path (Rule 5)
         run: ./scripts/check-single-render-path.sh
+      - name: One performance history (BENCHMARKS.md)
+        run: ./scripts/check-benchmark-history.sh
 
   check:
     name: clippy + build + test (${{ matrix.os }})
