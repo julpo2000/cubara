@@ -1632,8 +1632,33 @@ Kept from the superseded copy of ⁵¹ that the duplication carried, because it 
 measured and recorded nowhere else: **how far the visibility search still is from
 what is really seen** (`visibility_grain` example, surface view) — the sub-block
 search keeps 1.25M triangles, while the nodes ~39k actual rays hit hold 326k.
-That gap is what screen-space occlusion would close, and it is the open question
+That gap is what screen-space occlusion would close, and it was the open question
 in [#256](../../pull/256): the hi-Z pyramid was a net loss on an RTX 4060 once
-#257 landed, and its own conclusion is that the M3 — GPU-bound, tile-based, no
-discrete card — is the machine that decides. This row is the first half of that
-measurement; the A/B is the other half.
+#257 landed, and its own conclusion was that the M3 — GPU-bound, tile-based, no
+discrete card — is the machine that decides.
+
+**Measured here, and the answer is no.** `e5ed61a` cherry-picked onto `3b52c49`
+(branch `perf/occlusion-on-the-m3`, all render tests green including
+`occlusion_culling_never_changes_the_image`), alternating runs of one binary with
+and without `--no-occlusion`, median FPS:
+
+```
+view                  occlusion ON    OFF       triangles: face-culled -> occluded
+orbit (the gate)      1035            1570      480,547 -> 445,896   (7% saved)
+eye y=40              2020            3862      167,988 -> 150,516   (10%)
+eye y=300             2672            5106      102,664 -> 101,063   (1.6%)
+eye y=40, 4K           796            2020      167,988 -> 152,668   (9%)
+```
+
+The pyramid culls correctly; there is nothing left for it to find. #253/#254 and
+#257 already took that ground, on the CPU, for free -- on the 4060 before #257
+the same code saved 31%. And the cost is *worse* on a weak GPU, not better: the
+pyramid is itself GPU work that scales with pixels, and at 4K it takes 60% of the
+frame. CPU/frame doubles where the readback is not hidden (0.160 -> 0.333 ms at
+y=40; 0.344 -> 0.868 ms at 4K).
+
+**The number that settles it: with occlusion on, the gate orbit is ~1,035 FPS**
+against a 1,000-FPS criterion -- the margin in this row collapses from ~1.57x to
+~1.04x, on the machine that decides the gate. A 7% triangle saving does not buy
+that. Screen-space occlusion is not the way to close the 1.25M-vs-326k gap; a
+cheaper search is.
