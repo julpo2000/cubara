@@ -27,6 +27,15 @@ a phantom regression or speedup (this happened once; see footnote ³⁰). A sess
 records a row for whichever machine it is on; the other machine's row lands when
 the work is next run there.
 
+**Measure on an idle machine, and do not trust a number taken straight after a
+build.** On the 8 GB M3 the same binary on the same commit reads **1,540-1,587
+FPS cold and 623-861 FPS within a minute of `cargo test --all`** -- a factor of
+2.3 on identical geometry, with CPU/frame moving 0.441 -> 0.674 ms alongside it.
+That is throttling plus memory pressure, not work; footnote ⁵⁵ has the table.
+It matters because `check-phase-gate.sh` runs `--bench 64` immediately after the
+test suite, so on this machine the gate's perf line can report a failure the
+engine does not have.
+
 Footnotes carry the detail, and each one is **numbered once** — take the next
 unused number rather than the next one in reading order, because two notes under
 one number make a row cite someone else's measurement. This file is also the one
@@ -1627,6 +1636,32 @@ mountains already in the world. Nothing is being silently dropped.
 
 The visibility search costs 9.2 s for the bench's 65 camera positions, off the
 render path and before the measured frames; it is not in the numbers above.
+
+**What this machine does under sustained load, measured because the phase-2 gate
+went red on it at this very commit.** Same binary, same commit, and every run
+drew the identical scene (1,782 of 2,219 nodes):
+
+```
+condition                                   FPS               CPU/frame   p99
+cold, machine idle                          1540 1568 1582 1587   0.441 ms   0.70-0.98
+partway recovered                           1100                  0.477 ms   0.81
+immediately after `cargo test --all`          679  861             0.546-0.674  1.40-1.50
+inside check-phase-gate.sh 2 (two runs)       623  681             --         --
+```
+
+The scene does not change, so this is the machine: an M3 with 8 GB throttling and
+paging (436k pageouts over the session), both its CPU and its GPU side degrading
+together. Windows measured 3,982 FPS and 12/12 on the same commit. `b5dcfec`
+passed this gate at a *lower* cold number (1,112), which is the clearest sign
+that hot-vs-cold dominates the scene: the same 2.3x factor would have put it
+under 500.
+
+`check-phase-gate.sh` takes **one** `--bench 64` run, placed immediately after
+`cargo test --all` and clippy -- which on this machine is the worst available
+moment. Recorded here rather than fixed: what a gate asserts is the project
+owner's to change, never an agent's (`CLAUDE.md`), so this note is the evidence
+for that decision and not the decision. Phase 2's other 15 criteria pass on this
+commit, including the survival replay and all five multiplayer ones.
 
 Kept from the superseded copy of ⁵¹ that the duplication carried, because it is
 measured and recorded nowhere else: **how far the visibility search still is from
