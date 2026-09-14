@@ -35,6 +35,62 @@ use cubara_world::World;
 /// the bottom of a shaft you look into turns to solid rock. `2` keeps 80.
 pub(crate) const VERTICAL_LOD_SQUASH: i32 = 2;
 
+/// The nodes in `visible` that cover the same space `node` does: either its
+/// eight children one level finer (the camera came closer and the node split)
+/// or its parent one level coarser (the camera left and eight merged).
+///
+/// Checking exactly one level each way is enough because the ring schedule
+/// keeps neighbours within one level of each other
+/// (`cubara_world::node::desired_nodes`), and a node is replaced *in place* --
+/// by what the octree puts in its own footprint, which is its children or its
+/// parent and nothing else.
+///
+/// Empty means nothing is taking this space over: the camera walked away from
+/// it, or the visibility search stopped reaching it. Those unload at once;
+/// only a *replacement* is worth waiting for.
+fn replacements_of(node: NodeKey, visible: &HashSet<NodeKey>) -> Vec<NodeKey> {
+    let mut found = Vec::new();
+    if let Some(finer) = node.level.checked_sub(1) {
+        let [x, y, z] = node.pos;
+        for dx in 0..2 {
+            for dy in 0..2 {
+                for dz in 0..2 {
+                    let child = NodeKey::new(finer, [2 * x + dx, 2 * y + dy, 2 * z + dz]);
+                    if visible.contains(&child) {
+                        found.push(child);
+                    }
+                }
+            }
+        }
+    }
+    let [x, y, z] = node.pos;
+    let parent = NodeKey::new(
+        node.level + 1,
+        [x.div_euclid(2), y.div_euclid(2), z.div_euclid(2)],
+    );
+    if visible.contains(&parent) {
+        found.push(parent);
+    }
+    found
+}
+
+/// Whether `node` can leave the arena this frame without leaving a hole.
+///
+/// **This is the whole fix for #262.** A node used to be unloaded the moment
+/// it left the visible set, while what replaces it was still being meshed on
+/// the worker pool -- tens of milliseconds during which nothing at all was
+/// drawn there, so walking towards a mountain showed sky through it, over and
+/// over as the search re-ran. Waiting costs a few frames of a slightly coarser
+/// (or finer) mountain; not waiting costs a hole.
+///
+/// Drawing both meanwhile is not the alternative: a node and its replacement
+/// approximate the same surface, so both in the arena at once is z-fighting
+/// rather than a hole. Hence *swap*, in one `apply_node_updates` call.
+fn can_unload(node: NodeKey, visible: &HashSet<NodeKey>, resident: &HashSet<NodeKey>) -> bool {
+    let replacements = replacements_of(node, visible);
+    replacements.is_empty() || replacements.iter().all(|r| resident.contains(r))
+}
+
 pub(crate) fn to_node_id(node: NodeKey) -> NodeId {
     NodeId {
         level: node.level,
@@ -105,6 +161,11 @@ pub struct NodeStreaming {
     /// can take a snapshot without copying it; a write while a search holds
     /// one copies once.
     links: Arc<HashMap<NodeKey, visibility::NodeLinks>>,
+    /// Nodes that have left the visible set but are still drawn, because what
+    /// replaces them is not resident yet (#262). Dropping them on time is what
+    /// made mountains flicker; they leave in the same `apply_node_updates` call
+    /// that brings their replacement in.
+    held: HashSet<NodeKey>,
     /// The nodes the camera could see ([`visibility::visible_nodes`]); the only
     /// ones meshed and drawn.
     visible: HashSet<NodeKey>,
@@ -217,6 +278,7 @@ impl NodeStreaming {
             layer_of: Arc::new(layer_of),
             mesh_pool: MeshPool::new(),
             resident: HashSet::new(),
+            held: HashSet::new(),
             center: None,
             links: Arc::new(HashMap::new()),
             visible: HashSet::new(),
@@ -308,11 +370,25 @@ impl NodeStreaming {
             .filter(|n| !self.visible.contains(n))
             .copied()
             .collect();
+        // Nothing in flight is worth finishing once it has left the visible
+        // set -- that is work, not geometry, and cancelling it is what keeps
+        // walking back and forth from queueing meshes nobody wants.
         for &node in &stale {
-            self.resident.remove(&node);
             self.mesh_pool.cancel(node);
         }
-        let to_unload: Vec<NodeId> = stale.into_iter().map(to_node_id).collect();
+        // ...but what is already *drawn* only leaves once its replacement has
+        // arrived (#262). `held` keeps drawing until then; it is re-checked
+        // here and again as each mesh lands, so the swap happens on the frame
+        // the replacement is ready rather than on the next search.
+        let (unload_now, held): (Vec<NodeKey>, Vec<NodeKey>) = stale
+            .into_iter()
+            .filter(|n| self.resident.contains(n))
+            .partition(|&n| can_unload(n, &self.visible, &self.resident));
+        for &node in &unload_now {
+            self.resident.remove(&node);
+        }
+        self.held = held.into_iter().collect();
+        let to_unload: Vec<NodeId> = unload_now.into_iter().map(to_node_id).collect();
         renderer.apply_node_updates(to_unload, std::iter::empty());
 
         let mut to_load: Vec<NodeKey> = self
@@ -371,13 +447,153 @@ impl NodeStreaming {
                 to_meshed_node(built)
             })
             .collect();
-        renderer.apply_node_updates(std::iter::empty(), meshed);
+        // The arriving meshes may be exactly what a held node was waiting for
+        // (#262). Release those in the *same* call, so the coarse node and the
+        // fine ones that replace it are never both in the arena -- and never
+        // neither.
+        let released: Vec<NodeId> = if self.held.is_empty() {
+            Vec::new()
+        } else {
+            let ready: Vec<NodeKey> = self
+                .held
+                .iter()
+                .filter(|&&n| can_unload(n, &self.visible, &self.resident))
+                .copied()
+                .collect();
+            for node in &ready {
+                self.held.remove(node);
+                self.resident.remove(node);
+            }
+            ready.into_iter().map(to_node_id).collect()
+        };
+        renderer.apply_node_updates(released, meshed);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Chunks a node covers: `2^level` on each axis from its own grid position.
+    fn covers(node: NodeKey) -> Vec<[i32; 3]> {
+        let e = 1i32 << node.level;
+        let [x, y, z] = node.pos;
+        let mut out = Vec::new();
+        for cx in x * e..x * e + e {
+            for cy in y * e..y * e + e {
+                for cz in z * e..z * e + e {
+                    out.push([cx, cy, cz]);
+                }
+            }
+        }
+        out
+    }
+
+    fn children_of(node: NodeKey) -> Vec<NodeKey> {
+        let finer = node.level - 1;
+        let [x, y, z] = node.pos;
+        let mut out = Vec::new();
+        for dx in 0..2 {
+            for dy in 0..2 {
+                for dz in 0..2 {
+                    out.push(NodeKey::new(finer, [2 * x + dx, 2 * y + dy, 2 * z + dz]));
+                }
+            }
+        }
+        out
+    }
+
+    /// The owner walked towards a mountain and saw it flicker (#262): the
+    /// coarse node left the arena the instant it stopped being visible, while
+    /// its eight replacements were still on the worker pool.
+    #[test]
+    fn a_node_stays_until_every_child_replacing_it_has_arrived() {
+        let parent = NodeKey::new(2, [3, 0, -4]);
+        let kids = children_of(parent);
+        let visible: HashSet<NodeKey> = kids.iter().copied().collect();
+
+        // Nothing has arrived: holding it is the only thing that is not a hole.
+        let mut resident: HashSet<NodeKey> = HashSet::from([parent]);
+        assert!(!can_unload(parent, &visible, &resident));
+
+        // Seven of eight is still a hole -- an `any` here instead of `all`
+        // would leave one eighth of the mountain missing, which is precisely
+        // the shape of the bug being fixed.
+        for kid in kids.iter().take(7) {
+            resident.insert(*kid);
+            assert!(
+                !can_unload(parent, &visible, &resident),
+                "released with {kid:?} the last one missing"
+            );
+        }
+        resident.insert(kids[7]);
+        assert!(can_unload(parent, &visible, &resident));
+    }
+
+    /// Walking away merges eight into one, and had the identical hole. A fix
+    /// that only handled splitting would pass the test above and still flicker
+    /// on the way back down the mountain.
+    #[test]
+    fn eight_children_stay_until_the_parent_replacing_them_has_arrived() {
+        let parent = NodeKey::new(2, [3, 0, -4]);
+        let kids = children_of(parent);
+        let visible: HashSet<NodeKey> = HashSet::from([parent]);
+        let resident: HashSet<NodeKey> = kids.iter().copied().collect();
+
+        for kid in &kids {
+            assert!(!can_unload(*kid, &visible, &resident));
+        }
+        let with_parent: HashSet<NodeKey> = resident.union(&visible).copied().collect();
+        for kid in &kids {
+            assert!(can_unload(*kid, &visible, &with_parent));
+        }
+    }
+
+    /// Only *replacement* is worth waiting for. A node the camera has simply
+    /// left behind must go at once, or the render distance stops bounding
+    /// anything and the arena fills with the world behind you.
+    #[test]
+    fn a_node_nothing_is_replacing_leaves_immediately() {
+        let gone = NodeKey::new(1, [40, 0, 40]);
+        let elsewhere: HashSet<NodeKey> = HashSet::from([NodeKey::new(1, [-40, 0, -40])]);
+        let resident: HashSet<NodeKey> = HashSet::from([gone]);
+        assert!(can_unload(gone, &elsewhere, &resident));
+        // Including when nothing at all is visible (walked into a cave).
+        assert!(can_unload(gone, &HashSet::new(), &resident));
+    }
+
+    /// The property the old code broke, stated over chunks rather than nodes:
+    /// while detail changes, every chunk that was drawn stays drawn.
+    #[test]
+    fn no_chunk_is_ever_uncovered_while_the_detail_changes() {
+        let parent = NodeKey::new(2, [1, 0, 1]);
+        let kids = children_of(parent);
+        let before: HashSet<[i32; 3]> = covers(parent).into_iter().collect();
+        let visible: HashSet<NodeKey> = kids.iter().copied().collect();
+
+        // Feed the children in one at a time, unloading the parent as soon as
+        // the policy allows, and check coverage after every single step.
+        let mut resident: HashSet<NodeKey> = HashSet::from([parent]);
+        let mut parent_gone = false;
+        for kid in kids.iter().chain(std::iter::once(&kids[7])) {
+            resident.insert(*kid);
+            if !parent_gone && can_unload(parent, &visible, &resident) {
+                resident.remove(&parent);
+                parent_gone = true;
+            }
+            let drawn: HashSet<[i32; 3]> = resident.iter().flat_map(|&n| covers(n)).collect();
+            for chunk in &before {
+                assert!(
+                    drawn.contains(chunk),
+                    "chunk {chunk:?} was drawn and then was not"
+                );
+            }
+        }
+        assert!(
+            parent_gone,
+            "the coarse node must leave once it is replaced"
+        );
+    }
 
     /// The rendering lifecycle is a *different* lifecycle from the simulation's
     /// (§11.1), and this is where that is asserted rather than only written
