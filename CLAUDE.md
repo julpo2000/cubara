@@ -32,7 +32,8 @@ these and run in CI as the `architecture rules` check. **Run them locally before
 pushing.** They are greps and take under a second:
 
 ```bash
-./scripts/check-architecture.sh && ./scripts/check-single-render-path.sh
+./scripts/check-architecture.sh && ./scripts/check-single-render-path.sh \
+  && ./scripts/check-benchmark-history.sh
 ```
 
 They catch the violation *shapes* seen so far. They cannot catch a novel one, so

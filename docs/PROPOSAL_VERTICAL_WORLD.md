@@ -1,8 +1,10 @@
 # Proposal: a world with no height limit
 
-**Status:** proposed, not scheduled. **Owner's request, 2026-08-31:** *"duizenden
-blokken diep kunnen graven en omhoog kunnen bouwen. Gigantische bergen en
-ravijnen."*
+**Status: shipped, 2026-09-13 — and it went in by a different route than this
+document expected.** Kept as written, with this note and §8 added, because the
+reasoning is still the record of how the decision was made; but do not read §6
+and §7 as current. **Owner's request, 2026-08-31:** *"duizenden blokken diep
+kunnen graven en omhoog kunnen bouwen. Gigantische bergen en ravijnen."*
 
 `ROADMAP.md` requires a phase-3 feature to be **proposed in writing before it is
 built**, naming (a) which existing systems it deepens and how, (b) what it makes
@@ -190,6 +192,51 @@ assumed: **this changes `WORLDGEN_VERSION`, which invalidates every existing
 save.** Doing it before anyone has a world worth keeping is cheaper than after.
 That is a real cost of waiting, and it is the owner's to price.
 
-**Nothing in this proposal has been implemented.** The measurements in §2 were
-taken by temporarily editing constants, benchmarking, and reverting; `main` is
-untouched.
+**When this was written, nothing in it had been implemented.** The measurements
+in §2 were taken by temporarily editing constants, benchmarking, and reverting.
+That is no longer true — see §8.
+
+## §8 What actually happened (added 2026-09-14, after the fact)
+
+The world has no height limit, and mountains are in it. Neither §6's blocker nor
+§7's sequencing held, and the honest version of both is worth recording because
+this document got the *shape* of the problem right and the *solution* wrong.
+
+**§7 was overtaken.** Block 2.9b's hunger, food and mobs were deferred by the
+owner on 2026-09-05, which removed eating from phase 2's gate; the phase closed
+out 16/16 on 2026-09-10 and the owner played it. The vertical world then landed
+on the owner's direct request (*"Kan je heftige bergen aan de worldgen
+toevoegen?"*) as #252 (3D octree, no vertical band) and #259 (mountain ranges,
+`WORLDGEN_VERSION` 3, peaks ~y 240).
+
+**§6 named the wrong blocker, and this is the useful part.** It said #42 occlusion
+culling *"is the whole blocker, and it asks for nothing else first"*. What removed
+the blocker was three cheaper things, none of which is occlusion culling:
+
+- **#250** — border faces a neighbour covers are left out of the mesh.
+- **#253/#254** — nothing a line of sight cannot reach is generated, meshed,
+  uploaded or drawn. This is the one that answers §2.0: underground cave surface
+  is no longer *generated*, so it never becomes the geometry §2.0 was afraid of.
+- **#257** — no face turned away from the camera is sent to the GPU.
+
+**#42 itself was built, measured on both machines, and does not pay.** [#256](../../pull/256)
+implemented the hi-Z pyramid and measured a net loss on an RTX 4060 once #257 had
+landed; re-measured on the M3 on 2026-09-14 it costs 34–60% of the frame rate to
+save 1–10% of triangles, and puts the gate's orbit at ~1,035 FPS against a
+1,000-FPS criterion. The numbers are in `BENCHMARKS.md` footnote ⁵⁵ and in #256's
+thread. The branch `perf/occlusion-on-the-m3` keeps the work, rebased and green,
+in case a much heavier world changes the balance.
+
+**§2.1's arena warning was real and is now fine.** Every mountain run in §2 hit
+the ceiling (`d 5513/4096`) and silently dropped geometry. The draw-slot limit is
+16,384 now; with mountains in the world the M3 measures **v 1,803,864/4,000,000,
+i 2,705,796/6,000,000, d 2,219/16,384**. Nothing is being dropped, and the bench
+fails outright on an exhausted arena rather than reporting the frame rate of a
+world with parts missing.
+
+**What this document was right about:** that vertical extent is free and *surface
+area* is what costs (§2), and that the answer had to come from measurement rather
+than from reasoning about what ought to be expensive. It was wrong only about
+which mechanism would collect the saving — and it said so in the form of a
+falsifiable claim, which is why finding out cost a measurement instead of an
+argument.
