@@ -532,6 +532,18 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View, overlay: bool) 
     }
     let _ = device.poll(wgpu::Maintain::Wait);
     let wall_secs = wall_start.elapsed().as_secs_f64();
+    // The round-robin check above only visits slot `frame % GPU_TIMER_DEPTH`
+    // once per frame, so whichever slots were written in the loop's last
+    // `GPU_TIMER_DEPTH` frames never got their check-turn before the loop
+    // ended -- their GPU work is done (the `Wait` above blocked until it
+    // was), just never collected. One full scan here picks up that tail.
+    if let Some(timer) = &gpu_timer {
+        for slot in 0..GPU_TIMER_DEPTH {
+            if let Some(ms) = timer.take_ms(slot) {
+                gpu_ms.push(ms);
+            }
+        }
+    }
     let avg_draws = draws_sum as f64 / MEASURE_FRAMES as f64;
     let avg_visible = visible_sum as f64 / MEASURE_FRAMES as f64;
     log::info!(
@@ -761,16 +773,29 @@ mod tests {
             "the async map cannot have completed synchronously with begin_read"
         );
 
-        // `Maintain::Wait` (not `Poll`, which this test found out the hard
-        // way): on a software adapter (lavapipe on Linux CI, WARP on
-        // Windows CI) a bare `Poll` loop can spin past any fixed iteration
-        // count without the map ever completing, since nothing forces the
-        // backend to make progress. `Wait` blocks until it has -- the same
-        // pattern `headless.rs` and this file's own warmup drain use.
-        let _ = device.poll(wgpu::Maintain::Wait);
-        let ms = timer
-            .take_ms(slot)
-            .expect("Maintain::Wait must block until the map has completed");
+        // Not a bare `Poll` loop with a fixed iteration count: on a software
+        // adapter (lavapipe on Linux CI, WARP on Windows CI) that can spin
+        // past any fixed count without the map ever completing, since
+        // nothing forces the backend to make progress between polls (found
+        // the hard way -- CI red on both). And not `Maintain::Wait` either:
+        // wgpu gives it no timeout, so a mutation-tested build that broke
+        // this path (checked directly -- this genuinely hangs the whole test
+        // binary, not just a slow pass) blocks forever with no way for the
+        // test harness to fail it. A wall-clock deadline gets both: real
+        // adapters and CI's software ones finish in well under a second, so
+        // 10s of slack costs nothing when things work and fails loudly,
+        // rather than hanging, when they don't.
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let mut ms = None;
+        while Instant::now() < deadline {
+            let _ = device.poll(wgpu::Maintain::Poll);
+            if let Some(v) = timer.take_ms(slot) {
+                ms = Some(v);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let ms = ms.expect("GPU map did not complete within 10s -- likely hung");
         assert!(
             ms >= 0.0,
             "a pass duration read back off the GPU cannot be negative"
