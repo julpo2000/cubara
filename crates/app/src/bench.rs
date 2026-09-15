@@ -40,10 +40,16 @@ const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const VIRTUAL_DT: f32 = 1.0 / 240.0;
 
 /// How many frames of slack the GPU-timestamp readback keeps in flight
-/// (`cubara_render::TimestampRing`). 3 gives the driver two full frames to
-/// finish mapping the oldest slot before it is needed again, without which a
-/// slow readback would silently stop producing GPU samples.
-const GPU_TIMER_DEPTH: usize = 3;
+/// (`cubara_render::TimestampRing`). Started at 3 -- enough that a slot's map
+/// isn't needed again the instant it's written -- but measured on this
+/// machine at only 27 of 2000 measured frames actually producing a GPU
+/// sample: the CPU submits far faster than the GPU retires work (the whole
+/// point of "sustained pipelined throughput"), so a shallow ring runs out of
+/// free slots almost immediately and spends most frames skipping. 1024
+/// brings that to ~975/2000 (~49%) on this machine -- plenty for a stable
+/// avg/p99 -- at a cost that's still just small buffers (a `depth`-sized
+/// query set and `depth` 16-byte readback buffers, created once).
+const GPU_TIMER_DEPTH: usize = 1024;
 
 /// The two query-set indices `slot` writes its begin/end timestamps to.
 /// Pulled out of [`GpuTimer`] as plain arithmetic (no `&self`, no wgpu) so it
@@ -505,11 +511,20 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View, overlay: bool) 
         visible_sum += visible as u64;
         triangles_sum += arena.visible_triangles();
         let _ = device.poll(wgpu::Maintain::Poll);
+        // One slot per frame, round-robin, not all `GPU_TIMER_DEPTH` of them:
+        // scanning every slot every frame was measured to slow down
+        // *subsequent* frames' CPU submit time even though the scan itself
+        // sits outside `submit_frame`'s timed window -- `take_ms`'s
+        // `get_mapped_range`/`unmap` contend with wgpu's internal device
+        // locking that `arena.prepare`/`create_command_encoder` also use, so
+        // a big scan leaks into the next frame's numbers. One check per frame
+        // still visits every slot once every `GPU_TIMER_DEPTH` frames, which
+        // is plenty -- this is sampling for a distribution, not a per-frame
+        // reading each frame needs by the next frame.
         if let Some(timer) = &gpu_timer {
-            for slot in 0..GPU_TIMER_DEPTH {
-                if let Some(ms) = timer.take_ms(slot) {
-                    gpu_ms.push(ms);
-                }
+            let check_slot = (frame_index as usize) % GPU_TIMER_DEPTH;
+            if let Some(ms) = timer.take_ms(check_slot) {
+                gpu_ms.push(ms);
             }
         }
         virtual_t += VIRTUAL_DT;
@@ -559,6 +574,11 @@ fn report(
     // GPU-backpressure `CPU/frame` alone can't tell apart from real CPU cost.
     // `None` when the device has no `TIMESTAMP_QUERY_INSIDE_ENCODERS`, or
     // (in principle) if every readback is still in flight at report time.
+    // How many of `frames` actually got a GPU reading -- the ring skips a
+    // frame's timing rather than stall when a readback is still in flight
+    // (see `GpuTimer::write_slot`), so a p99 built from far fewer samples
+    // than `frames` would otherwise look identical to one from all of them.
+    let gpu_sample_count = gpu_ms.len();
     let gpu_stats = (!gpu_ms.is_empty()).then(|| {
         gpu_ms.sort_by(|a, b| a.partial_cmp(b).expect("no NaN GPU frame times"));
         let n = gpu_ms.len();
@@ -567,7 +587,9 @@ fn report(
         (avg, p99)
     });
     let gpu_line = match gpu_stats {
-        Some((avg, p99)) => format!("avg {avg:.3} ms | p99 {p99:.3}"),
+        Some((avg, p99)) => {
+            format!("avg {avg:.3} ms | p99 {p99:.3} | samples {gpu_sample_count}/{frames}")
+        }
         None => "n/a".to_string(),
     };
 
@@ -591,7 +613,9 @@ fn report(
         "NOT MET"
     };
     let gpu_summary = match gpu_stats {
-        Some((avg, p99)) => format!("GPU/frame avg {avg:.3} ms (p99 {p99:.3})"),
+        Some((avg, p99)) => {
+            format!("GPU/frame avg {avg:.3} ms (p99 {p99:.3}, {gpu_sample_count} samples)")
+        }
         None => "GPU/frame n/a".to_string(),
     };
     log::info!(
@@ -737,20 +761,18 @@ mod tests {
             "the async map cannot have completed synchronously with begin_read"
         );
 
-        let mut ms = None;
-        for _ in 0..1000 {
-            let _ = device.poll(wgpu::Maintain::Poll);
-            if let Some(v) = timer.take_ms(slot) {
-                ms = Some(v);
-                break;
-            }
-        }
+        // `Maintain::Wait` (not `Poll`, which this test found out the hard
+        // way): on a software adapter (lavapipe on Linux CI, WARP on
+        // Windows CI) a bare `Poll` loop can spin past any fixed iteration
+        // count without the map ever completing, since nothing forces the
+        // backend to make progress. `Wait` blocks until it has -- the same
+        // pattern `headless.rs` and this file's own warmup drain use.
+        let _ = device.poll(wgpu::Maintain::Wait);
+        let ms = timer
+            .take_ms(slot)
+            .expect("Maintain::Wait must block until the map has completed");
         assert!(
-            ms.is_some(),
-            "polling the device must eventually see the map complete"
-        );
-        assert!(
-            ms.unwrap() >= 0.0,
+            ms >= 0.0,
             "a pass duration read back off the GPU cannot be negative"
         );
     }
