@@ -148,12 +148,14 @@ frames after 200 warmup.
 | 2026-09-07 | Prediction, untrusted clients, server-side mining, persistence, sharding [#207, #211, #212, #216, #217, #218], radius 64, band ±2⁴³ | 3,138 | 912,964 | ~1,109 | 0.623 ms | ~1.19 ms | `397a653` |
 | 2026-09-11 | Multiplayer played: --connect, player figures, per-machine shirts, mining retuned, radius 64, band ±2⁴⁵ | 3,138 | 912,964 | ~1,112 | 0.611 ms | ~1.08 ms | `b5dcfec` |
 | 2026-09-14 | **macOS caught up to `main`** — covered borders, 3D octree LOD, visibility culling, faces turned away left out, distant caves, mountains [#250–#259], radius 64 (orbit)⁵⁵ | **2,219** | 901,932 (480,547 drawn) | **~1,568** | **0.441 ms** | ~0.94 ms | `3b52c49` |
+| 2026-09-15 | Bench measures GPU/frame, draws, its own timed window (cross-session review, package 1), radius 64 (orbit)⁵⁷ | 2,219 | 901,932 (480,547 drawn) | ~1,585 | 0.468 ms | 0.777 ms | `a539938` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
 | Date | Milestone / feature | Chunks | Tris | FPS | CPU/frame avg | CPU/frame p99 | Commit |
 |---|---|---|---|---|---|---|---|
 | 2026-09-11 | **Linux (Vulkan) baseline — first measured** [#36], radius 64, band ±2⁵⁴ | 3,138 | 912,964 | ~1,474 | 0.214 ms | 0.883 ms | `2ab5fb6` |
+| 2026-09-15 | **Bench measures GPU/frame, draws, its own timed window** (cross-session review, package 1), radius 64⁵⁶ | 2,219 | 901,932 | ~1,970 | 0.272 ms | 0.957 ms | `401a9e5` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -1697,3 +1699,97 @@ against a 1,000-FPS criterion -- the margin in this row collapses from ~1.57x to
 ~1.04x, on the machine that decides the gate. A 7% triangle saving does not buy
 that. Screen-space occlusion is not the way to close the 1.25M-vs-326k gap; a
 cheaper search is.
+
+⁵⁷ **Bench measurement tooling, package 1 -- the M3 row.** Measured on
+`a539938` (final PR #266 head), idle machine, lid open, `--gpu-timing off`;
+three orbit runs within 1,577-1,585 FPS (this row uses the median). `+0.02 ms`
+over the `3b52c49` row above (0.441 -> 0.468 ms) is `set_camera` + the
+frustum build moving inside the timed window, exactly as intended -- not a
+regression, the bench counting CPU cost it was previously excluding.
+
+`GPU/frame` is `n/a` here, deliberately: on Metal, `RenderPassDescriptor`'s
+`timestamp_writes` resolves every sample invalid (`end` always exactly `0`,
+`begin` plausible and advancing -- the end-of-pass sample is never written or
+never resolved) and the sample-buffer-attachment machinery is not free even
+though it produces nothing usable (~20% fewer FPS, +~30% CPU/frame measured
+with it forced on). Filed as **#267**, linked to H11 (the wgpu 24 -> 30
+upgrade) since Apple counter-sampling support has been revised in later wgpu
+releases.
+
+**`--gpu-timing auto` (the default) confirmed working on `a539938`**: seven
+M3 views, all seven correctly reported "disabled after warmup" with FPS/CPU
+matching this row (e.g. orbit 1080p 1568-1589 FPS / 0.466-0.474 ms). Getting
+there took two more rounds after the first attempt: a single
+`Maintain::Wait` doesn't reliably fire every pending `map_async` callback on
+Metal within warmup's short window (fixed by polling further,
+`GpuTimer::drain_after_wait`), and a broken backend can still produce a
+handful of coincidentally non-zero "valid"-looking samples per 200-frame
+warmup (1-7 seen across the seven runs) that are not real readings -- so
+`--gpu-timing auto` only stays enabled when warmup was *entirely* clean
+(zero invalid samples), not merely "at least one valid" (see
+`should_disable_gpu_timing` in `bench.rs`).
+
+Other M3 views at the same commit, `--gpu-timing off`, GPU/frame n/a
+throughout:
+
+```
+view                     FPS    CPU/frame avg (p99)   draws (nodes)
+orbit 480x270           1789    0.415 ms (0.962)      3945
+orbit 3840x2160         1362    0.546 ms (0.993)      3945
+eye 8,40,8 1080p        3577    0.215 ms (0.712)      1325 (592/1940)
+eye 8,40,8 480x270      5455    0.137 ms (0.266)      1325
+eye 8,40,8 3840x2160    2069    0.363 ms (0.633)      1325
+```
+
+⁵⁶ **Bench measurement tooling, package 1 of the cross-session engine review.**
+Not directly comparable to the 2026-09-11 row above: that one used `--band`
+(the old fixed ±2 slab, 3,138 chunks); this one is the plain default, which is
+the same squash-streamed scene the M3 rows above measure (2,219 meshed nodes,
+1,782 drawn, 901,932 triangles meshed / 480,547 drawn) -- so it lines up with
+those, not with this table's own prior row.
+
+Linux (i7-8750H, GTX 1060 Max-Q, Vulkan 580.178.04) had no reference GPU/frame
+number to compare against before this package, since the bench did not measure
+one. Three back-to-back `--bench 64` runs on the final commit (`401a9e5`),
+nothing else running:
+
+```
+FPS               1961 / 1876 / 2073
+CPU/frame avg     0.268 / 0.289 / 0.260 ms
+CPU/frame p99     1.016 / 0.968 / 0.888 ms
+GPU pass avg      0.481 / 0.518 / 0.431 ms
+GPU samples       1,024 of 2,000 measured frames (~51%) each run
+draws             3,945 (of up to 3 x 1,782 = 5,346 possible)
+peak RSS          ~1.0-1.4 GiB (grows with window size; not yet a table column)
+```
+
+GPU/frame (0.43-0.52 ms) exceeds CPU/frame (~0.27 ms) at this resolution on this
+GPU -- the mobile 1060 is the bottleneck at 1080p here, unlike the M3 rows'
+"CPU/frame moves with resolution" story above (¹⁴/⁵⁵-adjacent): on this machine
+it is the *GPU* pass, not backpressure on submit, that grows with pixels (0.53
+ms at 1080p up to 0.98 ms at 4K in the same session, CPU/frame flat at
+0.26-0.34 ms throughout) -- which package 1 exists to be able to say for the
+first time.
+
+The 1,024/2,000 sample rate (not 2,000/2,000) is `GPU_TIMER_DEPTH`'s ring
+running out of free slots faster than the GPU retires work -- the CPU submits
+much faster than the GPU completes each frame's pass (the whole point of
+"sustained pipelined throughput"), so most frames find every ring slot still
+waiting on an earlier readback. Getting closer to full coverage is left for
+package 2; the average/p99 above are already stable at this sample count.
+
+Thermal check (`nvidia-smi`, per-run): 60 degC / 139 MHz idle before, 72 degC /
+1,594 of 1,670 MHz boost after three runs, `hw_thermal_slowdown` and
+`sw_thermal_slowdown` both `Not Active` throughout. Lid open, machine on a desk,
+not throttling -- the spread above is ordinary submit-bound noise and clock
+ramp (¹), not degradation.
+
+`check-tests-can-fail.sh` on this package's final diff: 23 mutable lines, 3
+survivors after six rounds of fixes -- see the PR for the full table,
+including two bugs the mutation check itself surfaced along the way (a CI
+failure on software GPU adapters, and a genuine test hang traced to an
+unbounded `Maintain::Wait`). The three left: `main.rs`'s `--overlay`
+flag-detection (consistent with every sibling flag's same untested shape),
+`GpuTimer::begin_read`'s map-error guard (would need a real GPU map failure
+to exercise), and one `gpu_line` message-wording branch reachable only via
+`--gpu-timing on` forced against a broken backend during actual measurement.

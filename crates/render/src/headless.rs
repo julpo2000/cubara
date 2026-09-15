@@ -336,6 +336,9 @@ fn render_arena(
                         .map(|(burn, progress)| crate::scene::FurnaceGauges { burn, progress }),
                 }),
             crosshair,
+            // No GPU timing: a golden test wants pixels, not a query set the
+            // adapter may not even support.
+            gpu_timestamps: None,
         },
     );
     encoder.copy_texture_to_buffer(

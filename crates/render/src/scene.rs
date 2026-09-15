@@ -74,6 +74,35 @@ pub struct SceneFrame<'a> {
     /// through the camera or at a screen: a crosshair over an inventory is a
     /// mark on nothing.
     pub crosshair: bool,
+    /// Where to write GPU timestamps immediately before and after the main
+    /// scene pass, or `None` to write none. `cubara-app`'s bench uses this
+    /// for GPU/frame timing; the window and headless paths pass `None` so
+    /// this changes nothing about what either draws.
+    pub gpu_timestamps: Option<GpuTimestamps<'a>>,
+}
+
+/// Where [`SceneRenderer::encode_scene`] writes the two timestamps bracketing
+/// the main scene pass (terrain + figures + outline -- not the overlay text
+/// pass, which is comparatively free and not what a caller measuring draw
+/// cost wants included).
+///
+/// The caller owns the query set, any resolve/readback buffers, and the
+/// bookkeeping that makes reading them back safe ([`crate::TimestampRing`]);
+/// this only says *where* to write. Written via the pass descriptor's own
+/// `timestamp_writes` field (not `CommandEncoder::write_timestamp` outside
+/// the pass, which this used at first: on Metal, wgpu-hal's encoder-level
+/// timestamps both sample at the same "stage boundary" and come back
+/// identical, always reading 0ms). That needs only the base
+/// `wgpu::Features::TIMESTAMP_QUERY` -- not `TIMESTAMP_QUERY_INSIDE_PASSES`,
+/// which gates the separate, imperative `RenderPass::write_timestamp` call
+/// (for writing more than one timestamp inside a single pass), a different
+/// wgpu-core code path this crate doesn't use.
+pub struct GpuTimestamps<'a> {
+    pub query_set: &'a wgpu::QuerySet,
+    /// Index written just before the main pass begins.
+    pub begin: u32,
+    /// Index written just after the main pass ends.
+    pub end: u32,
 }
 
 /// Everything drawn over the world in screen space, as the window hands it to
@@ -334,6 +363,7 @@ impl SceneRenderer {
             panel,
             health,
             crosshair,
+            gpu_timestamps,
         } = frame;
 
         // Build this frame's figures and upload them. Done before the pass so
@@ -379,6 +409,28 @@ impl SceneRenderer {
             );
         }
         {
+            // Pass-scoped, not the encoder-level `write_timestamp` pair this
+            // used before: on Metal, wgpu-hal's encoder-level timestamps both
+            // sample "at stage boundaries" through a shared blit encoder and
+            // come back identical, reading as a permanent 0ms GPU pass. The
+            // pass-scoped form is what wgpu-hal actually maps to each
+            // backend's real per-pass timing primitive (Metal's
+            // `sample_buffer_attachments`, Vulkan/DX12's pass timestamps),
+            // and it is also a more honest description of what's being
+            // measured -- the pass, not whatever the encoder happened to be
+            // doing around it. Needs only the base `TIMESTAMP_QUERY` --
+            // setting this descriptor field is a different wgpu-core path
+            // than the encoder-level form's `_INSIDE_ENCODERS` tier, or the
+            // imperative in-pass `RenderPass::write_timestamp`'s
+            // `_INSIDE_PASSES` tier (neither of which this uses).
+            let timestamp_writes =
+                gpu_timestamps
+                    .as_ref()
+                    .map(|ts| wgpu::RenderPassTimestampWrites {
+                        query_set: ts.query_set,
+                        beginning_of_pass_write_index: Some(ts.begin),
+                        end_of_pass_write_index: Some(ts.end),
+                    });
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -397,7 +449,7 @@ impl SceneRenderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes,
                 occlusion_query_set: None,
             });
 

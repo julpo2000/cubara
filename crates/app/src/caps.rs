@@ -27,7 +27,22 @@ pub fn run() {
         info.backend
     );
 
-    // The features that gate the GPU-driven rendering path.
+    // The features that gate the GPU-driven rendering path, plus the three
+    // timestamp-query tiers relevant to the bench's GPU/frame timing
+    // (`bench.rs`, `scene.rs`). The base `TIMESTAMP_QUERY` is all it needs:
+    // `resolve_query_set`, `Queue::get_timestamp_period`, and setting a
+    // render/compute pass descriptor's own `timestamp_writes` field (what
+    // `scene.rs` does) are all gated on that alone in wgpu-core, not on
+    // either narrower tier. `TIMESTAMP_QUERY_INSIDE_ENCODERS` gates
+    // `CommandEncoder::write_timestamp` outside a pass (this crate used that
+    // at first -- reads back a silent, permanent 0ms on Metal, since
+    // wgpu-hal's encoder-level writes there both sample the same "stage
+    // boundary"). `TIMESTAMP_QUERY_INSIDE_PASSES` gates the separate,
+    // imperative `RenderPass`/`ComputePass::write_timestamp` (writing more
+    // than one timestamp inside a single pass) -- also unused here. All
+    // three are still reported, since a caller choosing between writing
+    // styles needs to know what's possible on this adapter regardless of
+    // which this crate happens to use.
     let checks = [
         ("MULTI_DRAW_INDIRECT", wgpu::Features::MULTI_DRAW_INDIRECT),
         (
@@ -37,6 +52,15 @@ pub fn run() {
         (
             "INDIRECT_FIRST_INSTANCE",
             wgpu::Features::INDIRECT_FIRST_INSTANCE,
+        ),
+        ("TIMESTAMP_QUERY", wgpu::Features::TIMESTAMP_QUERY),
+        (
+            "TIMESTAMP_QUERY_INSIDE_ENCODERS",
+            wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
+        ),
+        (
+            "TIMESTAMP_QUERY_INSIDE_PASSES",
+            wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES,
         ),
     ];
     log::info!("GPU-driven rendering feature support:");

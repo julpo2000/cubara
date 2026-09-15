@@ -274,9 +274,32 @@ pub const OUTLINE_CUBE_EDGES: [[f32; 3]; 24] = [
 /// everywhere. `node_index` is a plain vertex attribute instead (§5.3), so
 /// this feature is unused now; see the design doc for the full story.
 pub fn gpu_driven_features(adapter: &wgpu::Adapter) -> (wgpu::Features, bool) {
-    let features = adapter.features() & wgpu::Features::MULTI_DRAW_INDIRECT;
-    let multi_draw = features.contains(wgpu::Features::MULTI_DRAW_INDIRECT);
-    (features, multi_draw)
+    let mdi = adapter.features() & wgpu::Features::MULTI_DRAW_INDIRECT;
+    let multi_draw = mdi.contains(wgpu::Features::MULTI_DRAW_INDIRECT);
+    // The GPU-timing feature `bench.rs` wants for GPU/frame -- requested here
+    // (window, bench, headless all call this) so the feature set is the same
+    // everywhere rather than bench alone having a device the others don't.
+    //
+    // Just the base `TIMESTAMP_QUERY`. Two narrower tiers exist --
+    // `TIMESTAMP_QUERY_INSIDE_ENCODERS` (`CommandEncoder::write_timestamp`
+    // outside a pass: this used it at first, and it reads back a silent,
+    // permanent 0ms on Metal, since wgpu-hal's encoder-level writes there
+    // both sample the same "stage boundary") and `TIMESTAMP_QUERY_INSIDE_PASSES`
+    // -- but both gate `RenderPass`/`ComputePass::write_timestamp`, the
+    // imperative *in-pass* call for writing more than one timestamp per pass
+    // (`wgpu-core`'s `command/render.rs`/`compute.rs`, function
+    // `write_timestamp`, `require_features(TIMESTAMP_QUERY_INSIDE_PASSES)`).
+    // What's actually used here -- `RenderPassDescriptor`/
+    // `ComputePassDescriptor`'s own `timestamp_writes` field, set once when
+    // the pass begins (`scene.rs`) -- is a different code path in wgpu-core
+    // with no extra `require_features` check beyond the base feature.
+    // Requesting `INSIDE_PASSES` anyway (an earlier version of this comment
+    // did, having misread which function the check belonged to) meant the
+    // bench read `n/a` on the M3, which supports base `TIMESTAMP_QUERY` and
+    // `INSIDE_ENCODERS` but not `INSIDE_PASSES` -- exactly the machine this
+    // number needs to work on.
+    let timestamps = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+    (mdi | timestamps, multi_draw)
 }
 
 /// All GPU + window state. Created once the event loop has `resumed`.
@@ -438,7 +461,13 @@ impl Renderer {
             visible_chunks: 0,
             frames: 0,
             last_report: Instant::now(),
-            show_debug: true,
+            // Off by default (F3 to show it, `toggle_debug`) -- the overlay
+            // is a debug HUD, not something every player should see on
+            // launch, and `--bench`'s new `--overlay` flag (default off, for
+            // the same reason) is what actually exercises this text draw
+            // path off the GPU-bound-vs-submit-bound question it was added
+            // for.
+            show_debug: false,
             frame_ms: 0.0,
         };
         (renderer, mesh_assets)
@@ -589,6 +618,11 @@ impl Renderer {
                     panel,
                     health,
                     crosshair,
+                    // The window doesn't report a GPU/frame reading (only
+                    // `--bench` does, `bench.rs`); the feature is requested
+                    // here too (`gpu_driven_features`) only so it's available
+                    // if that changes later.
+                    gpu_timestamps: None,
                 },
             );
         }

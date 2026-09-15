@@ -16,6 +16,7 @@ mod arena;
 pub mod crack;
 pub mod culling;
 pub mod figure;
+mod gpu_timer;
 pub mod headless;
 pub mod materials;
 pub mod panel;
@@ -27,6 +28,7 @@ mod text;
 pub use arena::{ArenaUsage, ChunkArena, MeshedNode, NodeId};
 pub use culling::{Aabb, Frustum};
 pub use figure::{figure_vertices, FigureVertex, PlayerView};
+pub use gpu_timer::TimestampRing;
 pub use headless::{Frame, PanelLayout, Shot};
 pub use materials::{load_icon, swatch_color, MeshAssets};
 pub use panel::{InventoryPanel, PanelSlot, PanelSlotKind};
@@ -36,5 +38,7 @@ pub use render::{
     load_mesh_assets, load_registry, CameraPose, CameraUniform, Renderer,
 };
 pub use scene::HealthView;
-pub use scene::{FurnaceGauges, HotbarSlot, HotbarView, Hud, PanelView, SceneFrame, SceneRenderer};
+pub use scene::{
+    FurnaceGauges, GpuTimestamps, HotbarSlot, HotbarView, Hud, PanelView, SceneFrame, SceneRenderer,
+};
 pub use text::TextRenderer;
