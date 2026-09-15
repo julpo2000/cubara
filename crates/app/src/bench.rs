@@ -212,6 +212,37 @@ impl GpuTimer {
         buf.unmap();
         Some(sample)
     }
+
+    /// Call once, right after a `device.poll(Maintain::Wait)` -- polls the
+    /// device further, up to a 2-second deadline, until every outstanding
+    /// slot's `map_async` callback has actually fired
+    /// ([`TimestampRing::any_mapping`]), then reads back every slot that has
+    /// ever been written. Returns `(valid, invalid)` counts.
+    ///
+    /// A single `Wait` is not enough on every backend: observed on Metal,
+    /// where a scan taken immediately after `Wait` can see zero classified
+    /// slots even though the underlying GPU work is long finished --
+    /// `Wait` guarantees the *device* has caught up, not that every
+    /// `map_async` callback already ran. Warmup's short window (a few
+    /// hundred frames) makes this matter in practice in a way the much
+    /// longer measured run's own post-loop `Wait` mostly doesn't.
+    fn drain_after_wait(&self, device: &wgpu::Device) -> (u64, u64) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while self.ring.lock().unwrap().any_mapping() && Instant::now() < deadline {
+            let _ = device.poll(wgpu::Maintain::Poll);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let mut valid = 0u64;
+        let mut invalid = 0u64;
+        for slot in 0..GPU_TIMER_DEPTH {
+            match self.take_ms(slot) {
+                Some(GpuSample::Ms(_)) => valid += 1,
+                Some(GpuSample::Invalid) => invalid += 1,
+                None => {}
+            }
+        }
+        (valid, invalid)
+    }
 }
 
 /// Run the benchmark over a streamed square region of the given chunk `radius`
@@ -264,6 +295,36 @@ pub fn parse_gpu_timing_mode(text: &str) -> Option<GpuTimingMode> {
         "on" => Some(GpuTimingMode::On),
         _ => None,
     }
+}
+
+/// Whether the warmup's samples say GPU timing should be dropped before the
+/// measured frames -- only in `Auto` mode (`On`/`Off` both ignore warmup
+/// entirely: `Off` never has a timer to disable, `On` is the explicit "keep
+/// it regardless" override for diagnosis), and whenever warmup did not
+/// produce at least one genuinely valid sample -- "prove it works before
+/// paying for it", not "prove it's broken before dropping it". `warmup_valid
+/// == 0 && warmup_invalid == 0` (nothing classified at all, which happens in
+/// practice -- see `GpuTimer::drain_after_wait`'s doc comment) is treated
+/// the same as every sample invalid: no evidence it works is not the same as
+/// evidence it doesn't, but auto's whole point is to only pay the
+/// measurement's cost once it has actually been shown to produce something.
+/// Pulled out of `run` as plain arithmetic -- no device, no `GpuTimer` -- so
+/// it is unit-tested directly rather than only reachable through a full,
+/// ~20s world-meshing run.
+fn should_disable_gpu_timing(mode: GpuTimingMode, warmup_valid: u64) -> bool {
+    mode == GpuTimingMode::Auto && warmup_valid == 0
+}
+
+/// Whether the measured run's GPU samples are worth averaging at all: at
+/// least one valid sample, and not outnumbered by invalid ones. A backend
+/// that resolves most passes as garbage can still produce a few
+/// coincidentally non-zero, non-monotonic-looking readings (observed on
+/// Metal -- 2 "valid" samples out of 1024 that were themselves garbage, not
+/// real pass durations); averaging those in would print a confident-looking
+/// number built almost entirely from noise. Pulled out as plain arithmetic
+/// for the same reason as `should_disable_gpu_timing`.
+fn gpu_stats_are_trustworthy(valid: usize, invalid: u64) -> bool {
+    valid > 0 && valid as u64 >= invalid
 }
 
 pub fn run(
@@ -565,30 +626,30 @@ pub fn run(
     // measurement frames count -- but the drain still classifies them,
     // because that classification decides whether GPU timing runs at all
     // for the frames that *are* counted: `--gpu-timing auto` (the default)
-    // turns it off here if every warmup sample was invalid, rather than pay
-    // its cost through the whole measured run for a number that was never
-    // going to be usable (found on Metal: every sample invalid, and the
-    // pass-scoped machinery itself cost ~20% FPS and +30% CPU/frame there).
+    // turns it off here unless warmup produced at least one genuinely valid
+    // sample, rather than pay its cost through the whole measured run for a
+    // number that has not been shown to work (found on Metal: every sample
+    // invalid, and the pass-scoped machinery itself cost ~20% FPS and +30%
+    // CPU/frame there). `drain_after_wait` polls further than the `Wait`
+    // above by itself, because a single `Wait` was observed to not reliably
+    // fire every pending callback on Metal within warmup's short window.
     let mut gpu_timing_disabled_reason: Option<String> = None;
     if let Some(timer) = &gpu_timer {
-        let mut warmup_valid = 0u64;
-        let mut warmup_invalid = 0u64;
-        for slot in 0..GPU_TIMER_DEPTH {
-            match timer.take_ms(slot) {
-                Some(GpuSample::Ms(_)) => warmup_valid += 1,
-                Some(GpuSample::Invalid) => warmup_invalid += 1,
-                None => {}
-            }
-        }
-        if gpu_timing_mode == GpuTimingMode::Auto && warmup_valid == 0 && warmup_invalid > 0 {
-            let reason = format!(
-                "disabled after warmup: {warmup_invalid} of {warmup_invalid} warmup samples \
-                 invalid"
-            );
+        let (warmup_valid, warmup_invalid) = timer.drain_after_wait(&device);
+        if should_disable_gpu_timing(gpu_timing_mode, warmup_valid) {
+            let reason = if warmup_invalid > 0 {
+                format!("disabled after warmup: {warmup_invalid} of {warmup_invalid} warmup samples invalid")
+            } else {
+                // Not evidence it's *broken*, but no evidence it works
+                // either -- auto's rule is "prove it works before paying
+                // for it", so an unclassified warmup is treated the same
+                // as an invalid one, not the same as a working one.
+                "disabled after warmup: no warmup samples classified".to_string()
+            };
             log::info!(
-                "GPU/frame: {reason} -- this backend's pass-scoped timing looks unusable here \
-                 (RUST_LOG=debug shows the raw begin/end values). Use --gpu-timing on to force \
-                 it anyway."
+                "GPU/frame: {reason} -- this backend's pass-scoped timing has not been shown to \
+                 work here (RUST_LOG=debug shows any raw begin/end values that were seen). Use \
+                 --gpu-timing on to force it anyway."
             );
             gpu_timing_disabled_reason = Some(reason);
             gpu_timer = None;
@@ -708,7 +769,7 @@ fn report(
     // is counted separately and never folded into the average -- see
     // `GpuTimer::take_ms`.
     let gpu_sample_count = gpu_ms.len();
-    let gpu_stats = (!gpu_ms.is_empty()).then(|| {
+    let gpu_stats = gpu_stats_are_trustworthy(gpu_sample_count, gpu_invalid).then(|| {
         gpu_ms.sort_by(|a, b| a.partial_cmp(b).expect("no NaN GPU frame times"));
         let n = gpu_ms.len();
         let avg = gpu_ms.iter().sum::<f64>() / n as f64;
@@ -720,7 +781,12 @@ fn report(
             "avg {avg:.3} ms | p99 {p99:.3} | samples {gpu_sample_count}/{frames} | invalid {gpu_invalid}"
         ),
         (None, Some(reason)) => format!("n/a ({reason})"),
-        (None, None) if gpu_invalid > 0 => format!("n/a ({gpu_invalid} invalid samples, 0 valid)"),
+        (None, None) if gpu_invalid > 0 && gpu_sample_count == 0 => {
+            format!("n/a ({gpu_invalid} invalid samples, 0 valid)")
+        }
+        (None, None) if gpu_invalid > 0 => format!(
+            "n/a ({gpu_sample_count} valid, {gpu_invalid} invalid -- too many invalid to trust an average)"
+        ),
         (None, None) => "n/a".to_string(),
     };
 
@@ -951,6 +1017,42 @@ mod tests {
             // what this test is pinning.
             GpuSample::Invalid => {}
         }
+    }
+
+    #[test]
+    fn gpu_timing_is_disabled_in_auto_mode_unless_warmup_proved_at_least_one_valid_sample() {
+        // The case this exists for: auto, warmup produced nothing but bad
+        // readings.
+        assert!(should_disable_gpu_timing(GpuTimingMode::Auto, 0));
+        // At least one good reading: keep going, even in auto.
+        assert!(!should_disable_gpu_timing(GpuTimingMode::Auto, 1));
+        // No data at all (found in practice on Metal -- a scan taken right
+        // after `Maintain::Wait` can see nothing classified yet, see
+        // `GpuTimer::drain_after_wait`) is treated the same as "every
+        // sample invalid": auto's rule is proof it works, not absence of
+        // proof it's broken.
+        assert!(should_disable_gpu_timing(GpuTimingMode::Auto, 0));
+        // `On` forces it regardless of how bad warmup looked -- that is the
+        // point of the override.
+        assert!(!should_disable_gpu_timing(GpuTimingMode::On, 0));
+        // `Off` never has a timer to disable in the first place; the
+        // function is still total, and should still say no.
+        assert!(!should_disable_gpu_timing(GpuTimingMode::Off, 0));
+    }
+
+    #[test]
+    fn gpu_stats_need_at_least_as_many_valid_samples_as_invalid_ones() {
+        // The case this exists for: almost everything invalid, a couple of
+        // coincidental "valid" readings that are really garbage too.
+        assert!(!gpu_stats_are_trustworthy(2, 1022));
+        // Exactly balanced: valid is not outnumbered, so it counts.
+        assert!(gpu_stats_are_trustworthy(5, 5));
+        // Comfortably more valid than invalid.
+        assert!(gpu_stats_are_trustworthy(1024, 0));
+        // No valid samples at all is never trustworthy, however few invalid
+        // ones there were (including zero of either).
+        assert!(!gpu_stats_are_trustworthy(0, 0));
+        assert!(!gpu_stats_are_trustworthy(0, 3));
     }
 
     #[test]

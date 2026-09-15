@@ -148,6 +148,7 @@ frames after 200 warmup.
 | 2026-09-07 | Prediction, untrusted clients, server-side mining, persistence, sharding [#207, #211, #212, #216, #217, #218], radius 64, band ±2⁴³ | 3,138 | 912,964 | ~1,109 | 0.623 ms | ~1.19 ms | `397a653` |
 | 2026-09-11 | Multiplayer played: --connect, player figures, per-machine shirts, mining retuned, radius 64, band ±2⁴⁵ | 3,138 | 912,964 | ~1,112 | 0.611 ms | ~1.08 ms | `b5dcfec` |
 | 2026-09-14 | **macOS caught up to `main`** — covered borders, 3D octree LOD, visibility culling, faces turned away left out, distant caves, mountains [#250–#259], radius 64 (orbit)⁵⁵ | **2,219** | 901,932 (480,547 drawn) | **~1,568** | **0.441 ms** | ~0.94 ms | `3b52c49` |
+| 2026-09-15 | Bench measures GPU/frame, draws, its own timed window (cross-session review, package 1), radius 64 (orbit)⁵⁷ | 2,219 | 901,932 (480,547 drawn) | ~1,585 | 0.468 ms | 0.777 ms | `3ab5723` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -1698,6 +1699,38 @@ against a 1,000-FPS criterion -- the margin in this row collapses from ~1.57x to
 ~1.04x, on the machine that decides the gate. A 7% triangle saving does not buy
 that. Screen-space occlusion is not the way to close the 1.25M-vs-326k gap; a
 cheaper search is.
+
+⁵⁷ **Bench measurement tooling, package 1 -- the M3 row, `--gpu-timing off`.**
+Measured on `3ab5723`, idle machine, lid open, three orbit runs within
+1,577-1,585 FPS (this row uses the median). `+0.02 ms` over the `3b52c49` row
+above (0.441 -> 0.468 ms) is `set_camera` + the frustum build moving inside
+the timed window, exactly as intended -- not a regression, the bench counting
+CPU cost it was previously excluding.
+
+`GPU/frame` is `n/a` here, deliberately: on Metal, `RenderPassDescriptor`'s
+`timestamp_writes` resolves every sample invalid (`end` always exactly `0`,
+`begin` plausible and advancing -- the end-of-pass sample is never written or
+never resolved) and the sample-buffer-attachment machinery is not free even
+though it produces nothing usable (~20% fewer FPS, +~30% CPU/frame measured
+with it forced on). Filed as **#267**, linked to H11 (the wgpu 24 -> 30
+upgrade) since Apple counter-sampling support has been revised in later wgpu
+releases. `--gpu-timing auto` (the default) is meant to detect this and drop
+GPU timing before the measured frames automatically -- this row used
+`--gpu-timing off` explicitly because, on the commit measured, auto's
+detection was not yet reliable on Metal (see PR #266 for the fix that
+followed and the M3 run that confirmed it).
+
+Other M3 views at the same commit, `--gpu-timing off`, GPU/frame n/a
+throughout:
+
+```
+view                     FPS    CPU/frame avg (p99)   draws (nodes)
+orbit 480x270           1789    0.415 ms (0.962)      3945
+orbit 3840x2160         1362    0.546 ms (0.993)      3945
+eye 8,40,8 1080p        3577    0.215 ms (0.712)      1325 (592/1940)
+eye 8,40,8 480x270      5455    0.137 ms (0.266)      1325
+eye 8,40,8 3840x2160    2069    0.363 ms (0.633)      1325
+```
 
 ⁵⁶ **Bench measurement tooling, package 1 of the cross-session engine review.**
 Not directly comparable to the 2026-09-11 row above: that one used `--band`

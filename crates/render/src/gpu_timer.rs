@@ -76,6 +76,18 @@ impl TimestampRing {
             false
         }
     }
+
+    /// Whether any slot still has a `map_async` outstanding. A caller that
+    /// wants every already-submitted slot's result before moving on (rather
+    /// than sampling whatever happens to be ready right now) polls the
+    /// device in a loop until this is `false` -- found necessary in
+    /// practice: a single `Maintain::Wait` does not reliably fire every
+    /// pending `map_async` callback on every backend (observed on Metal),
+    /// so a caller that scans once immediately after `Wait` can see zero
+    /// classified slots even though the GPU work is long done.
+    pub fn any_mapping(&self) -> bool {
+        self.slots.contains(&Slot::Mapping)
+    }
 }
 
 #[cfg(test)]
@@ -104,6 +116,25 @@ mod tests {
         // Taken once; the slot goes back to idle rather than being readable twice.
         assert!(!ring.take_ready(0));
         assert!(ring.can_write(0));
+    }
+
+    #[test]
+    fn any_mapping_is_true_only_while_a_callback_is_outstanding() {
+        let mut ring = TimestampRing::new(3);
+        assert!(!ring.any_mapping(), "a fresh ring has nothing outstanding");
+        ring.begin_mapping(0);
+        assert!(ring.any_mapping());
+        ring.mark_ready(0);
+        // The callback fired; nothing is outstanding any more, even though
+        // slot 0 hasn't been taken yet.
+        assert!(!ring.any_mapping());
+        ring.begin_mapping(1);
+        ring.begin_mapping(2);
+        ring.mark_ready(1);
+        // Slot 2's callback still hasn't fired.
+        assert!(ring.any_mapping());
+        ring.mark_ready(2);
+        assert!(!ring.any_mapping());
     }
 
     #[test]
