@@ -88,12 +88,15 @@ pub struct SceneFrame<'a> {
 ///
 /// The caller owns the query set, any resolve/readback buffers, and the
 /// bookkeeping that makes reading them back safe ([`crate::TimestampRing`]);
-/// this only says *where* to write. Written via the pass's own
-/// `timestamp_writes` (not `CommandEncoder::write_timestamp` outside the
-/// pass, which this used at first: on Metal, wgpu-hal's encoder-level
+/// this only says *where* to write. Written via the pass descriptor's own
+/// `timestamp_writes` field (not `CommandEncoder::write_timestamp` outside
+/// the pass, which this used at first: on Metal, wgpu-hal's encoder-level
 /// timestamps both sample at the same "stage boundary" and come back
-/// identical, always reading 0ms). That needs
-/// `wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES` on the device.
+/// identical, always reading 0ms). That needs only the base
+/// `wgpu::Features::TIMESTAMP_QUERY` -- not `TIMESTAMP_QUERY_INSIDE_PASSES`,
+/// which gates the separate, imperative `RenderPass::write_timestamp` call
+/// (for writing more than one timestamp inside a single pass), a different
+/// wgpu-core code path this crate doesn't use.
 pub struct GpuTimestamps<'a> {
     pub query_set: &'a wgpu::QuerySet,
     /// Index written just before the main pass begins.
@@ -415,8 +418,11 @@ impl SceneRenderer {
             // `sample_buffer_attachments`, Vulkan/DX12's pass timestamps),
             // and it is also a more honest description of what's being
             // measured -- the pass, not whatever the encoder happened to be
-            // doing around it. Needs `TIMESTAMP_QUERY_INSIDE_PASSES`, not
-            // the `_INSIDE_ENCODERS` tier the encoder-level form needed.
+            // doing around it. Needs only the base `TIMESTAMP_QUERY` --
+            // setting this descriptor field is a different wgpu-core path
+            // than the encoder-level form's `_INSIDE_ENCODERS` tier, or the
+            // imperative in-pass `RenderPass::write_timestamp`'s
+            // `_INSIDE_PASSES` tier (neither of which this uses).
             let timestamp_writes =
                 gpu_timestamps
                     .as_ref()

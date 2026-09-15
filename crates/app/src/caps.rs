@@ -28,16 +28,21 @@ pub fn run() {
     );
 
     // The features that gate the GPU-driven rendering path, plus the three
-    // timestamp-query tiers the bench's GPU/frame timing depends on
-    // (`bench.rs`, `scene.rs`): the base feature only gets you
-    // `resolve_query_set` and `Queue::get_timestamp_period`; writing a
-    // timestamp from a command encoder outside a render pass needs
-    // `TIMESTAMP_QUERY_INSIDE_ENCODERS`; writing one via a pass's own
-    // `timestamp_writes` -- what the bench actually uses, since the
-    // encoder-level form reads back a silent, permanent 0ms on Metal --
-    // needs `TIMESTAMP_QUERY_INSIDE_PASSES` instead. All three are reported
-    // regardless of which the bench needs, since a caller deciding between
-    // the two writing styles needs to know what's even possible here.
+    // timestamp-query tiers relevant to the bench's GPU/frame timing
+    // (`bench.rs`, `scene.rs`). The base `TIMESTAMP_QUERY` is all it needs:
+    // `resolve_query_set`, `Queue::get_timestamp_period`, and setting a
+    // render/compute pass descriptor's own `timestamp_writes` field (what
+    // `scene.rs` does) are all gated on that alone in wgpu-core, not on
+    // either narrower tier. `TIMESTAMP_QUERY_INSIDE_ENCODERS` gates
+    // `CommandEncoder::write_timestamp` outside a pass (this crate used that
+    // at first -- reads back a silent, permanent 0ms on Metal, since
+    // wgpu-hal's encoder-level writes there both sample the same "stage
+    // boundary"). `TIMESTAMP_QUERY_INSIDE_PASSES` gates the separate,
+    // imperative `RenderPass`/`ComputePass::write_timestamp` (writing more
+    // than one timestamp inside a single pass) -- also unused here. All
+    // three are still reported, since a caller choosing between writing
+    // styles needs to know what's possible on this adapter regardless of
+    // which this crate happens to use.
     let checks = [
         ("MULTI_DRAW_INDIRECT", wgpu::Features::MULTI_DRAW_INDIRECT),
         (

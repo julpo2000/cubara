@@ -231,7 +231,7 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View, overlay: bool) 
 
     let (features, multi_draw) = gpu_driven_features(&adapter);
     log::info!("multi_draw_indirect: {multi_draw}");
-    let gpu_timing_supported = features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES);
+    let gpu_timing_supported = features.contains(wgpu::Features::TIMESTAMP_QUERY);
 
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
@@ -246,7 +246,7 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View, overlay: bool) 
 
     let gpu_timer = gpu_timing_supported.then(|| GpuTimer::new(&device, &queue));
     if !gpu_timing_supported {
-        log::info!("GPU/frame: n/a (no TIMESTAMP_QUERY_INSIDE_PASSES)");
+        log::info!("GPU/frame: n/a (no TIMESTAMP_QUERY)");
     }
 
     // Held for the duration of the benchmark when built with `--features profile`.
@@ -608,7 +608,7 @@ fn report(
     // separate from `CPU submit / frame` above -- at high resolutions the
     // two move together (submit stalls on a full GPU), which is exactly the
     // GPU-backpressure `CPU/frame` alone can't tell apart from real CPU cost.
-    // `None` when the device has no `TIMESTAMP_QUERY_INSIDE_PASSES`, or
+    // `None` when the device has no `TIMESTAMP_QUERY`, or
     // (in principle) if every readback is still in flight at report time.
     // How many of `frames` actually got a GPU reading -- the ring skips a
     // frame's timing rather than stall when a readback is still in flight
@@ -736,7 +736,7 @@ mod tests {
     }
 
     /// A real device (or `None` on a CI runner with no GPU adapter, or one
-    /// whose driver lacks `TIMESTAMP_QUERY_INSIDE_PASSES`) -- the same
+    /// whose driver lacks `TIMESTAMP_QUERY`) -- the same
     /// skip-loudly convention `mesh_arena_integration.rs` uses.
     fn test_gpu_timer_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -749,7 +749,7 @@ mod tests {
             force_fallback_adapter: false,
         }))?;
         let (features, _) = gpu_driven_features(&adapter);
-        if !features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES) {
+        if !features.contains(wgpu::Features::TIMESTAMP_QUERY) {
             return None;
         }
         pollster::block_on(adapter.request_device(
@@ -774,7 +774,7 @@ mod tests {
         let Some((device, queue)) = test_gpu_timer_device() else {
             eprintln!(
                 "SKIP take_ms_only_returns_a_value_once_the_slot_has_actually_finished_mapping: \
-                 no GPU adapter, or no TIMESTAMP_QUERY_INSIDE_PASSES"
+                 no GPU adapter, or no TIMESTAMP_QUERY"
             );
             return;
         };
@@ -797,7 +797,7 @@ mod tests {
         // pinned separately, through the real single render path, by
         // `cubara-render`'s `gpu_timestamps.rs` integration test -- not
         // duplicated here. A compute pass's `timestamp_writes` needs the
-        // same `TIMESTAMP_QUERY_INSIDE_PASSES` feature this crate already
+        // same `TIMESTAMP_QUERY` feature this crate already
         // requests, so it exercises the identical write mechanism without
         // needing a render target or a texture array to bind.
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {

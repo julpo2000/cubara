@@ -20,7 +20,7 @@ use cubara_render::{
 
 /// A device with the timestamp-query features this test needs, or `None` on
 /// a CI runner with no GPU adapter, or one whose driver lacks
-/// `TIMESTAMP_QUERY_INSIDE_PASSES` -- the same skip-loudly convention
+/// `TIMESTAMP_QUERY` -- the same skip-loudly convention
 /// `mesh_arena_integration.rs`'s `test_device()` uses.
 fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -33,7 +33,7 @@ fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         force_fallback_adapter: false,
     }))?;
     let (features, _) = gpu_driven_features(&adapter);
-    if !features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES) {
+    if !features.contains(wgpu::Features::TIMESTAMP_QUERY) {
         return None;
     }
     pollster::block_on(adapter.request_device(
@@ -53,7 +53,7 @@ fn gpu_timestamps_through_encode_scene_produce_a_real_reading() {
     let Some((device, queue)) = test_device() else {
         eprintln!(
             "SKIP gpu_timestamps_through_encode_scene_produce_a_real_reading: \
-             no GPU adapter, or no TIMESTAMP_QUERY_INSIDE_PASSES"
+             no GPU adapter, or no TIMESTAMP_QUERY"
         );
         return;
     };

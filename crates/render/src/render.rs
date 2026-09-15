@@ -280,23 +280,25 @@ pub fn gpu_driven_features(adapter: &wgpu::Adapter) -> (wgpu::Features, bool) {
     // (window, bench, headless all call this) so the feature set is the same
     // everywhere rather than bench alone having a device the others don't.
     //
-    // Pass-scoped (`TIMESTAMP_QUERY_INSIDE_PASSES`), not the encoder-level
-    // `TIMESTAMP_QUERY_INSIDE_ENCODERS` tier this used at first: on Metal,
-    // `CommandEncoder::write_timestamp` outside a render pass samples at a
-    // shared "stage boundary" and both the begin and end writes read back
-    // identical, so every GPU/frame reading was a silent, permanent 0ms
-    // there. `RenderPassDescriptor::timestamp_writes` (`scene.rs`) is what
-    // wgpu-hal actually maps to each backend's real per-pass timer -- and
-    // needs this narrower feature tier instead.
-    //
-    // Both `TIMESTAMP_QUERY` and `TIMESTAMP_QUERY_INSIDE_PASSES` are
-    // requested explicitly, not just the latter: wgpu tracks them as
-    // separate bits, and only bits actually named in `required_features` end
-    // up enabled on the device, even though `INSIDE_PASSES`'s doc says it
-    // "implies" the base feature is supported (that's an adapter-support
-    // guarantee, not an auto-enable of the bit).
-    let timestamps = adapter.features()
-        & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES);
+    // Just the base `TIMESTAMP_QUERY`. Two narrower tiers exist --
+    // `TIMESTAMP_QUERY_INSIDE_ENCODERS` (`CommandEncoder::write_timestamp`
+    // outside a pass: this used it at first, and it reads back a silent,
+    // permanent 0ms on Metal, since wgpu-hal's encoder-level writes there
+    // both sample the same "stage boundary") and `TIMESTAMP_QUERY_INSIDE_PASSES`
+    // -- but both gate `RenderPass`/`ComputePass::write_timestamp`, the
+    // imperative *in-pass* call for writing more than one timestamp per pass
+    // (`wgpu-core`'s `command/render.rs`/`compute.rs`, function
+    // `write_timestamp`, `require_features(TIMESTAMP_QUERY_INSIDE_PASSES)`).
+    // What's actually used here -- `RenderPassDescriptor`/
+    // `ComputePassDescriptor`'s own `timestamp_writes` field, set once when
+    // the pass begins (`scene.rs`) -- is a different code path in wgpu-core
+    // with no extra `require_features` check beyond the base feature.
+    // Requesting `INSIDE_PASSES` anyway (an earlier version of this comment
+    // did, having misread which function the check belonged to) meant the
+    // bench read `n/a` on the M3, which supports base `TIMESTAMP_QUERY` and
+    // `INSIDE_ENCODERS` but not `INSIDE_PASSES` -- exactly the machine this
+    // number needs to work on.
+    let timestamps = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
     (mdi | timestamps, multi_draw)
 }
 
