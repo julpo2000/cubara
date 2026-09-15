@@ -279,20 +279,24 @@ pub fn gpu_driven_features(adapter: &wgpu::Adapter) -> (wgpu::Features, bool) {
     // The GPU-timing feature `bench.rs` wants for GPU/frame -- requested here
     // (window, bench, headless all call this) so the feature set is the same
     // everywhere rather than bench alone having a device the others don't.
-    // `TIMESTAMP_QUERY_INSIDE_ENCODERS` implies the base `TIMESTAMP_QUERY`
-    // and covers writing a timestamp from a command encoder outside a render
-    // pass, which is all the bench needs -- the narrower
-    // `TIMESTAMP_QUERY_INSIDE_PASSES` tier is deliberately not requested.
-    // `INSIDE_ENCODERS`'s doc says it "implies" the base feature is
-    // supported, but wgpu tracks the two as separate bits, and only bits
-    // actually named in `required_features` end up enabled on the device
-    // (`create_query_set` with `QueryType::Timestamp` checks for the base
-    // `TIMESTAMP_QUERY` bit specifically -- requesting only `INSIDE_ENCODERS`
-    // is a validation error). Both are requested; the adapter reports the
-    // base bit set whenever it reports the encoder one, so this is exactly
-    // what `INSIDE_ENCODERS`'s presence already promised.
+    //
+    // Pass-scoped (`TIMESTAMP_QUERY_INSIDE_PASSES`), not the encoder-level
+    // `TIMESTAMP_QUERY_INSIDE_ENCODERS` tier this used at first: on Metal,
+    // `CommandEncoder::write_timestamp` outside a render pass samples at a
+    // shared "stage boundary" and both the begin and end writes read back
+    // identical, so every GPU/frame reading was a silent, permanent 0ms
+    // there. `RenderPassDescriptor::timestamp_writes` (`scene.rs`) is what
+    // wgpu-hal actually maps to each backend's real per-pass timer -- and
+    // needs this narrower feature tier instead.
+    //
+    // Both `TIMESTAMP_QUERY` and `TIMESTAMP_QUERY_INSIDE_PASSES` are
+    // requested explicitly, not just the latter: wgpu tracks them as
+    // separate bits, and only bits actually named in `required_features` end
+    // up enabled on the device, even though `INSIDE_PASSES`'s doc says it
+    // "implies" the base feature is supported (that's an adapter-support
+    // guarantee, not an auto-enable of the bit).
     let timestamps = adapter.features()
-        & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
+        & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES);
     (mdi | timestamps, multi_draw)
 }
 

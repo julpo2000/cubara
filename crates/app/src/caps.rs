@@ -29,15 +29,15 @@ pub fn run() {
 
     // The features that gate the GPU-driven rendering path, plus the three
     // timestamp-query tiers the bench's GPU/frame timing depends on
-    // (`bench.rs`): the base feature only gets you `resolve_query_set` and
-    // `Queue::get_timestamp_period`; writing a timestamp from a command
-    // encoder (outside a render pass, which is what the bench uses so it
-    // does not also need the pass-scoped tier) needs
-    // `TIMESTAMP_QUERY_INSIDE_ENCODERS`; writing one *inside* a pass needs
-    // `TIMESTAMP_QUERY_INSIDE_PASSES` on top. The bench only needs the first
-    // two, but this reports all three since a caller deciding whether
-    // in-pass timing is worth pursuing needs to know if it is even possible
-    // here.
+    // (`bench.rs`, `scene.rs`): the base feature only gets you
+    // `resolve_query_set` and `Queue::get_timestamp_period`; writing a
+    // timestamp from a command encoder outside a render pass needs
+    // `TIMESTAMP_QUERY_INSIDE_ENCODERS`; writing one via a pass's own
+    // `timestamp_writes` -- what the bench actually uses, since the
+    // encoder-level form reads back a silent, permanent 0ms on Metal --
+    // needs `TIMESTAMP_QUERY_INSIDE_PASSES` instead. All three are reported
+    // regardless of which the bench needs, since a caller deciding between
+    // the two writing styles needs to know what's even possible here.
     let checks = [
         ("MULTI_DRAW_INDIRECT", wgpu::Features::MULTI_DRAW_INDIRECT),
         (

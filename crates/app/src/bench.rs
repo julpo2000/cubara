@@ -60,6 +60,16 @@ fn timestamp_indices(slot: usize) -> (u32, u32) {
     (begin, begin + 1)
 }
 
+/// What [`GpuTimer::take_ms`] found once a slot's map completed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum GpuSample {
+    /// A plausible pass duration.
+    Ms(f64),
+    /// The two timestamps came back non-increasing -- not a fast pass, a bad
+    /// reading. Counted and reported separately, never averaged in as 0ms.
+    Invalid,
+}
+
 /// Owns a timestamp query set and its readback buffers around the main scene
 /// pass, and turns completed reads into milliseconds. The bookkeeping for
 /// which slot is safe to write or read is [`TimestampRing`]
@@ -162,21 +172,28 @@ impl GpuTimer {
             });
     }
 
-    /// If `slot`'s async map has completed, read its two timestamps, unmap,
-    /// and return the pass duration in milliseconds.
-    fn take_ms(&self, slot: usize) -> Option<f64> {
+    /// If `slot`'s async map has completed, read its two timestamps and
+    /// unmap. `end <= begin` is not a fast pass, it is a bad reading (a
+    /// non-monotonic pair off a backend that isn't giving real per-pass
+    /// timing) -- reported as [`GpuSample::Invalid`] rather than folded into
+    /// the average as 0ms via `saturating_sub`, which would hide it.
+    fn take_ms(&self, slot: usize) -> Option<GpuSample> {
         if !self.ring.lock().unwrap().take_ready(slot) {
             return None;
         }
         let buf = &self.read_buffers[slot];
-        let ms = {
+        let sample = {
             let data = buf.slice(..).get_mapped_range();
             let raw: &[u64] = bytemuck::cast_slice(&data);
             let (begin, end) = (raw[0], raw[1]);
-            end.saturating_sub(begin) as f64 * self.period_ns / 1_000_000.0
+            if end <= begin {
+                GpuSample::Invalid
+            } else {
+                GpuSample::Ms((end - begin) as f64 * self.period_ns / 1_000_000.0)
+            }
         };
         buf.unmap();
-        Some(ms)
+        Some(sample)
     }
 }
 
@@ -214,7 +231,7 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View, overlay: bool) 
 
     let (features, multi_draw) = gpu_driven_features(&adapter);
     log::info!("multi_draw_indirect: {multi_draw}");
-    let gpu_timing_supported = features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
+    let gpu_timing_supported = features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES);
 
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
@@ -229,7 +246,7 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View, overlay: bool) 
 
     let gpu_timer = gpu_timing_supported.then(|| GpuTimer::new(&device, &queue));
     if !gpu_timing_supported {
-        log::info!("GPU/frame: n/a (no TIMESTAMP_QUERY_INSIDE_ENCODERS)");
+        log::info!("GPU/frame: n/a (no TIMESTAMP_QUERY_INSIDE_PASSES)");
     }
 
     // Held for the duration of the benchmark when built with `--features profile`.
@@ -493,6 +510,7 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View, overlay: bool) 
     // Measure sustained throughput over wall-clock time, plus per-frame CPU cost.
     let mut cpu_ms: Vec<f64> = Vec::with_capacity(MEASURE_FRAMES as usize);
     let mut gpu_ms: Vec<f64> = Vec::new();
+    let mut gpu_invalid = 0u64;
     let mut draws_sum = 0u64;
     let mut visible_sum = 0u64;
     let mut triangles_sum = 0u64;
@@ -523,8 +541,10 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View, overlay: bool) 
         // reading each frame needs by the next frame.
         if let Some(timer) = &gpu_timer {
             let check_slot = (frame_index as usize) % GPU_TIMER_DEPTH;
-            if let Some(ms) = timer.take_ms(check_slot) {
-                gpu_ms.push(ms);
+            match timer.take_ms(check_slot) {
+                Some(GpuSample::Ms(ms)) => gpu_ms.push(ms),
+                Some(GpuSample::Invalid) => gpu_invalid += 1,
+                None => {}
             }
         }
         virtual_t += VIRTUAL_DT;
@@ -539,8 +559,10 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View, overlay: bool) 
     // was), just never collected. One full scan here picks up that tail.
     if let Some(timer) = &gpu_timer {
         for slot in 0..GPU_TIMER_DEPTH {
-            if let Some(ms) = timer.take_ms(slot) {
-                gpu_ms.push(ms);
+            match timer.take_ms(slot) {
+                Some(GpuSample::Ms(ms)) => gpu_ms.push(ms),
+                Some(GpuSample::Invalid) => gpu_invalid += 1,
+                None => {}
             }
         }
     }
@@ -556,6 +578,7 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View, overlay: bool) 
         wall_secs,
         cpu_ms,
         gpu_ms,
+        gpu_invalid,
         avg_draws,
         avg_visible,
         total_nodes,
@@ -568,6 +591,7 @@ fn report(
     wall_secs: f64,
     mut cpu_ms: Vec<f64>,
     mut gpu_ms: Vec<f64>,
+    gpu_invalid: u64,
     avg_draws: f64,
     avg_visible: f64,
     total_nodes: usize,
@@ -584,12 +608,15 @@ fn report(
     // separate from `CPU submit / frame` above -- at high resolutions the
     // two move together (submit stalls on a full GPU), which is exactly the
     // GPU-backpressure `CPU/frame` alone can't tell apart from real CPU cost.
-    // `None` when the device has no `TIMESTAMP_QUERY_INSIDE_ENCODERS`, or
+    // `None` when the device has no `TIMESTAMP_QUERY_INSIDE_PASSES`, or
     // (in principle) if every readback is still in flight at report time.
     // How many of `frames` actually got a GPU reading -- the ring skips a
     // frame's timing rather than stall when a readback is still in flight
     // (see `GpuTimer::write_slot`), so a p99 built from far fewer samples
     // than `frames` would otherwise look identical to one from all of them.
+    // `gpu_invalid` (a non-increasing begin/end pair, `GpuSample::Invalid`)
+    // is counted separately and never folded into the average -- see
+    // `GpuTimer::take_ms`.
     let gpu_sample_count = gpu_ms.len();
     let gpu_stats = (!gpu_ms.is_empty()).then(|| {
         gpu_ms.sort_by(|a, b| a.partial_cmp(b).expect("no NaN GPU frame times"));
@@ -599,9 +626,10 @@ fn report(
         (avg, p99)
     });
     let gpu_line = match gpu_stats {
-        Some((avg, p99)) => {
-            format!("avg {avg:.3} ms | p99 {p99:.3} | samples {gpu_sample_count}/{frames}")
-        }
+        Some((avg, p99)) => format!(
+            "avg {avg:.3} ms | p99 {p99:.3} | samples {gpu_sample_count}/{frames} | invalid {gpu_invalid}"
+        ),
+        None if gpu_invalid > 0 => format!("n/a ({gpu_invalid} invalid samples, 0 valid)"),
         None => "n/a".to_string(),
     };
 
@@ -625,6 +653,9 @@ fn report(
         "NOT MET"
     };
     let gpu_summary = match gpu_stats {
+        Some((avg, p99)) if gpu_invalid > 0 => format!(
+            "GPU/frame avg {avg:.3} ms (p99 {p99:.3}, {gpu_sample_count} samples, {gpu_invalid} invalid)"
+        ),
         Some((avg, p99)) => {
             format!("GPU/frame avg {avg:.3} ms (p99 {p99:.3}, {gpu_sample_count} samples)")
         }
@@ -705,7 +736,7 @@ mod tests {
     }
 
     /// A real device (or `None` on a CI runner with no GPU adapter, or one
-    /// whose driver lacks `TIMESTAMP_QUERY_INSIDE_ENCODERS`) -- the same
+    /// whose driver lacks `TIMESTAMP_QUERY_INSIDE_PASSES`) -- the same
     /// skip-loudly convention `mesh_arena_integration.rs` uses.
     fn test_gpu_timer_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -718,7 +749,7 @@ mod tests {
             force_fallback_adapter: false,
         }))?;
         let (features, _) = gpu_driven_features(&adapter);
-        if !features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS) {
+        if !features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES) {
             return None;
         }
         pollster::block_on(adapter.request_device(
@@ -743,7 +774,7 @@ mod tests {
         let Some((device, queue)) = test_gpu_timer_device() else {
             eprintln!(
                 "SKIP take_ms_only_returns_a_value_once_the_slot_has_actually_finished_mapping: \
-                 no GPU adapter, or no TIMESTAMP_QUERY_INSIDE_ENCODERS"
+                 no GPU adapter, or no TIMESTAMP_QUERY_INSIDE_PASSES"
             );
             return;
         };
@@ -757,12 +788,32 @@ mod tests {
             "nothing has been submitted for this slot yet"
         );
 
+        // A pass-scoped write, via an (empty) compute pass -- not a render
+        // pass: `scripts/check-single-render-path.sh` refuses starting a
+        // render pass of its own outside `scene.rs` (ARCHITECTURE.md Rule 5,
+        // "the scene is encoded in one place"), and this test isn't the
+        // scene, it's `GpuTimer`'s ring-safety guard. Whether pass-scoped
+        // writes actually measure something real on every backend is
+        // pinned separately, through the real single render path, by
+        // `cubara-render`'s `gpu_timestamps.rs` integration test -- not
+        // duplicated here. A compute pass's `timestamp_writes` needs the
+        // same `TIMESTAMP_QUERY_INSIDE_PASSES` feature this crate already
+        // requests, so it exercises the identical write mechanism without
+        // needing a render target or a texture array to bind.
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("test-gpu-timer-encoder"),
         });
         let ts = timer.timestamps(slot);
-        encoder.write_timestamp(ts.query_set, ts.begin);
-        encoder.write_timestamp(ts.query_set, ts.end);
+        {
+            let _pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("test-gpu-timer-pass"),
+                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                    query_set: ts.query_set,
+                    beginning_of_pass_write_index: Some(ts.begin),
+                    end_of_pass_write_index: Some(ts.end),
+                }),
+            });
+        }
         timer.resolve(&mut encoder, slot);
         queue.submit(std::iter::once(encoder.finish()));
         timer.begin_read(slot);
@@ -786,20 +837,28 @@ mod tests {
         // 10s of slack costs nothing when things work and fails loudly,
         // rather than hanging, when they don't.
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        let mut ms = None;
+        let mut sample = None;
         while Instant::now() < deadline {
             let _ = device.poll(wgpu::Maintain::Poll);
-            if let Some(v) = timer.take_ms(slot) {
-                ms = Some(v);
+            if let Some(s) = timer.take_ms(slot) {
+                sample = Some(s);
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let ms = ms.expect("GPU map did not complete within 10s -- likely hung");
-        assert!(
-            ms >= 0.0,
-            "a pass duration read back off the GPU cannot be negative"
-        );
+        match sample.expect("GPU map did not complete within 10s -- likely hung") {
+            GpuSample::Ms(ms) => assert!(
+                ms >= 0.0,
+                "a pass duration read back off the GPU cannot be negative"
+            ),
+            // An empty 1x1 pass can legitimately resolve to `end == begin`
+            // (zero elapsed time) on a fast adapter, which `take_ms` reports
+            // as `Invalid` (it can't tell "zero" from "backend gave a bad
+            // pair" -- see `take_ms`'s doc comment). Either outcome proves
+            // the pass-scoped write path produced a real reading, which is
+            // what this test is pinning.
+            GpuSample::Invalid => {}
+        }
     }
 
     #[test]

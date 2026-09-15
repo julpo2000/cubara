@@ -88,10 +88,12 @@ pub struct SceneFrame<'a> {
 ///
 /// The caller owns the query set, any resolve/readback buffers, and the
 /// bookkeeping that makes reading them back safe ([`crate::TimestampRing`]);
-/// this only says *where* to write. Writing outside a render pass needs
-/// `wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS` on the device -- the
-/// pass-scoped `TIMESTAMP_QUERY_INSIDE_PASSES` tier is deliberately not
-/// required, since it is a narrower guarantee some backends don't offer.
+/// this only says *where* to write. Written via the pass's own
+/// `timestamp_writes` (not `CommandEncoder::write_timestamp` outside the
+/// pass, which this used at first: on Metal, wgpu-hal's encoder-level
+/// timestamps both sample at the same "stage boundary" and come back
+/// identical, always reading 0ms). That needs
+/// `wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES` on the device.
 pub struct GpuTimestamps<'a> {
     pub query_set: &'a wgpu::QuerySet,
     /// Index written just before the main pass begins.
@@ -403,10 +405,26 @@ impl SceneRenderer {
                 bytemuck::bytes_of(&OutlineUniform::new(origin)),
             );
         }
-        if let Some(ts) = &gpu_timestamps {
-            encoder.write_timestamp(ts.query_set, ts.begin);
-        }
         {
+            // Pass-scoped, not the encoder-level `write_timestamp` pair this
+            // used before: on Metal, wgpu-hal's encoder-level timestamps both
+            // sample "at stage boundaries" through a shared blit encoder and
+            // come back identical, reading as a permanent 0ms GPU pass. The
+            // pass-scoped form is what wgpu-hal actually maps to each
+            // backend's real per-pass timing primitive (Metal's
+            // `sample_buffer_attachments`, Vulkan/DX12's pass timestamps),
+            // and it is also a more honest description of what's being
+            // measured -- the pass, not whatever the encoder happened to be
+            // doing around it. Needs `TIMESTAMP_QUERY_INSIDE_PASSES`, not
+            // the `_INSIDE_ENCODERS` tier the encoder-level form needed.
+            let timestamp_writes =
+                gpu_timestamps
+                    .as_ref()
+                    .map(|ts| wgpu::RenderPassTimestampWrites {
+                        query_set: ts.query_set,
+                        beginning_of_pass_write_index: Some(ts.begin),
+                        end_of_pass_write_index: Some(ts.end),
+                    });
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -425,7 +443,7 @@ impl SceneRenderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes,
                 occlusion_query_set: None,
             });
 
@@ -452,9 +470,6 @@ impl SceneRenderer {
                 pass.set_vertex_buffer(0, self.outline_vertex_buffer.slice(..));
                 pass.draw(0..OUTLINE_CUBE_EDGES.len() as u32, 0..1);
             }
-        }
-        if let Some(ts) = &gpu_timestamps {
-            encoder.write_timestamp(ts.query_set, ts.end);
         }
 
         // Overlay: a second pass over the same colour target (loaded, no depth).
