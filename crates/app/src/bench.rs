@@ -668,6 +668,93 @@ mod tests {
         }
     }
 
+    /// A real device (or `None` on a CI runner with no GPU adapter, or one
+    /// whose driver lacks `TIMESTAMP_QUERY_INSIDE_ENCODERS`) -- the same
+    /// skip-loudly convention `mesh_arena_integration.rs` uses.
+    fn test_gpu_timer_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..Default::default()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))?;
+        let (features, _) = gpu_driven_features(&adapter);
+        if !features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS) {
+            return None;
+        }
+        pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("cubara-test-gpu-timer-device"),
+                required_features: features,
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::Performance,
+            },
+            None,
+        ))
+        .ok()
+    }
+
+    /// Pins `GpuTimer::take_ms`'s `take_ready` guard (the other half of the
+    /// timestamp-ring safety the mutation check flagged as untested): it must
+    /// return `None` both before anything was ever submitted for a slot and
+    /// in the window after submit where the async map has not completed yet
+    /// -- reading either would be reading a buffer that isn't mapped.
+    #[test]
+    fn take_ms_only_returns_a_value_once_the_slot_has_actually_finished_mapping() {
+        let Some((device, queue)) = test_gpu_timer_device() else {
+            eprintln!(
+                "SKIP take_ms_only_returns_a_value_once_the_slot_has_actually_finished_mapping: \
+                 no GPU adapter, or no TIMESTAMP_QUERY_INSIDE_ENCODERS"
+            );
+            return;
+        };
+        let timer = GpuTimer::new(&device, &queue);
+        let slot = timer
+            .write_slot(0)
+            .expect("a fresh timer's slot 0 must be writable");
+        assert_eq!(
+            timer.take_ms(slot),
+            None,
+            "nothing has been submitted for this slot yet"
+        );
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test-gpu-timer-encoder"),
+        });
+        let ts = timer.timestamps(slot);
+        encoder.write_timestamp(ts.query_set, ts.begin);
+        encoder.write_timestamp(ts.query_set, ts.end);
+        timer.resolve(&mut encoder, slot);
+        queue.submit(std::iter::once(encoder.finish()));
+        timer.begin_read(slot);
+
+        assert_eq!(
+            timer.take_ms(slot),
+            None,
+            "the async map cannot have completed synchronously with begin_read"
+        );
+
+        let mut ms = None;
+        for _ in 0..1000 {
+            let _ = device.poll(wgpu::Maintain::Poll);
+            if let Some(v) = timer.take_ms(slot) {
+                ms = Some(v);
+                break;
+            }
+        }
+        assert!(
+            ms.is_some(),
+            "polling the device must eventually see the map complete"
+        );
+        assert!(
+            ms.unwrap() >= 0.0,
+            "a pass duration read back off the GPU cannot be negative"
+        );
+    }
+
     #[test]
     fn an_eye_is_three_numbers() {
         assert_eq!(parse_eye("8,40.5,-3"), Some([8.0, 40.5, -3.0]));
