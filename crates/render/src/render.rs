@@ -274,9 +274,26 @@ pub const OUTLINE_CUBE_EDGES: [[f32; 3]; 24] = [
 /// everywhere. `node_index` is a plain vertex attribute instead (§5.3), so
 /// this feature is unused now; see the design doc for the full story.
 pub fn gpu_driven_features(adapter: &wgpu::Adapter) -> (wgpu::Features, bool) {
-    let features = adapter.features() & wgpu::Features::MULTI_DRAW_INDIRECT;
-    let multi_draw = features.contains(wgpu::Features::MULTI_DRAW_INDIRECT);
-    (features, multi_draw)
+    let mdi = adapter.features() & wgpu::Features::MULTI_DRAW_INDIRECT;
+    let multi_draw = mdi.contains(wgpu::Features::MULTI_DRAW_INDIRECT);
+    // The GPU-timing feature `bench.rs` wants for GPU/frame -- requested here
+    // (window, bench, headless all call this) so the feature set is the same
+    // everywhere rather than bench alone having a device the others don't.
+    // `TIMESTAMP_QUERY_INSIDE_ENCODERS` implies the base `TIMESTAMP_QUERY`
+    // and covers writing a timestamp from a command encoder outside a render
+    // pass, which is all the bench needs -- the narrower
+    // `TIMESTAMP_QUERY_INSIDE_PASSES` tier is deliberately not requested.
+    // `INSIDE_ENCODERS`'s doc says it "implies" the base feature is
+    // supported, but wgpu tracks the two as separate bits, and only bits
+    // actually named in `required_features` end up enabled on the device
+    // (`create_query_set` with `QueryType::Timestamp` checks for the base
+    // `TIMESTAMP_QUERY` bit specifically -- requesting only `INSIDE_ENCODERS`
+    // is a validation error). Both are requested; the adapter reports the
+    // base bit set whenever it reports the encoder one, so this is exactly
+    // what `INSIDE_ENCODERS`'s presence already promised.
+    let timestamps = adapter.features()
+        & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
+    (mdi | timestamps, multi_draw)
 }
 
 /// All GPU + window state. Created once the event loop has `resumed`.
@@ -438,7 +455,13 @@ impl Renderer {
             visible_chunks: 0,
             frames: 0,
             last_report: Instant::now(),
-            show_debug: true,
+            // Off by default (F3 to show it, `toggle_debug`) -- the overlay
+            // is a debug HUD, not something every player should see on
+            // launch, and `--bench`'s new `--overlay` flag (default off, for
+            // the same reason) is what actually exercises this text draw
+            // path off the GPU-bound-vs-submit-bound question it was added
+            // for.
+            show_debug: false,
             frame_ms: 0.0,
         };
         (renderer, mesh_assets)
@@ -589,6 +612,11 @@ impl Renderer {
                     panel,
                     health,
                     crosshair,
+                    // The window doesn't report a GPU/frame reading (only
+                    // `--bench` does, `bench.rs`); the feature is requested
+                    // here too (`gpu_driven_features`) only so it's available
+                    // if that changes later.
+                    gpu_timestamps: None,
                 },
             );
         }

@@ -5,19 +5,24 @@
 //! sustained throughput against the 1000-FPS goal. A fixed virtual time step keeps
 //! the camera orbit identical regardless of how fast the machine runs.
 //!
-//! Run with: `cargo run --release -- --bench [radius] [--size WIDTHxHEIGHT]`
+//! Run with: `cargo run --release -- --bench [radius] [--size WIDTHxHEIGHT] [--overlay]`
 //!
 //! **Resolution matters, and 1920x1080 is only the default.** Frame cost has a
 //! part that grows with pixels -- every covered pixel is shaded -- and a bench
 //! pinned to one size cannot see it. The owner noticed FPS dropping as the
 //! window grew; `--size` is how that is measured rather than guessed. The
 //! history in `BENCHMARKS.md` is all at the default, so rows stay comparable.
+//!
+//! `--overlay` draws through the same debug-text path the window's F3 overlay
+//! does (off by default in both places, `render.rs`'s `show_debug`), so its
+//! cost shows up in the numbers rather than being silently excluded.
 
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use cubara_render::{
-    gpu_driven_features, load_mesh_assets, CameraUniform, ChunkArena, Frustum, SceneFrame,
-    SceneRenderer,
+    gpu_driven_features, load_mesh_assets, CameraUniform, ChunkArena, Frustum, GpuTimestamps,
+    SceneFrame, SceneRenderer, TimestampRing,
 };
 use cubara_voxel::ChunkCoord;
 use cubara_world::mesh::mesh_nodes;
@@ -33,6 +38,130 @@ const MEASURE_FRAMES: u32 = 2000;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// Fixed camera advance per frame, so the path is framerate-independent.
 const VIRTUAL_DT: f32 = 1.0 / 240.0;
+
+/// How many frames of slack the GPU-timestamp readback keeps in flight
+/// (`cubara_render::TimestampRing`). 3 gives the driver two full frames to
+/// finish mapping the oldest slot before it is needed again, without which a
+/// slow readback would silently stop producing GPU samples.
+const GPU_TIMER_DEPTH: usize = 3;
+
+/// Owns a timestamp query set and its readback buffers around the main scene
+/// pass, and turns completed reads into milliseconds. The bookkeeping for
+/// which slot is safe to write or read is [`TimestampRing`]
+/// (`cubara-render`, unit-tested there with no GPU involved); this is the
+/// thin GPU-owning wrapper around it.
+struct GpuTimer {
+    query_set: wgpu::QuerySet,
+    resolve_buffer: wgpu::Buffer,
+    read_buffers: Vec<wgpu::Buffer>,
+    ring: Arc<Mutex<TimestampRing>>,
+    period_ns: f64,
+}
+
+impl GpuTimer {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("bench-gpu-timestamps"),
+            ty: wgpu::QueryType::Timestamp,
+            count: (GPU_TIMER_DEPTH * 2) as u32,
+        });
+        // Each slot's region in the resolve buffer must start at a multiple
+        // of `wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT` (256 bytes) -- the two
+        // 8-byte timestamps it actually holds don't need that much room, but
+        // `resolve_query_set` validates the destination offset regardless.
+        let resolve_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bench-gpu-timestamps-resolve"),
+            size: (GPU_TIMER_DEPTH as u64) * wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let read_buffers = (0..GPU_TIMER_DEPTH)
+            .map(|_| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("bench-gpu-timestamps-read"),
+                    size: 16,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+        Self {
+            query_set,
+            resolve_buffer,
+            read_buffers,
+            ring: Arc::new(Mutex::new(TimestampRing::new(GPU_TIMER_DEPTH))),
+            period_ns: queue.get_timestamp_period() as f64,
+        }
+    }
+
+    /// This frame's slot to write into, or `None` if every slot still has
+    /// outstanding GPU work -- skip GPU timing this frame rather than stall
+    /// waiting for one to free up or overwrite one still in flight.
+    fn write_slot(&self, frame: u64) -> Option<usize> {
+        let slot = (frame as usize) % GPU_TIMER_DEPTH;
+        self.ring.lock().unwrap().can_write(slot).then_some(slot)
+    }
+
+    fn timestamps(&self, slot: usize) -> GpuTimestamps<'_> {
+        GpuTimestamps {
+            query_set: &self.query_set,
+            begin: (slot * 2) as u32,
+            end: (slot * 2 + 1) as u32,
+        }
+    }
+
+    /// Resolve `slot`'s two timestamps into the readback buffer -- called
+    /// within the same encoder that wrote them, before submit.
+    fn resolve(&self, encoder: &mut wgpu::CommandEncoder, slot: usize) {
+        let src_offset = (slot as u64) * wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT;
+        encoder.resolve_query_set(
+            &self.query_set,
+            (slot * 2) as u32..(slot * 2 + 2) as u32,
+            &self.resolve_buffer,
+            src_offset,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.resolve_buffer,
+            src_offset,
+            &self.read_buffers[slot],
+            0,
+            16,
+        );
+    }
+
+    /// Call after submit: marks `slot` in-flight and starts its async map.
+    fn begin_read(&self, slot: usize) {
+        self.ring.lock().unwrap().begin_mapping(slot);
+        let ring = Arc::clone(&self.ring);
+        self.read_buffers[slot]
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                // An error leaves the slot `Mapping` forever -- it just never
+                // contributes another GPU sample, which beats panicking a
+                // whole benchmark run over one dropped reading.
+                if result.is_ok() {
+                    ring.lock().unwrap().mark_ready(slot);
+                }
+            });
+    }
+
+    /// If `slot`'s async map has completed, read its two timestamps, unmap,
+    /// and return the pass duration in milliseconds.
+    fn take_ms(&self, slot: usize) -> Option<f64> {
+        if !self.ring.lock().unwrap().take_ready(slot) {
+            return None;
+        }
+        let buf = &self.read_buffers[slot];
+        let ms = {
+            let data = buf.slice(..).get_mapped_range();
+            let raw: &[u64] = bytemuck::cast_slice(&data);
+            let (begin, end) = (raw[0], raw[1]);
+            end.saturating_sub(begin) as f64 * self.period_ns / 1_000_000.0
+        };
+        buf.unmap();
+        Some(ms)
+    }
+}
 
 /// Run the benchmark over a streamed square region of the given chunk `radius`
 /// (default 12 = a realistically heavy world). The region streams as LOD nodes
@@ -53,7 +182,7 @@ pub struct View {
     pub squash: Option<i32>,
 }
 
-pub fn run(radius: i32, (width, height): (u32, u32), view: View) {
+pub fn run(radius: i32, (width, height): (u32, u32), view: View, overlay: bool) {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         ..Default::default()
@@ -68,6 +197,7 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View) {
 
     let (features, multi_draw) = gpu_driven_features(&adapter);
     log::info!("multi_draw_indirect: {multi_draw}");
+    let gpu_timing_supported = features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
 
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
@@ -79,6 +209,11 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View) {
         None,
     ))
     .expect("request device");
+
+    let gpu_timer = gpu_timing_supported.then(|| GpuTimer::new(&device, &queue));
+    if !gpu_timing_supported {
+        log::info!("GPU/frame: n/a (no TIMESTAMP_QUERY_INSIDE_ENCODERS)");
+    }
 
     // Held for the duration of the benchmark when built with `--features profile`.
     let _profiler = cubara_render::Profiler::init();
@@ -230,96 +365,175 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View) {
 
     // Records one frame (camera upload + frustum cull + indirect-list upload +
     // render-pass encode + submit) and returns the CPU time spent plus how many
-    // chunks were drawn. Frames are not individually waited on, so the GPU
+    // draws/chunks were drawn. Frames are not individually waited on, so the GPU
     // pipelines them — this measures sustained throughput.
     // `scene` is borrowed mutably here, so this is a closure over it rather than a
     // plain fn: same shared encode_scene the window calls, no bench-local copy.
-    let submit_frame =
-        |arena: &mut ChunkArena, scene: &mut SceneRenderer, vt: f32| -> (f64, usize) {
-            puffin::profile_scope!("frame");
-            let vp = match view.eye {
-                Some(eye) => {
-                    // A full turn every ~20 virtual seconds, pitched down a
-                    // little: what a player looking around sees.
-                    let yaw = vt * 0.3;
-                    let dir = glam::vec3(yaw.cos(), -0.25, yaw.sin());
-                    CameraUniform::look_view_proj(aspect, glam::Vec3::from(eye), dir)
-                }
-                None => CameraUniform::view_proj_matrix(aspect, vt, look_target, view_radius),
-            };
-            scene.set_camera(&queue, vp);
-            let frustum = Frustum::from_view_proj(vp);
-
-            let cpu_start = Instant::now();
-            // CPU cull + indirect-list upload — the per-frame work we're measuring.
-            let draw_count = arena.prepare(&queue, &frustum);
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("bench-encoder"),
-            });
-            // No selected block, no overlay: the bench measures the world,
-            // not a UI highlight or the debug HUD.
-            scene.encode_scene(
-                &device,
-                &queue,
-                &mut encoder,
-                &color_view,
-                SceneFrame {
-                    arena,
-                    draw_count,
-                    selected_block: None,
-                    cracking: None,
-                    players: &[],
-                    overlay: None,
-                    // The benchmark measures the scene, not the HUD.
-                    health: None,
-                    // The bench measures the world, not a HUD.
-                    hotbar: None,
-                    panel: None,
-                    crosshair: false,
-                },
-            );
-            queue.submit(std::iter::once(encoder.finish()));
-            (
-                cpu_start.elapsed().as_secs_f64() * 1000.0,
-                arena.visible_nodes() as usize,
-            )
+    //
+    // The timed window starts before the camera upload and frustum build, not
+    // after: both are real per-frame CPU cost (a `queue.write_buffer` plus six
+    // plane extractions), and excluding them understated what "CPU/frame" claims
+    // to measure.
+    let submit_frame = |arena: &mut ChunkArena,
+                         scene: &mut SceneRenderer,
+                         vt: f32,
+                         gpu_timer: Option<&GpuTimer>,
+                         frame_index: u64|
+     -> (f64, u32, usize) {
+        puffin::profile_scope!("frame");
+        let cpu_start = Instant::now();
+        let vp = match view.eye {
+            Some(eye) => {
+                // A full turn every ~20 virtual seconds, pitched down a
+                // little: what a player looking around sees.
+                let yaw = vt * 0.3;
+                let dir = glam::vec3(yaw.cos(), -0.25, yaw.sin());
+                CameraUniform::look_view_proj(aspect, glam::Vec3::from(eye), dir)
+            }
+            None => CameraUniform::view_proj_matrix(aspect, vt, look_target, view_radius),
         };
+        scene.set_camera(&queue, vp);
+        let frustum = Frustum::from_view_proj(vp);
+
+        // CPU cull + indirect-list upload — the per-frame work we're measuring.
+        let draw_count = arena.prepare(&queue, &frustum);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("bench-encoder"),
+        });
+        let overlay_text = overlay.then(|| {
+            format!(
+                "cubara --bench  ({width}x{height})\n\
+                 draws {draws}  nodes {visible}/{total_nodes}",
+                draws = draw_count,
+                visible = arena.visible_nodes(),
+            )
+        });
+        let gpu_slot = gpu_timer.and_then(|t| t.write_slot(frame_index));
+        // No selected block, no players/hotbar/panel/health/crosshair: the
+        // bench measures the world, not a UI the game overlays on top of it.
+        // `--overlay` draws the same debug-text path the F3 overlay does
+        // (through the one shared `encode_scene`, ARCHITECTURE.md Rule 5),
+        // with bench-specific content rather than the live HUD's, since the
+        // bench has no smoothed frame time or player position to show.
+        scene.encode_scene(
+            &device,
+            &queue,
+            &mut encoder,
+            &color_view,
+            SceneFrame {
+                arena,
+                draw_count,
+                selected_block: None,
+                cracking: None,
+                players: &[],
+                overlay: overlay_text.as_deref(),
+                health: None,
+                hotbar: None,
+                panel: None,
+                crosshair: false,
+                gpu_timestamps: gpu_slot.map(|slot| gpu_timer.unwrap().timestamps(slot)),
+            },
+        );
+        if let (Some(timer), Some(slot)) = (gpu_timer, gpu_slot) {
+            timer.resolve(&mut encoder, slot);
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+        if let (Some(timer), Some(slot)) = (gpu_timer, gpu_slot) {
+            timer.begin_read(slot);
+        }
+        (
+            cpu_start.elapsed().as_secs_f64() * 1000.0,
+            draw_count,
+            arena.visible_nodes() as usize,
+        )
+    };
 
     log::info!("warming up ({WARMUP_FRAMES} frames), then measuring {MEASURE_FRAMES}...");
 
+    let mut frame_index = 0u64;
     for _ in 0..WARMUP_FRAMES {
-        submit_frame(&mut arena, &mut scene, virtual_t);
+        submit_frame(
+            &mut arena,
+            &mut scene,
+            virtual_t,
+            gpu_timer.as_ref(),
+            frame_index,
+        );
         let _ = device.poll(wgpu::Maintain::Poll);
         virtual_t += VIRTUAL_DT;
+        frame_index += 1;
     }
     let _ = device.poll(wgpu::Maintain::Wait);
+    // Warmup's GPU-timing slots are never read back — only measurement
+    // frames count — so drain whatever they left ready rather than let a
+    // stale reading leak into the first measured sample.
+    if let Some(timer) = &gpu_timer {
+        for slot in 0..GPU_TIMER_DEPTH {
+            timer.take_ms(slot);
+        }
+    }
 
     // Measure sustained throughput over wall-clock time, plus per-frame CPU cost.
     let mut cpu_ms: Vec<f64> = Vec::with_capacity(MEASURE_FRAMES as usize);
+    let mut gpu_ms: Vec<f64> = Vec::new();
+    let mut draws_sum = 0u64;
     let mut visible_sum = 0u64;
     let mut triangles_sum = 0u64;
     let wall_start = Instant::now();
     for _ in 0..MEASURE_FRAMES {
         cubara_render::Profiler::new_frame();
-        let (ms, visible) = submit_frame(&mut arena, &mut scene, virtual_t);
+        let (ms, draws, visible) = submit_frame(
+            &mut arena,
+            &mut scene,
+            virtual_t,
+            gpu_timer.as_ref(),
+            frame_index,
+        );
         cpu_ms.push(ms);
+        draws_sum += draws as u64;
         visible_sum += visible as u64;
         triangles_sum += arena.visible_triangles();
         let _ = device.poll(wgpu::Maintain::Poll);
+        if let Some(timer) = &gpu_timer {
+            for slot in 0..GPU_TIMER_DEPTH {
+                if let Some(ms) = timer.take_ms(slot) {
+                    gpu_ms.push(ms);
+                }
+            }
+        }
         virtual_t += VIRTUAL_DT;
+        frame_index += 1;
     }
     let _ = device.poll(wgpu::Maintain::Wait);
     let wall_secs = wall_start.elapsed().as_secs_f64();
+    let avg_draws = draws_sum as f64 / MEASURE_FRAMES as f64;
     let avg_visible = visible_sum as f64 / MEASURE_FRAMES as f64;
     log::info!(
         "triangles drawn: avg {:.0} (faces turned away from the camera left out)",
         triangles_sum as f64 / MEASURE_FRAMES as f64
     );
 
-    report(MEASURE_FRAMES, wall_secs, cpu_ms, avg_visible, total_nodes);
+    report(
+        MEASURE_FRAMES,
+        wall_secs,
+        cpu_ms,
+        gpu_ms,
+        avg_draws,
+        avg_visible,
+        total_nodes,
+    );
 }
 
-fn report(frames: u32, wall_secs: f64, mut cpu_ms: Vec<f64>, avg_visible: f64, total_nodes: usize) {
+#[allow(clippy::too_many_arguments)]
+fn report(
+    frames: u32,
+    wall_secs: f64,
+    mut cpu_ms: Vec<f64>,
+    mut gpu_ms: Vec<f64>,
+    avg_draws: f64,
+    avg_visible: f64,
+    total_nodes: usize,
+) {
     let throughput = frames as f64 / wall_secs;
 
     cpu_ms.sort_by(|a, b| a.partial_cmp(b).expect("no NaN frame times"));
@@ -328,11 +542,35 @@ fn report(frames: u32, wall_secs: f64, mut cpu_ms: Vec<f64>, avg_visible: f64, t
     let cpu_p50 = cpu_ms[n / 2];
     let cpu_p99 = cpu_ms[((n as f64 * 0.99) as usize).min(n - 1)];
 
+    // GPU/frame: how long the main scene pass itself took on the GPU,
+    // separate from `CPU submit / frame` above -- at high resolutions the
+    // two move together (submit stalls on a full GPU), which is exactly the
+    // GPU-backpressure `CPU/frame` alone can't tell apart from real CPU cost.
+    // `None` when the device has no `TIMESTAMP_QUERY_INSIDE_ENCODERS`, or
+    // (in principle) if every readback is still in flight at report time.
+    let gpu_stats = (!gpu_ms.is_empty()).then(|| {
+        gpu_ms.sort_by(|a, b| a.partial_cmp(b).expect("no NaN GPU frame times"));
+        let n = gpu_ms.len();
+        let avg = gpu_ms.iter().sum::<f64>() / n as f64;
+        let p99 = gpu_ms[((n as f64 * 0.99) as usize).min(n - 1)];
+        (avg, p99)
+    });
+    let gpu_line = match gpu_stats {
+        Some((avg, p99)) => format!("avg {avg:.3} ms | p99 {p99:.3}"),
+        None => "n/a".to_string(),
+    };
+
     log::info!("=========== BENCHMARK RESULT ===========");
     log::info!("frames            : {frames}");
     log::info!("throughput        : {throughput:.0} FPS (sustained, pipelined)");
     log::info!("CPU submit / frame: avg {cpu_avg:.3} ms | p50 {cpu_p50:.3} | p99 {cpu_p99:.3}");
+    log::info!("GPU pass / frame  : {gpu_line}");
+    log::info!("draws issued      : avg {avg_draws:.1}");
     log::info!("nodes drawn       : avg {avg_visible:.1} / {total_nodes} (frustum-culled)");
+    match peak_rss_mib() {
+        Some(mib) => log::info!("peak RSS          : {mib:.0} MiB"),
+        None => log::info!("peak RSS          : n/a"),
+    }
     log::info!("========================================");
     // Lead with the numbers so every run is a data point for the performance
     // history in BENCHMARKS.md; the 1000-FPS gate is just a trailing tag now.
@@ -341,10 +579,38 @@ fn report(frames: u32, wall_secs: f64, mut cpu_ms: Vec<f64>, avg_visible: f64, t
     } else {
         "NOT MET"
     };
+    let gpu_summary = match gpu_stats {
+        Some((avg, p99)) => format!("GPU/frame avg {avg:.3} ms (p99 {p99:.3})"),
+        None => "GPU/frame n/a".to_string(),
+    };
     log::info!(
         "SUMMARY: {throughput:.0} FPS | CPU/frame avg {cpu_avg:.3} ms (p99 {cpu_p99:.3}) | \
-         {avg_visible:.0}/{total_nodes} nodes | 1000-FPS gate {gate}"
+         {gpu_summary} | {avg_draws:.0} draws ({avg_visible:.0}/{total_nodes} nodes) | \
+         1000-FPS gate {gate}"
     );
+}
+
+/// Peak resident set size since process start, in MiB -- `VmHWM` from
+/// `/proc/self/status`. `None` off Linux: `getrusage`'s `ru_maxrss` would
+/// cover macOS/Windows too, but that's a `libc` dependency this crate
+/// doesn't otherwise need, so it's left for whoever next measures on those
+/// platforms to add rather than pulled in for a `n/a` line to say less often.
+fn peak_rss_mib() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmHWM:") {
+                let kib: f64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+                return Some(kib / 1024.0);
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// Parse a `--size` value: `WIDTHxHEIGHT`, both positive, e.g. `2560x1440`.

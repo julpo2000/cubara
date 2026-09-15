@@ -149,3 +149,91 @@ fn sorted_batch_gives_the_same_arena_layout_regardless_of_arrival_order() {
         );
     }
 }
+
+/// `ChunkArena::prepare`'s doc comment says it emits "one draw per run of
+/// face directions that can face the camera... at most three runs" -- pin
+/// that against the real pipeline rather than trusting the comment. A corner
+/// view (diagonal on all three axes) is deliberate: a camera looking straight
+/// at one face only ever exercises a single run per node, which could not
+/// tell a regression that collapsed `prepare` back to one draw per node
+/// (dropping the face-direction split entirely) from correct behaviour --
+/// both would pass. The corner forces at least one node to need more than
+/// one draw, which is what `draw_count > visible_nodes` below actually pins.
+#[test]
+fn prepare_emits_between_one_and_three_draws_per_visible_node() {
+    let Some((device, queue)) = test_device() else {
+        eprintln!(
+            "SKIP prepare_emits_between_one_and_three_draws_per_visible_node: no GPU adapter"
+        );
+        return;
+    };
+
+    let world = World::new();
+    let registry = test_registry();
+    let layer_of = |_: &str| 0;
+    let schedule = [(0u32, 3i32)];
+    let nodes = desired_nodes(ChunkCoord::new(0, 0, 0), 0..=1, &schedule);
+
+    let mut arena = ChunkArena::new(&device, false);
+    for node in nodes {
+        let built = cubara_world::mesh::build_node(
+            &world,
+            &registry,
+            &layer_of,
+            node,
+            TerrainBlocks::from_registry(&registry),
+        );
+        if let Some(geometry) = built.geometry {
+            let id = cubara_render::NodeId {
+                level: built.node.level,
+                pos: built.node.pos,
+            };
+            arena.insert(
+                &queue,
+                id,
+                geometry.origin,
+                geometry.scale,
+                &geometry.mesh,
+                geometry.aabb,
+            );
+        }
+    }
+
+    let (min, max) = arena.bounds().expect("test region produced no geometry");
+    let center = glam::vec3(
+        (min[0] + max[0]) * 0.5,
+        (min[1] + max[1]) * 0.5,
+        (min[2] + max[2]) * 0.5,
+    );
+    let extent = (max[0] - min[0])
+        .max(max[1] - min[1])
+        .max(max[2] - min[2])
+        .max(1.0);
+    let eye = center + glam::vec3(extent, extent, extent);
+    let vp = cubara_render::CameraUniform::look_view_proj(1.0, eye, center - eye);
+    let frustum = cubara_render::Frustum::from_view_proj(vp);
+
+    let draw_count = arena.prepare(&queue, &frustum);
+    let visible_nodes = arena.visible_nodes();
+
+    assert!(
+        visible_nodes > 0,
+        "the corner camera must see some of the test region"
+    );
+    assert!(
+        draw_count >= visible_nodes,
+        "prepare must issue at least one draw per visible node, got {draw_count} draws for \
+         {visible_nodes} nodes"
+    );
+    assert!(
+        draw_count <= visible_nodes * 3,
+        "prepare must issue at most three draws per visible node (one per opposite-face pair \
+         still facing the camera), got {draw_count} draws for {visible_nodes} nodes"
+    );
+    assert!(
+        draw_count > visible_nodes,
+        "a corner view must see more than one face direction on at least one node; \
+         draw_count == visible_nodes ({visible_nodes}) means prepare stopped splitting \
+         by face direction"
+    );
+}

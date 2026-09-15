@@ -74,6 +74,30 @@ pub struct SceneFrame<'a> {
     /// through the camera or at a screen: a crosshair over an inventory is a
     /// mark on nothing.
     pub crosshair: bool,
+    /// Where to write GPU timestamps immediately before and after the main
+    /// scene pass, or `None` to write none. `cubara-app`'s bench uses this
+    /// for GPU/frame timing; the window and headless paths pass `None` so
+    /// this changes nothing about what either draws.
+    pub gpu_timestamps: Option<GpuTimestamps<'a>>,
+}
+
+/// Where [`SceneRenderer::encode_scene`] writes the two timestamps bracketing
+/// the main scene pass (terrain + figures + outline -- not the overlay text
+/// pass, which is comparatively free and not what a caller measuring draw
+/// cost wants included).
+///
+/// The caller owns the query set, any resolve/readback buffers, and the
+/// bookkeeping that makes reading them back safe ([`crate::TimestampRing`]);
+/// this only says *where* to write. Writing outside a render pass needs
+/// `wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS` on the device -- the
+/// pass-scoped `TIMESTAMP_QUERY_INSIDE_PASSES` tier is deliberately not
+/// required, since it is a narrower guarantee some backends don't offer.
+pub struct GpuTimestamps<'a> {
+    pub query_set: &'a wgpu::QuerySet,
+    /// Index written just before the main pass begins.
+    pub begin: u32,
+    /// Index written just after the main pass ends.
+    pub end: u32,
 }
 
 /// Everything drawn over the world in screen space, as the window hands it to
@@ -334,6 +358,7 @@ impl SceneRenderer {
             panel,
             health,
             crosshair,
+            gpu_timestamps,
         } = frame;
 
         // Build this frame's figures and upload them. Done before the pass so
@@ -377,6 +402,9 @@ impl SceneRenderer {
                 0,
                 bytemuck::bytes_of(&OutlineUniform::new(origin)),
             );
+        }
+        if let Some(ts) = &gpu_timestamps {
+            encoder.write_timestamp(ts.query_set, ts.begin);
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -424,6 +452,9 @@ impl SceneRenderer {
                 pass.set_vertex_buffer(0, self.outline_vertex_buffer.slice(..));
                 pass.draw(0..OUTLINE_CUBE_EDGES.len() as u32, 0..1);
             }
+        }
+        if let Some(ts) = &gpu_timestamps {
+            encoder.write_timestamp(ts.query_set, ts.end);
         }
 
         // Overlay: a second pass over the same colour target (loaded, no depth).
