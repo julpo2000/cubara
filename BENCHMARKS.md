@@ -154,7 +154,7 @@ frames after 200 warmup.
 | Date | Milestone / feature | Chunks | Tris | FPS | CPU/frame avg | CPU/frame p99 | Commit |
 |---|---|---|---|---|---|---|---|
 | 2026-09-11 | **Linux (Vulkan) baseline — first measured** [#36], radius 64, band ±2⁵⁴ | 3,138 | 912,964 | ~1,474 | 0.214 ms | 0.883 ms | `2ab5fb6` |
-| 2026-09-15 | **Bench measures GPU/frame, draws, its own timed window** (cross-session review, package 1), radius 64⁵⁶ | 2,219 | 901,932 | ~2,033 | 0.266 ms | 0.986 ms | `6cc3a85` |
+| 2026-09-15 | **Bench measures GPU/frame, draws, its own timed window** (cross-session review, package 1), radius 64⁵⁶ | 2,219 | 901,932 | ~1,970 | 0.272 ms | 0.957 ms | `401a9e5` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -1708,18 +1708,20 @@ those, not with this table's own prior row.
 
 Linux (i7-8750H, GTX 1060 Max-Q, Vulkan 580.178.04) had no reference GPU/frame
 number to compare against before this package, since the bench did not measure
-one. Three back-to-back `--bench 64` runs, same commit, nothing else running:
+one. Three back-to-back `--bench 64` runs on the final commit (`401a9e5`),
+nothing else running:
 
 ```
-FPS               2017 / 1953 / 2130
-CPU/frame avg     0.266 / 0.270 / 0.262 ms
-CPU/frame p99     0.965 / 0.999 / 0.994 ms
-GPU pass avg      0.530 / 0.524 / 0.432 ms
+FPS               1961 / 1876 / 2073
+CPU/frame avg     0.268 / 0.289 / 0.260 ms
+CPU/frame p99     1.016 / 0.968 / 0.888 ms
+GPU pass avg      0.481 / 0.518 / 0.431 ms
+GPU samples       1,024 of 2,000 measured frames (~51%) each run
 draws             3,945 (of up to 3 x 1,782 = 5,346 possible)
 peak RSS          ~1.0-1.4 GiB (grows with window size; not yet a table column)
 ```
 
-GPU/frame (0.43-0.53 ms) exceeds CPU/frame (~0.27 ms) at this resolution on this
+GPU/frame (0.43-0.52 ms) exceeds CPU/frame (~0.27 ms) at this resolution on this
 GPU -- the mobile 1060 is the bottleneck at 1080p here, unlike the M3 rows'
 "CPU/frame moves with resolution" story above (¹⁴/⁵⁵-adjacent): on this machine
 it is the *GPU* pass, not backpressure on submit, that grows with pixels (0.53
@@ -1727,13 +1729,22 @@ ms at 1080p up to 0.98 ms at 4K in the same session, CPU/frame flat at
 0.26-0.34 ms throughout) -- which package 1 exists to be able to say for the
 first time.
 
+The 1,024/2,000 sample rate (not 2,000/2,000) is `GPU_TIMER_DEPTH`'s ring
+running out of free slots faster than the GPU retires work -- the CPU submits
+much faster than the GPU completes each frame's pass (the whole point of
+"sustained pipelined throughput"), so most frames find every ring slot still
+waiting on an earlier readback. Getting closer to full coverage is left for
+package 2; the average/p99 above are already stable at this sample count.
+
 Thermal check (`nvidia-smi`, per-run): 60 degC / 139 MHz idle before, 72 degC /
 1,594 of 1,670 MHz boost after three runs, `hw_thermal_slowdown` and
 `sw_thermal_slowdown` both `Not Active` throughout. Lid open, machine on a desk,
 not throttling -- the spread above is ordinary submit-bound noise and clock
 ramp (¹), not degradation.
 
-`check-tests-can-fail.sh` on this package's diff: 18 mutable lines, one
-survivor after two rounds of fixes (`main.rs`'s `--overlay` flag-detection
+`check-tests-can-fail.sh` on this package's final diff: 20 mutable lines, one
+survivor after three rounds of fixes (`main.rs`'s `--overlay` flag-detection
 line, consistent with every sibling flag in that function having the same
-untested shape) -- see the PR for the full table.
+untested shape) -- see the PR for the full table, including two bugs the
+mutation check itself surfaced along the way (a CI failure on software GPU
+adapters, and a genuine test hang traced to an unbounded `Maintain::Wait`).
