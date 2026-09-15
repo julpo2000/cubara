@@ -148,7 +148,7 @@ frames after 200 warmup.
 | 2026-09-07 | Prediction, untrusted clients, server-side mining, persistence, sharding [#207, #211, #212, #216, #217, #218], radius 64, band ±2⁴³ | 3,138 | 912,964 | ~1,109 | 0.623 ms | ~1.19 ms | `397a653` |
 | 2026-09-11 | Multiplayer played: --connect, player figures, per-machine shirts, mining retuned, radius 64, band ±2⁴⁵ | 3,138 | 912,964 | ~1,112 | 0.611 ms | ~1.08 ms | `b5dcfec` |
 | 2026-09-14 | **macOS caught up to `main`** — covered borders, 3D octree LOD, visibility culling, faces turned away left out, distant caves, mountains [#250–#259], radius 64 (orbit)⁵⁵ | **2,219** | 901,932 (480,547 drawn) | **~1,568** | **0.441 ms** | ~0.94 ms | `3b52c49` |
-| 2026-09-15 | Bench measures GPU/frame, draws, its own timed window (cross-session review, package 1), radius 64 (orbit)⁵⁷ | 2,219 | 901,932 (480,547 drawn) | ~1,585 | 0.468 ms | 0.777 ms | `3ab5723` |
+| 2026-09-15 | Bench measures GPU/frame, draws, its own timed window (cross-session review, package 1), radius 64 (orbit)⁵⁷ | 2,219 | 901,932 (480,547 drawn) | ~1,585 | 0.468 ms | 0.777 ms | `a539938` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -1700,12 +1700,12 @@ against a 1,000-FPS criterion -- the margin in this row collapses from ~1.57x to
 that. Screen-space occlusion is not the way to close the 1.25M-vs-326k gap; a
 cheaper search is.
 
-⁵⁷ **Bench measurement tooling, package 1 -- the M3 row, `--gpu-timing off`.**
-Measured on `3ab5723`, idle machine, lid open, three orbit runs within
-1,577-1,585 FPS (this row uses the median). `+0.02 ms` over the `3b52c49` row
-above (0.441 -> 0.468 ms) is `set_camera` + the frustum build moving inside
-the timed window, exactly as intended -- not a regression, the bench counting
-CPU cost it was previously excluding.
+⁵⁷ **Bench measurement tooling, package 1 -- the M3 row.** Measured on
+`a539938` (final PR #266 head), idle machine, lid open, `--gpu-timing off`;
+three orbit runs within 1,577-1,585 FPS (this row uses the median). `+0.02 ms`
+over the `3b52c49` row above (0.441 -> 0.468 ms) is `set_camera` + the
+frustum build moving inside the timed window, exactly as intended -- not a
+regression, the bench counting CPU cost it was previously excluding.
 
 `GPU/frame` is `n/a` here, deliberately: on Metal, `RenderPassDescriptor`'s
 `timestamp_writes` resolves every sample invalid (`end` always exactly `0`,
@@ -1714,11 +1714,20 @@ never resolved) and the sample-buffer-attachment machinery is not free even
 though it produces nothing usable (~20% fewer FPS, +~30% CPU/frame measured
 with it forced on). Filed as **#267**, linked to H11 (the wgpu 24 -> 30
 upgrade) since Apple counter-sampling support has been revised in later wgpu
-releases. `--gpu-timing auto` (the default) is meant to detect this and drop
-GPU timing before the measured frames automatically -- this row used
-`--gpu-timing off` explicitly because, on the commit measured, auto's
-detection was not yet reliable on Metal (see PR #266 for the fix that
-followed and the M3 run that confirmed it).
+releases.
+
+**`--gpu-timing auto` (the default) confirmed working on `a539938`**: seven
+M3 views, all seven correctly reported "disabled after warmup" with FPS/CPU
+matching this row (e.g. orbit 1080p 1568-1589 FPS / 0.466-0.474 ms). Getting
+there took two more rounds after the first attempt: a single
+`Maintain::Wait` doesn't reliably fire every pending `map_async` callback on
+Metal within warmup's short window (fixed by polling further,
+`GpuTimer::drain_after_wait`), and a broken backend can still produce a
+handful of coincidentally non-zero "valid"-looking samples per 200-frame
+warmup (1-7 seen across the seven runs) that are not real readings -- so
+`--gpu-timing auto` only stays enabled when warmup was *entirely* clean
+(zero invalid samples), not merely "at least one valid" (see
+`should_disable_gpu_timing` in `bench.rs`).
 
 Other M3 views at the same commit, `--gpu-timing off`, GPU/frame n/a
 throughout:
@@ -1775,9 +1784,12 @@ Thermal check (`nvidia-smi`, per-run): 60 degC / 139 MHz idle before, 72 degC /
 not throttling -- the spread above is ordinary submit-bound noise and clock
 ramp (¹), not degradation.
 
-`check-tests-can-fail.sh` on this package's final diff: 20 mutable lines, one
-survivor after three rounds of fixes (`main.rs`'s `--overlay` flag-detection
-line, consistent with every sibling flag in that function having the same
-untested shape) -- see the PR for the full table, including two bugs the
-mutation check itself surfaced along the way (a CI failure on software GPU
-adapters, and a genuine test hang traced to an unbounded `Maintain::Wait`).
+`check-tests-can-fail.sh` on this package's final diff: 23 mutable lines, 3
+survivors after six rounds of fixes -- see the PR for the full table,
+including two bugs the mutation check itself surfaced along the way (a CI
+failure on software GPU adapters, and a genuine test hang traced to an
+unbounded `Maintain::Wait`). The three left: `main.rs`'s `--overlay`
+flag-detection (consistent with every sibling flag's same untested shape),
+`GpuTimer::begin_read`'s map-error guard (would need a real GPU map failure
+to exercise), and one `gpu_line` message-wording branch reachable only via
+`--gpu-timing on` forced against a broken backend during actual measurement.
