@@ -19,9 +19,11 @@
 //! cost shows up in the numbers rather than being silently excluded.
 //!
 //! `--gpu-timing` controls the GPU/frame reading ([`GpuTimingMode`]) --
-//! `auto` (the default) turns it off before the measured frames if every
-//! warmup sample came back invalid, since a backend whose pass-scoped timer
-//! doesn't work can still charge real time for trying.
+//! `auto` (the default) turns it off before the measured frames unless
+//! warmup was entirely clean (every classified sample valid), since a
+//! backend whose pass-scoped timer doesn't work can still charge real time
+//! for trying, and can still produce an occasional "valid"-looking sample
+//! that is really garbage (see [`should_disable_gpu_timing`]).
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -74,6 +76,23 @@ enum GpuSample {
     /// The two timestamps came back non-increasing -- not a fast pass, a bad
     /// reading. Counted and reported separately, never averaged in as 0ms.
     Invalid,
+}
+
+/// Classify a raw `(begin, end)` timestamp pair. `end <= begin` is not a
+/// fast pass, it is a bad reading (a non-monotonic pair off a backend that
+/// isn't giving real per-pass timing -- observed on Metal, where `end` came
+/// back exactly `0` every time) -- reported as [`GpuSample::Invalid`] rather
+/// than folded into the average as 0ms via `saturating_sub`, which would
+/// hide it. Pulled out of `GpuTimer::take_ms` as plain arithmetic (no
+/// `&self`, no wgpu) so the classification itself is unit-tested with fixed
+/// inputs, rather than only reachable by getting a real GPU to produce a
+/// bad reading on purpose.
+fn classify_sample(begin: u64, end: u64, period_ns: f64) -> GpuSample {
+    if end <= begin {
+        GpuSample::Invalid
+    } else {
+        GpuSample::Ms((end - begin) as f64 * period_ns / 1_000_000.0)
+    }
 }
 
 /// Owns a timestamp query set and its readback buffers around the main scene
@@ -178,11 +197,8 @@ impl GpuTimer {
             });
     }
 
-    /// If `slot`'s async map has completed, read its two timestamps and
-    /// unmap. `end <= begin` is not a fast pass, it is a bad reading (a
-    /// non-monotonic pair off a backend that isn't giving real per-pass
-    /// timing) -- reported as [`GpuSample::Invalid`] rather than folded into
-    /// the average as 0ms via `saturating_sub`, which would hide it.
+    /// If `slot`'s async map has completed, read its two timestamps, unmap,
+    /// and classify them ([`classify_sample`]).
     fn take_ms(&self, slot: usize) -> Option<GpuSample> {
         if !self.ring.lock().unwrap().take_ready(slot) {
             return None;
@@ -192,7 +208,10 @@ impl GpuTimer {
             let data = buf.slice(..).get_mapped_range();
             let raw: &[u64] = bytemuck::cast_slice(&data);
             let (begin, end) = (raw[0], raw[1]);
-            if end <= begin {
+            if matches!(
+                classify_sample(begin, end, self.period_ns),
+                GpuSample::Invalid
+            ) {
                 // Unconditional, not just the first few: `log::debug!` costs
                 // nothing unless enabled, and this is exactly the raw data
                 // needed to tell "counter never resolved" (0/0) apart from
@@ -204,10 +223,8 @@ impl GpuTimer {
                      period_ns={period}",
                     period = self.period_ns
                 );
-                GpuSample::Invalid
-            } else {
-                GpuSample::Ms((end - begin) as f64 * self.period_ns / 1_000_000.0)
             }
+            classify_sample(begin, end, self.period_ns)
         };
         buf.unmap();
         Some(sample)
@@ -300,19 +317,41 @@ pub fn parse_gpu_timing_mode(text: &str) -> Option<GpuTimingMode> {
 /// Whether the warmup's samples say GPU timing should be dropped before the
 /// measured frames -- only in `Auto` mode (`On`/`Off` both ignore warmup
 /// entirely: `Off` never has a timer to disable, `On` is the explicit "keep
-/// it regardless" override for diagnosis), and whenever warmup did not
-/// produce at least one genuinely valid sample -- "prove it works before
-/// paying for it", not "prove it's broken before dropping it". `warmup_valid
-/// == 0 && warmup_invalid == 0` (nothing classified at all, which happens in
-/// practice -- see `GpuTimer::drain_after_wait`'s doc comment) is treated
-/// the same as every sample invalid: no evidence it works is not the same as
-/// evidence it doesn't, but auto's whole point is to only pay the
-/// measurement's cost once it has actually been shown to produce something.
-/// Pulled out of `run` as plain arithmetic -- no device, no `GpuTimer` -- so
-/// it is unit-tested directly rather than only reachable through a full,
-/// ~20s world-meshing run.
-fn should_disable_gpu_timing(mode: GpuTimingMode, warmup_valid: u64) -> bool {
-    mode == GpuTimingMode::Auto && warmup_valid == 0
+/// it regardless" override for diagnosis). Kept enabled only when warmup was
+/// *entirely* clean: at least one valid sample and zero invalid ones -- not
+/// "at least one valid", which sounds safer but isn't: on the M3, a broken
+/// backend still produces an occasional non-zero `end` that classifies as
+/// "valid" (traced to a stale/shifted read landing on a neighbouring slot's
+/// `begin` value, not a real end-of-pass sample -- see the linked Metal
+/// issue), so requiring only one good-looking reading let the costly,
+/// unusable measurement through 5 of 6 real runs. A working backend
+/// produces zero invalid samples; anything else -- some invalid, all
+/// invalid, or nothing classified at all -- is treated the same: not proven
+/// to work, so don't pay for it. Pulled out of `run` as plain arithmetic --
+/// no device, no `GpuTimer` -- so it is unit-tested directly rather than
+/// only reachable through a full, ~20s world-meshing run.
+fn should_disable_gpu_timing(mode: GpuTimingMode, warmup_valid: u64, warmup_invalid: u64) -> bool {
+    mode == GpuTimingMode::Auto && !(warmup_valid > 0 && warmup_invalid == 0)
+}
+
+/// What `run` should do about constructing a [`GpuTimer`] at all, given the
+/// requested mode and whether the device actually supports it.
+enum GpuTimerDecision {
+    /// Don't build one; log this as the reason.
+    Skip(&'static str),
+    Create,
+}
+
+/// Pure version of the `mode`/`supported` decision -- pulled out of `run` so
+/// all four combinations (`Off`/`Auto`/`On` x supported/not) are unit-tested
+/// directly rather than only reachable by getting a real adapter into each
+/// state.
+fn decide_gpu_timer(mode: GpuTimingMode, supported: bool) -> GpuTimerDecision {
+    match mode {
+        GpuTimingMode::Off => GpuTimerDecision::Skip("disabled (--gpu-timing off)"),
+        _ if !supported => GpuTimerDecision::Skip("n/a (no TIMESTAMP_QUERY)"),
+        GpuTimingMode::Auto | GpuTimingMode::On => GpuTimerDecision::Create,
+    }
 }
 
 /// Whether the measured run's GPU samples are worth averaging at all: at
@@ -361,16 +400,12 @@ pub fn run(
     ))
     .expect("request device");
 
-    let mut gpu_timer = match gpu_timing_mode {
-        GpuTimingMode::Off => {
-            log::info!("GPU/frame: disabled (--gpu-timing off)");
+    let mut gpu_timer = match decide_gpu_timer(gpu_timing_mode, gpu_timing_supported) {
+        GpuTimerDecision::Skip(reason) => {
+            log::info!("GPU/frame: {reason}");
             None
         }
-        _ if !gpu_timing_supported => {
-            log::info!("GPU/frame: n/a (no TIMESTAMP_QUERY)");
-            None
-        }
-        GpuTimingMode::Auto | GpuTimingMode::On => Some(GpuTimer::new(&device, &queue)),
+        GpuTimerDecision::Create => Some(GpuTimer::new(&device, &queue)),
     };
 
     // Held for the duration of the benchmark when built with `--features profile`.
@@ -636,15 +671,16 @@ pub fn run(
     let mut gpu_timing_disabled_reason: Option<String> = None;
     if let Some(timer) = &gpu_timer {
         let (warmup_valid, warmup_invalid) = timer.drain_after_wait(&device);
-        if should_disable_gpu_timing(gpu_timing_mode, warmup_valid) {
-            let reason = if warmup_invalid > 0 {
-                format!("disabled after warmup: {warmup_invalid} of {warmup_invalid} warmup samples invalid")
-            } else {
-                // Not evidence it's *broken*, but no evidence it works
-                // either -- auto's rule is "prove it works before paying
-                // for it", so an unclassified warmup is treated the same
-                // as an invalid one, not the same as a working one.
-                "disabled after warmup: no warmup samples classified".to_string()
+        if should_disable_gpu_timing(gpu_timing_mode, warmup_valid, warmup_invalid) {
+            let reason = match (warmup_valid, warmup_invalid) {
+                (0, 0) => "disabled after warmup: no warmup samples classified".to_string(),
+                (0, invalid) => {
+                    format!("disabled after warmup: {invalid} of {invalid} warmup samples invalid")
+                }
+                (valid, invalid) => format!(
+                    "disabled after warmup: {valid} valid but {invalid} invalid warmup samples \
+                     (a working backend produces zero invalid)"
+                ),
             };
             log::info!(
                 "GPU/frame: {reason} -- this backend's pass-scoped timing has not been shown to \
@@ -1020,24 +1056,74 @@ mod tests {
     }
 
     #[test]
-    fn gpu_timing_is_disabled_in_auto_mode_unless_warmup_proved_at_least_one_valid_sample() {
-        // The case this exists for: auto, warmup produced nothing but bad
-        // readings.
-        assert!(should_disable_gpu_timing(GpuTimingMode::Auto, 0));
-        // At least one good reading: keep going, even in auto.
-        assert!(!should_disable_gpu_timing(GpuTimingMode::Auto, 1));
-        // No data at all (found in practice on Metal -- a scan taken right
-        // after `Maintain::Wait` can see nothing classified yet, see
-        // `GpuTimer::drain_after_wait`) is treated the same as "every
-        // sample invalid": auto's rule is proof it works, not absence of
-        // proof it's broken.
-        assert!(should_disable_gpu_timing(GpuTimingMode::Auto, 0));
+    fn gpu_timing_stays_enabled_in_auto_mode_only_when_warmup_was_entirely_clean() {
+        // Nothing but bad readings.
+        assert!(should_disable_gpu_timing(GpuTimingMode::Auto, 0, 5));
+        // Nothing classified at all (Metal, immediately after `Wait`).
+        assert!(should_disable_gpu_timing(GpuTimingMode::Auto, 0, 0));
+        // The case that used to (wrongly) keep it enabled: at least one
+        // "valid" sample, but not *only* valid ones -- on the M3 this was a
+        // stale/shifted read landing on a neighbouring slot's begin value,
+        // not a real reading, and a working backend simply produces zero
+        // invalid samples. Any invalid sample at all disables it.
+        assert!(should_disable_gpu_timing(GpuTimingMode::Auto, 1, 5));
+        assert!(should_disable_gpu_timing(GpuTimingMode::Auto, 500, 1));
+        // Entirely clean: every classified sample valid. This is the only
+        // case that keeps it enabled.
+        assert!(!should_disable_gpu_timing(GpuTimingMode::Auto, 1, 0));
+        assert!(!should_disable_gpu_timing(GpuTimingMode::Auto, 1024, 0));
         // `On` forces it regardless of how bad warmup looked -- that is the
         // point of the override.
-        assert!(!should_disable_gpu_timing(GpuTimingMode::On, 0));
+        assert!(!should_disable_gpu_timing(GpuTimingMode::On, 0, 5));
         // `Off` never has a timer to disable in the first place; the
         // function is still total, and should still say no.
-        assert!(!should_disable_gpu_timing(GpuTimingMode::Off, 0));
+        assert!(!should_disable_gpu_timing(GpuTimingMode::Off, 0, 5));
+    }
+
+    #[test]
+    fn gpu_timer_is_only_created_when_requested_and_supported() {
+        // Off never creates one, supported or not.
+        assert!(matches!(
+            decide_gpu_timer(GpuTimingMode::Off, true),
+            GpuTimerDecision::Skip(_)
+        ));
+        assert!(matches!(
+            decide_gpu_timer(GpuTimingMode::Off, false),
+            GpuTimerDecision::Skip(_)
+        ));
+        // Auto and On both need the device to actually support it.
+        assert!(matches!(
+            decide_gpu_timer(GpuTimingMode::Auto, false),
+            GpuTimerDecision::Skip(_)
+        ));
+        assert!(matches!(
+            decide_gpu_timer(GpuTimingMode::On, false),
+            GpuTimerDecision::Skip(_)
+        ));
+        // With support, both create one.
+        assert!(matches!(
+            decide_gpu_timer(GpuTimingMode::Auto, true),
+            GpuTimerDecision::Create
+        ));
+        assert!(matches!(
+            decide_gpu_timer(GpuTimingMode::On, true),
+            GpuTimerDecision::Create
+        ));
+    }
+
+    #[test]
+    fn classify_sample_is_invalid_exactly_when_end_does_not_exceed_begin() {
+        // The pattern observed on Metal: begin plausible, end always 0.
+        assert_eq!(
+            classify_sample(47_755_107_454_708, 0, 1.0),
+            GpuSample::Invalid
+        );
+        // Equal counters: zero elapsed time is not distinguishable from a
+        // backend that didn't resolve the end sample either -- treated the
+        // same way, not as a valid 0ms reading.
+        assert_eq!(classify_sample(10, 10, 1.0), GpuSample::Invalid);
+        // A real, increasing pair converts through the period to ms.
+        assert_eq!(classify_sample(100, 1_100, 2.0), GpuSample::Ms(0.002));
     }
 
     #[test]
