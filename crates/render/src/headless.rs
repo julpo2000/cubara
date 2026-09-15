@@ -238,10 +238,11 @@ fn render_arena(
     let mut arena = build_arena(&device, &queue, multi_draw, &ctx);
     let (min, max) = arena.bounds()?;
 
-    let vp = match camera {
-        Some((eye, look_dir)) => {
-            CameraUniform::look_view_proj(width as f32 / height as f32, eye, look_dir)
-        }
+    let (vp, eye) = match camera {
+        Some((eye, look_dir)) => (
+            CameraUniform::look_view_proj(width as f32 / height as f32, eye, look_dir),
+            eye,
+        ),
         None => {
             let look_target = [
                 (min[0] + max[0]) * 0.5,
@@ -249,12 +250,14 @@ fn render_arena(
                 (min[2] + max[2]) * 0.5,
             ];
             let view_radius = (max[0] - min[0]).max(max[2] - min[2]) * 0.75;
-            CameraUniform::view_proj_matrix(
+            let vp = CameraUniform::view_proj_matrix(
                 width as f32 / height as f32,
                 orbit_t,
                 look_target,
                 view_radius,
-            )
+            );
+            let eye = glam::Vec3::from(CameraUniform::orbit_eye(orbit_t, look_target, view_radius));
+            (vp, eye)
         }
     };
     let draw_count = arena.prepare(&queue, &Frustum::from_view_proj(vp));
@@ -268,7 +271,12 @@ fn render_arena(
         &tex_view,
         &tex_sampler,
     );
-    scene.set_camera(&queue, vp);
+    // Fog off: a golden test wants the same pixels every run, and this
+    // crate's headless callers have no render-radius concept of their own
+    // to derive a fog range from anyway (`ARCHITECTURE.md` Rule 3 -- that's
+    // `cubara-app`'s job, which is why `--screenshot`/the golden tests never
+    // see it either).
+    scene.set_camera(&queue, vp, eye, crate::render::Lighting::default());
     if !icons.is_empty() {
         scene.set_icons(&device, &queue, &icons);
     }

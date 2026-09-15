@@ -18,8 +18,8 @@ use crate::materials;
 use crate::panel::{InventoryPanel, PanelSlotKind};
 use crate::render::{
     build_figure_pipeline, build_outline_pipeline, build_pipeline, camera_bind_group_layout,
-    create_depth_view, origins_bind_group_layout, outline_bind_group_layout, CameraUniform,
-    OutlineUniform, OUTLINE_CUBE_EDGES,
+    create_depth_view, origins_bind_group_layout, outline_bind_group_layout, FrameUniform,
+    Lighting, OutlineUniform, OUTLINE_CUBE_EDGES,
 };
 use crate::text::font;
 use crate::text::TextRenderer;
@@ -234,7 +234,7 @@ impl SceneRenderer {
     ) -> Self {
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("camera-uniform"),
-            size: std::mem::size_of::<CameraUniform>() as u64,
+            size: std::mem::size_of::<FrameUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -333,9 +333,19 @@ impl SceneRenderer {
         self.width as f32 / self.height as f32
     }
 
-    /// Upload the view-projection matrix this frame draws with.
-    pub fn set_camera(&self, queue: &wgpu::Queue, view_proj: Mat4) {
-        let uniform = CameraUniform::from_matrix(view_proj);
+    /// Upload the view-projection matrix, the eye position, and the
+    /// lighting/fog this frame draws with. `eye` is a separate parameter
+    /// rather than derived from `view_proj` (which is possible but a
+    /// needless round trip through a matrix inverse) since every caller
+    /// already knows where its camera is.
+    pub fn set_camera(
+        &self,
+        queue: &wgpu::Queue,
+        view_proj: Mat4,
+        eye: glam::Vec3,
+        lighting: Lighting,
+    ) {
+        let uniform = FrameUniform::new(view_proj, eye, lighting);
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 

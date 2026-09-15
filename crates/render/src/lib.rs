@@ -35,7 +35,7 @@ pub use panel::{InventoryPanel, PanelSlot, PanelSlotKind};
 pub use profiling::Profiler;
 pub use render::{
     build_pipeline, camera_bind_group_layout, create_depth_view, gpu_driven_features, grab_cursor,
-    load_mesh_assets, load_registry, CameraPose, CameraUniform, Renderer,
+    load_mesh_assets, load_registry, CameraPose, CameraUniform, FrameUniform, Lighting, Renderer,
 };
 pub use scene::HealthView;
 pub use scene::{

@@ -177,6 +177,127 @@ impl CameraUniform {
     }
 }
 
+/// Everything about a frame that is not the camera or the geometry: the sun,
+/// the ambient floor, the AO floor, and (from block 2 of this package on) the
+/// distance fog. One place these live, read by both `mesh.wgsl` and
+/// `figure.wgsl`, rather than each shader hard-coding its own sun (they used
+/// to disagree: `mesh.wgsl` had `(0.4, 1.0, 0.3)`, `figure.wgsl` had
+/// `(0.4, 0.9, 0.25)`).
+///
+/// `Default` encodes exactly the literals `mesh.wgsl` hard-coded before this
+/// existed, and `fog_end <= fog_start` (both `0.0`) is deliberately "fog
+/// off" -- the shader treats that pair as a special case rather than relying
+/// on distances happening to fall outside some very large range, so a
+/// caller that never sets fog gets pixel-identical output to before this
+/// type existed.
+#[derive(Clone, Copy, Debug)]
+pub struct Lighting {
+    /// Normalized on the CPU; the shader does not renormalize it.
+    pub sun_dir: glam::Vec3,
+    pub sun_color: glam::Vec3,
+    /// How much the sun's `max(dot(n, sun_dir), 0)` term contributes,
+    /// separate from `sun_color` so a coloured sun and a dim sun are two
+    /// different knobs.
+    pub diffuse_weight: f32,
+    /// Hemispheric ambient floor/ceiling: ground-facing / sky-facing.
+    pub ambient_low: f32,
+    pub ambient_high: f32,
+    /// Baked ambient occlusion never darkens a surface past this.
+    pub ao_floor: f32,
+    pub fog_color: glam::Vec3,
+    /// Distance at which fog starts blending in, and finishes (fully
+    /// `fog_color`). `fog_end <= fog_start` means "no fog", not "fog
+    /// starting behind the camera" -- see the type's doc comment.
+    pub fog_start: f32,
+    pub fog_end: f32,
+    /// `0.0..1.0` around a day; unused (fixed at `0.0`) until a later
+    /// package turns on the day/night cycle this only carries the plumbing
+    /// for.
+    pub time_of_day: f32,
+}
+
+impl Default for Lighting {
+    fn default() -> Self {
+        Self {
+            sun_dir: glam::vec3(0.4, 1.0, 0.3).normalize(),
+            sun_color: glam::Vec3::ONE,
+            diffuse_weight: 0.75,
+            ambient_low: 0.28,
+            ambient_high: 0.42,
+            ao_floor: 0.4,
+            // Matches `scene::CLEAR_COLOR` -- fog fading into anything else
+            // would draw a visible ring where geometry gives way to sky
+            // instead of the two disappearing into each other.
+            fog_color: glam::vec3(0.45, 0.62, 0.80),
+            fog_start: 0.0,
+            fog_end: 0.0,
+            time_of_day: 0.0,
+        }
+    }
+}
+
+/// The uniform actually bound at `@group(0) @binding(0)`: the camera plus
+/// [`Lighting`], std140-safe (every field a full `vec4`, so nothing needs
+/// manual padding to hit 16-byte alignment). `mesh.wgsl` and `figure.wgsl`
+/// declare the matching `Frame` struct and read all of it; `outline.wgsl`
+/// still declares only the leading `view_proj` it actually uses -- WGSL
+/// doesn't require a shader to describe a whole bound buffer, only the
+/// prefix it reads, so a smaller struct there stays correct as long as
+/// `view_proj` stays first.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct FrameUniform {
+    view_proj: [[f32; 4]; 4],
+    eye: [f32; 4],
+    sun_dir: [f32; 4],
+    /// `.w` is [`Lighting::diffuse_weight`].
+    sun_color: [f32; 4],
+    /// `.x` [`Lighting::ambient_low`], `.y` `ambient_high`, `.z` `ao_floor`.
+    ambient: [f32; 4],
+    fog_color: [f32; 4],
+    /// `.x` [`Lighting::fog_start`], `.y` `fog_end`, `.z` `time_of_day`.
+    fog: [f32; 4],
+}
+
+impl FrameUniform {
+    pub fn new(view_proj: glam::Mat4, eye: glam::Vec3, lighting: Lighting) -> Self {
+        Self {
+            view_proj: view_proj.to_cols_array_2d(),
+            eye: [eye.x, eye.y, eye.z, 0.0],
+            sun_dir: [
+                lighting.sun_dir.x,
+                lighting.sun_dir.y,
+                lighting.sun_dir.z,
+                0.0,
+            ],
+            sun_color: [
+                lighting.sun_color.x,
+                lighting.sun_color.y,
+                lighting.sun_color.z,
+                lighting.diffuse_weight,
+            ],
+            ambient: [
+                lighting.ambient_low,
+                lighting.ambient_high,
+                lighting.ao_floor,
+                0.0,
+            ],
+            fog_color: [
+                lighting.fog_color.x,
+                lighting.fog_color.y,
+                lighting.fog_color.z,
+                0.0,
+            ],
+            fog: [
+                lighting.fog_start,
+                lighting.fog_end,
+                lighting.time_of_day,
+                0.0,
+            ],
+        }
+    }
+}
+
 /// A camera position and facing to render from -- the renderer's *entire*
 /// idea of "the camera": no input, no movement, no keys held
 /// (`ARCHITECTURE.md` Rule 3 -- if the renderer could move the player, the
@@ -704,7 +825,8 @@ impl Renderer {
 
         let vp = camera.view_proj(self.scene.aspect());
         self.frustum = Frustum::from_view_proj(vp);
-        self.scene.set_camera(&self.queue, vp);
+        self.scene
+            .set_camera(&self.queue, vp, camera.eye, Lighting::default());
     }
 
     /// Report frames-per-second roughly once per second.
@@ -744,7 +866,12 @@ pub fn camera_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout 
         label: Some("camera-bgl"),
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX,
+            // Vertex-only until `Lighting`/`FrameUniform`: `mesh.wgsl` and
+            // `figure.wgsl`'s fragment stages now read the sun/ambient/fog
+            // fields too. `outline.wgsl`'s fragment stage still doesn't
+            // touch this group at all, which is fine -- a pipeline is never
+            // required to use every stage a layout makes visible.
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: false,
@@ -1048,5 +1175,41 @@ mod tests {
         // Offsets must land on the real field boundaries.
         let offsets: Vec<u64> = layout.attributes.iter().map(|a| a.offset).collect();
         assert_eq!(offsets, vec![0, 4, 8]);
+    }
+
+    #[test]
+    fn lighting_default_matches_mesh_wgsls_original_literals() {
+        // `mesh.wgsl` hard-coded these before `Lighting`/`FrameUniform`
+        // existed (`vec3<f32>(0.4, 1.0, 0.3)`, `mix(0.28, 0.42, ...)`,
+        // `mix(0.4, 1.0, in.ao)`, `diffuse * 0.75`). Pinned here so nobody
+        // can "clean up" a default and silently shift every terrain pixel.
+        let l = Lighting::default();
+        assert_eq!(l.sun_dir, glam::vec3(0.4, 1.0, 0.3).normalize());
+        assert_eq!(l.sun_color, glam::Vec3::ONE);
+        assert_eq!(l.diffuse_weight, 0.75);
+        assert_eq!(l.ambient_low, 0.28);
+        assert_eq!(l.ambient_high, 0.42);
+        assert_eq!(l.ao_floor, 0.4);
+        // `scene::CLEAR_COLOR` -- kept in step by this assertion rather than
+        // by hoping two literals in two files never drift apart.
+        assert_eq!(l.fog_color, glam::vec3(0.45, 0.62, 0.80));
+        assert!(
+            l.fog_end <= l.fog_start,
+            "the default must have fog off, not merely far away"
+        );
+    }
+
+    #[test]
+    fn frame_uniform_packs_lighting_at_the_offsets_the_shader_expects() {
+        let f = FrameUniform::new(
+            glam::Mat4::IDENTITY,
+            glam::Vec3::new(1.0, 2.0, 3.0),
+            Lighting::default(),
+        );
+        assert_eq!(f.eye, [1.0, 2.0, 3.0, 0.0]);
+        assert_eq!(f.sun_color[3], 0.75, "diffuse weight lives in sun_color.w");
+        assert_eq!(f.ambient, [0.28, 0.42, 0.4, 0.0]);
+        assert_eq!(f.fog[0], 0.0, "fog_start");
+        assert_eq!(f.fog[1], 0.0, "fog_end");
     }
 }

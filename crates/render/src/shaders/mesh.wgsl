@@ -5,11 +5,26 @@
 // a per-node origin add (scaled by the node's own lattice step) here, not a
 // CPU-side translate.
 
-struct Camera {
+// Everything about the frame beyond the geometry: camera, sun, ambient, fog.
+// One binding shared with `figure.wgsl` (`render.rs`'s `FrameUniform`/
+// `Lighting`), so the two can't disagree about where the sun is the way
+// they used to. Fog fields exist here from this shader's first use of this
+// struct; the fragment stage below does not use them yet -- see
+// `docs`/the PR that introduces distance fog for the code that reads them.
+struct Frame {
     view_proj: mat4x4<f32>,
+    eye: vec4<f32>,
+    sun_dir: vec4<f32>,
+    // .w is the diffuse term's weight.
+    sun_color: vec4<f32>,
+    // .x ambient (ground-facing), .y ambient (sky-facing), .z AO floor.
+    ambient: vec4<f32>,
+    fog_color: vec4<f32>,
+    // .x fog start, .y fog end, .z time of day.
+    fog: vec4<f32>,
 };
 
-@group(0) @binding(0) var<uniform> camera: Camera;
+@group(0) @binding(0) var<uniform> frame: Frame;
 
 // One world-space origin per resident node, indexed by the node_index packed
 // into word 2 of each vertex (see crates/render/src/arena.rs). xyz is the
@@ -74,7 +89,7 @@ fn vs_main(in: VsIn) -> VsOut {
     let world_pos = node_origin.xyz + local_pos * node_origin.w;
 
     var out: VsOut;
-    out.clip_pos = camera.view_proj * vec4<f32>(world_pos, 1.0);
+    out.clip_pos = frame.view_proj * vec4<f32>(world_pos, 1.0);
     out.normal = FACE_NORMALS[face];
     out.ao = f32(ao_raw) / 3.0;
     out.uv = vec2<f32>(u, v);
@@ -86,17 +101,18 @@ fn vs_main(in: VsIn) -> VsOut {
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
 
-    // Directional sun: clear sun-side / shadow-side split.
-    let light_dir = normalize(vec3<f32>(0.4, 1.0, 0.3));
-    let diffuse = max(dot(n, light_dir), 0.0);
+    // Directional sun: clear sun-side / shadow-side split. `sun_dir` arrives
+    // already normalized (`Lighting`'s doc comment); the shader does not
+    // renormalize it.
+    let diffuse = max(dot(n, frame.sun_dir.xyz), 0.0) * frame.sun_color.w;
 
     // Hemispheric ambient: a touch brighter facing up (sky) than down (ground).
-    let ambient = mix(0.28, 0.42, n.y * 0.5 + 0.5);
+    let ambient = mix(frame.ambient.x, frame.ambient.y, n.y * 0.5 + 0.5);
 
     // Baked ambient occlusion darkens crevices; keep a floor so nothing is pure black.
-    let ao = mix(0.4, 1.0, in.ao);
+    let ao = mix(frame.ambient.z, 1.0, in.ao);
 
     let tex = textureSample(block_textures, block_sampler, in.uv, in.layer);
-    let color = tex.rgb * (ambient + diffuse * 0.75) * ao;
+    let color = tex.rgb * frame.sun_color.rgb * (ambient + diffuse) * ao;
     return vec4<f32>(color, 1.0);
 }
