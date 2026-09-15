@@ -484,7 +484,20 @@ fn main() {
             None => Some(streaming::VERTICAL_LOD_SQUASH),
         };
         let overlay = args.iter().any(|a| a == "--overlay");
-        bench::run(radius, size, bench::View { eye, squash }, overlay);
+        let gpu_timing = match flag("--gpu-timing") {
+            Some(text) => bench::parse_gpu_timing_mode(text).unwrap_or_else(|| {
+                eprintln!("--gpu-timing needs off, auto, or on");
+                std::process::exit(2);
+            }),
+            None => bench::GpuTimingMode::default(),
+        };
+        bench::run(
+            radius,
+            size,
+            bench::View { eye, squash },
+            overlay,
+            gpu_timing,
+        );
         return;
     }
 

@@ -5,7 +5,8 @@
 //! sustained throughput against the 1000-FPS goal. A fixed virtual time step keeps
 //! the camera orbit identical regardless of how fast the machine runs.
 //!
-//! Run with: `cargo run --release -- --bench [radius] [--size WIDTHxHEIGHT] [--overlay]`
+//! Run with:
+//! `cargo run --release -- --bench [radius] [--size WIDTHxHEIGHT] [--overlay] [--gpu-timing off|auto|on]`
 //!
 //! **Resolution matters, and 1920x1080 is only the default.** Frame cost has a
 //! part that grows with pixels -- every covered pixel is shaded -- and a bench
@@ -16,6 +17,11 @@
 //! `--overlay` draws through the same debug-text path the window's F3 overlay
 //! does (off by default in both places, `render.rs`'s `show_debug`), so its
 //! cost shows up in the numbers rather than being silently excluded.
+//!
+//! `--gpu-timing` controls the GPU/frame reading ([`GpuTimingMode`]) --
+//! `auto` (the default) turns it off before the measured frames if every
+//! warmup sample came back invalid, since a backend whose pass-scoped timer
+//! doesn't work can still charge real time for trying.
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -187,6 +193,17 @@ impl GpuTimer {
             let raw: &[u64] = bytemuck::cast_slice(&data);
             let (begin, end) = (raw[0], raw[1]);
             if end <= begin {
+                // Unconditional, not just the first few: `log::debug!` costs
+                // nothing unless enabled, and this is exactly the raw data
+                // needed to tell "counter never resolved" (0/0) apart from
+                // "resolved backwards" from a diagnosis a plain "invalid"
+                // count can't -- found necessary on Metal, where every
+                // sample came back this way (see the linked issue).
+                log::debug!(
+                    "GPU timestamp invalid: slot {slot} begin={begin} end={end} \
+                     period_ns={period}",
+                    period = self.period_ns
+                );
                 GpuSample::Invalid
             } else {
                 GpuSample::Ms((end - begin) as f64 * self.period_ns / 1_000_000.0)
@@ -216,7 +233,46 @@ pub struct View {
     pub squash: Option<i32>,
 }
 
-pub fn run(radius: i32, (width, height): (u32, u32), view: View, overlay: bool) {
+/// `--gpu-timing off|auto|on`. Found necessary on Metal: attaching
+/// `timestamp_writes` to the main pass there resolved every sample as
+/// invalid (`end <= begin`) *and* cost real time doing it -- 20% fewer FPS,
+/// CPU/frame up ~30% on the M3, for a number that was never going to be
+/// usable. A pass with no working per-pass timer still pays for the
+/// sample-buffer machinery around it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GpuTimingMode {
+    /// Never attach GPU timing -- no query set, no per-pass cost.
+    Off,
+    /// Try it; if every warmup-frame sample comes back invalid, drop it
+    /// before the measured frames so the FPS/CPU numbers aren't paying for
+    /// a reading that was never going to be usable. The default: makes
+    /// `--bench` safe to run unattended on a backend this hasn't been
+    /// tried on yet.
+    #[default]
+    Auto,
+    /// Keep it on regardless of what warmup found -- for diagnosing *why*
+    /// a backend's samples are invalid (paired with `RUST_LOG=debug` for
+    /// the raw begin/end values `GpuTimer::take_ms` logs).
+    On,
+}
+
+/// Parse a `--gpu-timing` value: `off`, `auto`, or `on` (case-insensitive).
+pub fn parse_gpu_timing_mode(text: &str) -> Option<GpuTimingMode> {
+    match text.to_ascii_lowercase().as_str() {
+        "off" => Some(GpuTimingMode::Off),
+        "auto" => Some(GpuTimingMode::Auto),
+        "on" => Some(GpuTimingMode::On),
+        _ => None,
+    }
+}
+
+pub fn run(
+    radius: i32,
+    (width, height): (u32, u32),
+    view: View,
+    overlay: bool,
+    gpu_timing_mode: GpuTimingMode,
+) {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         ..Default::default()
@@ -244,10 +300,17 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View, overlay: bool) 
     ))
     .expect("request device");
 
-    let gpu_timer = gpu_timing_supported.then(|| GpuTimer::new(&device, &queue));
-    if !gpu_timing_supported {
-        log::info!("GPU/frame: n/a (no TIMESTAMP_QUERY)");
-    }
+    let mut gpu_timer = match gpu_timing_mode {
+        GpuTimingMode::Off => {
+            log::info!("GPU/frame: disabled (--gpu-timing off)");
+            None
+        }
+        _ if !gpu_timing_supported => {
+            log::info!("GPU/frame: n/a (no TIMESTAMP_QUERY)");
+            None
+        }
+        GpuTimingMode::Auto | GpuTimingMode::On => Some(GpuTimer::new(&device, &queue)),
+    };
 
     // Held for the duration of the benchmark when built with `--features profile`.
     let _profiler = cubara_render::Profiler::init();
@@ -498,12 +561,37 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View, overlay: bool) 
         frame_index += 1;
     }
     let _ = device.poll(wgpu::Maintain::Wait);
-    // Warmup's GPU-timing slots are never read back — only measurement
-    // frames count — so drain whatever they left ready rather than let a
-    // stale reading leak into the first measured sample.
+    // Warmup's own readings are never counted in the reported stats -- only
+    // measurement frames count -- but the drain still classifies them,
+    // because that classification decides whether GPU timing runs at all
+    // for the frames that *are* counted: `--gpu-timing auto` (the default)
+    // turns it off here if every warmup sample was invalid, rather than pay
+    // its cost through the whole measured run for a number that was never
+    // going to be usable (found on Metal: every sample invalid, and the
+    // pass-scoped machinery itself cost ~20% FPS and +30% CPU/frame there).
+    let mut gpu_timing_disabled_reason: Option<String> = None;
     if let Some(timer) = &gpu_timer {
+        let mut warmup_valid = 0u64;
+        let mut warmup_invalid = 0u64;
         for slot in 0..GPU_TIMER_DEPTH {
-            timer.take_ms(slot);
+            match timer.take_ms(slot) {
+                Some(GpuSample::Ms(_)) => warmup_valid += 1,
+                Some(GpuSample::Invalid) => warmup_invalid += 1,
+                None => {}
+            }
+        }
+        if gpu_timing_mode == GpuTimingMode::Auto && warmup_valid == 0 && warmup_invalid > 0 {
+            let reason = format!(
+                "disabled after warmup: {warmup_invalid} of {warmup_invalid} warmup samples \
+                 invalid"
+            );
+            log::info!(
+                "GPU/frame: {reason} -- this backend's pass-scoped timing looks unusable here \
+                 (RUST_LOG=debug shows the raw begin/end values). Use --gpu-timing on to force \
+                 it anyway."
+            );
+            gpu_timing_disabled_reason = Some(reason);
+            gpu_timer = None;
         }
     }
 
@@ -579,6 +667,7 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View, overlay: bool) 
         cpu_ms,
         gpu_ms,
         gpu_invalid,
+        gpu_timing_disabled_reason,
         avg_draws,
         avg_visible,
         total_nodes,
@@ -592,6 +681,7 @@ fn report(
     mut cpu_ms: Vec<f64>,
     mut gpu_ms: Vec<f64>,
     gpu_invalid: u64,
+    gpu_timing_disabled_reason: Option<String>,
     avg_draws: f64,
     avg_visible: f64,
     total_nodes: usize,
@@ -625,12 +715,13 @@ fn report(
         let p99 = gpu_ms[((n as f64 * 0.99) as usize).min(n - 1)];
         (avg, p99)
     });
-    let gpu_line = match gpu_stats {
-        Some((avg, p99)) => format!(
+    let gpu_line = match (&gpu_stats, &gpu_timing_disabled_reason) {
+        (Some((avg, p99)), _) => format!(
             "avg {avg:.3} ms | p99 {p99:.3} | samples {gpu_sample_count}/{frames} | invalid {gpu_invalid}"
         ),
-        None if gpu_invalid > 0 => format!("n/a ({gpu_invalid} invalid samples, 0 valid)"),
-        None => "n/a".to_string(),
+        (None, Some(reason)) => format!("n/a ({reason})"),
+        (None, None) if gpu_invalid > 0 => format!("n/a ({gpu_invalid} invalid samples, 0 valid)"),
+        (None, None) => "n/a".to_string(),
     };
 
     log::info!("=========== BENCHMARK RESULT ===========");
@@ -652,14 +743,15 @@ fn report(
     } else {
         "NOT MET"
     };
-    let gpu_summary = match gpu_stats {
-        Some((avg, p99)) if gpu_invalid > 0 => format!(
+    let gpu_summary = match (&gpu_stats, &gpu_timing_disabled_reason) {
+        (Some((avg, p99)), _) if gpu_invalid > 0 => format!(
             "GPU/frame avg {avg:.3} ms (p99 {p99:.3}, {gpu_sample_count} samples, {gpu_invalid} invalid)"
         ),
-        Some((avg, p99)) => {
+        (Some((avg, p99)), _) => {
             format!("GPU/frame avg {avg:.3} ms (p99 {p99:.3}, {gpu_sample_count} samples)")
         }
-        None => "GPU/frame n/a".to_string(),
+        (None, Some(reason)) => format!("GPU/frame n/a ({reason})"),
+        (None, None) => "GPU/frame n/a".to_string(),
     };
     log::info!(
         "SUMMARY: {throughput:.0} FPS | CPU/frame avg {cpu_avg:.3} ms (p99 {cpu_p99:.3}) | \
@@ -858,6 +950,16 @@ mod tests {
             // the pass-scoped write path produced a real reading, which is
             // what this test is pinning.
             GpuSample::Invalid => {}
+        }
+    }
+
+    #[test]
+    fn gpu_timing_mode_parses_the_three_values_case_insensitively() {
+        assert_eq!(parse_gpu_timing_mode("off"), Some(GpuTimingMode::Off));
+        assert_eq!(parse_gpu_timing_mode("Auto"), Some(GpuTimingMode::Auto));
+        assert_eq!(parse_gpu_timing_mode("ON"), Some(GpuTimingMode::On));
+        for bad in ["", "yes", "auto ", " on"] {
+            assert_eq!(parse_gpu_timing_mode(bad), None, "{bad:?}");
         }
     }
 
