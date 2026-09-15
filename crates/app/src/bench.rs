@@ -45,6 +45,15 @@ const VIRTUAL_DT: f32 = 1.0 / 240.0;
 /// slow readback would silently stop producing GPU samples.
 const GPU_TIMER_DEPTH: usize = 3;
 
+/// The two query-set indices `slot` writes its begin/end timestamps to.
+/// Pulled out of [`GpuTimer`] as plain arithmetic (no `&self`, no wgpu) so it
+/// is unit-tested without a device: an off-by-one here would have a slot's
+/// `end` alias the next slot's `begin`, silently mixing two frames' readings.
+fn timestamp_indices(slot: usize) -> (u32, u32) {
+    let begin = (slot * 2) as u32;
+    (begin, begin + 1)
+}
+
 /// Owns a timestamp query set and its readback buffers around the main scene
 /// pass, and turns completed reads into milliseconds. The bookkeeping for
 /// which slot is safe to write or read is [`TimestampRing`]
@@ -103,10 +112,11 @@ impl GpuTimer {
     }
 
     fn timestamps(&self, slot: usize) -> GpuTimestamps<'_> {
+        let (begin, end) = timestamp_indices(slot);
         GpuTimestamps {
             query_set: &self.query_set,
-            begin: (slot * 2) as u32,
-            end: (slot * 2 + 1) as u32,
+            begin,
+            end,
         }
     }
 
@@ -114,9 +124,10 @@ impl GpuTimer {
     /// within the same encoder that wrote them, before submit.
     fn resolve(&self, encoder: &mut wgpu::CommandEncoder, slot: usize) {
         let src_offset = (slot as u64) * wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT;
+        let (begin, end) = timestamp_indices(slot);
         encoder.resolve_query_set(
             &self.query_set,
-            (slot * 2) as u32..(slot * 2 + 2) as u32,
+            begin..end + 1,
             &self.resolve_buffer,
             src_offset,
         );
@@ -375,10 +386,10 @@ pub fn run(radius: i32, (width, height): (u32, u32), view: View, overlay: bool) 
     // plane extractions), and excluding them understated what "CPU/frame" claims
     // to measure.
     let submit_frame = |arena: &mut ChunkArena,
-                         scene: &mut SceneRenderer,
-                         vt: f32,
-                         gpu_timer: Option<&GpuTimer>,
-                         frame_index: u64|
+                        scene: &mut SceneRenderer,
+                        vt: f32,
+                        gpu_timer: Option<&GpuTimer>,
+                        frame_index: u64|
      -> (f64, u32, usize) {
         puffin::profile_scope!("frame");
         let cpu_start = Instant::now();
@@ -638,6 +649,24 @@ pub fn parse_eye(text: &str) -> Option<[f32; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_slots_timestamp_indices_are_adjacent_and_slots_never_overlap() {
+        let mut seen = std::collections::HashSet::new();
+        for slot in 0..GPU_TIMER_DEPTH {
+            let (begin, end) = timestamp_indices(slot);
+            assert_eq!(
+                end,
+                begin + 1,
+                "slot {slot}'s end index must immediately follow its begin index"
+            );
+            assert!(
+                seen.insert(begin) && seen.insert(end),
+                "slot {slot}'s indices ({begin}, {end}) overlap an earlier slot's -- \
+                 two slots would alias the same GPU timestamp"
+            );
+        }
+    }
 
     #[test]
     fn an_eye_is_three_numbers() {

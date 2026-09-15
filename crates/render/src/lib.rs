@@ -39,7 +39,6 @@ pub use render::{
 };
 pub use scene::HealthView;
 pub use scene::{
-    FurnaceGauges, GpuTimestamps, HotbarSlot, HotbarView, Hud, PanelView, SceneFrame,
-    SceneRenderer,
+    FurnaceGauges, GpuTimestamps, HotbarSlot, HotbarView, Hud, PanelView, SceneFrame, SceneRenderer,
 };
 pub use text::TextRenderer;
