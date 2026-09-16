@@ -575,17 +575,35 @@ pub fn run(
      -> (f64, u32, usize) {
         puffin::profile_scope!("frame");
         let cpu_start = Instant::now();
-        let vp = match view.eye {
+        let (vp, eye) = match view.eye {
             Some(eye) => {
                 // A full turn every ~20 virtual seconds, pitched down a
                 // little: what a player looking around sees.
                 let yaw = vt * 0.3;
                 let dir = glam::vec3(yaw.cos(), -0.25, yaw.sin());
-                CameraUniform::look_view_proj(aspect, glam::Vec3::from(eye), dir)
+                (
+                    CameraUniform::look_view_proj(aspect, glam::Vec3::from(eye), dir),
+                    glam::Vec3::from(eye),
+                )
             }
-            None => CameraUniform::view_proj_matrix(aspect, vt, look_target, view_radius),
+            None => (
+                CameraUniform::view_proj_matrix(aspect, vt, look_target, view_radius),
+                glam::Vec3::from(CameraUniform::orbit_eye(vt, look_target, view_radius)),
+            ),
         };
-        scene.set_camera(&queue, vp);
+        // Fog end tied to the region's own radius, so it moves with
+        // `--bench <radius>` rather than a number picked for radius 64.
+        let (fog_start, fog_end) = cubara_render::Lighting::fog_range(view_radius);
+        scene.set_camera(
+            &queue,
+            vp,
+            eye,
+            cubara_render::Lighting {
+                fog_start,
+                fog_end,
+                ..Default::default()
+            },
+        );
         let frustum = Frustum::from_view_proj(vp);
 
         // CPU cull + indirect-list upload — the per-frame work we're measuring.
@@ -596,7 +614,8 @@ pub fn run(
         let overlay_text = overlay.then(|| {
             format!(
                 "cubara --bench  ({width}x{height})\n\
-                 draws {draws}  nodes {visible}/{total_nodes}",
+                 draws {draws}  nodes {visible}/{total_nodes}\n\
+                 fog  {fog_start:.0}-{fog_end:.0}",
                 draws = draw_count,
                 visible = arena.visible_nodes(),
             )

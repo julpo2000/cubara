@@ -10,7 +10,7 @@
 //! `--screenshot out.png --eye X,Y,Z --look DX,DY,DZ [--radius N] [--size WxH]`.
 
 use cubara_render::materials::TextureLayers;
-use cubara_render::{headless, load_registry, Shot};
+use cubara_render::{headless, load_registry, Lighting, Shot};
 use cubara_voxel::ChunkCoord;
 use cubara_world::mesh::{mesh_nodes, mesh_region};
 use cubara_world::node::{desired_nodes_3d, schedule_for_radius};
@@ -27,6 +27,27 @@ pub struct View {
     /// Render distance in chunks.
     pub radius: i32,
     pub size: (u32, u32),
+}
+
+/// Fog for `shot`'s own `region_radius` -- not `streaming::render_radius_blocks()`
+/// (the *window*'s fixed schedule), since `--screenshot --radius N` can ask
+/// for a region smaller or larger than the game streams: reusing a fixed
+/// number here would put fog past this shot's own meshed region exactly the
+/// way `FAR_PLANE` put it past the window's, for a different fixed value.
+/// A screenshot is meant to show what the game looks like, fog included --
+/// without this, `--screenshot` was the one entry point the review found
+/// where it never did.
+fn shot_with_fog(shot: Shot) -> Shot {
+    let radius_blocks = (shot.region_radius * 16) as f32;
+    let (fog_start, fog_end) = Lighting::fog_range(radius_blocks);
+    Shot {
+        lighting: Lighting {
+            fog_start,
+            fog_end,
+            ..Lighting::default()
+        },
+        ..shot
+    }
 }
 
 pub fn run(path: &str, view: Option<View>) {
@@ -50,7 +71,7 @@ pub fn run(path: &str, view: Option<View>) {
                 &schedule,
                 blocks,
             );
-            (shot, built)
+            (shot_with_fog(shot), built)
         }
         // The nodes the game streams around a player standing at `eye`.
         Some(v) => {
@@ -65,7 +86,7 @@ pub fn run(path: &str, view: Option<View>) {
                 camera: Some((glam::Vec3::from(v.eye), glam::Vec3::from(v.look))),
                 ..Shot::default()
             };
-            (shot, built)
+            (shot_with_fog(shot), built)
         }
     };
     let meshed = built.into_iter().filter_map(to_meshed_node);
@@ -87,4 +108,27 @@ pub fn run(path: &str, view: Option<View>) {
         frame.width,
         frame.height
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shot_with_fog_stays_inside_its_own_region_regardless_of_radius() {
+        // The bug class this exists to avoid repeating: a fixed fog range
+        // reused across shots of different sizes lands outside a smaller
+        // one's meshed geometry, same as `FAR_PLANE` did for the window.
+        for region_radius in [3, 6, 32, 64] {
+            let shot = shot_with_fog(Shot {
+                region_radius,
+                ..Shot::default()
+            });
+            let radius_blocks = (region_radius * 16) as f32;
+            assert!(
+                shot.lighting.fog_end < radius_blocks,
+                "region_radius {region_radius}: fog_end must land inside this shot's own region"
+            );
+        }
+    }
 }

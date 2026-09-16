@@ -114,6 +114,12 @@ pub struct Shot {
     pub gauges: Option<(f32, f32)>,
     /// Item icons that [`crate::HotbarSlot::icon`] indexes into.
     pub icons: Vec<Option<Vec<u8>>>,
+    /// Sun, ambient and fog for this shot. `Lighting::default()` (fog off)
+    /// keeps every existing golden byte-identical; a shot that wants to show
+    /// fog (there is exactly one, for the fog feature itself) sets it
+    /// explicitly rather than this crate guessing a render radius from
+    /// `region_radius` -- a golden's whole point is a fixed, chosen scene.
+    pub lighting: crate::render::Lighting,
 }
 
 impl Default for Shot {
@@ -134,6 +140,7 @@ impl Default for Shot {
             tooltip: None,
             gauges: None,
             icons: Vec::new(),
+            lighting: crate::render::Lighting::default(),
         }
     }
 }
@@ -219,6 +226,7 @@ fn render_arena(
         tooltip,
         gauges,
         icons,
+        lighting,
     } = shot;
     // Slot 0 held: a fixed choice, so a golden reference has a stable
     // selection highlight to compare against.
@@ -238,10 +246,11 @@ fn render_arena(
     let mut arena = build_arena(&device, &queue, multi_draw, &ctx);
     let (min, max) = arena.bounds()?;
 
-    let vp = match camera {
-        Some((eye, look_dir)) => {
-            CameraUniform::look_view_proj(width as f32 / height as f32, eye, look_dir)
-        }
+    let (vp, eye) = match camera {
+        Some((eye, look_dir)) => (
+            CameraUniform::look_view_proj(width as f32 / height as f32, eye, look_dir),
+            eye,
+        ),
         None => {
             let look_target = [
                 (min[0] + max[0]) * 0.5,
@@ -249,12 +258,14 @@ fn render_arena(
                 (min[2] + max[2]) * 0.5,
             ];
             let view_radius = (max[0] - min[0]).max(max[2] - min[2]) * 0.75;
-            CameraUniform::view_proj_matrix(
+            let vp = CameraUniform::view_proj_matrix(
                 width as f32 / height as f32,
                 orbit_t,
                 look_target,
                 view_radius,
-            )
+            );
+            let eye = glam::Vec3::from(CameraUniform::orbit_eye(orbit_t, look_target, view_radius));
+            (vp, eye)
         }
     };
     let draw_count = arena.prepare(&queue, &Frustum::from_view_proj(vp));
@@ -268,7 +279,12 @@ fn render_arena(
         &tex_view,
         &tex_sampler,
     );
-    scene.set_camera(&queue, vp);
+    // Fog off: a golden test wants the same pixels every run, and this
+    // crate's headless callers have no render-radius concept of their own
+    // to derive a fog range from anyway (`ARCHITECTURE.md` Rule 3 -- that's
+    // `cubara-app`'s job, which is why `--screenshot`/the golden tests never
+    // see it either).
+    scene.set_camera(&queue, vp, eye, lighting);
     if !icons.is_empty() {
         scene.set_icons(&device, &queue, &icons);
     }
