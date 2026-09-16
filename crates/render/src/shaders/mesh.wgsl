@@ -8,9 +8,7 @@
 // Everything about the frame beyond the geometry: camera, sun, ambient, fog.
 // One binding shared with `figure.wgsl` (`render.rs`'s `FrameUniform`/
 // `Lighting`), so the two can't disagree about where the sun is the way
-// they used to. Fog fields exist here from this shader's first use of this
-// struct; the fragment stage below does not use them yet -- see
-// `docs`/the PR that introduces distance fog for the code that reads them.
+// they used to.
 struct Frame {
     view_proj: mat4x4<f32>,
     eye: vec4<f32>,

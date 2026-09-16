@@ -35,6 +35,27 @@ use cubara_world::World;
 /// the bottom of a shaft you look into turns to solid rock. `2` keeps 80.
 pub(crate) const VERTICAL_LOD_SQUASH: i32 = 2;
 
+/// Blocks per chunk, for turning a chunk-radius schedule entry into a block
+/// distance. Not exported from `cubara_voxel` as a constant elsewhere in a
+/// form this could reuse without repeating the literal -- chunk dimensions
+/// are baked into `ChunkCoord`'s arithmetic, not named as a number.
+const BLOCKS_PER_CHUNK: i32 = 16;
+
+/// How far streaming actually reaches, in blocks: the outer edge of
+/// [`node::DEFAULT_RING_SCHEDULE`]'s last (coarsest) ring. Handed to
+/// [`cubara_render::Renderer::render`] each frame so distance fog fades out
+/// at the real edge of what is drawn rather than at `FAR_PLANE`, which is
+/// nearly twice as far and would leave the render-distance ring exactly as
+/// hard an edge as before fog existed (`ARCHITECTURE.md` Rule 3: the render
+/// crate has no schedule of its own to derive this from).
+pub(crate) fn render_radius_blocks() -> f32 {
+    let outer_chunks = node::DEFAULT_RING_SCHEDULE
+        .last()
+        .expect("the ring schedule is never empty")
+        .1;
+    (outer_chunks * BLOCKS_PER_CHUNK) as f32
+}
+
 /// The nodes in `visible` that cover the same space `node` does: either its
 /// eight children one level finer (the camera came closer and the node split)
 /// or its parent one level coarser (the camera left and eight merged).
@@ -473,6 +494,23 @@ impl NodeStreaming {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_radius_matches_the_schedules_outer_ring_in_blocks() {
+        let outer_chunks = node::DEFAULT_RING_SCHEDULE.last().unwrap().1;
+        assert_eq!(render_radius_blocks(), (outer_chunks * 16) as f32);
+        // The number this exists to get right: fog's end must land inside
+        // the schedule's outer ring, not past it -- past it, every pixel
+        // streaming ever draws is nearer than fog_end, so the smoothstep
+        // never reaches 1.0 and the render-distance edge stays exactly as
+        // hard as it was before fog existed. `FAR_PLANE` (2000.0) is what
+        // this replaced, specifically because it failed this assertion.
+        let (_, fog_end) = cubara_render::Lighting::fog_range(render_radius_blocks());
+        assert!(
+            fog_end < render_radius_blocks(),
+            "fog must finish inside the render radius, not past it"
+        );
+    }
 
     /// Chunks a node covers: `2^level` on each axis from its own grid position.
     fn covers(node: NodeKey) -> Vec<[i32; 3]> {

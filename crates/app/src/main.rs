@@ -393,6 +393,7 @@ impl ApplicationHandler for App {
                         // screen it would mark nothing.
                         crosshair: self.cursor_captured && !self.game.inventory_open(),
                     },
+                    streaming::render_radius_blocks(),
                 );
                 // Immediately queue the next frame — we render continuously.
                 renderer.window().request_redraw();

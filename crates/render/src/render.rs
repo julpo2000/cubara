@@ -478,6 +478,15 @@ pub struct Renderer {
     show_debug: bool,
     /// Smoothed frame time in ms, for a stable on-screen FPS reading.
     frame_ms: f32,
+    /// How far out geometry actually streams in, in blocks -- the caller's
+    /// (`cubara-app`'s) idea of its own render radius, handed in each
+    /// [`render`](Self::render) call rather than this crate guessing at one
+    /// (`ARCHITECTURE.md` Rule 3: this crate knows nothing about
+    /// `cubara_world`'s streaming schedule). Used to fade distance fog out
+    /// at the actual edge of what is drawn -- `FAR_PLANE` alone would put
+    /// the fog past where anything is, leaving the old hard edge exactly as
+    /// visible as before this existed.
+    render_radius_blocks: f32,
 }
 
 impl Renderer {
@@ -605,6 +614,11 @@ impl Renderer {
             // for.
             show_debug: false,
             frame_ms: 0.0,
+            // Updated from the first `render()` call; `FAR_PLANE` here is
+            // only ever visible for the zero-or-more frames before that
+            // (there is always at least one `render()` before a frame
+            // reaches the screen), not a claim about the actual radius.
+            render_radius_blocks: FAR_PLANE,
         };
         (renderer, mesh_assets)
     }
@@ -693,7 +707,10 @@ impl Renderer {
     }
 
     /// `hud` is plain data the caller reduces its state to -- this crate never
-    /// learns what an item is, or what hurt the player (Rule 3).
+    /// learns what an item is, or what hurt the player (Rule 3). `render_radius_blocks`
+    /// is how far the caller's own streaming actually reaches (`ARCHITECTURE.md`
+    /// Rule 3 again: this crate has no schedule of its own to derive it from) --
+    /// used only to fade distance fog out at that real edge.
     pub fn render(
         &mut self,
         camera: CameraPose,
@@ -701,6 +718,7 @@ impl Renderer {
         cracking: Option<([i32; 3], f32)>,
         players: &[crate::figure::PlayerView],
         hud: crate::scene::Hud<'_>,
+        render_radius_blocks: f32,
     ) {
         let crate::scene::Hud {
             hotbar,
@@ -710,6 +728,7 @@ impl Renderer {
         } = hud;
         crate::profiling::Profiler::new_frame();
         puffin::profile_function!();
+        self.render_radius_blocks = render_radius_blocks;
         self.update(camera);
 
         let frame = match self.surface.get_current_texture() {
@@ -801,7 +820,7 @@ impl Renderer {
             0.0
         };
         let c = ChunkCoord::from_world_pos(p.to_array());
-        let (fog_start, fog_end) = Lighting::fog_range(FAR_PLANE);
+        let (fog_start, fog_end) = Lighting::fog_range(self.render_radius_blocks);
         format!(
             "Cubara  (F3)\n\
              {fps:.0} fps  ({ms:.2} ms)\n\
@@ -842,13 +861,10 @@ impl Renderer {
 
         let vp = camera.view_proj(self.scene.aspect());
         self.frustum = Frustum::from_view_proj(vp);
-        // The window has no single "render radius" the way `--bench`'s CLI
-        // argument or a `Shot`'s `region_radius` do -- streaming here is
-        // visibility-driven (`streaming.rs`), not a fixed ring. `FAR_PLANE`
-        // is the one existing "how far this renderer draws" number, so fog
-        // fades out right at the actual clip limit rather than at an
-        // invented render-distance constant.
-        let (fog_start, fog_end) = Lighting::fog_range(FAR_PLANE);
+        // `self.render_radius_blocks` came in with this frame's `render()`
+        // call -- `cubara-app`'s idea of how far streaming actually reaches
+        // (Rule 3: this crate has no schedule to derive it from itself).
+        let (fog_start, fog_end) = Lighting::fog_range(self.render_radius_blocks);
         self.scene.set_camera(
             &self.queue,
             vp,
