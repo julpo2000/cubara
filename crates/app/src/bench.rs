@@ -610,7 +610,14 @@ pub fn run(
         } else {
             cubara_render::Lighting::default()
         };
-        scene.set_camera(&queue, vp, eye, lighting);
+        scene.set_camera(&device, &queue, vp, eye, lighting);
+        // `lighting` is the same value every frame in one bench run, so
+        // after the first frame's rebuild lands this is a free no-op; on
+        // the first frame it keeps a cold pipeline-specialization compile
+        // (up to ~39 ms, see SceneRenderer::set_lighting) out of the
+        // measured window rather than reading a stale default pipeline for
+        // however many warmup frames it takes to land on its own.
+        scene.wait_for_lighting_rebuild();
         let frustum = Frustum::from_view_proj(vp);
 
         // CPU cull + indirect-list upload — the per-frame work we're measuring.
