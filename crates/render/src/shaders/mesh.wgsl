@@ -54,6 +54,7 @@ struct VsOut {
     @location(1) ao: f32,
     @location(2) uv: vec2<f32>,
     @location(3) @interpolate(flat) layer: u32,
+    @location(4) world_pos: vec3<f32>,
 };
 
 // Indexed by the packed `face` field (3 bits) -- always one of the six axis
@@ -94,6 +95,7 @@ fn vs_main(in: VsIn) -> VsOut {
     out.ao = f32(ao_raw) / 3.0;
     out.uv = vec2<f32>(u, v);
     out.layer = tex_layer;
+    out.world_pos = world_pos;
     return out;
 }
 
@@ -113,6 +115,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let ao = mix(frame.ambient.z, 1.0, in.ao);
 
     let tex = textureSample(block_textures, block_sampler, in.uv, in.layer);
-    let color = tex.rgb * frame.sun_color.rgb * (ambient + diffuse) * ao;
+    let lit = tex.rgb * frame.sun_color.rgb * (ambient + diffuse) * ao;
+
+    // Distance fog, fading toward `fog_color` (the sky colour, by default --
+    // `Lighting::default`) rather than a hard render-radius edge.
+    // `fog.y <= fog.x` is "fog off" ([`Lighting`]'s documented convention),
+    // checked explicitly rather than relied on via a huge sentinel distance:
+    // `select` here means a disabled fog never evaluates `smoothstep` on an
+    // equal-edges range, whose result WGSL leaves unspecified.
+    let dist = distance(in.world_pos, frame.eye.xyz);
+    let fog_amount = select(0.0, smoothstep(frame.fog.x, frame.fog.y, dist), frame.fog.y > frame.fog.x);
+    let color = mix(lit, frame.fog_color.rgb, fog_amount);
     return vec4<f32>(color, 1.0);
 }

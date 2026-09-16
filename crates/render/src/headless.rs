@@ -114,6 +114,12 @@ pub struct Shot {
     pub gauges: Option<(f32, f32)>,
     /// Item icons that [`crate::HotbarSlot::icon`] indexes into.
     pub icons: Vec<Option<Vec<u8>>>,
+    /// Sun, ambient and fog for this shot. `Lighting::default()` (fog off)
+    /// keeps every existing golden byte-identical; a shot that wants to show
+    /// fog (there is exactly one, for the fog feature itself) sets it
+    /// explicitly rather than this crate guessing a render radius from
+    /// `region_radius` -- a golden's whole point is a fixed, chosen scene.
+    pub lighting: crate::render::Lighting,
 }
 
 impl Default for Shot {
@@ -134,6 +140,7 @@ impl Default for Shot {
             tooltip: None,
             gauges: None,
             icons: Vec::new(),
+            lighting: crate::render::Lighting::default(),
         }
     }
 }
@@ -219,6 +226,7 @@ fn render_arena(
         tooltip,
         gauges,
         icons,
+        lighting,
     } = shot;
     // Slot 0 held: a fixed choice, so a golden reference has a stable
     // selection highlight to compare against.
@@ -276,7 +284,7 @@ fn render_arena(
     // to derive a fog range from anyway (`ARCHITECTURE.md` Rule 3 -- that's
     // `cubara-app`'s job, which is why `--screenshot`/the golden tests never
     // see it either).
-    scene.set_camera(&queue, vp, eye, crate::render::Lighting::default());
+    scene.set_camera(&queue, vp, eye, lighting);
     if !icons.is_empty() {
         scene.set_icons(&device, &queue, &icons);
     }

@@ -591,7 +591,19 @@ pub fn run(
                 glam::Vec3::from(CameraUniform::orbit_eye(vt, look_target, view_radius)),
             ),
         };
-        scene.set_camera(&queue, vp, eye, cubara_render::Lighting::default());
+        // Fog end tied to the region's own radius, so it moves with
+        // `--bench <radius>` rather than a number picked for radius 64.
+        let (fog_start, fog_end) = cubara_render::Lighting::fog_range(view_radius);
+        scene.set_camera(
+            &queue,
+            vp,
+            eye,
+            cubara_render::Lighting {
+                fog_start,
+                fog_end,
+                ..Default::default()
+            },
+        );
         let frustum = Frustum::from_view_proj(vp);
 
         // CPU cull + indirect-list upload — the per-frame work we're measuring.
@@ -602,7 +614,8 @@ pub fn run(
         let overlay_text = overlay.then(|| {
             format!(
                 "cubara --bench  ({width}x{height})\n\
-                 draws {draws}  nodes {visible}/{total_nodes}",
+                 draws {draws}  nodes {visible}/{total_nodes}\n\
+                 fog  {fog_start:.0}-{fog_end:.0}",
                 draws = draw_count,
                 visible = arena.visible_nodes(),
             )

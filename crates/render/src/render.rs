@@ -236,6 +236,21 @@ impl Default for Lighting {
     }
 }
 
+impl Lighting {
+    /// `(fog_start, fog_end)` for a render radius of `radius_blocks`, so fog
+    /// dissolves the render-distance ring instead of drawing a hard edge --
+    /// `end` a little inside the edge (`- 64.0`, one chunk), `start` at 60%
+    /// of the way to it, so the fade has room instead of snapping on in the
+    /// last few blocks. Clamped at `0.0`: a radius smaller than 64 blocks
+    /// (a bench region tinier than one chunk, say) collapses to
+    /// `(0.0, 0.0)`, which is exactly [`Lighting::default`]'s "fog off"
+    /// rather than fog starting behind the camera.
+    pub fn fog_range(radius_blocks: f32) -> (f32, f32) {
+        let end = (radius_blocks - 64.0).max(0.0);
+        (0.6 * end, end)
+    }
+}
+
 /// The uniform actually bound at `@group(0) @binding(0)`: the camera plus
 /// [`Lighting`], std140-safe (every field a full `vec4`, so nothing needs
 /// manual padding to hit 16-byte alignment). `mesh.wgsl` and `figure.wgsl`
@@ -786,13 +801,15 @@ impl Renderer {
             0.0
         };
         let c = ChunkCoord::from_world_pos(p.to_array());
+        let (fog_start, fog_end) = Lighting::fog_range(FAR_PLANE);
         format!(
             "Cubara  (F3)\n\
              {fps:.0} fps  ({ms:.2} ms)\n\
              xyz  {x:.1} / {y:.1} / {z:.1}\n\
              chunk  {cx} {cy} {cz}\n\
              facing  {facing}\n\
-             nodes  {vis} drawn / {res} resident",
+             nodes  {vis} drawn / {res} resident\n\
+             fog  {fog_start:.0}-{fog_end:.0}",
             ms = self.frame_ms,
             x = p.x,
             y = p.y,
@@ -825,8 +842,23 @@ impl Renderer {
 
         let vp = camera.view_proj(self.scene.aspect());
         self.frustum = Frustum::from_view_proj(vp);
-        self.scene
-            .set_camera(&self.queue, vp, camera.eye, Lighting::default());
+        // The window has no single "render radius" the way `--bench`'s CLI
+        // argument or a `Shot`'s `region_radius` do -- streaming here is
+        // visibility-driven (`streaming.rs`), not a fixed ring. `FAR_PLANE`
+        // is the one existing "how far this renderer draws" number, so fog
+        // fades out right at the actual clip limit rather than at an
+        // invented render-distance constant.
+        let (fog_start, fog_end) = Lighting::fog_range(FAR_PLANE);
+        self.scene.set_camera(
+            &self.queue,
+            vp,
+            camera.eye,
+            Lighting {
+                fog_start,
+                fog_end,
+                ..Default::default()
+            },
+        );
     }
 
     /// Report frames-per-second roughly once per second.
@@ -1211,5 +1243,24 @@ mod tests {
         assert_eq!(f.ambient, [0.28, 0.42, 0.4, 0.0]);
         assert_eq!(f.fog[0], 0.0, "fog_start");
         assert_eq!(f.fog[1], 0.0, "fog_end");
+    }
+
+    #[test]
+    fn fog_range_starts_before_it_ends_and_ends_inside_the_render_radius() {
+        let (start, end) = Lighting::fog_range(1024.0);
+        assert!(start < end, "smoothstep(start, end, ..) needs start < end");
+        assert_eq!(end, 1024.0 - 64.0);
+        assert_eq!(start, 0.6 * end);
+    }
+
+    #[test]
+    fn fog_range_below_one_chunk_collapses_to_off_not_negative() {
+        // A radius smaller than the `- 64.0` margin must not produce
+        // `end < 0.0` (which would make `start > end`, inverting the
+        // smoothstep and lighting up everything behind the camera instead
+        // of nothing) -- it collapses to the same `(0.0, 0.0)` `Default`
+        // already uses for "no fog".
+        assert_eq!(Lighting::fog_range(0.0), (0.0, 0.0));
+        assert_eq!(Lighting::fog_range(32.0), (0.0, 0.0));
     }
 }

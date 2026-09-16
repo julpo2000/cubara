@@ -22,7 +22,9 @@ use std::path::{Path, PathBuf};
 
 use cubara_render::headless::{self, Frame, Shot};
 use cubara_render::materials::TextureLayers;
-use cubara_render::{HotbarSlot, InventoryPanel, MeshedNode, NodeId, PanelLayout, PanelSlotKind};
+use cubara_render::{
+    HotbarSlot, InventoryPanel, Lighting, MeshedNode, NodeId, PanelLayout, PanelSlotKind,
+};
 use cubara_voxel::{BlockId, BlockRegistry, Chunk, ChunkCoord};
 use cubara_world::mesh::mesh_region;
 use cubara_world::node::schedule_for_radius;
@@ -380,6 +382,47 @@ fn terrain_renders_as_expected() {
 }
 
 #[test]
+fn distance_fog_fades_the_far_ring_into_the_sky() {
+    // Package 2 (cross-session engine review): distance fog dissolves the
+    // render-distance ring into the sky colour instead of a hard edge. A
+    // first-person eye rather than the default orbit -- the orbit's fixed,
+    // steep overhead angle (`Shot::camera`'s doc comment) foreshortens the
+    // ring near the top of the frame; a ground-level view looking outward
+    // toward the region's edge is what a player actually sees fog do.
+    let world = World::new();
+    let region_radius = 8; // 128 blocks -- small enough to mesh quickly,
+                           // large enough that `Lighting::fog_range` puts
+                           // the fade inside the meshed region rather than
+                           // past its edge.
+    let eye = glam::vec3(8.0, 40.0, 8.0);
+    let target = glam::vec3(120.0, 15.0, 120.0);
+    let (fog_start, fog_end) = Lighting::fog_range((region_radius * 16) as f32);
+    let shot = Shot {
+        width: 960,
+        height: 540,
+        region_radius,
+        orbit_t: 0.0,
+        camera: Some((eye, target - eye)),
+        players: Vec::new(),
+        highlighted_block: None,
+        cracking: None,
+        hotbar: None,
+        panel: None,
+        health: None,
+        crosshair: false,
+        tooltip: None,
+        gauges: None,
+        icons: Vec::new(),
+        lighting: Lighting {
+            fog_start,
+            fog_end,
+            ..Lighting::default()
+        },
+    };
+    assert_golden("fog_over_the_far_ring", &world, shot);
+}
+
+#[test]
 fn a_cave_mouth_is_visible() {
     // Block 1.5 (#48)'s own bar: caves are a real, cross-chunk 3D noise
     // field carved into the terrain (§8.3), not just a promise buried in
@@ -417,6 +460,7 @@ fn a_cave_mouth_is_visible() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        lighting: Lighting::default(),
     };
     assert_golden("cave_mouth", &world, shot);
 }
@@ -457,6 +501,7 @@ fn iron_ore_is_visible_in_a_cave_wall() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        lighting: Lighting::default(),
     };
     assert_golden("iron_ore", &world, shot);
 }
@@ -531,6 +576,7 @@ fn the_selected_block_shows_an_outline() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        lighting: Lighting::default(),
     };
     assert_golden("outline", &world, shot);
 }
@@ -571,6 +617,7 @@ fn a_block_being_dug_shows_cracks() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        lighting: Lighting::default(),
     };
     // Measured: the image comparison alone caught missing cracks at 0.53%
     // against a 0.5% threshold -- one driver's rounding from passing. So also
@@ -646,6 +693,7 @@ fn items_show_their_icons() {
         tooltip: None,
         gauges: None,
         icons,
+        lighting: Lighting::default(),
     };
     // Nine icons against nine magenta swatches differ in well under the
     // golden's 0.5% of a 960x540 frame, so compare against the swatches on
@@ -655,6 +703,7 @@ fn items_show_their_icons() {
         &world,
         Shot {
             icons: Vec::new(),
+            lighting: Lighting::default(),
             ..shot.clone()
         },
     );
@@ -720,6 +769,7 @@ fn the_hotbar_shows_slots_counts_and_the_held_one() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        lighting: Lighting::default(),
     };
     assert_golden("hotbar", &world, shot);
 }
@@ -774,6 +824,7 @@ fn the_inventory_screen_shows_slots_a_recipe_and_the_cursor() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        lighting: Lighting::default(),
         panel: Some((
             PanelLayout::Grid(2),
             contents,
@@ -826,6 +877,7 @@ fn an_item_name_shows_beside_the_cursor() {
         tooltip: Some("Wooden Pick".to_string()),
         gauges: None,
         icons: Vec::new(),
+        lighting: Lighting::default(),
         panel: Some((
             PanelLayout::Grid(2),
             contents,
@@ -858,6 +910,7 @@ fn the_crosshair_marks_the_centre_of_the_screen() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        lighting: Lighting::default(),
     };
     // A crosshair is about 0.1% of the frame -- under the golden's 0.5%
     // tolerance, so the image comparison alone passes with it missing (found
@@ -903,6 +956,7 @@ fn hearts_show_health_including_a_half() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        lighting: Lighting::default(),
     };
     assert_golden("hearts", &world, shot);
 }
@@ -954,6 +1008,7 @@ fn the_furnace_screen_shows_input_fuel_and_output() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        lighting: Lighting::default(),
         panel: Some((
             PanelLayout::Furnace,
             contents,
@@ -1005,6 +1060,7 @@ fn a_furnace_shows_its_flame_and_progress() {
         tooltip: None,
         gauges: Some((0.25, 0.75)),
         icons: Vec::new(),
+        lighting: Lighting::default(),
         panel: Some((PanelLayout::Furnace, contents, None, (10.0, 10.0))),
     };
     // Both meters together are well under the golden's 0.5% tolerance, so a
@@ -1093,6 +1149,7 @@ fn distinct_materials_render_with_distinct_textures() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        lighting: Lighting::default(),
     };
 
     let Some(frame) = headless::render_chunks(&chunks, shot) else {
@@ -1234,6 +1291,7 @@ fn three_players_stand_in_front_of_the_camera() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        lighting: Lighting::default(),
     };
     assert_golden("three_players", &world, shot);
 }
