@@ -394,6 +394,7 @@ pub fn run(
         label: Some("cubara-bench-device"),
         required_features: features,
         required_limits: wgpu::Limits::default(),
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
         memory_hints: wgpu::MemoryHints::Performance,
         trace: wgpu::Trace::Off,
     }))
@@ -689,7 +690,7 @@ pub fn run(
         virtual_t += VIRTUAL_DT;
         frame_index += 1;
     }
-    let _ = device.poll(wgpu::PollType::Wait);
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
     // Warmup's own readings are never counted in the reported stats -- only
     // measurement frames count -- but the drain still classifies them,
     // because that classification decides whether GPU timing runs at all
@@ -768,7 +769,7 @@ pub fn run(
         virtual_t += VIRTUAL_DT;
         frame_index += 1;
     }
-    let _ = device.poll(wgpu::PollType::Wait);
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
     let wall_secs = wall_start.elapsed().as_secs_f64();
     // The round-robin check above only visits slot `frame % GPU_TIMER_DEPTH`
     // once per frame, so whichever slots were written in the loop's last
@@ -984,6 +985,7 @@ mod tests {
             label: Some("cubara-test-gpu-timer-device"),
             required_features: features,
             required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
         }))

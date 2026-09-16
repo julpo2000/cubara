@@ -41,6 +41,7 @@ fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         label: Some("cubara-test-gpu-timestamps-device"),
         required_features: features,
         required_limits: wgpu::Limits::default(),
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
         memory_hints: wgpu::MemoryHints::Performance,
         trace: wgpu::Trace::Off,
     }))

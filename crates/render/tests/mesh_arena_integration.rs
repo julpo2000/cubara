@@ -59,6 +59,7 @@ fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         label: Some("cubara-test-device"),
         required_features: wgpu::Features::empty(),
         required_limits: wgpu::Limits::default(),
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
         memory_hints: wgpu::MemoryHints::Performance,
         trace: wgpu::Trace::Off,
     }))

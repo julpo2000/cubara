@@ -204,6 +204,7 @@ fn render_arena(
         label: Some("cubara-headless-device"),
         required_features: features,
         required_limits: wgpu::Limits::default(),
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
         memory_hints: wgpu::MemoryHints::Performance,
         trace: wgpu::Trace::Off,
     }))
@@ -385,7 +386,7 @@ fn render_arena(
 
     let slice = readback.slice(..);
     slice.map_async(wgpu::MapMode::Read, |r| r.expect("map readback"));
-    let _ = device.poll(wgpu::PollType::Wait);
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
 
     let data = slice.get_mapped_range();
     let mut pixels = Vec::with_capacity((width * height * 4) as usize);

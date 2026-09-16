@@ -438,8 +438,16 @@ pub const OUTLINE_CUBE_EDGES: [[f32; 3]; 24] = [
 /// everywhere. `node_index` is a plain vertex attribute instead (§5.3), so
 /// this feature is unused now; see the design doc for the full story.
 pub fn gpu_driven_features(adapter: &wgpu::Adapter) -> (wgpu::Features, bool) {
-    let mdi = adapter.features() & wgpu::Features::MULTI_DRAW_INDIRECT;
-    let multi_draw = mdi.contains(wgpu::Features::MULTI_DRAW_INDIRECT);
+    // wgpu 27 removed the `MULTI_DRAW_INDIRECT` feature flag: plain
+    // `multi_draw_indexed_indirect` (not the GPU-decided-count variant,
+    // `MULTI_DRAW_INDIRECT_COUNT`, which is a separate feature and still
+    // unused here) moved to a downlevel capability instead of an opt-in
+    // feature -- the WebGPU spec's baseline apparently grew to expect it,
+    // where wgpu 24 didn't.
+    let multi_draw = adapter
+        .get_downlevel_capabilities()
+        .flags
+        .contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION);
     // The GPU-timing feature `bench.rs` wants for GPU/frame -- requested here
     // (window, bench, headless all call this) so the feature set is the same
     // everywhere rather than bench alone having a device the others don't.
@@ -463,7 +471,7 @@ pub fn gpu_driven_features(adapter: &wgpu::Adapter) -> (wgpu::Features, bool) {
     // `INSIDE_ENCODERS` but not `INSIDE_PASSES` -- exactly the machine this
     // number needs to work on.
     let timestamps = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
-    (mdi | timestamps, multi_draw)
+    (timestamps, multi_draw)
 }
 
 /// All GPU + window state. Created once the event loop has `resumed`.
@@ -557,6 +565,7 @@ impl Renderer {
             label: Some("cubara-device"),
             required_features: features,
             required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
         }))
