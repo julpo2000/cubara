@@ -797,6 +797,8 @@ pub fn run(
         avg_visible,
         total_nodes,
     );
+
+    measure_lighting_pipeline_rebuild(&device);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -887,6 +889,74 @@ fn report(
         "SUMMARY: {throughput:.0} FPS | CPU/frame avg {cpu_avg:.3} ms (p99 {cpu_p99:.3}) | \
          {gpu_summary} | {avg_draws:.0} draws ({avg_visible:.0}/{total_nodes} nodes) | \
          1000-FPS gate {gate}"
+    );
+}
+
+/// Throwaway prototype (H, extended): answers "how long does one pipeline
+/// rebuild cost" for the quantized-day/night design the cross-session
+/// review proposed as a third option between "lighting fixed at build time
+/// for +12% M3 FPS" (H) and "lighting fully dynamic for ~400 FPS less".
+/// Builds 64 mesh pipelines, one per simulated sun-direction step around a
+/// full day, discarding each immediately -- this measures rebuild cost in
+/// isolation, not integrated into the live scene (a real cache keyed on
+/// which values changed, wired into `SceneRenderer`, is follow-up work if
+/// this number says the idea is worth pursuing at all).
+fn measure_lighting_pipeline_rebuild(device: &wgpu::Device) {
+    let camera_bgl = cubara_render::camera_bind_group_layout(device);
+    let origins_bgl = cubara_render::origins_bind_group_layout(device);
+    let textures_bgl = cubara_render::materials::bind_group_layout(device);
+    // Built once, outside the loop: a real rebuild-on-lighting-change never
+    // re-parses the WGSL or rebuilds the layout, only re-specializes the
+    // pipeline with new override values, so timing shader-module creation
+    // inside the loop would measure work no real implementation repeats.
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("mesh-shader-rebuild-probe"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../../render/src/shaders/mesh.wgsl").into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("mesh-layout-rebuild-probe"),
+        bind_group_layouts: &[&camera_bgl, &origins_bgl, &textures_bgl],
+        push_constant_ranges: &[],
+    });
+
+    const STEPS: usize = 64;
+    let mut millis: Vec<f64> = Vec::with_capacity(STEPS);
+    for step in 0..STEPS {
+        let angle = std::f32::consts::TAU * step as f32 / STEPS as f32;
+        let sun_dir = glam::vec3(angle.cos(), 0.6, angle.sin()).normalize();
+        let constants = std::collections::HashMap::from([
+            ("ambient_low".to_string(), 0.28),
+            ("ambient_high".to_string(), 0.42),
+            ("ao_floor".to_string(), 0.4),
+            ("diffuse_weight".to_string(), 0.75),
+            ("sun_dir_x".to_string(), sun_dir.x as f64),
+            ("sun_dir_y".to_string(), sun_dir.y as f64),
+            ("sun_dir_z".to_string(), sun_dir.z as f64),
+        ]);
+        let start = Instant::now();
+        let pipeline = cubara_render::build_pipeline_from_module_with_constants(
+            device,
+            COLOR_FORMAT,
+            &shader,
+            &layout,
+            &constants,
+        );
+        // wgpu's pipeline creation can be asynchronous under the hood on
+        // some backends; polling once ensures the device has actually
+        // finished the work this Instant pair is meant to bound rather than
+        // just enqueuing it.
+        device.poll(wgpu::MaintainBase::Wait).panic_on_timeout();
+        millis.push(start.elapsed().as_secs_f64() * 1000.0);
+        drop(pipeline);
+    }
+    millis.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let min = millis.first().copied().unwrap_or(0.0);
+    let max = millis.last().copied().unwrap_or(0.0);
+    let median = millis[millis.len() / 2];
+    let mean = millis.iter().sum::<f64>() / millis.len() as f64;
+    log::info!(
+        "REBUILD: {STEPS} mesh-pipeline rebuilds (quantized sun step) -- \
+         min {min:.2} ms, median {median:.2} ms, mean {mean:.2} ms, max {max:.2} ms"
     );
 }
 

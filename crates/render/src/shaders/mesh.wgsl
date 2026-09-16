@@ -32,10 +32,13 @@ struct Frame {
 // overrides, so fs_main never touches `frame` at all. Fog thresholds
 // pre-converted to clip-space for --bench 64's actual fog_start=576/
 // fog_end=960, same values variant E used.
-override h_ambient_low: f32 = 0.28;
-override h_ambient_high: f32 = 0.42;
-override h_ao_floor: f32 = 0.4;
-override h_diffuse_weight: f32 = 0.75;
+override ambient_low: f32 = 0.28;
+override ambient_high: f32 = 0.42;
+override ao_floor: f32 = 0.4;
+override diffuse_weight: f32 = 0.75;
+override sun_dir_x: f32 = 0.37115407;
+override sun_dir_y: f32 = 0.92788516;
+override sun_dir_z: f32 = 0.27836555;
 override h_fog_z_start: f32 = 0.0001236172919757099;
 override h_fog_z_end: f32 = 5.4169375135423426e-05;
 
@@ -120,9 +123,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Throwaway diagnostic (variant H): lighting and fog entirely as
     // pipeline overrides -- this function never reads `frame`.
     let n = FACE_NORMALS[in.face];
-    let diffuse = max(dot(n, vec3<f32>(0.37115407, 0.92788516, 0.27836555)), 0.0) * h_diffuse_weight;
-    let ambient = mix(h_ambient_low, h_ambient_high, n.y * 0.5 + 0.5);
-    let ao = mix(h_ao_floor, 1.0, in.ao);
+    let diffuse = max(dot(n, vec3<f32>(sun_dir_x, sun_dir_y, sun_dir_z)), 0.0) * diffuse_weight;
+    let ambient = mix(ambient_low, ambient_high, n.y * 0.5 + 0.5);
+    let ao = mix(ao_floor, 1.0, in.ao);
     let tex = textureSample(block_textures, block_sampler, in.uv, in.layer);
     let lit = tex.rgb * (ambient + diffuse) * ao;
     let fog_amount = 1.0 - smoothstep(h_fog_z_end, h_fog_z_start, in.clip_pos.z);

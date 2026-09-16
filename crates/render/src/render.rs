@@ -1030,6 +1030,29 @@ pub fn build_pipeline(
     origins_bgl: &wgpu::BindGroupLayout,
     textures_bgl: &wgpu::BindGroupLayout,
 ) -> wgpu::RenderPipeline {
+    build_pipeline_with_constants(
+        device,
+        format,
+        camera_bgl,
+        origins_bgl,
+        textures_bgl,
+        &std::collections::HashMap::new(),
+    )
+}
+
+/// Throwaway prototype only (H, extended): lets a caller rebuild the mesh
+/// pipeline with different `override` values without retyping the whole
+/// descriptor. Real wiring (a cache keyed on the values that changed, called
+/// from `SceneRenderer`) is deliberately not done here -- this exists to
+/// answer one question, how long one rebuild costs, not to ship the design.
+pub fn build_pipeline_with_constants(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    camera_bgl: &wgpu::BindGroupLayout,
+    origins_bgl: &wgpu::BindGroupLayout,
+    textures_bgl: &wgpu::BindGroupLayout,
+    constants: &std::collections::HashMap<String, f64>,
+) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("mesh-shader"),
         source: wgpu::ShaderSource::Wgsl(include_str!("shaders/mesh.wgsl").into()),
@@ -1041,24 +1064,44 @@ pub fn build_pipeline(
         push_constant_ranges: &[],
     });
 
+    build_pipeline_from_module_with_constants(device, format, &shader, &layout, constants)
+}
+
+/// The part of a rebuild that actually changes when only `override` values
+/// change: the shader module (parsed once from WGSL source) and pipeline
+/// layout (fixed by the bind group layouts, not by lighting) are unaffected
+/// by which lighting values the overrides carry, so a real rebuild-on-change
+/// implementation would keep both fixed and only call this. Split out so the
+/// rebuild-cost measurement below times *this*, not shader-module
+/// re-parsing it would otherwise redundantly repeat every iteration.
+pub fn build_pipeline_from_module_with_constants(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    constants: &std::collections::HashMap<String, f64>,
+) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("mesh-pipeline"),
-        layout: Some(&layout),
+        layout: Some(layout),
         vertex: wgpu::VertexState {
-            module: &shader,
+            module: shader,
             entry_point: Some("vs_main"),
             buffers: &[vertex_layout()],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {
-            module: &shader,
+            module: shader,
             entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
                 blend: Some(wgpu::BlendState::REPLACE),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants,
+                ..Default::default()
+            },
         }),
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,

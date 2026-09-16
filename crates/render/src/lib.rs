@@ -34,8 +34,10 @@ pub use materials::{load_icon, swatch_color, MeshAssets};
 pub use panel::{InventoryPanel, PanelSlot, PanelSlotKind};
 pub use profiling::Profiler;
 pub use render::{
-    build_pipeline, camera_bind_group_layout, create_depth_view, gpu_driven_features, grab_cursor,
-    load_mesh_assets, load_registry, CameraPose, CameraUniform, FrameUniform, Lighting, Renderer,
+    build_pipeline, build_pipeline_from_module_with_constants, build_pipeline_with_constants,
+    camera_bind_group_layout, create_depth_view, gpu_driven_features, grab_cursor,
+    load_mesh_assets, load_registry, origins_bind_group_layout, CameraPose, CameraUniform,
+    FrameUniform, Lighting, Renderer,
 };
 pub use scene::HealthView;
 pub use scene::{
