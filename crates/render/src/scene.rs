@@ -598,6 +598,7 @@ impl SceneRenderer {
                 label: Some("main-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: color,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(CLEAR_COLOR),
@@ -677,6 +678,7 @@ impl SceneRenderer {
             label: Some("overlay-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: color,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Load,
