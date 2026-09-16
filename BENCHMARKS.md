@@ -157,6 +157,7 @@ frames after 200 warmup.
 |---|---|---|---|---|---|---|---|
 | 2026-09-11 | **Linux (Vulkan) baseline — first measured** [#36], radius 64, band ±2⁵⁴ | 3,138 | 912,964 | ~1,474 | 0.214 ms | 0.883 ms | `2ab5fb6` |
 | 2026-09-15 | **Bench measures GPU/frame, draws, its own timed window** (cross-session review, package 1), radius 64⁵⁶ | 2,219 | 901,932 | ~1,970 | 0.272 ms | 0.957 ms | `401a9e5` |
+| 2026-09-16 | Mesh fog from `clip_pos.w` + flat face index, not a `world_pos` varying (M3 regression fix), radius 64⁵⁹ | 2,219 | 901,932 | ~1,975 | 0.264 ms | 0.936 ms | `d16d3e0` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -1826,3 +1827,51 @@ Time-of-day (the original package-2 spec's item 5) is not in this row:
 day-length/night-existence question is gameplay, not engineering -- flagged
 to the review and the owner rather than guessed at, deliberately left out
 of this package's scope.
+
+⁵⁹ **Package 2's fog, fixed for the M3 (cross-session review).** The peer
+session's interleaved A/B on the M3 found ⁵⁸'s fog costing ~40% FPS
+(1567→928 orbit) and the 1000-FPS gate failing on `main` there -- traced to
+the `world_pos` varying's interpolation cost on Apple's tiled GPU, not the
+fog math itself. `@builtin(position).w` is `1/w_clip` in the fragment stage
+(a WGSL/WebGPU guarantee, unaffected by `reverse_z`'s z-row-only flip), and
+for this projection `w_clip` *is* view-space depth -- so `1.0 /
+in.clip_pos.w` recovers exactly what `world_pos` was there for, with no
+extra varying. Same idea applied to the face normal: greedy-meshed faces
+never bend across a triangle, so the interpolated-then-renormalized
+`normal: vec3<f32>` became a flat `face: u32` indexing the same
+`FACE_NORMALS` table -- less varying traffic for an identical answer
+(byte-identical on every golden).
+
+Three commits, three same-commit `--fog off`/`--fog on` measurement points
+(the tool this fix adds first, so the A/B has no cross-commit noise):
+`--bench 64` orbit, this machine (Linux/Vulkan, where the tiled-GPU cost
+this fix targets does not exist, so these are a no-regression check, not
+the fix's own evidence):
+
+| commit | fog off (FPS / CPU / GPU) | fog on (FPS / CPU / GPU) |
+|---|---|---|
+| `9fae678` -- `--fog` flag added, shaders untouched | 1959 / 0.273 / 0.475 ms | 2062 / 0.266 / 0.427 ms |
+| `bcad2b8` -- fog from `clip_pos.w`, `world_pos` gone | 1951 / 0.271 / 0.475 ms | 1919 / 0.285 / 0.493 ms |
+| `d16d3e0` -- flat `face: u32`, no more `normal` varying | 1987 / 0.265 / 0.472 ms | 2086 / 0.265 / 0.419 ms |
+
+Every number across all three commits and both flag states sits inside the
+noise band ⁵⁶ already documented for this scene on this machine
+(GPU/frame 0.43-0.53 ms at 1080p orbit) -- as expected, since the cost this
+fix removes is specific to tile-based deferred rendering and this is an
+immediate-mode desktop GPU. Also measured at `d16d3e0`, fog on: 4K orbit 982
+FPS / 0.340 ms / 0.968 ms (gate not met, as at radius 64 before package 2);
+`--eye 8,40,8` 1080p 2600 FPS / 0.222 ms / 0.321 ms; `--eye 8,40,8` 4K 822
+FPS / 0.317 ms / 1.089 ms -- all consistent with, and slightly better than,
+⁵⁸'s package-2 figures at the same views.
+
+Golden `fog_over_the_far_ring` is re-blessed (radial → planar fog changes
+the image at the screen edges: off-axis pixels have `distance > depth`, so
+the plane fades in slightly later than the radial version did there, never
+earlier -- visually confirmed before blessing, not just diffed). Every
+other golden, including `figure.wgsl`'s output (unchanged, keeps radial
+fog and the `normal` varying -- see the PR), stayed byte-identical; the
+flat-face commit alone is byte-identical on *all* goldens including this
+one, confirming it changes cost, not output.
+
+Sent back to the peer session for the M3 re-run this fix exists to pass;
+this row will be updated (or a macOS row added) once that lands.
