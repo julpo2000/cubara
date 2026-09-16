@@ -61,6 +61,32 @@ pub fn reverse_z(proj: glam::Mat4) -> glam::Mat4 {
     flip * proj
 }
 
+/// The `(A, B)` such that `view_depth = A / (ndc_z + B)` inverts
+/// [`reverse_z`]'s depth -- i.e. `@builtin(position).z` in the fragment
+/// stage, which is exactly `ndc_z` (`perspective_rh`'s clip space is already
+/// wgpu's 0..1 range, no further remap). `mesh.wgsl`'s fog reads this pair
+/// straight from `FrameUniform` instead of carrying its own view-depth
+/// varying: derivation below (`reverse_z` only touches the z output row, so
+/// start from the un-reversed projection's standard NDC z):
+///
+/// - Un-reversed `perspective_rh` gives `ndc_z = C - A/d` where `d` is view
+///   depth, `C = far/(far-near)`, `A = near*far/(far-near)`.
+/// - `reverse_z`'s flip computes `new_clip.z = old_clip.w - old_clip.z` with
+///   `new_clip.w` unchanged, so `new_ndc_z = 1 - ndc_z = (1-C) + A/d`.
+/// - `1 - C = -near/(far-near) = -B`, so `new_ndc_z = A/d - B` with
+///   `B = near/(far-near)` -- solving for `d` gives the `A/(ndc_z+B)` above.
+///
+/// Computed once from the same [`NEAR_PLANE`]/[`FAR_PLANE`] the projection
+/// itself uses, so there is no second place these can drift apart from it;
+/// `reverse_z_depth_constants_invert_the_projection_at_several_depths` pins
+/// the pair against the actual matrix rather than trusting the algebra above
+/// unchecked.
+fn reverse_z_depth_constants() -> (f32, f32) {
+    let a = NEAR_PLANE * FAR_PLANE / (FAR_PLANE - NEAR_PLANE);
+    let b = NEAR_PLANE / (FAR_PLANE - NEAR_PLANE);
+    (a, b)
+}
+
 /// Load the real `assets/blocks/*.ron` registry, validated against
 /// `assets/textures/` -- the GPU-free half of [`load_mesh_assets`], for a
 /// caller that needs to mesh nodes (`cubara_world::mesh`, resolving
@@ -284,10 +310,15 @@ pub struct FrameUniform {
     fog_color: [f32; 4],
     /// `.x` [`Lighting::fog_start`], `.y` `fog_end`, `.z` `time_of_day`.
     fog: [f32; 4],
+    /// `.x`/`.y` are [`reverse_z_depth_constants`]'s `(A, B)`, letting
+    /// `mesh.wgsl` recover view-space depth from `@builtin(position).z`
+    /// alone -- two uniform scalars, no varying at all. `.z`/`.w` unused.
+    depth: [f32; 4],
 }
 
 impl FrameUniform {
     pub fn new(view_proj: glam::Mat4, eye: glam::Vec3, lighting: Lighting) -> Self {
+        let (depth_a, depth_b) = reverse_z_depth_constants();
         Self {
             view_proj: view_proj.to_cols_array_2d(),
             eye: [eye.x, eye.y, eye.z, 0.0],
@@ -315,6 +346,7 @@ impl FrameUniform {
                 lighting.time_of_day,
                 0.0,
             ],
+            depth: [depth_a, depth_b, 0.0, 0.0],
         }
     }
 }
@@ -1316,6 +1348,36 @@ mod tests {
         assert_eq!(c["ao_floor"], 0.4f32 as f64);
         assert_eq!(c["diffuse_weight"], 0.75f32 as f64);
         assert_eq!(c["sun_is_white"], 1.0, "Lighting::default's sun is white");
+    }
+
+    #[test]
+    fn reverse_z_depth_constants_invert_the_projection_at_several_depths() {
+        // Pins `reverse_z_depth_constants`'s closed form against the actual
+        // matrix `mesh.wgsl`'s fog now depends on, rather than trusting its
+        // derivation comment unchecked -- if the projection ever changes
+        // (a different FOV, a different NEAR_PLANE/FAR_PLANE), this fails
+        // instead of the fog silently drifting.
+        let (a, b) = reverse_z_depth_constants();
+        let aspect = 16.0 / 9.0;
+        let eye = glam::Vec3::ZERO;
+        let look_dir = glam::vec3(0.0, 0.0, -1.0);
+        let vp = CameraUniform::look_view_proj(aspect, eye, look_dir);
+        for depth in [1.0f32, 10.0, 100.0, 960.0, 1999.0] {
+            let world = eye + look_dir * depth;
+            let clip = vp * glam::vec4(world.x, world.y, world.z, 1.0);
+            let ndc_z = clip.z / clip.w;
+            let recovered = a / (ndc_z + b);
+            let relative_error = ((recovered - depth) / depth).abs();
+            // 2e-3, not 1e-3: reversed-Z spends its precision near the *near*
+            // plane by design (the type's own doc comment), so recovering
+            // depth from `ndc_z` right at the far edge (1999 of 2000) is
+            // dividing by a value close to `f32`'s noise floor -- this is
+            // that tradeoff showing up, not an error in the closed form.
+            assert!(
+                relative_error < 2e-3,
+                "depth {depth}: recovered {recovered} ({relative_error:e} relative error)"
+            );
+        }
     }
 
     #[test]
