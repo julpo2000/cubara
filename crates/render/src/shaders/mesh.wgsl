@@ -52,12 +52,17 @@ struct VsIn {
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
-    // The packed `face` index itself, not the unit vector it picks out of
-    // `FACE_NORMALS` -- greedy-meshed faces never bend across a triangle, so
-    // there is nothing for the rasterizer to interpolate, and shipping one
-    // flat u32 instead of an interpolated (and fragment-renormalized) vec3
-    // is strictly less varying traffic for the same answer.
-    @location(0) @interpolate(flat) face: u32,
+    // The resolved unit normal, not the packed `face` index -- looked up
+    // from `FACE_NORMALS` once per *vertex* here instead of once per
+    // *fragment* in fs_main. Measured on both machines (an A/B/C throwaway:
+    // hardcoding the fragment-stage index away, isolated from everything
+    // else): the dynamic array index into a const array is a real fragment
+    // cost, worth more than the flat u32 it used to be a "free" alternative
+    // to -- greedy-meshed faces never bend across a triangle, so there is
+    // nothing for the rasterizer to interpolate either way, and moving the
+    // index to the vertex stage amortizes it over one lookup per vertex
+    // instead of one per covered pixel.
+    @location(0) @interpolate(flat) normal: vec3<f32>,
     @location(1) ao: f32,
     @location(2) uv: vec2<f32>,
     @location(3) @interpolate(flat) layer: u32,
@@ -97,7 +102,7 @@ fn vs_main(in: VsIn) -> VsOut {
 
     var out: VsOut;
     out.clip_pos = frame.view_proj * vec4<f32>(world_pos, 1.0);
-    out.face = face;
+    out.normal = FACE_NORMALS[face];
     out.ao = f32(ao_raw) / 3.0;
     out.uv = vec2<f32>(u, v);
     out.layer = tex_layer;
@@ -106,7 +111,7 @@ fn vs_main(in: VsIn) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let n = FACE_NORMALS[in.face];
+    let n = in.normal;
 
     // Directional sun: clear sun-side / shadow-side split. `sun_dir` arrives
     // already normalized (`Lighting`'s doc comment); the shader does not
