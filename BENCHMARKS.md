@@ -150,6 +150,7 @@ frames after 200 warmup.
 | 2026-09-14 | **macOS caught up to `main`** — covered borders, 3D octree LOD, visibility culling, faces turned away left out, distant caves, mountains [#250–#259], radius 64 (orbit)⁵⁵ | **2,219** | 901,932 (480,547 drawn) | **~1,568** | **0.441 ms** | ~0.94 ms | `3b52c49` |
 | 2026-09-15 | Bench measures GPU/frame, draws, its own timed window (cross-session review, package 1), radius 64 (orbit)⁵⁷ | 2,219 | 901,932 (480,547 drawn) | ~1,585 | 0.468 ms | 0.777 ms | `a539938` |
 | 2026-09-16 | One FrameUniform, distance fog, one sun instead of two (cross-session review, package 2), radius 64 (orbit)⁵⁸ | 2,219 | 901,932 (480,547 drawn) | ~1,762 | 0.289 ms | 1.056 ms | `c34101e` |
+| 2026-09-16 | Mesh fog from a plain 1/w varying + flat face index, not a `world_pos` varying (fixes ⁵⁸'s regression), radius 64 (orbit)⁵⁹ | 2,219 | 901,932 (480,547 drawn) | **~1,207** | **0.614 ms** | -- | `d16d3e0` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -157,7 +158,7 @@ frames after 200 warmup.
 |---|---|---|---|---|---|---|---|
 | 2026-09-11 | **Linux (Vulkan) baseline — first measured** [#36], radius 64, band ±2⁵⁴ | 3,138 | 912,964 | ~1,474 | 0.214 ms | 0.883 ms | `2ab5fb6` |
 | 2026-09-15 | **Bench measures GPU/frame, draws, its own timed window** (cross-session review, package 1), radius 64⁵⁶ | 2,219 | 901,932 | ~1,970 | 0.272 ms | 0.957 ms | `401a9e5` |
-| 2026-09-16 | Mesh fog from `clip_pos.w` + flat face index, not a `world_pos` varying (M3 regression fix), radius 64⁵⁹ | 2,219 | 901,932 | ~1,975 | 0.264 ms | 0.936 ms | `d16d3e0` |
+| 2026-09-16 | Mesh fog from a plain 1/w varying + flat face index, not a `world_pos` varying (M3 regression fix), radius 64⁵⁹ | 2,219 | 901,932 | ~2,062 | 0.266 ms | 0.980 ms | `28564f8` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -1873,5 +1874,48 @@ fog and the `normal` varying -- see the PR), stayed byte-identical; the
 flat-face commit alone is byte-identical on *all* goldens including this
 one, confirming it changes cost, not output.
 
-Sent back to the peer session for the M3 re-run this fix exists to pass;
-this row will be updated (or a macOS row added) once that lands.
+**M3 re-run (peer session, interleaved, two rounds, `--bench 64` orbit) --
+the fix confirmed on the machine it targets:**
+
+| commit | FPS | CPU/frame |
+|---|---|---|
+| `1fcd449` -- before package 2's fog (≈⁵⁷) | 1565 / 1577 | 0.475 / 0.468 ms |
+| `9a840dd` -- package 2 on `main` now | 939 / 939 | 0.785 / 0.785 ms -- **gate NOT MET** |
+| `bcad2b8` -- fog from `w_clip`, `world_pos` gone | 1103 / 1109 | 0.670 / 0.667 ms |
+| `d16d3e0` -- flat `face: u32` too | 1202 / 1207 | 0.612 / 0.614 ms -- **gate MET** |
+
+Same-commit `--fog off`/`on` at `d16d3e0`: 1207/1194 FPS off, 1208/1213 FPS
+on -- fog now costs nothing measurable on the M3 either, which is what the
+toggle exists to show. The `world_pos` removal (commit 2) recovered 0.118 ms
+of the 0.310 ms package 2 added; the flat face index (commit 3) recovered
+another 0.055 ms. ~0.19 ms/0.14 ms (wall/CPU) is still unaccounted for
+against the pre-package-2 baseline -- not fog (off/on is identical) and not
+varying count (this branch's head carries *fewer* varyings than pre-package-2
+had: 1 flat u32 + 1 linear f32 + 1 f32 + 1 flat u32, vs. the old shader's
+plain `Camera` uniform reading compile-time-folded lighting literals). The
+peer session's read: the remainder is the real cost of *dynamic* lighting --
+reading `frame.sun_dir`, `frame.ambient.*`, `frame.fog_color`, `frame.fog.*`
+etc. from the uniform every fragment where the old shader had them as
+literals the compiler folded away, plus `tex.rgb * frame.sun_color.rgb` (a
+vec3 multiply that used to vanish because the sun was hardcoded white), plus
+the bind-group visibility going `VERTEX` → `VERTEX_FRAGMENT`. Two follow-up
+experiments were proposed for this (flat `vec3` normal instead of flat u32 +
+array-index, since a dynamic array index can compile to a real load or a
+select chain on Metal; and WGSL `override` pipeline constants for
+`ambient_low/high`/`ao_floor`/`diffuse_weight`, which never change mid-run,
+so they should not be uniform reads at all) -- deliberately **not** in this
+PR. This one fixes the measured regression and gets the gate back over 1000;
+the constant-folding question is real but separate, and belongs in its own
+PR with its own before/after, not folded into a fix that already has three
+commits and two machines' worth of numbers to keep straight.
+
+A fourth commit landed after this row was first measured: Windows CI caught
+a `wgpu` 24 DX12/naga quirk where `@builtin(position).w` in the fragment
+stage is not `1/w_clip` on that backend the way the WGSL spec (and Vulkan,
+and Metal) says it should be -- see the shader comment and that commit's
+message for the full story. The fix reads `1/w_clip` off a plain vertex-
+shader-computed varying instead of the position builtin, which is
+mathematically identical to what commit 2 did on every backend that was
+already correct (byte-identical on every Linux/Vulkan golden), so the M3
+numbers above are not expected to change and were not re-measured for it --
+flagged here rather than silently assumed.
