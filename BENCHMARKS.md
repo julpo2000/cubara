@@ -151,6 +151,7 @@ frames after 200 warmup.
 | 2026-09-15 | Bench measures GPU/frame, draws, its own timed window (cross-session review, package 1), radius 64 (orbit)⁵⁷ | 2,219 | 901,932 (480,547 drawn) | ~1,585 | 0.468 ms | 0.777 ms | `a539938` |
 | 2026-09-16 | One FrameUniform, distance fog, one sun instead of two (cross-session review, package 2), radius 64 (orbit)⁵⁸ | 2,219 | 901,932 (480,547 drawn) | ~1,762 | 0.289 ms | 1.056 ms | `c34101e` |
 | 2026-09-16 | Mesh fog from a plain 1/w varying + flat face index, not a `world_pos` varying (fixes ⁵⁸'s regression), radius 64 (orbit)⁵⁹ | 2,219 | 901,932 (480,547 drawn) | **~1,126** | **0.656 ms** | -- | `28564f8` |
+| 2026-09-16 | Fog depth from `clip_pos.z`, zero varyings (recovers ⁵⁹'s M3 varying cost), radius 64 (orbit)⁶⁰ | 2,219 | 901,932 (480,547 drawn) | **~1,157** | **0.638 ms** | -- | `dad0dd6` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -159,6 +160,7 @@ frames after 200 warmup.
 | 2026-09-11 | **Linux (Vulkan) baseline — first measured** [#36], radius 64, band ±2⁵⁴ | 3,138 | 912,964 | ~1,474 | 0.214 ms | 0.883 ms | `2ab5fb6` |
 | 2026-09-15 | **Bench measures GPU/frame, draws, its own timed window** (cross-session review, package 1), radius 64⁵⁶ | 2,219 | 901,932 | ~1,970 | 0.272 ms | 0.957 ms | `401a9e5` |
 | 2026-09-16 | Mesh fog from a plain 1/w varying + flat face index, not a `world_pos` varying (M3 regression fix), radius 64⁵⁹ | 2,219 | 901,932 | ~2,062 | 0.266 ms | 0.980 ms | `28564f8` |
+| 2026-09-16 | Fog depth from `clip_pos.z`, zero varyings (recovers ⁵⁹'s M3 varying cost)⁶⁰ | 2,219 | 901,932 | ~1,940 | 0.274 ms | 1.021 ms | `dad0dd6` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -1933,3 +1935,133 @@ definition) via the render.rs:163-168 projection's closed form
 `view_depth = A / (clip_pos.z + B)` with `A = near*far/(far-near)`,
 `B = near/(far-near)` as two uniform scalars -- no varying at all, if the
 Windows golden confirms `.z` doesn't carry its own version of the `.w` bug.
+
+⁶⁰ **Package 4: recovering ⁵⁹'s M3 varying cost, and an occupancy cliff
+found while trying to recover the rest.** ⁵⁹'s DX12 varying fix left the M3
+at ~1128 FPS against ~1550-1580 before package 2's fog existed at all --
+~400 FPS still missing. Goal for this package: get as much of it back as
+the review's spec called for (three commits, three measurement points),
+without reintroducing the DX12 bug ⁵⁹ fixed.
+
+**Shipped, this row:** fog depth from `@builtin(position).z` instead of the
+`@interpolate(linear)` `inv_w` varying ⁵⁹ added. `.z` is the rasterizer's
+actual depth-buffer value -- not a value naga's DX12 backend mishandles
+(that bug was specifically `.w`'s raw-vs-reciprocal mixup) -- and already
+per-fragment via the hardware depth interpolant every pipeline computes
+regardless, so recovering view depth from it costs zero varyings.
+`view_depth = A/(clip_pos.z + B)` with `(A, B)` derived from the same
+near/far the projection uses (`reverse_z_depth_constants`), pinned against
+the real matrix by a unit test. Confirmed correct on Windows/DX12 by CI
+(the machine that caught the `.w` bug in the first place) before being
+trusted. M3: `28564f8` (⁵⁹, varying) 1128/1126 -> `dad0dd6` (`.z`, this row)
+1154/1155/1160 -- **+26-32 FPS**, smaller than the varying's own ~78 FPS
+cost because `.z` isn't quite free either (see below), but net positive and
+correct everywhere.
+
+**Tried and dropped, with the numbers as the reason (this project's rule):**
+
+- *Ambient/diffuse-weight as `override` pipeline constants* (every
+  `Lighting` call site leaves them at `Lighting::default`, so in principle
+  the compiler could fold them the way it did before `Lighting` existed).
+  Measured zero gain on **both** machines: M3 `d14bfa7` 1124/1128 vs
+  baseline 1130/1123 (no difference); this machine's `--fog on` GPU/frame
+  1959-2068 either way. Apple's GPU apparently loads a uniform once per
+  wave and shares it, making a uniform read as cheap as a constant already
+  -- the "lost constant folding" theory this was built on doesn't hold.
+  Traded runtime flexibility (ambient becomes pipeline-time; a future
+  day/night feature would have to undo it) for nothing measurable. Dropped.
+
+- *Flat `vec3` normal, resolved in the vertex stage instead of a per-fragment
+  `FACE_NORMALS[in.face]` array index.* An isolated A/B/C throwaway (hardcode
+  the fragment-stage index away entirely, wrong image, purely to measure)
+  found the dynamic index itself costly on both machines: M3 +29 FPS
+  (1157->1185), this machine +12-13% of GPU/frame (0.481->0.420 ms,
+  reproducible over 3 rounds). Moving the lookup to the vertex stage should
+  have recovered a similar win with a correct image -- instead it measured
+  **~90 FPS *slower*** on the M3 (`fd394d9` 1063/1068/1065 vs `dad0dd6`
+  baseline 1154/1155/1160, consistent over 3 rounds), while staying flat on
+  this machine (no signal either way, GPU/frame in the same noise band as
+  baseline). The isolated A/B/C win came from removing the index; this
+  commit removed the index *and added a flat `vec3` varying* to carry the
+  now-precomputed normal across, and on a tile-based GPU a varying is
+  expensive enough to cost more than the index saved. Dropped -- the
+  "obviously better" version of an optimization needs its own number, not
+  just the number from the diagnostic that inspired it.
+
+- *Fog with pre-divided clip-space thresholds* (`z' = A/d - B` computed on
+  the CPU for `fog_start`/`fog_end`, `smoothstep` directly on `clip_pos.z`,
+  zero fragment-side division). M3: 1162/1172/1157 against a `dad0dd6`
+  baseline of 1157/1158/1136 -- **+5 FPS**, noise-level. The division
+  wasn't the cost. Changes the fog ramp's shape too (linear in depth-space,
+  not distance-space) for no measured benefit. Dropped.
+
+**The occupancy cliff.** Chasing the remaining ~290 FPS gap with more
+diagnostics (fs_main with the fog block compiled out via a real `if`, not
+`select` -- WGSL evaluates both `select` branches, so `--fog off` never
+actually removed the fog math before this: +48 FPS, M3 1205 vs 1157) led to
+reverting `fs_main` to its exact pre-package-2 form (`1fcd449`): no `frame`
+reference anywhere in the fragment stage, every lighting value a literal,
+no fog. That alone landed at **1526-1577 FPS** -- statistically level with,
+or slightly above, the 1550-1580 FPS this scene ran *before fog existed at
+all*. The entire ~400 FPS gap lived in the fragment stage touching the
+uniform buffer, not in any specific field it read or any specific
+computation on those fields.
+
+Two more throwaways on top of that pinned it down further:
+
+| variant | what it does | M3 FPS (3 rounds) |
+|---|---|---|
+| F | literal lighting, no fog, no `frame` in `fs_main` | 1579 / 1584 / 1578 |
+| G | literal lighting + fog via one interpolated `f32` (computed per-vertex) | 1390 / 1408 / 1406 |
+| H | lighting *and* fog entirely as `override` constants, `fs_main` never touches `frame` | **1745 / 1742 / 1708** |
+
+H is **12% faster than the scene ever ran, fog included** -- ⁵⁹'s and this
+row's `.z`-based depth read is in there too, so the ~48-78 FPS `.z`/`.w`
+question above turns out to be a symptom of the same cliff, not a cost of
+`.z` itself: once the fragment stage is back under whatever threshold this
+GPU has, everything gets cheap again, including `.z`. G (fog as a single
+extra interpolated scalar) costs ~340 FPS versus H -- one varying, again,
+is not a small thing here.
+
+Three small changes (B/C/D above: +29, +10, +48 = ~87 FPS) did not add up
+to anything near F's single +400 FPS jump. That non-additivity is the
+signature of a cliff, not a sum of instruction costs: none of B, C or D
+individually got the fragment shader's resource usage under whatever
+threshold trips it, so each measured only its own small piece; F crossed
+the threshold in one step by removing the uniform touch entirely, and the
+whole remaining cost vanished at once.
+
+**This machine (Linux/GTX 1060, immediate-mode) shows none of it.** Every
+throwaway above (B, C, D, F, G, H) measured flat here -- GPU/frame stayed in
+the same 0.42-0.49 ms noise band regardless of how much of the fragment
+stage touched the uniform buffer. Consistent with an occupancy cliff being
+a tile-based-GPU-specific effect (limited on-chip memory for live values per
+threadgroup) rather than a general "fewer instructions is faster" result --
+this is exactly why this project measures on two architecturally different
+GPUs rather than one.
+
+**What this means going forward, flagged rather than decided here:** any
+future per-fragment feature that touches this uniform buffer (shadows,
+HDR/tonemap, block light) risks the same cliff on the gate machine -- a
+~25% cost that arrives in one step when some threshold is crossed, not
+gradually. With the M3 gate at 1000 FPS and this row at ~1157, the margin
+for a feature that reintroduces heavier fragment-stage state is thin. H's
+1745 FPS shows what's available if lighting is fixed at pipeline-build
+time instead of varying per frame -- a real design tradeoff (build-time-fixed
+vs. runtime-mutable lighting, or a third option: `override` constants
+rebuilt only when the values actually change, e.g. a quantized day/night
+step) that belongs to the project owner, not to either session measuring
+it. Being written up separately with H extended into a real prototype
+(rebuild-on-change, cached, with both steady-state FPS and rebuild latency
+measured) rather than folded into this PR.
+
+Mutation testing: 1 mutable Rust line in this PR's final diff
+(`reverse_z_depth_constants`'s `sun_is_white`-equivalent comparison --
+carried over from an earlier commit in this branch's history -- caught).
+`reverse_z_depth_constants` itself has no comparisons or guards for the
+script's mutator to try; hand-mutated (swapped the `(A, B)` return order) and
+confirmed caught by both the new pinning unit test and the fog golden.
+Golden images: byte-identical on every Linux/Vulkan golden for this row's
+commit (the `.z` math is equivalent to `.w`'s on every backend that was
+already correct) -- no re-bless needed, unlike ⁵⁹'s original `.w`-varying
+commit which did need one.

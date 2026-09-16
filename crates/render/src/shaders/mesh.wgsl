@@ -20,6 +20,10 @@ struct Frame {
     fog_color: vec4<f32>,
     // .x fog start, .y fog end, .z time of day.
     fog: vec4<f32>,
+    // .x/.y are the (A, B) in `view_depth = A / (clip_pos.z + B)`, which
+    // inverts `reverse_z`'s depth -- see the fog comment below for the
+    // derivation and why this reads `clip_pos.z`, not a varying.
+    depth: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -57,11 +61,6 @@ struct VsOut {
     @location(1) ao: f32,
     @location(2) uv: vec2<f32>,
     @location(3) @interpolate(flat) layer: u32,
-    // 1/w_clip, for the fog below -- an ordinary linearly-interpolated
-    // varying, not read back off `clip_pos.w`. See the comment at its use
-    // site: reading the position builtin's `w` in the fragment stage is not
-    // portable on wgpu 24's DX12 backend.
-    @location(4) @interpolate(linear) inv_w: f32,
 };
 
 // Indexed by the packed `face` field (3 bits) -- always one of the six axis
@@ -98,14 +97,6 @@ fn vs_main(in: VsIn) -> VsOut {
 
     var out: VsOut;
     out.clip_pos = frame.view_proj * vec4<f32>(world_pos, 1.0);
-    // 1/w here, in the vertex shader, is unambiguous -- `clip_pos.w` is a
-    // plain value this shader just computed, not a value read back off a
-    // position-semantic builtin. Marked `@interpolate(linear)` (screen-space
-    // linear, not perspective-correct) deliberately: 1/w is exactly affine
-    // in screen space, which is the standard identity perspective-correct
-    // interpolation itself is built on, so a plain linear interpolation of
-    // this already-reciprocal value recovers the true per-fragment 1/w_clip.
-    out.inv_w = 1.0 / out.clip_pos.w;
     out.face = face;
     out.ao = f32(ao_raw) / 3.0;
     out.uv = vec2<f32>(u, v);
@@ -137,25 +128,30 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // a tile-based GPU (Apple M3) that a world-space `distance()` needs a
     // `world_pos` varying, and on this scene (~480k triangles, real
     // overdraw) that varying alone cost ~0.3ms/frame in interpolation
-    // traffic, on top of the extra ALU cost. View-space depth for this
-    // projection is exactly `w_clip`, i.e. `1/frag_coord.w` -- a WGSL/WebGPU
-    // guarantee, true regardless of `reverse_z`'s flip (that only touches
-    // the z output row, not w) -- so it looks free: no extra varying, just
-    // reading the position builtin's `w` back in the fragment stage.
+    // traffic, on top of the extra ALU cost.
     //
-    // It is not actually free, on every backend: wgpu 24's DX12 target hit a
-    // known naga/HLSL quirk here (CI caught it on the Windows runner, where
-    // this golden came back ~23% different at up to 220/255 per channel --
-    // not driver noise, a wrong value). Direct3D's SV_Position.w in a pixel
-    // shader is the raw interpolated `w`, not `1/w` like Vulkan and Metal;
-    // naga's HLSL backend does not correct for the difference, so
-    // `in.clip_pos.w` on that backend was not `1/w_clip` at all. `inv_w` above
-    // sidesteps it entirely by never reading the position builtin's `w` in
-    // this stage -- it is a plain vertex-shader value, computed the same way
-    // on every backend, carried across as an ordinary linear-interpolated
-    // varying. One extra `f32` (the cheapest interpolation mode there is),
-    // for a fog that is actually cross-backend rather than only
-    // cross-backend on the machines this branch happened to be measured on.
+    // Two earlier approaches to view-space depth both turned out to read a
+    // value naga's DX12 backend gets wrong (wgpu 24; CI's Windows runner
+    // caught both, not this machine or the M3): `@builtin(position).w`,
+    // which the WGSL/WebGPU spec says is `1/w_clip` but which Direct3D's
+    // pixel-shader `SV_Position.w` gives raw, uninverted, with naga not
+    // correcting for the difference; and, as a fix, a plain vertex-shader
+    // `1/w_clip` carried across as an ordinary `@interpolate(linear)`
+    // varying, which was correct everywhere but still cost an extra f32 of
+    // interpolation traffic (measured on the M3: ~80 FPS, ~0.043 ms/frame).
+    //
+    // This reads `@builtin(position).z` instead -- the rasterizer's actual
+    // depth-buffer value, not a value under naga's `.w` handling at all, and
+    // recoverable with zero varyings since it's already per-fragment via the
+    // hardware depth interpolant every pipeline needs anyway. `reverse_z`
+    // only touches the z output row (not w), so starting from
+    // `perspective_rh`'s un-reversed NDC (`ndc_z = C - A/d` for view depth
+    // `d`) and applying `new_ndc_z = 1 - ndc_z` gives `ndc_z' = A/d - B` --
+    // solved for `d`, that's the `A/(z+B)` below. `frame.depth` carries
+    // `(A, B)`, computed once on the CPU from the same near/far the
+    // projection itself uses (`render.rs`'s `reverse_z_depth_constants`,
+    // pinned against the real matrix by a unit test there rather than
+    // trusted as algebra alone).
     //
     // The visible difference from the old world_pos-based radial fog is
     // real, not a regression: at the screen edges the plane fades in
@@ -166,7 +162,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // checked explicitly rather than relied on via a huge sentinel distance:
     // `select` here means a disabled fog never evaluates `smoothstep` on an
     // equal-edges range, whose result WGSL leaves unspecified.
-    let view_depth = 1.0 / in.inv_w;
+    let view_depth = frame.depth.x / (in.clip_pos.z + frame.depth.y);
     let fog_amount = select(0.0, smoothstep(frame.fog.x, frame.fog.y, view_depth), frame.fog.y > frame.fog.x);
     let color = mix(lit, frame.fog_color.rgb, fog_amount);
     return vec4<f32>(color, 1.0);
