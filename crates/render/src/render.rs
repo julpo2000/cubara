@@ -614,11 +614,11 @@ impl Renderer {
             // for.
             show_debug: false,
             frame_ms: 0.0,
-            // Updated from the first `render()` call; `FAR_PLANE` here is
-            // only ever visible for the zero-or-more frames before that
-            // (there is always at least one `render()` before a frame
-            // reaches the screen), not a claim about the actual radius.
-            render_radius_blocks: FAR_PLANE,
+            // `0.0`, not a guessed distance: `Lighting::fog_range(0.0)` is
+            // `(0.0, 0.0)`, i.e. fog off, which is the honest state before
+            // the first `render()` call tells this how far streaming
+            // actually reaches.
+            render_radius_blocks: 0.0,
         };
         (renderer, mesh_assets)
     }
