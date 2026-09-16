@@ -150,7 +150,7 @@ frames after 200 warmup.
 | 2026-09-14 | **macOS caught up to `main`** — covered borders, 3D octree LOD, visibility culling, faces turned away left out, distant caves, mountains [#250–#259], radius 64 (orbit)⁵⁵ | **2,219** | 901,932 (480,547 drawn) | **~1,568** | **0.441 ms** | ~0.94 ms | `3b52c49` |
 | 2026-09-15 | Bench measures GPU/frame, draws, its own timed window (cross-session review, package 1), radius 64 (orbit)⁵⁷ | 2,219 | 901,932 (480,547 drawn) | ~1,585 | 0.468 ms | 0.777 ms | `a539938` |
 | 2026-09-16 | One FrameUniform, distance fog, one sun instead of two (cross-session review, package 2), radius 64 (orbit)⁵⁸ | 2,219 | 901,932 (480,547 drawn) | ~1,762 | 0.289 ms | 1.056 ms | `c34101e` |
-| 2026-09-16 | Mesh fog from a plain 1/w varying + flat face index, not a `world_pos` varying (fixes ⁵⁸'s regression), radius 64 (orbit)⁵⁹ | 2,219 | 901,932 (480,547 drawn) | **~1,207** | **0.614 ms** | -- | `d16d3e0` |
+| 2026-09-16 | Mesh fog from a plain 1/w varying + flat face index, not a `world_pos` varying (fixes ⁵⁸'s regression), radius 64 (orbit)⁵⁹ | 2,219 | 901,932 (480,547 drawn) | **~1,126** | **0.656 ms** | -- | `28564f8` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -1914,8 +1914,22 @@ a `wgpu` 24 DX12/naga quirk where `@builtin(position).w` in the fragment
 stage is not `1/w_clip` on that backend the way the WGSL spec (and Vulkan,
 and Metal) says it should be -- see the shader comment and that commit's
 message for the full story. The fix reads `1/w_clip` off a plain vertex-
-shader-computed varying instead of the position builtin, which is
-mathematically identical to what commit 2 did on every backend that was
-already correct (byte-identical on every Linux/Vulkan golden), so the M3
-numbers above are not expected to change and were not re-measured for it --
-flagged here rather than silently assumed.
+shader-computed varying instead of the position builtin. Byte-identical on
+every Linux/Vulkan golden -- but it *does* move the M3 numbers, just not the
+way a first guess here assumed: an `@interpolate(linear)` `f32` varying is
+still a varying, and the peer session's re-run measured it costing 80 FPS /
+0.043 ms on that machine (`d16d3e0` 1206/1207 FPS, 0.613/0.612 ms →
+`28564f8` 1128/1126 FPS, 0.656/0.656 ms) -- right in line with R16's
+"one float costs about a sixth of what three did" model. Gate still cleared
+with room (1126 > 1000), and a correct fog value everywhere is worth more
+than 80 M3 FPS, so this ships -- but the number belongs here rather than
+the "not expected to change" claim this replaced, which was wrong.
+`--fog off`/`on` at the head is still identical (1121/1121), confirming the
+regression this PR fixes is still fixed; only the DX12 workaround's own
+small cost is new. A third follow-up experiment now joins the other two for
+the separate PR: read depth from `@builtin(position).z` (the depth-buffer
+value, unaffected by naga's `.w` bug, backend-invariant almost by
+definition) via the render.rs:163-168 projection's closed form
+`view_depth = A / (clip_pos.z + B)` with `A = near*far/(far-near)`,
+`B = near/(far-near)` as two uniform scalars -- no varying at all, if the
+Windows golden confirms `.z` doesn't carry its own version of the `.w` bug.
