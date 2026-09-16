@@ -149,6 +149,7 @@ frames after 200 warmup.
 | 2026-09-11 | Multiplayer played: --connect, player figures, per-machine shirts, mining retuned, radius 64, band ±2⁴⁵ | 3,138 | 912,964 | ~1,112 | 0.611 ms | ~1.08 ms | `b5dcfec` |
 | 2026-09-14 | **macOS caught up to `main`** — covered borders, 3D octree LOD, visibility culling, faces turned away left out, distant caves, mountains [#250–#259], radius 64 (orbit)⁵⁵ | **2,219** | 901,932 (480,547 drawn) | **~1,568** | **0.441 ms** | ~0.94 ms | `3b52c49` |
 | 2026-09-15 | Bench measures GPU/frame, draws, its own timed window (cross-session review, package 1), radius 64 (orbit)⁵⁷ | 2,219 | 901,932 (480,547 drawn) | ~1,585 | 0.468 ms | 0.777 ms | `a539938` |
+| 2026-09-16 | One FrameUniform, distance fog, one sun instead of two (cross-session review, package 2), radius 64 (orbit)⁵⁸ | 2,219 | 901,932 (480,547 drawn) | ~1,762 | 0.289 ms | 1.056 ms | `c34101e` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -1793,3 +1794,35 @@ flag-detection (consistent with every sibling flag's same untested shape),
 `GpuTimer::begin_read`'s map-error guard (would need a real GPU map failure
 to exercise), and one `gpu_line` message-wording branch reachable only via
 `--gpu-timing on` forced against a broken backend during actual measurement.
+
+⁵⁸ **`FrameUniform` + distance fog + one sun (package 2).** Fog on
+throughout this row (`Lighting::fog_range` from `--bench`'s own
+`view_radius`) -- there is no `--fog off` toggle, so the comparison against
+⁵⁷'s fog-free baseline is package-to-package, not a same-commit flag flip.
+Three back-to-back `--bench 64` orbit runs on `c34101e`: 1540/1762/1869 FPS,
+CPU/frame 0.427/0.289/0.280 ms, GPU/frame 0.636/0.540/0.474 ms (all
+1024/2000 samples, 0 invalid) -- the first run's higher numbers are the
+usual cold-boost-clock pattern (¹), not fog; the table row uses the middle,
+representative run.
+
+Also measured, all fog-on: 4K orbit 911 FPS / 0.360 ms CPU / 1.049 ms GPU
+(gate not met, as at radius 64 before this package); `--eye 8,40,8` 1080p
+2378 FPS / 0.223 ms / 0.346 ms; `--eye 8,40,8` 4K 814 FPS / 0.332 ms /
+1.103 ms. Every GPU/frame number here sits inside the noise band ⁵⁶ already
+documented for this machine without fog (1080p orbit was 0.43-0.53 ms, 4K
+~0.98 ms) -- one `distance()` and one `mix()` per fragment costs nothing
+measurable, as expected for a package that adds no new geometry or draws.
+
+New golden `fog_over_the_far_ring` (`crates/render/tests/golden.rs`) is
+blessed on this machine -- Linux/Vulkan -- not the Windows/Vulkan the rest
+of this file's goldens are blessed on (no Windows machine available this
+session). Flagged for the cross-session review to confirm the cross-backend
+delta once CI runs; every *other* golden, including the figure one, stayed
+byte-identical despite figure.wgsl's sun direction actually changing, so no
+re-bless was needed there.
+
+Time-of-day (the original package-2 spec's item 5) is not in this row:
+`FrameUniform` carries the field, fixed at `0.0` and unused, but the actual
+day-length/night-existence question is gameplay, not engineering -- flagged
+to the review and the owner rather than guessed at, deliberately left out
+of this package's scope.
