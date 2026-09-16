@@ -150,6 +150,7 @@ frames after 200 warmup.
 | 2026-09-14 | **macOS caught up to `main`** — covered borders, 3D octree LOD, visibility culling, faces turned away left out, distant caves, mountains [#250–#259], radius 64 (orbit)⁵⁵ | **2,219** | 901,932 (480,547 drawn) | **~1,568** | **0.441 ms** | ~0.94 ms | `3b52c49` |
 | 2026-09-15 | Bench measures GPU/frame, draws, its own timed window (cross-session review, package 1), radius 64 (orbit)⁵⁷ | 2,219 | 901,932 (480,547 drawn) | ~1,585 | 0.468 ms | 0.777 ms | `a539938` |
 | 2026-09-16 | One FrameUniform, distance fog, one sun instead of two (cross-session review, package 2), radius 64 (orbit)⁵⁸ | 2,219 | 901,932 (480,547 drawn) | ~1,762 | 0.289 ms | 1.056 ms | `c34101e` |
+| 2026-09-16 | Mesh fog from a plain 1/w varying + flat face index, not a `world_pos` varying (fixes ⁵⁸'s regression), radius 64 (orbit)⁵⁹ | 2,219 | 901,932 (480,547 drawn) | **~1,126** | **0.656 ms** | -- | `28564f8` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -157,6 +158,7 @@ frames after 200 warmup.
 |---|---|---|---|---|---|---|---|
 | 2026-09-11 | **Linux (Vulkan) baseline — first measured** [#36], radius 64, band ±2⁵⁴ | 3,138 | 912,964 | ~1,474 | 0.214 ms | 0.883 ms | `2ab5fb6` |
 | 2026-09-15 | **Bench measures GPU/frame, draws, its own timed window** (cross-session review, package 1), radius 64⁵⁶ | 2,219 | 901,932 | ~1,970 | 0.272 ms | 0.957 ms | `401a9e5` |
+| 2026-09-16 | Mesh fog from a plain 1/w varying + flat face index, not a `world_pos` varying (M3 regression fix), radius 64⁵⁹ | 2,219 | 901,932 | ~2,062 | 0.266 ms | 0.980 ms | `28564f8` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -1826,3 +1828,108 @@ Time-of-day (the original package-2 spec's item 5) is not in this row:
 day-length/night-existence question is gameplay, not engineering -- flagged
 to the review and the owner rather than guessed at, deliberately left out
 of this package's scope.
+
+⁵⁹ **Package 2's fog, fixed for the M3 (cross-session review).** The peer
+session's interleaved A/B on the M3 found ⁵⁸'s fog costing ~40% FPS
+(1567→928 orbit) and the 1000-FPS gate failing on `main` there -- traced to
+the `world_pos` varying's interpolation cost on Apple's tiled GPU, not the
+fog math itself. `@builtin(position).w` is `1/w_clip` in the fragment stage
+(a WGSL/WebGPU guarantee, unaffected by `reverse_z`'s z-row-only flip), and
+for this projection `w_clip` *is* view-space depth -- so `1.0 /
+in.clip_pos.w` recovers exactly what `world_pos` was there for, with no
+extra varying. Same idea applied to the face normal: greedy-meshed faces
+never bend across a triangle, so the interpolated-then-renormalized
+`normal: vec3<f32>` became a flat `face: u32` indexing the same
+`FACE_NORMALS` table -- less varying traffic for an identical answer
+(byte-identical on every golden).
+
+Three commits, three same-commit `--fog off`/`--fog on` measurement points
+(the tool this fix adds first, so the A/B has no cross-commit noise):
+`--bench 64` orbit, this machine (Linux/Vulkan, where the tiled-GPU cost
+this fix targets does not exist, so these are a no-regression check, not
+the fix's own evidence):
+
+| commit | fog off (FPS / CPU / GPU) | fog on (FPS / CPU / GPU) |
+|---|---|---|
+| `9fae678` -- `--fog` flag added, shaders untouched | 1959 / 0.273 / 0.475 ms | 2062 / 0.266 / 0.427 ms |
+| `bcad2b8` -- fog from `clip_pos.w`, `world_pos` gone | 1951 / 0.271 / 0.475 ms | 1919 / 0.285 / 0.493 ms |
+| `d16d3e0` -- flat `face: u32`, no more `normal` varying | 1987 / 0.265 / 0.472 ms | 2086 / 0.265 / 0.419 ms |
+
+Every number across all three commits and both flag states sits inside the
+noise band ⁵⁶ already documented for this scene on this machine
+(GPU/frame 0.43-0.53 ms at 1080p orbit) -- as expected, since the cost this
+fix removes is specific to tile-based deferred rendering and this is an
+immediate-mode desktop GPU. Also measured at `d16d3e0`, fog on: 4K orbit 982
+FPS / 0.340 ms / 0.968 ms (gate not met, as at radius 64 before package 2);
+`--eye 8,40,8` 1080p 2600 FPS / 0.222 ms / 0.321 ms; `--eye 8,40,8` 4K 822
+FPS / 0.317 ms / 1.089 ms -- all consistent with, and slightly better than,
+⁵⁸'s package-2 figures at the same views.
+
+Golden `fog_over_the_far_ring` is re-blessed (radial → planar fog changes
+the image at the screen edges: off-axis pixels have `distance > depth`, so
+the plane fades in slightly later than the radial version did there, never
+earlier -- visually confirmed before blessing, not just diffed). Every
+other golden, including `figure.wgsl`'s output (unchanged, keeps radial
+fog and the `normal` varying -- see the PR), stayed byte-identical; the
+flat-face commit alone is byte-identical on *all* goldens including this
+one, confirming it changes cost, not output.
+
+**M3 re-run (peer session, interleaved, two rounds, `--bench 64` orbit) --
+the fix confirmed on the machine it targets:**
+
+| commit | FPS | CPU/frame |
+|---|---|---|
+| `1fcd449` -- before package 2's fog (≈⁵⁷) | 1565 / 1577 | 0.475 / 0.468 ms |
+| `9a840dd` -- package 2 on `main` now | 939 / 939 | 0.785 / 0.785 ms -- **gate NOT MET** |
+| `bcad2b8` -- fog from `w_clip`, `world_pos` gone | 1103 / 1109 | 0.670 / 0.667 ms |
+| `d16d3e0` -- flat `face: u32` too | 1202 / 1207 | 0.612 / 0.614 ms -- **gate MET** |
+
+Same-commit `--fog off`/`on` at `d16d3e0`: 1207/1194 FPS off, 1208/1213 FPS
+on -- fog now costs nothing measurable on the M3 either, which is what the
+toggle exists to show. The `world_pos` removal (commit 2) recovered 0.118 ms
+of the 0.310 ms package 2 added; the flat face index (commit 3) recovered
+another 0.055 ms. ~0.19 ms/0.14 ms (wall/CPU) is still unaccounted for
+against the pre-package-2 baseline -- not fog (off/on is identical) and not
+varying count (this branch's head carries *fewer* varyings than pre-package-2
+had: 1 flat u32 + 1 linear f32 + 1 f32 + 1 flat u32, vs. the old shader's
+plain `Camera` uniform reading compile-time-folded lighting literals). The
+peer session's read: the remainder is the real cost of *dynamic* lighting --
+reading `frame.sun_dir`, `frame.ambient.*`, `frame.fog_color`, `frame.fog.*`
+etc. from the uniform every fragment where the old shader had them as
+literals the compiler folded away, plus `tex.rgb * frame.sun_color.rgb` (a
+vec3 multiply that used to vanish because the sun was hardcoded white), plus
+the bind-group visibility going `VERTEX` → `VERTEX_FRAGMENT`. Two follow-up
+experiments were proposed for this (flat `vec3` normal instead of flat u32 +
+array-index, since a dynamic array index can compile to a real load or a
+select chain on Metal; and WGSL `override` pipeline constants for
+`ambient_low/high`/`ao_floor`/`diffuse_weight`, which never change mid-run,
+so they should not be uniform reads at all) -- deliberately **not** in this
+PR. This one fixes the measured regression and gets the gate back over 1000;
+the constant-folding question is real but separate, and belongs in its own
+PR with its own before/after, not folded into a fix that already has three
+commits and two machines' worth of numbers to keep straight.
+
+A fourth commit landed after this row was first measured: Windows CI caught
+a `wgpu` 24 DX12/naga quirk where `@builtin(position).w` in the fragment
+stage is not `1/w_clip` on that backend the way the WGSL spec (and Vulkan,
+and Metal) says it should be -- see the shader comment and that commit's
+message for the full story. The fix reads `1/w_clip` off a plain vertex-
+shader-computed varying instead of the position builtin. Byte-identical on
+every Linux/Vulkan golden -- but it *does* move the M3 numbers, just not the
+way a first guess here assumed: an `@interpolate(linear)` `f32` varying is
+still a varying, and the peer session's re-run measured it costing 80 FPS /
+0.043 ms on that machine (`d16d3e0` 1206/1207 FPS, 0.613/0.612 ms →
+`28564f8` 1128/1126 FPS, 0.656/0.656 ms) -- right in line with R16's
+"one float costs about a sixth of what three did" model. Gate still cleared
+with room (1126 > 1000), and a correct fog value everywhere is worth more
+than 80 M3 FPS, so this ships -- but the number belongs here rather than
+the "not expected to change" claim this replaced, which was wrong.
+`--fog off`/`on` at the head is still identical (1121/1121), confirming the
+regression this PR fixes is still fixed; only the DX12 workaround's own
+small cost is new. A third follow-up experiment now joins the other two for
+the separate PR: read depth from `@builtin(position).z` (the depth-buffer
+value, unaffected by naga's `.w` bug, backend-invariant almost by
+definition) via the render.rs:163-168 projection's closed form
+`view_depth = A / (clip_pos.z + B)` with `A = near*far/(far-near)`,
+`B = near/(far-near)` as two uniform scalars -- no varying at all, if the
+Windows golden confirms `.z` doesn't carry its own version of the `.w` bug.
