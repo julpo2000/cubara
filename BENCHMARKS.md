@@ -2065,3 +2065,82 @@ Golden images: byte-identical on every Linux/Vulkan golden for this row's
 commit (the `.z` math is equivalent to `.w`'s on every backend that was
 already correct) -- no re-bless needed, unlike ⁵⁹'s original `.w`-varying
 commit which did need one.
+
+**Update, after the PR merged: the design question reached the project
+owner, and the M3 reference table this research produced.** Two more
+throwaways answered the questions the occupancy-cliff finding raised:
+
+- *Variant I -- radial fog reconstructed per fragment, zero varyings, on
+  top of H.* The scene's actual fog (planar, `main` as of this row) has a
+  visible artifact the project owner noticed independently while playing:
+  a mountain dead ahead reads foggier than the same mountain at the screen
+  edge, because planar fog follows view-axis depth, not true distance.
+  Radial distance is recoverable with no varying either -- `clip_pos.xy`
+  (the framebuffer pixel, converted to NDC with the viewport size, *not*
+  `clip_pos.w`, so this stays clear of the DX12 `.w` quirk entirely) plus
+  `view_depth` (already recovered from `clip_pos.z` elsewhere) gives
+  `radial = view_depth * sqrt(1 + (ndc_x*tan_half_fov*aspect)^2 +
+  (ndc_y*tan_half_fov)^2)` -- the same relationship a projection matrix
+  itself encodes, evaluated per fragment instead of carried across.
+  Measured against H interleaved on both machines (canceling out the
+  thermal drift this machine hit mid-session -- H itself re-measured lower
+  once this session's GPU reached 90°C, which is why the M3 comparison
+  matters more than this machine's absolute numbers here): **I costs
+  nothing over H, within noise, on both machines.** Screenshots at
+  identical cameras confirm the expected difference: I visibly fogs
+  screen-edge terrain that H leaves clear, center-frame indistinguishable
+  between the two -- correct radial behavior.
+
+- *Rebuild cost, corrected.* The first rebuild-prototype measurement
+  included re-parsing the WGSL shader module on every rebuild, which no
+  real implementation would do; splitting shader-module creation (once)
+  from pipeline specialization (per lighting change) dropped this
+  machine's median from ~4.3 ms to ~0.4 ms. The M3 run surfaced something
+  this machine's measurement couldn't: **the *first* time any given
+  override permutation is used, Metal compiles a new specialization at
+  ~39 ms** (one round measured 37.84-398.49 ms across 64 first-time
+  variants); every subsequent use of that same permutation drops to
+  ~0.17 ms once the OS shader cache has it. For a 64-step quantized
+  day/night cycle this means **64 one-time ~39 ms hitches the first time
+  each sun position is ever reached**, never again after. Any
+  rebuild-on-change design needs pre-warming (build all 64 variants at
+  startup, off the main thread, ~2.5 s total) as part of the design, not
+  an afterthought discovered as a stutter at the first in-game sunrise.
+
+Both are now in front of the project owner as two independent, no-cost
+design choices with screenshots and numbers, not decided by either
+session measuring them: **which fog** (planar, what's live now and what
+he already likes the look of, vs. radial, physically correct and fixes
+the noticed artifact -- no FPS difference either way) and **which
+lighting model** (runtime-mutable at ~1155 FPS vs. pipeline-fixed with
+rebuild-on-quantized-change at ~1730 FPS, pre-warmed). Nothing further
+implemented pending that choice -- the real work (`Lighting` as the
+override source, a change-keyed cache, `SceneRenderer::set_lighting`,
+startup pre-warming, wiring through window/bench/screenshot, and
+`--fog off|on` becoming a real `override` rather than a runtime branch if
+radial + fixed lighting is chosen) is follow-up, not done here.
+
+**Full M3 reference table, this package's research** (`--bench 64` orbit,
+`--fog on` throughout except where marked; `Vec3` = "not applicable",
+scene is the radius-64/~480k-drawn-triangle one this whole package used):
+
+| label | what | FPS | ms/frame | vs. `dad0dd6` baseline |
+|---|---|---|---|---|
+| -- | before package 2's fog existed (`1fcd449`) | 1550-1579 | 0.469-0.478 | +34-37% |
+| -- | package 2's fog, DX12-varying-fixed (`28564f8`, ⁵⁹) | 1123-1130 | -- | baseline -3% |
+| **shipped** | `.z`-based depth fog, zero varying (`dad0dd6`, this row) | 1136-1160 | 0.637-0.653 | -- |
+| dropped | + ambient/diffuse as override constants (`d14bfa7`) | 1124-1130 | -- | +0% (noise) |
+| dropped | + flat `vec3` normal in the vertex stage (`fd394d9`) | 1063-1068 | 0.694-0.696 | **-8%** |
+| diagnostic B | `FACE_NORMALS[0]` hardcoded (wrong image, isolates the index) | 1156-1186 | 0.624-0.640 | +2% |
+| diagnostic C | sun/fog-color/range as overrides (isolates remaining reads) | 1136-1167 | 0.634 | +0-1% |
+| diagnostic D | fog block folded out via a real `if` (isolates fog math) | 1200-1208 | 0.615-0.619 | +4% |
+| dropped | fog thresholds pre-divided, no fragment division (E) | 1136-1172 | 0.632-0.637 | +0-1% |
+| diagnostic F | `fs_main` reverted to pre-fog verbatim, no `frame` touch | 1526-1584 | 0.467-0.494 | **+33-37%** |
+| diagnostic G | literal lighting + fog via one interpolated `f32` | 1390-1408 | 0.523-0.534 | +21% |
+| **proposal** | H -- lighting+fog entirely `override`, `fs_main` frame-free | 1708-1749 | 0.424-0.437 | **+48-51%** |
+| **proposal** | I -- H + radial fog, zero varying | 1724-1749 | 0.424-0.433 | +48-51% (= H) |
+
+`main`'s post-package-2 regression this package set out to fix is now
+~+2-3% over ⁵⁹ instead of the ~-27% ⁵⁹ shipped with, on the shipped `.z`
+commit alone -- everything from H down is not shipped, and is what's in
+front of the project owner now.
