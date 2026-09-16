@@ -17,9 +17,10 @@ use crate::arena::ChunkArena;
 use crate::materials;
 use crate::panel::{InventoryPanel, PanelSlotKind};
 use crate::render::{
-    build_figure_pipeline, build_outline_pipeline, build_pipeline, camera_bind_group_layout,
-    create_depth_view, origins_bind_group_layout, outline_bind_group_layout, FrameUniform,
-    Lighting, OutlineUniform, OUTLINE_CUBE_EDGES,
+    build_figure_pipeline, build_mesh_pipeline_from_module, build_outline_pipeline, build_pipeline,
+    camera_bind_group_layout, create_depth_view, mesh_pipeline_constants,
+    origins_bind_group_layout, outline_bind_group_layout, FrameUniform, Lighting, OutlineUniform,
+    OUTLINE_CUBE_EDGES,
 };
 use crate::text::font;
 use crate::text::TextRenderer;
@@ -195,6 +196,28 @@ pub struct HotbarView<'a> {
 /// [`encode_scene`](Self::encode_scene) per frame.
 pub struct SceneRenderer {
     pipeline: wgpu::RenderPipeline,
+    /// The `Lighting` `pipeline` was actually built with -- compared against
+    /// on every [`set_lighting`](Self::set_lighting) call so an unchanged
+    /// value (the common case: most frames pass the same `Lighting` as last
+    /// frame) never spawns a rebuild.
+    pipeline_lighting: Lighting,
+    /// `mesh.wgsl`'s shader module and pipeline layout, kept around so a
+    /// rebuild only re-specializes the pipeline rather than re-parsing WGSL
+    /// or rebuilding the layout -- both fixed by lighting-independent things
+    /// (the WGSL source; the bind group layouts).
+    mesh_shader: wgpu::ShaderModule,
+    mesh_layout: wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+    /// A lighting rebuild in flight on a background thread, if
+    /// [`set_lighting`](Self::set_lighting) has kicked one off since the
+    /// last time it landed. `encode_scene` polls this every frame so a
+    /// finished rebuild swaps in without the caller doing anything; `resize`
+    /// and [`wait_for_lighting_rebuild`](Self::wait_for_lighting_rebuild)
+    /// both also drain it directly, for the callers that can't tolerate a
+    /// frame or two of stale lighting (a resized pipeline must match the new
+    /// viewport immediately; a one-shot screenshot has only one frame to be
+    /// right in).
+    lighting_rebuild: Option<std::sync::mpsc::Receiver<(Lighting, wgpu::RenderPipeline)>>,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     /// `@group(2)` in `mesh.wgsl`: the block texture array + sampler.
@@ -290,8 +313,24 @@ impl SceneRenderer {
             }],
         });
 
+        let pipeline_lighting = Lighting::default();
+        let constants = mesh_pipeline_constants(&pipeline_lighting, width, height);
+        let (mesh_shader, mesh_layout, pipeline) = build_pipeline(
+            device,
+            format,
+            &camera_bgl,
+            &origins_bgl,
+            &textures_bgl,
+            &constants,
+        );
+
         Self {
-            pipeline: build_pipeline(device, format, &camera_bgl, &origins_bgl, &textures_bgl),
+            pipeline,
+            pipeline_lighting,
+            mesh_shader,
+            mesh_layout,
+            format,
+            lighting_rebuild: None,
             camera_buffer,
             camera_bind_group,
             texture_bind_group,
@@ -320,12 +359,31 @@ impl SceneRenderer {
         self.text.set_icons(device, queue, icons);
     }
 
-    /// Rebuild the depth buffer for a new target size.
+    /// Rebuild the depth buffer, and the mesh pipeline, for a new target
+    /// size. The pipeline rebuild is synchronous (unlike
+    /// [`set_lighting`](Self::set_lighting)'s background one): resizing
+    /// already recreates the depth buffer on the spot, is a rare, deliberate
+    /// action rather than a per-frame occurrence, and radial fog's ray
+    /// direction depends on the viewport size (`viewport_width`/`height`/
+    /// `aspect` in `mesh.wgsl`) -- drawing even one frame at the old size's
+    /// constants against the new depth buffer would be a visible mismatch,
+    /// not just stale lighting. Drops any in-flight *lighting* rebuild: it
+    /// targeted the old viewport size and would stomp this one when it
+    /// landed.
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         if width > 0 && height > 0 {
             self.width = width;
             self.height = height;
             self.depth_view = create_depth_view(device, width, height);
+            let constants = mesh_pipeline_constants(&self.pipeline_lighting, width, height);
+            self.pipeline = build_mesh_pipeline_from_module(
+                device,
+                self.format,
+                &self.mesh_shader,
+                &self.mesh_layout,
+                &constants,
+            );
+            self.lighting_rebuild = None;
         }
     }
 
@@ -333,13 +391,103 @@ impl SceneRenderer {
         self.width as f32 / self.height as f32
     }
 
-    /// Upload the view-projection matrix, the eye position, and the
-    /// lighting/fog this frame draws with. `eye` is a separate parameter
-    /// rather than derived from `view_proj` (which is possible but a
-    /// needless round trip through a matrix inverse) since every caller
-    /// already knows where its camera is.
+    /// Rebuild `mesh.wgsl`'s pipeline with `lighting`'s values, on a
+    /// background thread, if they actually differ from what the current
+    /// pipeline already has (the common per-frame case: [`set_camera`]
+    /// calls this every frame with whatever `Lighting` the caller has, and
+    /// most frames it hasn't changed since the last one -- the equality
+    /// check makes that free rather than a rebuild).
+    ///
+    /// Lighting lives in `mesh.wgsl` as pipeline `override` constants, not a
+    /// per-frame uniform read (`render.rs`'s `mesh_pipeline_constants`
+    /// doc comment has the measurement this is built on), so changing it
+    /// costs a pipeline rebuild rather than a buffer write. A rebuild is
+    /// ~0.2-0.4 ms once Metal has compiled that exact override permutation
+    /// before, but the *first* time a given permutation is ever used it is
+    /// closer to 40 ms -- too slow to do on the frame that wants it,
+    /// especially at the >1000 FPS this engine targets. Doing it on a
+    /// background thread and swapping in once
+    /// [`poll_lighting_rebuild`](Self::poll_lighting_rebuild) (called every
+    /// frame from [`encode_scene`](Self::encode_scene)) finds it ready means
+    /// the current frame, and every frame until the new one lands, keeps
+    /// rendering with the old lighting rather than stalling for it --
+    /// exactly the "spread over frames, smooth on-the-go updates" the
+    /// project owner asked for instead of pre-building every value up front.
+    ///
+    /// A rebuild already in flight for a value that's since changed again is
+    /// simply superseded: replacing `lighting_rebuild` drops the old
+    /// receiver, so that thread's eventual `send` finds no one listening and
+    /// is silently discarded.
+    pub fn set_lighting(&mut self, device: &wgpu::Device, lighting: Lighting) {
+        if lighting == self.pipeline_lighting {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.lighting_rebuild = Some(rx);
+        let device = device.clone();
+        let format = self.format;
+        let shader = self.mesh_shader.clone();
+        let layout = self.mesh_layout.clone();
+        let (width, height) = (self.width, self.height);
+        std::thread::spawn(move || {
+            let constants = mesh_pipeline_constants(&lighting, width, height);
+            let pipeline =
+                build_mesh_pipeline_from_module(&device, format, &shader, &layout, &constants);
+            let _ = tx.send((lighting, pipeline));
+        });
+    }
+
+    /// Pick up a background [`set_lighting`](Self::set_lighting) rebuild if
+    /// one has finished since the last call -- a non-blocking channel check,
+    /// cheap enough to call every frame regardless of whether a rebuild is
+    /// actually in flight. Called from [`encode_scene`](Self::encode_scene)
+    /// so no caller needs to remember to do this themselves.
+    fn poll_lighting_rebuild(&mut self) {
+        let Some(rx) = &self.lighting_rebuild else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((lighting, pipeline)) => {
+                self.pipeline = pipeline;
+                self.pipeline_lighting = lighting;
+                self.lighting_rebuild = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.lighting_rebuild = None;
+            }
+        }
+    }
+
+    /// Block until an in-flight [`set_lighting`](Self::set_lighting) rebuild
+    /// lands, for a caller that draws exactly one measured/captured frame
+    /// and cannot tolerate the window's usual "stale lighting for a frame or
+    /// two while the rebuild finishes in the background" -- `--bench` and
+    /// `--screenshot` both call this right after `set_camera` and before
+    /// their one draw. A no-op when nothing is in flight (the pipeline
+    /// already matches, the overwhelmingly common case once a scene's first
+    /// frame has built its real pipeline).
+    pub fn wait_for_lighting_rebuild(&mut self) {
+        let Some(rx) = self.lighting_rebuild.take() else {
+            return;
+        };
+        if let Ok((lighting, pipeline)) = rx.recv() {
+            self.pipeline = pipeline;
+            self.pipeline_lighting = lighting;
+        }
+    }
+
+    /// Upload the view-projection matrix, the eye position, and the figure/
+    /// outline lighting this frame draws with (`figure.wgsl`'s own uniform
+    /// read -- unaffected by `mesh.wgsl`'s move to overrides), and kick off
+    /// a mesh pipeline rebuild via [`set_lighting`](Self::set_lighting) if
+    /// `lighting` has actually changed. `eye` is a separate parameter rather
+    /// than derived from `view_proj` (which is possible but a needless round
+    /// trip through a matrix inverse) since every caller already knows where
+    /// its camera is.
     pub fn set_camera(
-        &self,
+        &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         view_proj: Mat4,
         eye: glam::Vec3,
@@ -347,6 +495,7 @@ impl SceneRenderer {
     ) {
         let uniform = FrameUniform::new(view_proj, eye, lighting);
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+        self.set_lighting(device, lighting);
     }
 
     /// Encode one frame: the world, then an optional screen-space text overlay.
@@ -362,6 +511,10 @@ impl SceneRenderer {
         color: &wgpu::TextureView,
         frame: SceneFrame<'_>,
     ) {
+        // Non-blocking: picks up a set_lighting rebuild if one finished
+        // since last frame, otherwise costs one channel check and returns.
+        self.poll_lighting_rebuild();
+
         let SceneFrame {
             arena,
             draw_count,

@@ -216,7 +216,7 @@ impl CameraUniform {
 /// on distances happening to fall outside some very large range, so a
 /// caller that never sets fog gets pixel-identical output to before this
 /// type existed.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Lighting {
     /// Normalized on the CPU; the shader does not renormalize it.
     pub sun_dir: glam::Vec3,
@@ -279,12 +279,14 @@ impl Lighting {
 
 /// The uniform actually bound at `@group(0) @binding(0)`: the camera plus
 /// [`Lighting`], std140-safe (every field a full `vec4`, so nothing needs
-/// manual padding to hit 16-byte alignment). `mesh.wgsl` and `figure.wgsl`
-/// declare the matching `Frame` struct and read all of it; `outline.wgsl`
-/// still declares only the leading `view_proj` it actually uses -- WGSL
-/// doesn't require a shader to describe a whole bound buffer, only the
-/// prefix it reads, so a smaller struct there stays correct as long as
-/// `view_proj` stays first.
+/// manual padding to hit 16-byte alignment). `figure.wgsl` declares the
+/// matching `Frame` struct and reads through `fog`; `outline.wgsl` and
+/// `mesh.wgsl` both declare only the leading `view_proj` they actually use
+/// -- WGSL doesn't require a shader to describe a whole bound buffer, only
+/// the prefix it reads, so a smaller struct there stays correct as long as
+/// `view_proj` stays first. `mesh.wgsl` gets its lighting and fog from
+/// pipeline `override` constants instead ([`mesh_pipeline_constants`]), not
+/// this uniform -- see that function's doc comment for why.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct FrameUniform {
@@ -298,15 +300,10 @@ pub struct FrameUniform {
     fog_color: [f32; 4],
     /// `.x` [`Lighting::fog_start`], `.y` `fog_end`, `.z` `time_of_day`.
     fog: [f32; 4],
-    /// `.x`/`.y` are [`reverse_z_depth_constants`]'s `(A, B)`, letting
-    /// `mesh.wgsl` recover view-space depth from `@builtin(position).z`
-    /// alone -- two uniform scalars, no varying at all. `.z`/`.w` unused.
-    depth: [f32; 4],
 }
 
 impl FrameUniform {
     pub fn new(view_proj: glam::Mat4, eye: glam::Vec3, lighting: Lighting) -> Self {
-        let (depth_a, depth_b) = reverse_z_depth_constants();
         Self {
             view_proj: view_proj.to_cols_array_2d(),
             eye: [eye.x, eye.y, eye.z, 0.0],
@@ -340,7 +337,6 @@ impl FrameUniform {
                 lighting.time_of_day,
                 0.0,
             ],
-            depth: [depth_a, depth_b, 0.0, 0.0],
         }
     }
 }
@@ -898,6 +894,7 @@ impl Renderer {
         // (Rule 3: this crate has no schedule to derive it from itself).
         let (fog_start, fog_end) = Lighting::fog_range(self.render_radius_blocks);
         self.scene.set_camera(
+            &self.device,
             &self.queue,
             vp,
             camera.eye,
@@ -1023,42 +1020,112 @@ pub fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu
     texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
-pub fn build_pipeline(
+/// [`mesh.wgsl`]'s `override` pipeline constants, derived from a [`Lighting`]
+/// and the current viewport size. mesh.wgsl's fragment stage reads *none* of
+/// `FrameUniform` -- every lighting/fog value, plus the (A, B) depth-recovery
+/// pair and the viewport/FOV terms radial fog needs, are pipeline-compile-time
+/// constants instead of per-frame uniform reads. That trade only makes sense
+/// because it is exactly this: something that changes rarely (a lighting
+/// update, a window resize), not something read every frame -- see the
+/// occupancy-cliff research in `BENCHMARKS.md`'s package-4 footnote for the
+/// measurements this is built on (touching this uniform buffer at all cost
+/// the M3 ~400 FPS; going through overrides instead recovered nearly all of
+/// it). A caller that changes `Lighting` calls [`crate::SceneRenderer::set_lighting`],
+/// which rebuilds the pipeline with these in the background rather than every
+/// frame.
+pub fn mesh_pipeline_constants(
+    lighting: &Lighting,
+    width: u32,
+    height: u32,
+) -> std::collections::HashMap<String, f64> {
+    let (depth_a, depth_b) = reverse_z_depth_constants();
+    std::collections::HashMap::from([
+        ("ambient_low".to_string(), lighting.ambient_low as f64),
+        ("ambient_high".to_string(), lighting.ambient_high as f64),
+        ("ao_floor".to_string(), lighting.ao_floor as f64),
+        ("diffuse_weight".to_string(), lighting.diffuse_weight as f64),
+        ("sun_dir_x".to_string(), lighting.sun_dir.x as f64),
+        ("sun_dir_y".to_string(), lighting.sun_dir.y as f64),
+        ("sun_dir_z".to_string(), lighting.sun_dir.z as f64),
+        ("sun_color_r".to_string(), lighting.sun_color.x as f64),
+        ("sun_color_g".to_string(), lighting.sun_color.y as f64),
+        ("sun_color_b".to_string(), lighting.sun_color.z as f64),
+        ("fog_color_r".to_string(), lighting.fog_color.x as f64),
+        ("fog_color_g".to_string(), lighting.fog_color.y as f64),
+        ("fog_color_b".to_string(), lighting.fog_color.z as f64),
+        ("fog_start".to_string(), lighting.fog_start as f64),
+        ("fog_end".to_string(), lighting.fog_end as f64),
+        ("depth_a".to_string(), depth_a as f64),
+        ("depth_b".to_string(), depth_b as f64),
+        ("viewport_width".to_string(), width as f64),
+        ("viewport_height".to_string(), height as f64),
+        ("aspect".to_string(), width as f64 / height as f64),
+    ])
+}
+
+/// `mesh.wgsl`'s shader module, parsed from WGSL once and reused for every
+/// pipeline rebuild -- [`build_mesh_pipeline_from_module`] is the part that
+/// actually changes when only the `override` constants change, so a rebuild
+/// never needs this again. Split out from the old single `build_pipeline`
+/// specifically so [`crate::SceneRenderer::set_lighting`]'s background
+/// rebuilds reuse it, per the same measurement that showed re-parsing WGSL
+/// on every rebuild cost ~10x more than it needed to.
+pub fn build_mesh_shader(device: &wgpu::Device) -> wgpu::ShaderModule {
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("mesh-shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/mesh.wgsl").into()),
+    })
+}
+
+/// `mesh.wgsl`'s pipeline layout -- fixed by the bind group layouts, not by
+/// lighting, so this is built once and reused the same way the shader module
+/// is.
+pub fn build_mesh_layout(
     device: &wgpu::Device,
-    format: wgpu::TextureFormat,
     camera_bgl: &wgpu::BindGroupLayout,
     origins_bgl: &wgpu::BindGroupLayout,
     textures_bgl: &wgpu::BindGroupLayout,
-) -> wgpu::RenderPipeline {
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("mesh-shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/mesh.wgsl").into()),
-    });
-
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+) -> wgpu::PipelineLayout {
+    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("mesh-layout"),
         bind_group_layouts: &[camera_bgl, origins_bgl, textures_bgl],
         push_constant_ranges: &[],
-    });
+    })
+}
 
+/// The part of building the mesh pipeline that actually changes with
+/// `constants`: specializing `shader`/`layout` (both fixed, built once) with
+/// this particular set of `override` values. Called both for the initial
+/// pipeline ([`build_pipeline`]) and for every background rebuild
+/// ([`crate::SceneRenderer::set_lighting`]).
+pub fn build_mesh_pipeline_from_module(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    constants: &std::collections::HashMap<String, f64>,
+) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("mesh-pipeline"),
-        layout: Some(&layout),
+        layout: Some(layout),
         vertex: wgpu::VertexState {
-            module: &shader,
+            module: shader,
             entry_point: Some("vs_main"),
             buffers: &[vertex_layout()],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {
-            module: &shader,
+            module: shader,
             entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
                 blend: Some(wgpu::BlendState::REPLACE),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants,
+                ..Default::default()
+            },
         }),
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -1079,6 +1146,28 @@ pub fn build_pipeline(
         multiview: None,
         cache: None,
     })
+}
+
+/// Build the mesh shader, layout and an initial pipeline together -- what
+/// [`crate::SceneRenderer::new`] wants once, at construction. Every rebuild
+/// after that goes through [`build_mesh_pipeline_from_module`] directly,
+/// reusing the shader/layout this returns.
+pub fn build_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    camera_bgl: &wgpu::BindGroupLayout,
+    origins_bgl: &wgpu::BindGroupLayout,
+    textures_bgl: &wgpu::BindGroupLayout,
+    constants: &std::collections::HashMap<String, f64>,
+) -> (
+    wgpu::ShaderModule,
+    wgpu::PipelineLayout,
+    wgpu::RenderPipeline,
+) {
+    let shader = build_mesh_shader(device);
+    let layout = build_mesh_layout(device, camera_bgl, origins_bgl, textures_bgl);
+    let pipeline = build_mesh_pipeline_from_module(device, format, &shader, &layout, constants);
+    (shader, layout, pipeline)
 }
 
 /// The selected-block outline's pipeline: a line list, sharing the mesh
@@ -1291,6 +1380,37 @@ mod tests {
         assert_eq!(f.ambient, [0.28, 0.42, 0.4, 0.0]);
         assert_eq!(f.fog[0], 0.0, "fog_start");
         assert_eq!(f.fog[1], 0.0, "fog_end");
+    }
+
+    #[test]
+    fn mesh_pipeline_constants_carry_lightings_values_and_the_viewport() {
+        // Pinned so a future edit to either `Lighting::default` or this
+        // function's key names can't silently drift from what `mesh.wgsl`'s
+        // `override` declarations actually expect -- a typo'd key here would
+        // just fall back to the shader's own default silently, not error.
+        let lighting = Lighting {
+            fog_start: 100.0,
+            fog_end: 200.0,
+            ..Lighting::default()
+        };
+        let c = mesh_pipeline_constants(&lighting, 1920, 1080);
+        assert_eq!(c["ambient_low"], lighting.ambient_low as f64);
+        assert_eq!(c["ambient_high"], lighting.ambient_high as f64);
+        assert_eq!(c["ao_floor"], lighting.ao_floor as f64);
+        assert_eq!(c["diffuse_weight"], lighting.diffuse_weight as f64);
+        assert_eq!(c["sun_dir_x"], lighting.sun_dir.x as f64);
+        assert_eq!(c["sun_dir_y"], lighting.sun_dir.y as f64);
+        assert_eq!(c["sun_dir_z"], lighting.sun_dir.z as f64);
+        assert_eq!(c["sun_color_r"], lighting.sun_color.x as f64);
+        assert_eq!(c["fog_color_b"], lighting.fog_color.z as f64);
+        assert_eq!(c["fog_start"], 100.0);
+        assert_eq!(c["fog_end"], 200.0);
+        assert_eq!(c["viewport_width"], 1920.0);
+        assert_eq!(c["viewport_height"], 1080.0);
+        assert_eq!(c["aspect"], 1920.0 / 1080.0);
+        let (depth_a, depth_b) = reverse_z_depth_constants();
+        assert_eq!(c["depth_a"], depth_a as f64);
+        assert_eq!(c["depth_b"], depth_b as f64);
     }
 
     #[test]

@@ -161,6 +161,7 @@ frames after 200 warmup.
 | 2026-09-15 | **Bench measures GPU/frame, draws, its own timed window** (cross-session review, package 1), radius 64⁵⁶ | 2,219 | 901,932 | ~1,970 | 0.272 ms | 0.957 ms | `401a9e5` |
 | 2026-09-16 | Mesh fog from a plain 1/w varying + flat face index, not a `world_pos` varying (M3 regression fix), radius 64⁵⁹ | 2,219 | 901,932 | ~2,062 | 0.266 ms | 0.980 ms | `28564f8` |
 | 2026-09-16 | Fog depth from `clip_pos.z`, zero varyings (recovers ⁵⁹'s M3 varying cost)⁶⁰ | 2,219 | 901,932 | ~1,940 | 0.274 ms | 1.021 ms | `dad0dd6` |
+| 2026-09-17 | Radial fog + lighting as pipeline overrides, background rebuild on change (owner's decision from the ⁶⁰ research)⁶¹ | 2,219 | 901,932 | ~1,933 | 0.270 ms | 1.145 ms | `e4e676a` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -2159,3 +2160,72 @@ against the wrong baseline later.
 ~+2-3% over ⁵⁹ instead of the ~-27% ⁵⁹ shipped with, on the shipped `.z`
 commit alone -- everything from H down is not shipped, and is what's in
 front of the project owner now.
+
+⁶¹ **The project owner's decision on ⁶⁰'s two questions, implemented.** Shown
+the fog screenshots, the owner reported seeing no visible difference and
+asked for whichever costs less -- since H and I measured equal on both
+machines, radial (I) ships, since it also fixes the artifact he separately
+noticed in play. For lighting he rejected the 64-step pre-warmed-at-startup
+design outright ("I think loading that up front is not a good one, if we
+have to recalculate it on every block change") and asked instead for
+something that loads fast, spreads the expensive work rather than
+front-loading it, and can update roughly once a second using state from
+previous frames -- a background-thread rebuild that swaps in when ready,
+not a fixed table of pre-baked values.
+
+`mesh.wgsl`'s fragment stage now reads nothing from the camera uniform at
+all: ambient, sun, fog colour/range, and the view-depth/radial-distance
+constants are all `override` pipeline values (`render.rs`'s
+`mesh_pipeline_constants`), the same mechanism variant H measured. Radial
+distance comes from `@builtin(position).xy` (a framebuffer pixel, converted
+to NDC with the viewport size, themselves overrides) plus the existing
+`.z`-based `view_depth` -- `.w` is never touched, staying clear of wgpu 24's
+DX12 bug entirely. `SceneRenderer::set_lighting` rebuilds the pipeline on a
+background thread only when `Lighting` actually changes (an equality check
+skips the common per-frame case of an unchanged value), reusing the parsed
+shader module and pipeline layout so a rebuild only re-specializes rather
+than re-parsing WGSL; `encode_scene` polls for a finished rebuild every
+frame (non-blocking), so the window keeps rendering with the previous
+lighting for however many frames the rebuild takes rather than stalling.
+`resize` rebuilds synchronously instead (the viewport terms radial fog
+needs change too, and a resize already stalls for the depth buffer).
+`bench`/`--screenshot`/goldens additionally call the new
+`wait_for_lighting_rebuild` (blocking) right after `set_camera`, since a
+one-shot capture cannot tolerate the window's "correct in a frame or two"
+tolerance.
+
+This machine, uncontended (a runaway `--help` process from earlier in the
+session had been silently eating a full CPU core for hours and inflated an
+earlier round of measurements on this row by ~45% CPU/frame before it was
+found and killed -- flagged here rather than left as an unexplained
+best-of-three): `--bench 64` orbit, fog on, three rounds, 1916/1933/1995
+FPS, CPU/frame 0.298/0.270/0.272 ms, GPU/frame 0.480/0.480/0.440 ms -- flat
+against ⁶⁰'s `dad0dd6` baseline (~1940 FPS, 0.274 ms), exactly as H and I
+already predicted for this immediate-mode GPU. `--fog off` still measures
+identically (1956/1942 FPS) -- confirmed as a real pipeline-level change,
+not a runtime branch, since `Lighting::default()`'s fog-off values now
+produce a genuinely different `override` set and a genuinely different
+compiled pipeline, not a `select()` on the same one.
+
+Golden `fog_over_the_far_ring` re-blessed for radial fog, visually
+inspected before blessing (screen-edge terrain now fades consistently with
+true distance, matching the artifact fix -- the same check this file's
+package-4 rows have used at every radial/planar transition). Every other
+golden stayed byte-identical: `Lighting::default`'s actual values are
+unchanged, only the mechanism carrying them to the shader changed.
+Mutation testing: 2 mutable lines (the `set_lighting` equality guard and
+`wait_for_lighting_rebuild`'s success match), both caught -- a mutation to
+either breaks the fog golden, since every golden's render depends on the
+pipeline actually reflecting the `Lighting` it was given. The one
+mechanism not yet under an automated test: calling `set_camera` a *second*
+time with a *different* `Lighting` on an already-built `SceneRenderer` --
+every golden today exercises exactly one `set_camera` call per instance, so
+the rebuild-on-a-second-change path (what a live day/night system would
+actually do) runs the same code but is reasoned-about rather than directly
+tested. Flagged as follow-up, not silently assumed covered.
+
+M3 numbers for this row: not yet run this session -- the peer session that
+did the interleaved M3 measurements for the rest of this package's research
+went offline partway through the owner's decision being made, and this
+session continued solo per the owner's instruction. Whoever next has the
+M3 available should add it here rather than leave the row Linux-only.

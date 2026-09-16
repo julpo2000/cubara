@@ -284,7 +284,11 @@ fn render_arena(
     // to derive a fog range from anyway (`ARCHITECTURE.md` Rule 3 -- that's
     // `cubara-app`'s job, which is why `--screenshot`/the golden tests never
     // see it either).
-    scene.set_camera(&queue, vp, eye, lighting);
+    scene.set_camera(&device, &queue, vp, eye, lighting);
+    // A one-shot capture (headless render/golden/`--screenshot`): the mesh
+    // pipeline must match `lighting` in this exact frame, not a frame or two
+    // later once a background rebuild lands.
+    scene.wait_for_lighting_rebuild();
     if !icons.is_empty() {
         scene.set_icons(&device, &queue, &icons);
     }
