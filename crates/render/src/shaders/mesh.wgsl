@@ -57,6 +57,11 @@ struct VsOut {
     @location(1) ao: f32,
     @location(2) uv: vec2<f32>,
     @location(3) @interpolate(flat) layer: u32,
+    // 1/w_clip, for the fog below -- an ordinary linearly-interpolated
+    // varying, not read back off `clip_pos.w`. See the comment at its use
+    // site: reading the position builtin's `w` in the fragment stage is not
+    // portable on wgpu 24's DX12 backend.
+    @location(4) @interpolate(linear) inv_w: f32,
 };
 
 // Indexed by the packed `face` field (3 bits) -- always one of the six axis
@@ -93,6 +98,14 @@ fn vs_main(in: VsIn) -> VsOut {
 
     var out: VsOut;
     out.clip_pos = frame.view_proj * vec4<f32>(world_pos, 1.0);
+    // 1/w here, in the vertex shader, is unambiguous -- `clip_pos.w` is a
+    // plain value this shader just computed, not a value read back off a
+    // position-semantic builtin. Marked `@interpolate(linear)` (screen-space
+    // linear, not perspective-correct) deliberately: 1/w is exactly affine
+    // in screen space, which is the standard identity perspective-correct
+    // interpolation itself is built on, so a plain linear interpolation of
+    // this already-reciprocal value recovers the true per-fragment 1/w_clip.
+    out.inv_w = 1.0 / out.clip_pos.w;
     out.face = face;
     out.ao = f32(ao_raw) / 3.0;
     out.uv = vec2<f32>(u, v);
@@ -124,21 +137,36 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // a tile-based GPU (Apple M3) that a world-space `distance()` needs a
     // `world_pos` varying, and on this scene (~480k triangles, real
     // overdraw) that varying alone cost ~0.3ms/frame in interpolation
-    // traffic, on top of what the extra ALU cost. `@builtin(position)`'s `w`
-    // in the fragment stage is `1/w_clip` (a WGSL/WebGPU guarantee, true
-    // regardless of `reverse_z`'s flip -- that only touches the z output
-    // row, not w), so `1.0 / in.clip_pos.w` recovers `w_clip` itself --
-    // which for this projection *is* view-space depth -- for free, with no
-    // extra varying at all. The visible difference is real, not a
-    // regression: at the screen edges the plane fades in slightly later
-    // than the true radial distance would (`distance` > `depth` off-axis),
-    // never earlier, so nothing pops out of fog too soon.
+    // traffic, on top of the extra ALU cost. View-space depth for this
+    // projection is exactly `w_clip`, i.e. `1/frag_coord.w` -- a WGSL/WebGPU
+    // guarantee, true regardless of `reverse_z`'s flip (that only touches
+    // the z output row, not w) -- so it looks free: no extra varying, just
+    // reading the position builtin's `w` back in the fragment stage.
+    //
+    // It is not actually free, on every backend: wgpu 24's DX12 target hit a
+    // known naga/HLSL quirk here (CI caught it on the Windows runner, where
+    // this golden came back ~23% different at up to 220/255 per channel --
+    // not driver noise, a wrong value). Direct3D's SV_Position.w in a pixel
+    // shader is the raw interpolated `w`, not `1/w` like Vulkan and Metal;
+    // naga's HLSL backend does not correct for the difference, so
+    // `in.clip_pos.w` on that backend was not `1/w_clip` at all. `inv_w` above
+    // sidesteps it entirely by never reading the position builtin's `w` in
+    // this stage -- it is a plain vertex-shader value, computed the same way
+    // on every backend, carried across as an ordinary linear-interpolated
+    // varying. One extra `f32` (the cheapest interpolation mode there is),
+    // for a fog that is actually cross-backend rather than only
+    // cross-backend on the machines this branch happened to be measured on.
+    //
+    // The visible difference from the old world_pos-based radial fog is
+    // real, not a regression: at the screen edges the plane fades in
+    // slightly later than the true radial distance would (`distance` >
+    // `depth` off-axis), never earlier, so nothing pops out of fog too soon.
     //
     // `fog.y <= fog.x` is "fog off" ([`Lighting`]'s documented convention),
     // checked explicitly rather than relied on via a huge sentinel distance:
     // `select` here means a disabled fog never evaluates `smoothstep` on an
     // equal-edges range, whose result WGSL leaves unspecified.
-    let view_depth = 1.0 / in.clip_pos.w;
+    let view_depth = 1.0 / in.inv_w;
     let fog_amount = select(0.0, smoothstep(frame.fog.x, frame.fog.y, view_depth), frame.fog.y > frame.fog.x);
     let color = mix(lit, frame.fog_color.rgb, fog_amount);
     return vec4<f32>(color, 1.0);
