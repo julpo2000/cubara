@@ -5,24 +5,47 @@
 // a per-node origin add (scaled by the node's own lattice step) here, not a
 // CPU-side translate.
 
-// Everything about the frame beyond the geometry: camera, sun, ambient, fog.
-// One binding shared with `figure.wgsl` (`render.rs`'s `FrameUniform`/
-// `Lighting`), so the two can't disagree about where the sun is the way
-// they used to.
+// Everything about the frame beyond the geometry that still varies at
+// runtime: camera, sun direction/colour, fog. One binding shared with
+// `figure.wgsl` (`render.rs`'s `FrameUniform`/`Lighting`), so the two can't
+// disagree about where the sun is the way they used to.
+//
+// Ambient (ground/sky/AO floor) and the diffuse weight are *not* here --
+// every call site that builds a `Lighting` leaves them at `Lighting::default`
+// (only fog varies), so they are `override` pipeline constants below
+// instead of uniform reads. `.w` on `sun_color` is unused (was the diffuse
+// weight); kept as a full `vec4` for std140 alignment and so a future
+// non-white sun has a ready runtime-varying field.
 struct Frame {
     view_proj: mat4x4<f32>,
     eye: vec4<f32>,
     sun_dir: vec4<f32>,
-    // .w is the diffuse term's weight.
     sun_color: vec4<f32>,
-    // .x ambient (ground-facing), .y ambient (sky-facing), .z AO floor.
-    ambient: vec4<f32>,
     fog_color: vec4<f32>,
     // .x fog start, .y fog end, .z time of day.
     fog: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
+
+// Pipeline-compile-time, not frame-time: `render.rs`'s `mesh_pipeline_constants`
+// feeds these from the same `Lighting::default()` that used to be packed into
+// this uniform every frame. Where `mix(0.28, 0.42, t)` and `* 0.75` were once
+// hard `mesh.wgsl` literals (before `Lighting` existed), then became uniform
+// reads (before this), they are pipeline overrides now -- the compiler folds
+// them the way it folded the original literals, since a pipeline recompile
+// (not a per-frame write) is the only way they can change. If a feature ever
+// needs one of these to vary within a run (day/night dimming ambient, a
+// coloured sun), it moves back into `Frame` above, and its cost is measured
+// again on arrival -- the same way moving it out was.
+override ambient_low: f32 = 0.28;
+override ambient_high: f32 = 0.42;
+override ao_floor: f32 = 0.4;
+override diffuse_weight: f32 = 0.75;
+// Folds away the `sun_color.rgb` multiply entirely when true (the only value
+// `Lighting::default` has ever produced) -- `tex.rgb * vec3(1.0)` is exactly
+// `tex.rgb`, so the multiply was pure cost for a shader that never used it.
+override sun_is_white: bool = true;
 
 // One world-space origin per resident node, indexed by the node_index packed
 // into word 2 of each vertex (see crates/render/src/arena.rs). xyz is the
@@ -120,16 +143,25 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Directional sun: clear sun-side / shadow-side split. `sun_dir` arrives
     // already normalized (`Lighting`'s doc comment); the shader does not
     // renormalize it.
-    let diffuse = max(dot(n, frame.sun_dir.xyz), 0.0) * frame.sun_color.w;
+    let diffuse = max(dot(n, frame.sun_dir.xyz), 0.0) * diffuse_weight;
 
     // Hemispheric ambient: a touch brighter facing up (sky) than down (ground).
-    let ambient = mix(frame.ambient.x, frame.ambient.y, n.y * 0.5 + 0.5);
+    let ambient = mix(ambient_low, ambient_high, n.y * 0.5 + 0.5);
 
     // Baked ambient occlusion darkens crevices; keep a floor so nothing is pure black.
-    let ao = mix(frame.ambient.z, 1.0, in.ao);
+    let ao = mix(ao_floor, 1.0, in.ao);
 
     let tex = textureSample(block_textures, block_sampler, in.uv, in.layer);
-    let lit = tex.rgb * frame.sun_color.rgb * (ambient + diffuse) * ao;
+    // `sun_is_white` folds this branch to just `tex.rgb * (...)` at pipeline
+    // compile time in the only configuration this engine has ever shipped --
+    // `frame.sun_color.rgb` is read at all only the day a non-white sun
+    // exists, and even then only by the pipeline built for it.
+    var lit: vec3<f32>;
+    if sun_is_white {
+        lit = tex.rgb * (ambient + diffuse) * ao;
+    } else {
+        lit = tex.rgb * frame.sun_color.rgb * (ambient + diffuse) * ao;
+    }
 
     // Depth fog, fading toward `fog_color` (the sky colour, by default --
     // `Lighting::default`) rather than a hard render-radius edge. Planar

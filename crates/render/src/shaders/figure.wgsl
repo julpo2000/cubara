@@ -15,13 +15,14 @@
 // Same `Frame` `mesh.wgsl` binds (`render.rs`'s `FrameUniform`/`Lighting`):
 // figures used to light themselves from a *different* hard-coded sun
 // (`(0.4, 0.9, 0.25)` here, `(0.4, 1.0, 0.3)` in `mesh.wgsl`) -- one binding
-// means one sun.
+// means one sun. No `ambient` field -- it moved to `mesh.wgsl`'s `override`
+// pipeline constants (this shader never read it), so the struct shrank to
+// match the buffer `mesh.wgsl`'s pipeline now writes.
 struct Frame {
     view_proj: mat4x4<f32>,
     eye: vec4<f32>,
     sun_dir: vec4<f32>,
     sun_color: vec4<f32>,
-    ambient: vec4<f32>,
     fog_color: vec4<f32>,
     fog: vec4<f32>,
 };

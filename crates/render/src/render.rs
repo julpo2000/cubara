@@ -252,23 +252,35 @@ impl Lighting {
 }
 
 /// The uniform actually bound at `@group(0) @binding(0)`: the camera plus
-/// [`Lighting`], std140-safe (every field a full `vec4`, so nothing needs
-/// manual padding to hit 16-byte alignment). `mesh.wgsl` and `figure.wgsl`
-/// declare the matching `Frame` struct and read all of it; `outline.wgsl`
-/// still declares only the leading `view_proj` it actually uses -- WGSL
-/// doesn't require a shader to describe a whole bound buffer, only the
-/// prefix it reads, so a smaller struct there stays correct as long as
-/// `view_proj` stays first.
+/// whatever of [`Lighting`] still varies per frame, std140-safe (every field
+/// a full `vec4`, so nothing needs manual padding to hit 16-byte alignment).
+/// `mesh.wgsl` and `figure.wgsl` declare the matching `Frame` struct and
+/// read all of it; `outline.wgsl` still declares only the leading
+/// `view_proj` it actually uses -- WGSL doesn't require a shader to
+/// describe a whole bound buffer, only the prefix it reads, so a smaller
+/// struct there stays correct as long as `view_proj` stays first.
+///
+/// `ambient_low`/`ambient_high`/`ao_floor`/`diffuse_weight` are *not* here:
+/// every call site that builds a [`Lighting`] leaves them at
+/// [`Lighting::default`]'s values (only `fog_start`/`fog_end` ever vary), so
+/// they moved to `mesh.wgsl`'s `override` pipeline constants instead --
+/// [`build_pipeline`] feeds them from the same `Lighting::default()` this
+/// type would otherwise have packed, so there is still exactly one place
+/// they're written down. That makes them pipeline-compile-time rather than
+/// frame-time: if a future feature needs one to vary at runtime (time-of-day
+/// dimming ambient, say), it moves back into this struct, and its cost gets
+/// measured again on arrival, the same way removing it was.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct FrameUniform {
     view_proj: [[f32; 4]; 4],
     eye: [f32; 4],
     sun_dir: [f32; 4],
-    /// `.w` is [`Lighting::diffuse_weight`].
+    /// `.w` unused -- `diffuse_weight` moved to an `override` constant. Kept
+    /// as a full `vec4` (not shrunk to `vec3`) both for std140 alignment and
+    /// so a non-white sun (`sun_is_white`'s `false` branch, dead code today)
+    /// has a runtime-varying field ready without a layout change.
     sun_color: [f32; 4],
-    /// `.x` [`Lighting::ambient_low`], `.y` `ambient_high`, `.z` `ao_floor`.
-    ambient: [f32; 4],
     fog_color: [f32; 4],
     /// `.x` [`Lighting::fog_start`], `.y` `fog_end`, `.z` `time_of_day`.
     fog: [f32; 4],
@@ -289,12 +301,6 @@ impl FrameUniform {
                 lighting.sun_color.x,
                 lighting.sun_color.y,
                 lighting.sun_color.z,
-                lighting.diffuse_weight,
-            ],
-            ambient: [
-                lighting.ambient_low,
-                lighting.ambient_high,
-                lighting.ao_floor,
                 0.0,
             ],
             fog_color: [
@@ -311,6 +317,29 @@ impl FrameUniform {
             ],
         }
     }
+}
+
+/// [`mesh.wgsl`]'s `override` pipeline constants, fed from the same
+/// [`Lighting::default`] values [`FrameUniform`]'s doc comment points to --
+/// one source, not a second set of literals. Keys are the WGSL identifiers
+/// the shader declares (`override ambient_low: f32 = ...` etc.); a bare
+/// `bool` override is passed as `0.0`/`1.0`, per the WebGPU spec.
+fn mesh_pipeline_constants() -> std::collections::HashMap<String, f64> {
+    let lighting = Lighting::default();
+    std::collections::HashMap::from([
+        ("ambient_low".to_string(), lighting.ambient_low as f64),
+        ("ambient_high".to_string(), lighting.ambient_high as f64),
+        ("ao_floor".to_string(), lighting.ao_floor as f64),
+        ("diffuse_weight".to_string(), lighting.diffuse_weight as f64),
+        (
+            "sun_is_white".to_string(),
+            if lighting.sun_color == glam::Vec3::ONE {
+                1.0
+            } else {
+                0.0
+            },
+        ),
+    ])
 }
 
 /// A camera position and facing to render from -- the renderer's *entire*
@@ -1009,6 +1038,8 @@ pub fn build_pipeline(
         push_constant_ranges: &[],
     });
 
+    let constants = mesh_pipeline_constants();
+
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("mesh-pipeline"),
         layout: Some(&layout),
@@ -1026,7 +1057,10 @@ pub fn build_pipeline(
                 blend: Some(wgpu::BlendState::REPLACE),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &constants,
+                ..Default::default()
+            },
         }),
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -1255,10 +1289,33 @@ mod tests {
             Lighting::default(),
         );
         assert_eq!(f.eye, [1.0, 2.0, 3.0, 0.0]);
-        assert_eq!(f.sun_color[3], 0.75, "diffuse weight lives in sun_color.w");
-        assert_eq!(f.ambient, [0.28, 0.42, 0.4, 0.0]);
+        assert_eq!(
+            f.sun_color,
+            [1.0, 1.0, 1.0, 0.0],
+            "diffuse_weight and ambient moved to override pipeline constants, not the uniform"
+        );
         assert_eq!(f.fog[0], 0.0, "fog_start");
         assert_eq!(f.fog[1], 0.0, "fog_end");
+    }
+
+    #[test]
+    fn mesh_pipeline_constants_match_lightings_default() {
+        // The whole point of `mesh_pipeline_constants` is that it is the
+        // only place these four (plus `sun_is_white`) are written down --
+        // pinned here so a future edit to `Lighting::default` that forgets
+        // this function fails a test instead of silently mismatching what
+        // `mesh.wgsl`'s `override` declarations default to.
+        let c = mesh_pipeline_constants();
+        // Compared against the `f32` widened to `f64`, not a fresh `0.28`
+        // literal: `PipelineCompilationOptions::constants` is `f64` (the
+        // WebGPU API's type for override values), but the value itself
+        // started as `Lighting::default()`'s `f32` -- `0.28f32 as f64` is
+        // not bit-identical to the literal `0.28f64`.
+        assert_eq!(c["ambient_low"], 0.28f32 as f64);
+        assert_eq!(c["ambient_high"], 0.42f32 as f64);
+        assert_eq!(c["ao_floor"], 0.4f32 as f64);
+        assert_eq!(c["diffuse_weight"], 0.75f32 as f64);
+        assert_eq!(c["sun_is_white"], 1.0, "Lighting::default's sun is white");
     }
 
     #[test]
