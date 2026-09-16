@@ -2121,8 +2121,16 @@ startup pre-warming, wiring through window/bench/screenshot, and
 radial + fixed lighting is chosen) is follow-up, not done here.
 
 **Full M3 reference table, this package's research** (`--bench 64` orbit,
-`--fog on` throughout except where marked; `Vec3` = "not applicable",
-scene is the radius-64/~480k-drawn-triangle one this whole package used):
+`--fog on` throughout except where marked, scene is the radius-64/
+~480k-drawn-triangle one this whole package used). What it proves, in one
+line before the numbers: **on a tile-based GPU the fragment stage is a
+cliff, not a slope** -- B, C and D each touch a different small piece of
+what the fragment stage reads and each is worth only 2-4%, but removing
+*all* of it at once (F) is worth +33-37%, and "fewer instructions" is not
+the same axis at all (dropping the array index sounds like a pure win, but
+carrying its replacement across as a varying, commit 3, costs -8%). Read
+the rest of the table as the evidence for that one line, not as a list of
+independent micro-optimizations to combine piecemeal:
 
 | label | what | FPS | ms/frame | vs. `dad0dd6` baseline |
 |---|---|---|---|---|
@@ -2139,6 +2147,13 @@ scene is the radius-64/~480k-drawn-triangle one this whole package used):
 | diagnostic G | literal lighting + fog via one interpolated `f32` | 1390-1408 | 0.523-0.534 | +21% |
 | **proposal** | H -- lighting+fog entirely `override`, `fs_main` frame-free | 1708-1749 | 0.424-0.437 | **+48-51%** |
 | **proposal** | I -- H + radial fog, zero varying | 1724-1749 | 0.424-0.433 | +48-51% (= H) |
+
+Diagnostic B alone was measured on `b0d2fec` (which still had the dropped
+ambient/diffuse override commit underneath it), not `dad0dd6` like every
+other row -- doesn't change its conclusion, since that commit measured
+zero effect of its own, but it's the actual commit the number came from,
+recorded so "+2%" stays checkable rather than needing to be re-derived
+against the wrong baseline later.
 
 `main`'s post-package-2 regression this package set out to fix is now
 ~+2-3% over ⁵⁹ instead of the ~-27% ⁵⁹ shipped with, on the shipped `.z`
