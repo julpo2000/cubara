@@ -28,6 +28,17 @@ struct Frame {
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 
+// Throwaway diagnostic (variant H): lighting AND fog entirely as pipeline
+// overrides, so fs_main never touches `frame` at all. Fog thresholds
+// pre-converted to clip-space for --bench 64's actual fog_start=576/
+// fog_end=960, same values variant E used.
+override h_ambient_low: f32 = 0.28;
+override h_ambient_high: f32 = 0.42;
+override h_ao_floor: f32 = 0.4;
+override h_diffuse_weight: f32 = 0.75;
+override h_fog_z_start: f32 = 0.0001236172919757099;
+override h_fog_z_end: f32 = 5.4169375135423426e-05;
+
 // One world-space origin per resident node, indexed by the node_index packed
 // into word 2 of each vertex (see crates/render/src/arena.rs). xyz is the
 // node's world-space min corner; w is its scale -- world units per lattice
@@ -106,64 +117,15 @@ fn vs_main(in: VsIn) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    // Throwaway diagnostic (variant H): lighting and fog entirely as
+    // pipeline overrides -- this function never reads `frame`.
     let n = FACE_NORMALS[in.face];
-
-    // Directional sun: clear sun-side / shadow-side split. `sun_dir` arrives
-    // already normalized (`Lighting`'s doc comment); the shader does not
-    // renormalize it.
-    let diffuse = max(dot(n, frame.sun_dir.xyz), 0.0) * frame.sun_color.w;
-
-    // Hemispheric ambient: a touch brighter facing up (sky) than down (ground).
-    let ambient = mix(frame.ambient.x, frame.ambient.y, n.y * 0.5 + 0.5);
-
-    // Baked ambient occlusion darkens crevices; keep a floor so nothing is pure black.
-    let ao = mix(frame.ambient.z, 1.0, in.ao);
-
+    let diffuse = max(dot(n, vec3<f32>(0.37115407, 0.92788516, 0.27836555)), 0.0) * h_diffuse_weight;
+    let ambient = mix(h_ambient_low, h_ambient_high, n.y * 0.5 + 0.5);
+    let ao = mix(h_ao_floor, 1.0, in.ao);
     let tex = textureSample(block_textures, block_sampler, in.uv, in.layer);
-    let lit = tex.rgb * frame.sun_color.rgb * (ambient + diffuse) * ao;
-
-    // Depth fog, fading toward `fog_color` (the sky colour, by default --
-    // `Lighting::default`) rather than a hard render-radius edge. Planar
-    // (view-space depth), not radial (distance from the eye) -- measured on
-    // a tile-based GPU (Apple M3) that a world-space `distance()` needs a
-    // `world_pos` varying, and on this scene (~480k triangles, real
-    // overdraw) that varying alone cost ~0.3ms/frame in interpolation
-    // traffic, on top of the extra ALU cost.
-    //
-    // Two earlier approaches to view-space depth both turned out to read a
-    // value naga's DX12 backend gets wrong (wgpu 24; CI's Windows runner
-    // caught both, not this machine or the M3): `@builtin(position).w`,
-    // which the WGSL/WebGPU spec says is `1/w_clip` but which Direct3D's
-    // pixel-shader `SV_Position.w` gives raw, uninverted, with naga not
-    // correcting for the difference; and, as a fix, a plain vertex-shader
-    // `1/w_clip` carried across as an ordinary `@interpolate(linear)`
-    // varying, which was correct everywhere but still cost an extra f32 of
-    // interpolation traffic (measured on the M3: ~80 FPS, ~0.043 ms/frame).
-    //
-    // This reads `@builtin(position).z` instead -- the rasterizer's actual
-    // depth-buffer value, not a value under naga's `.w` handling at all, and
-    // recoverable with zero varyings since it's already per-fragment via the
-    // hardware depth interpolant every pipeline needs anyway. `reverse_z`
-    // only touches the z output row (not w), so starting from
-    // `perspective_rh`'s un-reversed NDC (`ndc_z = C - A/d` for view depth
-    // `d`) and applying `new_ndc_z = 1 - ndc_z` gives `ndc_z' = A/d - B` --
-    // solved for `d`, that's the `A/(z+B)` below. `frame.depth` carries
-    // `(A, B)`, computed once on the CPU from the same near/far the
-    // projection itself uses (`render.rs`'s `reverse_z_depth_constants`,
-    // pinned against the real matrix by a unit test there rather than
-    // trusted as algebra alone).
-    //
-    // The visible difference from the old world_pos-based radial fog is
-    // real, not a regression: at the screen edges the plane fades in
-    // slightly later than the true radial distance would (`distance` >
-    // `depth` off-axis), never earlier, so nothing pops out of fog too soon.
-    //
-    // `fog.y <= fog.x` is "fog off" ([`Lighting`]'s documented convention),
-    // checked explicitly rather than relied on via a huge sentinel distance:
-    // `select` here means a disabled fog never evaluates `smoothstep` on an
-    // equal-edges range, whose result WGSL leaves unspecified.
-    let view_depth = frame.depth.x / (in.clip_pos.z + frame.depth.y);
-    let fog_amount = select(0.0, smoothstep(frame.fog.x, frame.fog.y, view_depth), frame.fog.y > frame.fog.x);
-    let color = mix(lit, frame.fog_color.rgb, fog_amount);
+    let lit = tex.rgb * (ambient + diffuse) * ao;
+    let fog_amount = 1.0 - smoothstep(h_fog_z_end, h_fog_z_start, in.clip_pos.z);
+    let color = mix(lit, vec3<f32>(0.45, 0.62, 0.80), fog_amount);
     return vec4<f32>(color, 1.0);
 }
