@@ -372,6 +372,7 @@ pub fn run(
     view: View,
     overlay: bool,
     gpu_timing_mode: GpuTimingMode,
+    fog: bool,
 ) {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
@@ -593,17 +594,23 @@ pub fn run(
         };
         // Fog end tied to the region's own radius, so it moves with
         // `--bench <radius>` rather than a number picked for radius 64.
-        let (fog_start, fog_end) = cubara_render::Lighting::fog_range(view_radius);
-        scene.set_camera(
-            &queue,
-            vp,
-            eye,
+        // `--fog off` (via the `fog` parameter) gives a same-commit,
+        // same-run A/B for exactly this: package 2's real cost on Metal
+        // (~0.3ms/frame) went unnoticed until measured against a
+        // *different* commit, by which point run-to-run and cold-boost
+        // noise (15-40% swings, already documented for this scene) buried
+        // it. A same-commit flag flip has none of that noise.
+        let lighting = if fog {
+            let (fog_start, fog_end) = cubara_render::Lighting::fog_range(view_radius);
             cubara_render::Lighting {
                 fog_start,
                 fog_end,
                 ..Default::default()
-            },
-        );
+            }
+        } else {
+            cubara_render::Lighting::default()
+        };
+        scene.set_camera(&queue, vp, eye, lighting);
         let frustum = Frustum::from_view_proj(vp);
 
         // CPU cull + indirect-list upload — the per-frame work we're measuring.
@@ -618,6 +625,8 @@ pub fn run(
                  fog  {fog_start:.0}-{fog_end:.0}",
                 draws = draw_count,
                 visible = arena.visible_nodes(),
+                fog_start = lighting.fog_start,
+                fog_end = lighting.fog_end,
             )
         });
         let gpu_slot = gpu_timer.and_then(|t| t.write_slot(frame_index));

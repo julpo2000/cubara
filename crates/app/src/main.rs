@@ -492,12 +492,24 @@ fn main() {
             }),
             None => bench::GpuTimingMode::default(),
         };
+        // Default on (this is what every other row in BENCHMARKS.md now
+        // measures); `off` is the same-commit, same-run A/B a package that
+        // changes shading needs -- see bench.rs's `run` for why.
+        let fog = match flag("--fog").map(String::as_str) {
+            Some("off") => false,
+            Some("on") | None => true,
+            Some(_) => {
+                eprintln!("--fog needs off or on");
+                std::process::exit(2);
+            }
+        };
         bench::run(
             radius,
             size,
             bench::View { eye, squash },
             overlay,
             gpu_timing,
+            fog,
         );
         return;
     }
