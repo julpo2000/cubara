@@ -48,7 +48,12 @@ struct VsIn {
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
-    @location(0) normal: vec3<f32>,
+    // The packed `face` index itself, not the unit vector it picks out of
+    // `FACE_NORMALS` -- greedy-meshed faces never bend across a triangle, so
+    // there is nothing for the rasterizer to interpolate, and shipping one
+    // flat u32 instead of an interpolated (and fragment-renormalized) vec3
+    // is strictly less varying traffic for the same answer.
+    @location(0) @interpolate(flat) face: u32,
     @location(1) ao: f32,
     @location(2) uv: vec2<f32>,
     @location(3) @interpolate(flat) layer: u32,
@@ -88,7 +93,7 @@ fn vs_main(in: VsIn) -> VsOut {
 
     var out: VsOut;
     out.clip_pos = frame.view_proj * vec4<f32>(world_pos, 1.0);
-    out.normal = FACE_NORMALS[face];
+    out.face = face;
     out.ao = f32(ao_raw) / 3.0;
     out.uv = vec2<f32>(u, v);
     out.layer = tex_layer;
@@ -97,7 +102,7 @@ fn vs_main(in: VsIn) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let n = normalize(in.normal);
+    let n = FACE_NORMALS[in.face];
 
     // Directional sun: clear sun-side / shadow-side split. `sun_dir` arrives
     // already normalized (`Lighting`'s doc comment); the shader does not
