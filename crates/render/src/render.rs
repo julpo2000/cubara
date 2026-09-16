@@ -1096,7 +1096,7 @@ pub fn build_mesh_layout(
     device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("mesh-layout"),
         bind_group_layouts: &[camera_bgl, origins_bgl, textures_bgl],
-        push_constant_ranges: &[],
+        immediate_size: 0,
     })
 }
 
@@ -1150,7 +1150,7 @@ pub fn build_mesh_pipeline_from_module(
             bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }
@@ -1230,7 +1230,7 @@ pub fn build_figure_pipeline(
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("figure-layout"),
         bind_group_layouts: &[camera_bgl],
-        push_constant_ranges: &[],
+        immediate_size: 0,
     });
 
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1266,7 +1266,7 @@ pub fn build_figure_pipeline(
             bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }
@@ -1285,7 +1285,7 @@ pub fn build_outline_pipeline(
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("outline-layout"),
         bind_group_layouts: &[camera_bgl, outline_bgl],
-        push_constant_ranges: &[],
+        immediate_size: 0,
     });
 
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1325,7 +1325,7 @@ pub fn build_outline_pipeline(
             },
         }),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }

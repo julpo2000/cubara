@@ -318,7 +318,7 @@ pub fn build(
         // look, not an oversight.
         mag_filter: wgpu::FilterMode::Nearest,
         min_filter: wgpu::FilterMode::Linear,
-        mipmap_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
         ..Default::default()
     });
 
