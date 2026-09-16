@@ -36,8 +36,26 @@ override h_ambient_low: f32 = 0.28;
 override h_ambient_high: f32 = 0.42;
 override h_ao_floor: f32 = 0.4;
 override h_diffuse_weight: f32 = 0.75;
-override h_fog_z_start: f32 = 0.0001236172919757099;
-override h_fog_z_end: f32 = 5.4169375135423426e-05;
+
+// Throwaway diagnostic (variant I, on top of H): radial fog (Julian noticed
+// the planar-fog artifact -- a mountain dead ahead is foggier than the same
+// mountain at the screen edge, since planar fog follows depth along the
+// view axis, not true distance) reconstructed with zero varyings. View
+// depth comes back from clip_pos.z via (depth_a, depth_b) exactly as
+// elsewhere; the ray direction per fragment comes from clip_pos.xy (the
+// framebuffer pixel, not NDC -- converted here with the viewport size)
+// instead of a per-vertex varying. For a symmetric perspective frustum,
+// radial distance = view_depth * sqrt(1 + (ndc_x*tan_half_fov*aspect)^2 +
+// (ndc_y*tan_half_fov)^2) -- the same relationship a projection matrix
+// itself encodes, just evaluated per fragment instead of carried across.
+override depth_a: f32 = 0.1000050002500125;
+override depth_b: f32 = 5.000250012500625e-05;
+override viewport_width: f32 = 1920.0;
+override viewport_height: f32 = 1080.0;
+override tan_half_fov: f32 = 0.5773502691896257;
+override aspect: f32 = 1.7777777777777777;
+override fog_start: f32 = 576.0;
+override fog_end: f32 = 960.0;
 
 // One world-space origin per resident node, indexed by the node_index packed
 // into word 2 of each vertex (see crates/render/src/arena.rs). xyz is the
@@ -125,7 +143,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let ao = mix(h_ao_floor, 1.0, in.ao);
     let tex = textureSample(block_textures, block_sampler, in.uv, in.layer);
     let lit = tex.rgb * (ambient + diffuse) * ao;
-    let fog_amount = 1.0 - smoothstep(h_fog_z_end, h_fog_z_start, in.clip_pos.z);
+
+    let view_depth = depth_a / (in.clip_pos.z + depth_b);
+    let ndc_x = (in.clip_pos.x / viewport_width) * 2.0 - 1.0;
+    let ndc_y = 1.0 - (in.clip_pos.y / viewport_height) * 2.0;
+    let off_axis_x = ndc_x * tan_half_fov * aspect;
+    let off_axis_y = ndc_y * tan_half_fov;
+    let radial = view_depth * sqrt(1.0 + off_axis_x * off_axis_x + off_axis_y * off_axis_y);
+    let fog_amount = smoothstep(fog_start, fog_end, radial);
     let color = mix(lit, vec3<f32>(0.45, 0.62, 0.80), fog_amount);
     return vec4<f32>(color, 1.0);
 }
