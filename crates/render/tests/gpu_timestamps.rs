@@ -31,20 +31,19 @@ fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
-    }))?;
+    }))
+    .ok()?;
     let (features, _) = gpu_driven_features(&adapter);
     if !features.contains(wgpu::Features::TIMESTAMP_QUERY) {
         return None;
     }
-    pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("cubara-test-gpu-timestamps-device"),
-            required_features: features,
-            required_limits: wgpu::Limits::default(),
-            memory_hints: wgpu::MemoryHints::Performance,
-        },
-        None,
-    ))
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("cubara-test-gpu-timestamps-device"),
+        required_features: features,
+        required_limits: wgpu::Limits::default(),
+        memory_hints: wgpu::MemoryHints::Performance,
+        trace: wgpu::Trace::Off,
+    }))
     .ok()
 }
 
@@ -161,7 +160,7 @@ fn gpu_timestamps_through_encode_scene_produce_a_real_reading() {
             std::time::Instant::now() < deadline,
             "GPU map did not complete within 10s -- likely hung"
         );
-        let _ = device.poll(wgpu::Maintain::Poll);
+        let _ = device.poll(wgpu::PollType::Poll);
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
     ring.mark_ready(0);

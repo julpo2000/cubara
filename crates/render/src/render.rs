@@ -553,15 +553,13 @@ impl Renderer {
         let (features, multi_draw) = gpu_driven_features(&adapter);
         log::info!("multi_draw_indirect: {multi_draw}");
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("cubara-device"),
-                required_features: features,
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("cubara-device"),
+            required_features: features,
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        }))
         .expect("request device");
 
         let caps = surface.get_capabilities(&adapter);
@@ -1037,30 +1035,30 @@ pub fn mesh_pipeline_constants(
     lighting: &Lighting,
     width: u32,
     height: u32,
-) -> std::collections::HashMap<String, f64> {
+) -> Vec<(&'static str, f64)> {
     let (depth_a, depth_b) = reverse_z_depth_constants();
-    std::collections::HashMap::from([
-        ("ambient_low".to_string(), lighting.ambient_low as f64),
-        ("ambient_high".to_string(), lighting.ambient_high as f64),
-        ("ao_floor".to_string(), lighting.ao_floor as f64),
-        ("diffuse_weight".to_string(), lighting.diffuse_weight as f64),
-        ("sun_dir_x".to_string(), lighting.sun_dir.x as f64),
-        ("sun_dir_y".to_string(), lighting.sun_dir.y as f64),
-        ("sun_dir_z".to_string(), lighting.sun_dir.z as f64),
-        ("sun_color_r".to_string(), lighting.sun_color.x as f64),
-        ("sun_color_g".to_string(), lighting.sun_color.y as f64),
-        ("sun_color_b".to_string(), lighting.sun_color.z as f64),
-        ("fog_color_r".to_string(), lighting.fog_color.x as f64),
-        ("fog_color_g".to_string(), lighting.fog_color.y as f64),
-        ("fog_color_b".to_string(), lighting.fog_color.z as f64),
-        ("fog_start".to_string(), lighting.fog_start as f64),
-        ("fog_end".to_string(), lighting.fog_end as f64),
-        ("depth_a".to_string(), depth_a as f64),
-        ("depth_b".to_string(), depth_b as f64),
-        ("viewport_width".to_string(), width as f64),
-        ("viewport_height".to_string(), height as f64),
-        ("aspect".to_string(), width as f64 / height as f64),
-    ])
+    vec![
+        ("ambient_low", lighting.ambient_low as f64),
+        ("ambient_high", lighting.ambient_high as f64),
+        ("ao_floor", lighting.ao_floor as f64),
+        ("diffuse_weight", lighting.diffuse_weight as f64),
+        ("sun_dir_x", lighting.sun_dir.x as f64),
+        ("sun_dir_y", lighting.sun_dir.y as f64),
+        ("sun_dir_z", lighting.sun_dir.z as f64),
+        ("sun_color_r", lighting.sun_color.x as f64),
+        ("sun_color_g", lighting.sun_color.y as f64),
+        ("sun_color_b", lighting.sun_color.z as f64),
+        ("fog_color_r", lighting.fog_color.x as f64),
+        ("fog_color_g", lighting.fog_color.y as f64),
+        ("fog_color_b", lighting.fog_color.z as f64),
+        ("fog_start", lighting.fog_start as f64),
+        ("fog_end", lighting.fog_end as f64),
+        ("depth_a", depth_a as f64),
+        ("depth_b", depth_b as f64),
+        ("viewport_width", width as f64),
+        ("viewport_height", height as f64),
+        ("aspect", width as f64 / height as f64),
+    ]
 }
 
 /// `mesh.wgsl`'s shader module, parsed from WGSL once and reused for every
@@ -1103,7 +1101,7 @@ pub fn build_mesh_pipeline_from_module(
     format: wgpu::TextureFormat,
     shader: &wgpu::ShaderModule,
     layout: &wgpu::PipelineLayout,
-    constants: &std::collections::HashMap<String, f64>,
+    constants: &[(&str, f64)],
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("mesh-pipeline"),
@@ -1158,7 +1156,7 @@ pub fn build_pipeline(
     camera_bgl: &wgpu::BindGroupLayout,
     origins_bgl: &wgpu::BindGroupLayout,
     textures_bgl: &wgpu::BindGroupLayout,
-    constants: &std::collections::HashMap<String, f64>,
+    constants: &[(&str, f64)],
 ) -> (
     wgpu::ShaderModule,
     wgpu::PipelineLayout,
@@ -1394,23 +1392,32 @@ mod tests {
             ..Lighting::default()
         };
         let c = mesh_pipeline_constants(&lighting, 1920, 1080);
-        assert_eq!(c["ambient_low"], lighting.ambient_low as f64);
-        assert_eq!(c["ambient_high"], lighting.ambient_high as f64);
-        assert_eq!(c["ao_floor"], lighting.ao_floor as f64);
-        assert_eq!(c["diffuse_weight"], lighting.diffuse_weight as f64);
-        assert_eq!(c["sun_dir_x"], lighting.sun_dir.x as f64);
-        assert_eq!(c["sun_dir_y"], lighting.sun_dir.y as f64);
-        assert_eq!(c["sun_dir_z"], lighting.sun_dir.z as f64);
-        assert_eq!(c["sun_color_r"], lighting.sun_color.x as f64);
-        assert_eq!(c["fog_color_b"], lighting.fog_color.z as f64);
-        assert_eq!(c["fog_start"], 100.0);
-        assert_eq!(c["fog_end"], 200.0);
-        assert_eq!(c["viewport_width"], 1920.0);
-        assert_eq!(c["viewport_height"], 1080.0);
-        assert_eq!(c["aspect"], 1920.0 / 1080.0);
+        // `PipelineCompilationOptions::constants` is `&[(&str, f64)]`, not a
+        // map -- a plain lookup rather than indexing keeps this test honest
+        // about the same shape the real caller uses.
+        let get = |key: &str| {
+            c.iter()
+                .find(|(k, _)| *k == key)
+                .unwrap_or_else(|| panic!("no constant named {key}"))
+                .1
+        };
+        assert_eq!(get("ambient_low"), lighting.ambient_low as f64);
+        assert_eq!(get("ambient_high"), lighting.ambient_high as f64);
+        assert_eq!(get("ao_floor"), lighting.ao_floor as f64);
+        assert_eq!(get("diffuse_weight"), lighting.diffuse_weight as f64);
+        assert_eq!(get("sun_dir_x"), lighting.sun_dir.x as f64);
+        assert_eq!(get("sun_dir_y"), lighting.sun_dir.y as f64);
+        assert_eq!(get("sun_dir_z"), lighting.sun_dir.z as f64);
+        assert_eq!(get("sun_color_r"), lighting.sun_color.x as f64);
+        assert_eq!(get("fog_color_b"), lighting.fog_color.z as f64);
+        assert_eq!(get("fog_start"), 100.0);
+        assert_eq!(get("fog_end"), 200.0);
+        assert_eq!(get("viewport_width"), 1920.0);
+        assert_eq!(get("viewport_height"), 1080.0);
+        assert_eq!(get("aspect"), 1920.0 / 1080.0);
         let (depth_a, depth_b) = reverse_z_depth_constants();
-        assert_eq!(c["depth_a"], depth_a as f64);
-        assert_eq!(c["depth_b"], depth_b as f64);
+        assert_eq!(get("depth_a"), depth_a as f64);
+        assert_eq!(get("depth_b"), depth_b as f64);
     }
 
     #[test]
