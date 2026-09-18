@@ -66,6 +66,10 @@ pub enum WireError {
     BadTag(u8),
     /// A length prefix that would run past the end of the buffer.
     BadLength(u32),
+    /// A string's bytes weren't valid UTF-8. Every encoder here writes from a
+    /// real Rust `String`, which cannot produce this -- it means a stranger's
+    /// bytes, not this crate's own.
+    BadUtf8,
 }
 
 impl std::fmt::Display for WireError {
@@ -74,6 +78,7 @@ impl std::fmt::Display for WireError {
             WireError::Truncated => write!(f, "message ended early"),
             WireError::BadTag(t) => write!(f, "unknown tag byte {t}"),
             WireError::BadLength(n) => write!(f, "length prefix {n} overruns the buffer"),
+            WireError::BadUtf8 => write!(f, "string was not valid UTF-8"),
         }
     }
 }
@@ -151,6 +156,14 @@ impl<'a> Cursor<'a> {
         Ok([self.i32()?, self.i32()?, self.i32()?])
     }
 
+    /// A `u16`-length-prefixed UTF-8 string. Only [`Action::Command`]'s
+    /// free text needs this -- everything else on the wire is fixed shape.
+    fn str(&mut self) -> Result<String, WireError> {
+        let len = self.u16()? as usize;
+        let bytes = self.take(len)?;
+        String::from_utf8(bytes.to_vec()).map_err(|_| WireError::BadUtf8)
+    }
+
     fn fixed_vec3(&mut self) -> Result<FixedVec3, WireError> {
         Ok(FixedVec3::new(
             Fixed::from_raw(self.i64()?),
@@ -179,6 +192,13 @@ fn put_pos(out: &mut Vec<u8>, p: [i32; 3]) {
     for v in p {
         out.extend_from_slice(&v.to_le_bytes());
     }
+}
+
+/// A `u16`-length-prefixed UTF-8 string. See [`Cursor::str`].
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    out.extend_from_slice(bytes);
 }
 
 fn put_fixed_vec3(out: &mut Vec<u8>, v: FixedVec3) {
@@ -273,6 +293,7 @@ fn put_player_state(out: &mut Vec<u8>, s: &PlayerState) {
     out.extend_from_slice(&s.pitch.raw().to_le_bytes());
     out.push(s.on_ground as u8);
     out.push(s.free_fly as u8);
+    out.push(s.creative as u8);
     out.extend_from_slice(&s.fall_distance.raw().to_le_bytes());
     out.push(s.health);
     out.extend_from_slice(&s.ticks_since_damage.to_le_bytes());
@@ -286,6 +307,7 @@ fn get_player_state(c: &mut Cursor<'_>) -> Result<PlayerState, WireError> {
         pitch: c.angle()?,
         on_ground: c.bool()?,
         free_fly: c.bool()?,
+        creative: c.bool()?,
         fall_distance: Fixed::from_raw(c.i64()?),
         health: c.u8()?,
         ticks_since_damage: c.u32()?,
@@ -506,6 +528,14 @@ impl Action {
                 out.push(6);
                 out.push(*slot);
             }
+            Action::SetCreative(creative) => {
+                out.push(7);
+                out.push(*creative as u8);
+            }
+            Action::Command(text) => {
+                out.push(8);
+                put_str(out, text);
+            }
         }
     }
 
@@ -541,6 +571,8 @@ impl Action {
             }
             5 => Action::CloseScreen,
             6 => Action::SelectHotbar(c.u8()?),
+            7 => Action::SetCreative(c.bool()?),
+            8 => Action::Command(c.str()?),
             t => return Err(WireError::BadTag(t)),
         })
     }
@@ -910,6 +942,7 @@ mod tests {
             pitch: Angle::from_raw(-7_654),
             on_ground: true,
             free_fly: false,
+            creative: true,
             fall_distance: Fixed::from_f32(12.5),
             health: 13,
             ticks_since_damage: 4_242,

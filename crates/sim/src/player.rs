@@ -80,6 +80,7 @@ pub struct PlayerState {
     pub pitch: Angle,
     pub on_ground: bool,
     pub free_fly: bool,
+    pub creative: bool,
     pub fall_distance: Fixed,
     pub health: u8,
     pub ticks_since_damage: u32,
@@ -110,6 +111,16 @@ pub struct Player {
     /// a replay (block 1.8) needs to reproduce -- not a side channel outside
     /// it.
     pub(crate) free_fly: bool,
+    /// Survival vs. creative (owner's call, 2026-09-18 -- `ROADMAP.md`'s phase
+    /// 3 note). `pub(crate)`, same reason as [`Self::free_fly`]: changed only
+    /// through [`Self::set_creative`], which is what keeps it flowing through
+    /// the recorded `Action` stream a replay needs, not a side channel.
+    ///
+    /// Deliberately a `bool`, not an enum: exactly two modes are decided.
+    /// `ROADMAP.md`'s note names "survival and creative for now" -- a third
+    /// mode is a real possibility this leaves for whoever adds it, not a
+    /// hypothetical designed around today.
+    pub(crate) creative: bool,
     /// Heading around +Y. 0 looks toward −Z. `pub(crate)`, not private:
     /// `crate::hash::WorldHash` needs the raw angle (`look_dir()` only exposes
     /// the derived unit vector) to include orientation in the world-state hash
@@ -188,6 +199,7 @@ impl Player {
             velocity: FixedVec3::ZERO,
             on_ground: false,
             free_fly: false,
+            creative: false,
             yaw,
             pitch: pitch.clamp(PITCH_LIMIT),
             inventory: Inventory::new(),
@@ -274,6 +286,29 @@ impl Player {
         self.free_fly
     }
 
+    /// Whether the player is in creative mode. Read-only outside this crate --
+    /// only [`Self::set_creative`] changes it.
+    pub fn is_creative(&self) -> bool {
+        self.creative
+    }
+
+    /// Enter or leave creative mode.
+    ///
+    /// Entering always starts flying and leaving always stops it: survival
+    /// never flies, and a player switching to creative mid-air or mid-walk
+    /// should not fall the instant they land. `F4`'s independent
+    /// [`Self::free_fly`] toggle still works normally once creative, exactly
+    /// as it always has, to land and walk around without leaving creative --
+    /// the two flags are set together only at this transition, not tied
+    /// together afterward.
+    pub fn set_creative(&mut self, creative: bool) {
+        self.creative = creative;
+        self.free_fly = creative;
+        self.velocity = FixedVec3::ZERO;
+        self.on_ground = false;
+        self.fall_distance = Fixed::ZERO;
+    }
+
     /// Unit view direction from the current yaw/pitch, in [`Fixed`].
     ///
     /// Computed by [`cubara_voxel::angle::look_dir`]'s own integer
@@ -290,6 +325,7 @@ impl Player {
             pitch: self.pitch,
             on_ground: self.on_ground,
             free_fly: self.free_fly,
+            creative: self.creative,
             fall_distance: self.fall_distance,
             health: self.health,
             ticks_since_damage: self.ticks_since_damage,
@@ -309,6 +345,7 @@ impl Player {
         self.pitch = state.pitch;
         self.on_ground = state.on_ground;
         self.free_fly = state.free_fly;
+        self.creative = state.creative;
         self.fall_distance = state.fall_distance;
         self.health = state.health;
         self.ticks_since_damage = state.ticks_since_damage;
@@ -408,6 +445,7 @@ impl Player {
             velocity: other.velocity,
             on_ground: other.on_ground,
             free_fly: other.free_fly,
+            creative: other.creative,
             // The short way round, which wrapping gives for free -- and the one
             // place a float belongs, because this is the render camera (§9).
             yaw: self.yaw.lerp(other.yaw, t),
@@ -733,5 +771,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn entering_creative_starts_flying_and_leaving_stops_it() {
+        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
+        assert!(!p.is_creative());
+        assert!(!p.is_free_fly());
+
+        p.set_creative(true);
+        assert!(p.is_creative());
+        assert!(p.is_free_fly(), "entering creative should start flying");
+
+        p.set_creative(false);
+        assert!(!p.is_creative());
+        assert!(
+            !p.is_free_fly(),
+            "leaving creative should stop flying -- survival never flies"
+        );
+    }
+
+    #[test]
+    fn f4_still_toggles_flight_independently_while_creative() {
+        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
+        p.set_creative(true);
+        assert!(p.is_free_fly());
+
+        // The existing debug toggle (`InputFrame::toggle_fly`, consumed in
+        // `Sim::step_player`) flips `free_fly` directly -- it doesn't know
+        // about creative and shouldn't need to. Exercised here at the
+        // `Player` level since that's as far down as this field reaches.
+        p.free_fly = false;
+        assert!(
+            p.is_creative(),
+            "landing in creative must not leave creative mode"
+        );
     }
 }

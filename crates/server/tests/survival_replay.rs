@@ -108,7 +108,11 @@ const STANCES: [(i32, i32, [i32; 3]); 8] = [
 /// *Cobble:* a new block named `cubara:cobble` sorts first, so every block id
 /// shifts up by one, and the hash folds edited blocks by id. Nothing about what
 /// the player did changed.
-const KNOWN_SURVIVAL_HASH: u64 = 0x2AA4_55D0_FE61_79ED;
+// Updated 2026-09-18: `WorldHash::write_player` now hashes `Player::creative`
+// (see `crates/sim/tests/determinism.rs`'s `KNOWN_FIXTURE_HASH` note) --
+// the script never enters creative mode, so this is the only reason the
+// value moved.
+const KNOWN_SURVIVAL_HASH: u64 = 0xCAE3_7250_90BB_BBC5;
 
 /// How many logs the script fells: three become planks, three become furnace
 /// fuel. When this was written oak burned 80 ticks and an ingot took 200, so
