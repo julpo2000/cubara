@@ -19,7 +19,7 @@ authors = ["Julian Poelsma"]
 # Shared dependency versions for all crates in the workspace.
 [workspace.dependencies]
 winit = "0.30"
-wgpu = "29"
+wgpu = "30"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 glam = "0.29"

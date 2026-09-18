@@ -31,6 +31,7 @@ fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
+        apply_limit_buckets: false,
     }))
     .ok()?;
     let (features, _) = gpu_driven_features(&adapter);
@@ -167,7 +168,10 @@ fn gpu_timestamps_through_encode_scene_produce_a_real_reading() {
     ring.mark_ready(0);
     assert!(ring.take_ready(0));
 
-    let data = read_buffer.slice(..).get_mapped_range();
+    let data = read_buffer
+        .slice(..)
+        .get_mapped_range()
+        .expect("read back mapped range");
     let raw: &[u64] = bytemuck::cast_slice(&data);
     let (begin, end) = (raw[0], raw[1]);
     drop(data);

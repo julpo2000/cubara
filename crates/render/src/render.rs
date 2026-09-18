@@ -553,6 +553,7 @@ impl Renderer {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .expect("no suitable GPU adapter");
 
@@ -602,6 +603,10 @@ impl Renderer {
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
+            // `Auto` reproduces wgpu's pre-30 behaviour exactly (srgb, or
+            // ExtendedSrgbLinear for an fp16 surface) -- no HDR/wide-gamut
+            // opt-in here.
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
         log::info!(
             "surface present modes offered: {:?}; chose {:?}",
@@ -824,7 +829,7 @@ impl Renderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        frame.present();
+        self.queue.present(frame);
 
         self.report_fps();
     }
@@ -1124,7 +1129,7 @@ pub fn build_mesh_pipeline_from_module(
         vertex: wgpu::VertexState {
             module: shader,
             entry_point: Some("vs_main"),
-            buffers: &[vertex_layout()],
+            buffers: &[Some(vertex_layout())],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -1245,7 +1250,7 @@ pub fn build_figure_pipeline(
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_main"),
-            buffers: &[figure_vertex_layout()],
+            buffers: &[Some(figure_vertex_layout())],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -1300,7 +1305,7 @@ pub fn build_outline_pipeline(
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_main"),
-            buffers: &[outline_vertex_layout()],
+            buffers: &[Some(outline_vertex_layout())],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {

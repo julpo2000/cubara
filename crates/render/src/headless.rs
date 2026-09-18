@@ -196,6 +196,7 @@ fn render_arena(
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
+        apply_limit_buckets: false,
     }))
     .ok()?;
 
@@ -388,7 +389,7 @@ fn render_arena(
     slice.map_async(wgpu::MapMode::Read, |r| r.expect("map readback"));
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
 
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().expect("read back mapped range");
     let mut pixels = Vec::with_capacity((width * height * 4) as usize);
     for row in 0..height {
         let start = (row * padded_bpr) as usize;

@@ -205,7 +205,10 @@ impl GpuTimer {
         }
         let buf = &self.read_buffers[slot];
         let sample = {
-            let data = buf.slice(..).get_mapped_range();
+            let data = buf
+                .slice(..)
+                .get_mapped_range()
+                .expect("read back mapped range");
             let raw: &[u64] = bytemuck::cast_slice(&data);
             let (begin, end) = (raw[0], raw[1]);
             if matches!(
@@ -382,6 +385,7 @@ pub fn run(
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
+        apply_limit_buckets: false,
     }))
     .expect("no suitable GPU adapter");
     log::info!("GPU: {:?}", adapter.get_info());
@@ -975,6 +979,7 @@ mod tests {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .ok()?;
         let (features, _) = gpu_driven_features(&adapter);
