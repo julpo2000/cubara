@@ -45,24 +45,25 @@ fn test_registry() -> BlockRegistry {
 /// convention `cubara_render::headless::render` uses, so this test skips loudly
 /// instead of failing where there is nothing to test against.
 fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
-    }))?;
-    pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("cubara-test-device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            memory_hints: wgpu::MemoryHints::Performance,
-        },
-        None,
-    ))
+        apply_limit_buckets: false,
+    }))
+    .ok()?;
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("cubara-test-device"),
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::default(),
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        memory_hints: wgpu::MemoryHints::Performance,
+        trace: wgpu::Trace::Off,
+    }))
     .ok()
 }
 

@@ -23,28 +23,29 @@ use cubara_render::{
 /// `TIMESTAMP_QUERY` -- the same skip-loudly convention
 /// `mesh_arena_integration.rs`'s `test_device()` uses.
 fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
-    }))?;
+        apply_limit_buckets: false,
+    }))
+    .ok()?;
     let (features, _) = gpu_driven_features(&adapter);
     if !features.contains(wgpu::Features::TIMESTAMP_QUERY) {
         return None;
     }
-    pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("cubara-test-gpu-timestamps-device"),
-            required_features: features,
-            required_limits: wgpu::Limits::default(),
-            memory_hints: wgpu::MemoryHints::Performance,
-        },
-        None,
-    ))
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("cubara-test-gpu-timestamps-device"),
+        required_features: features,
+        required_limits: wgpu::Limits::default(),
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        memory_hints: wgpu::MemoryHints::Performance,
+        trace: wgpu::Trace::Off,
+    }))
     .ok()
 }
 
@@ -161,13 +162,16 @@ fn gpu_timestamps_through_encode_scene_produce_a_real_reading() {
             std::time::Instant::now() < deadline,
             "GPU map did not complete within 10s -- likely hung"
         );
-        let _ = device.poll(wgpu::Maintain::Poll);
+        let _ = device.poll(wgpu::PollType::Poll);
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
     ring.mark_ready(0);
     assert!(ring.take_ready(0));
 
-    let data = read_buffer.slice(..).get_mapped_range();
+    let data = read_buffer
+        .slice(..)
+        .get_mapped_range()
+        .expect("read back mapped range");
     let raw: &[u64] = bytemuck::cast_slice(&data);
     let (begin, end) = (raw[0], raw[1]);
     drop(data);

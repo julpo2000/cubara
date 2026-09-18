@@ -188,26 +188,27 @@ fn render_arena(
     shot: Shot,
     build_arena: impl FnOnce(&wgpu::Device, &wgpu::Queue, bool, &MeshContext) -> ChunkArena,
 ) -> Option<Frame> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
-    }))?;
+        apply_limit_buckets: false,
+    }))
+    .ok()?;
 
     let (features, multi_draw) = gpu_driven_features(&adapter);
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("cubara-headless-device"),
-            required_features: features,
-            required_limits: wgpu::Limits::default(),
-            memory_hints: wgpu::MemoryHints::Performance,
-        },
-        None,
-    ))
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("cubara-headless-device"),
+        required_features: features,
+        required_limits: wgpu::Limits::default(),
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        memory_hints: wgpu::MemoryHints::Performance,
+        trace: wgpu::Trace::Off,
+    }))
     .ok()?;
 
     let Shot {
@@ -386,9 +387,9 @@ fn render_arena(
 
     let slice = readback.slice(..);
     slice.map_async(wgpu::MapMode::Read, |r| r.expect("map readback"));
-    let _ = device.poll(wgpu::Maintain::Wait);
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
 
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().expect("read back mapped range");
     let mut pixels = Vec::with_capacity((width * height * 4) as usize);
     for row in 0..height {
         let start = (row * padded_bpr) as usize;

@@ -183,8 +183,8 @@ impl TextRenderer {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("text-layout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("text-pipeline"),
@@ -192,11 +192,11 @@ impl TextRenderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<TextVertex>() as wgpu::BufferAddress,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &TEXT_ATTRS,
-                }],
+                })],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -215,7 +215,7 @@ impl TextRenderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 

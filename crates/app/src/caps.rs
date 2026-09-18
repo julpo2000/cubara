@@ -5,14 +5,15 @@
 //! `cargo run --release -- --caps`, then paste the output into the spike issue.
 
 pub fn run() {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
+        apply_limit_buckets: false,
     }))
     .expect("no suitable GPU adapter");
 
@@ -44,7 +45,6 @@ pub fn run() {
     // styles needs to know what's possible on this adapter regardless of
     // which this crate happens to use.
     let checks = [
-        ("MULTI_DRAW_INDIRECT", wgpu::Features::MULTI_DRAW_INDIRECT),
         (
             "MULTI_DRAW_INDIRECT_COUNT",
             wgpu::Features::MULTI_DRAW_INDIRECT_COUNT,
@@ -72,6 +72,18 @@ pub fn run() {
         };
         log::info!("  [{mark}] {name}");
     }
+    // wgpu 27 removed the `MULTI_DRAW_INDIRECT` feature flag: plain
+    // `multi_draw_indexed_indirect` moved to this downlevel capability
+    // instead of an opt-in feature (`render.rs`'s `gpu_driven_features` has
+    // the full story).
+    let indirect_execution = adapter
+        .get_downlevel_capabilities()
+        .flags
+        .contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION);
+    log::info!(
+        "  [{}] INDIRECT_EXECUTION (downlevel capability, not a feature -- gates multi_draw_indexed_indirect)",
+        if indirect_execution { "yes" } else { "NO " }
+    );
 
     log::info!(
         "limits: max_buffer_size {} MiB | max_storage_buffer_binding {} MiB | max_bind_groups {}",

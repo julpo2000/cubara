@@ -205,7 +205,10 @@ impl GpuTimer {
         }
         let buf = &self.read_buffers[slot];
         let sample = {
-            let data = buf.slice(..).get_mapped_range();
+            let data = buf
+                .slice(..)
+                .get_mapped_range()
+                .expect("read back mapped range");
             let raw: &[u64] = bytemuck::cast_slice(&data);
             let (begin, end) = (raw[0], raw[1]);
             if matches!(
@@ -246,7 +249,7 @@ impl GpuTimer {
     fn drain_after_wait(&self, device: &wgpu::Device) -> (u64, u64) {
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
         while self.ring.lock().unwrap().any_mapping() && Instant::now() < deadline {
-            let _ = device.poll(wgpu::Maintain::Poll);
+            let _ = device.poll(wgpu::PollType::Poll);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let mut valid = 0u64;
@@ -374,14 +377,15 @@ pub fn run(
     gpu_timing_mode: GpuTimingMode,
     fog: bool,
 ) {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
+        apply_limit_buckets: false,
     }))
     .expect("no suitable GPU adapter");
     log::info!("GPU: {:?}", adapter.get_info());
@@ -390,15 +394,14 @@ pub fn run(
     log::info!("multi_draw_indirect: {multi_draw}");
     let gpu_timing_supported = features.contains(wgpu::Features::TIMESTAMP_QUERY);
 
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("cubara-bench-device"),
-            required_features: features,
-            required_limits: wgpu::Limits::default(),
-            memory_hints: wgpu::MemoryHints::Performance,
-        },
-        None,
-    ))
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("cubara-bench-device"),
+        required_features: features,
+        required_limits: wgpu::Limits::default(),
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        memory_hints: wgpu::MemoryHints::Performance,
+        trace: wgpu::Trace::Off,
+    }))
     .expect("request device");
 
     let mut gpu_timer = match decide_gpu_timer(gpu_timing_mode, gpu_timing_supported) {
@@ -687,11 +690,11 @@ pub fn run(
             gpu_timer.as_ref(),
             frame_index,
         );
-        let _ = device.poll(wgpu::Maintain::Poll);
+        let _ = device.poll(wgpu::PollType::Poll);
         virtual_t += VIRTUAL_DT;
         frame_index += 1;
     }
-    let _ = device.poll(wgpu::Maintain::Wait);
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
     // Warmup's own readings are never counted in the reported stats -- only
     // measurement frames count -- but the drain still classifies them,
     // because that classification decides whether GPU timing runs at all
@@ -748,7 +751,7 @@ pub fn run(
         draws_sum += draws as u64;
         visible_sum += visible as u64;
         triangles_sum += arena.visible_triangles();
-        let _ = device.poll(wgpu::Maintain::Poll);
+        let _ = device.poll(wgpu::PollType::Poll);
         // One slot per frame, round-robin, not all `GPU_TIMER_DEPTH` of them:
         // scanning every slot every frame was measured to slow down
         // *subsequent* frames' CPU submit time even though the scan itself
@@ -770,7 +773,7 @@ pub fn run(
         virtual_t += VIRTUAL_DT;
         frame_index += 1;
     }
-    let _ = device.poll(wgpu::Maintain::Wait);
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
     let wall_secs = wall_start.elapsed().as_secs_f64();
     // The round-robin check above only visits slot `frame % GPU_TIMER_DEPTH`
     // once per frame, so whichever slots were written in the loop's last
@@ -968,28 +971,29 @@ mod tests {
     /// whose driver lacks `TIMESTAMP_QUERY`) -- the same
     /// skip-loudly convention `mesh_arena_integration.rs` uses.
     fn test_gpu_timer_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
-        }))?;
+            apply_limit_buckets: false,
+        }))
+        .ok()?;
         let (features, _) = gpu_driven_features(&adapter);
         if !features.contains(wgpu::Features::TIMESTAMP_QUERY) {
             return None;
         }
-        pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("cubara-test-gpu-timer-device"),
-                required_features: features,
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("cubara-test-gpu-timer-device"),
+            required_features: features,
+            required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        }))
         .ok()
     }
 
@@ -1068,7 +1072,7 @@ mod tests {
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
         let mut sample = None;
         while Instant::now() < deadline {
-            let _ = device.poll(wgpu::Maintain::Poll);
+            let _ = device.poll(wgpu::PollType::Poll);
             if let Some(s) = timer.take_ms(slot) {
                 sample = Some(s);
                 break;

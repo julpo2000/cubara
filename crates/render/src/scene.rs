@@ -598,6 +598,7 @@ impl SceneRenderer {
                 label: Some("main-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: color,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(CLEAR_COLOR),
@@ -614,6 +615,7 @@ impl SceneRenderer {
                 }),
                 timestamp_writes,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             pass.set_pipeline(&self.pipeline);
@@ -677,6 +679,7 @@ impl SceneRenderer {
             label: Some("overlay-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: color,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Load,
@@ -686,6 +689,7 @@ impl SceneRenderer {
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         self.text
             .flush(queue, &mut pass, self.width as f32, self.height as f32);

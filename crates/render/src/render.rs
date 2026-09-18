@@ -438,8 +438,16 @@ pub const OUTLINE_CUBE_EDGES: [[f32; 3]; 24] = [
 /// everywhere. `node_index` is a plain vertex attribute instead (§5.3), so
 /// this feature is unused now; see the design doc for the full story.
 pub fn gpu_driven_features(adapter: &wgpu::Adapter) -> (wgpu::Features, bool) {
-    let mdi = adapter.features() & wgpu::Features::MULTI_DRAW_INDIRECT;
-    let multi_draw = mdi.contains(wgpu::Features::MULTI_DRAW_INDIRECT);
+    // wgpu 27 removed the `MULTI_DRAW_INDIRECT` feature flag: plain
+    // `multi_draw_indexed_indirect` (not the GPU-decided-count variant,
+    // `MULTI_DRAW_INDIRECT_COUNT`, which is a separate feature and still
+    // unused here) moved to a downlevel capability instead of an opt-in
+    // feature -- the WebGPU spec's baseline apparently grew to expect it,
+    // where wgpu 24 didn't.
+    let multi_draw = adapter
+        .get_downlevel_capabilities()
+        .flags
+        .contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION);
     // The GPU-timing feature `bench.rs` wants for GPU/frame -- requested here
     // (window, bench, headless all call this) so the feature set is the same
     // everywhere rather than bench alone having a device the others don't.
@@ -463,7 +471,7 @@ pub fn gpu_driven_features(adapter: &wgpu::Adapter) -> (wgpu::Features, bool) {
     // `INSIDE_ENCODERS` but not `INSIDE_PASSES` -- exactly the machine this
     // number needs to work on.
     let timestamps = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
-    (mdi | timestamps, multi_draw)
+    (timestamps, multi_draw)
 }
 
 /// All GPU + window state. Created once the event loop has `resumed`.
@@ -532,9 +540,9 @@ impl Renderer {
     pub fn new(window: Arc<Window>, camera: CameraPose) -> (Self, MeshAssets) {
         let size = window.inner_size();
 
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
         let surface = instance
@@ -545,6 +553,7 @@ impl Renderer {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .expect("no suitable GPU adapter");
 
@@ -553,15 +562,14 @@ impl Renderer {
         let (features, multi_draw) = gpu_driven_features(&adapter);
         log::info!("multi_draw_indirect: {multi_draw}");
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("cubara-device"),
-                required_features: features,
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("cubara-device"),
+            required_features: features,
+            required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        }))
         .expect("request device");
 
         let caps = surface.get_capabilities(&adapter);
@@ -595,6 +603,10 @@ impl Renderer {
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
+            // `Auto` reproduces wgpu's pre-30 behaviour exactly (srgb, or
+            // ExtendedSrgbLinear for an fp16 surface) -- no HDR/wide-gamut
+            // opt-in here.
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
         log::info!(
             "surface present modes offered: {:?}; chose {:?}",
@@ -760,9 +772,15 @@ impl Renderer {
         self.update(camera);
 
         let frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            // Surface lost/outdated (e.g. during resize) — reconfigure and skip.
-            Err(_) => {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            // Surface lost/outdated/occluded/timed out (e.g. during resize) —
+            // reconfigure and skip.
+            wgpu::CurrentSurfaceTexture::Timeout
+            | wgpu::CurrentSurfaceTexture::Occluded
+            | wgpu::CurrentSurfaceTexture::Outdated
+            | wgpu::CurrentSurfaceTexture::Lost
+            | wgpu::CurrentSurfaceTexture::Validation => {
                 self.surface.configure(&self.device, &self.config);
                 return;
             }
@@ -811,7 +829,7 @@ impl Renderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        frame.present();
+        self.queue.present(frame);
 
         self.report_fps();
     }
@@ -1037,30 +1055,30 @@ pub fn mesh_pipeline_constants(
     lighting: &Lighting,
     width: u32,
     height: u32,
-) -> std::collections::HashMap<String, f64> {
+) -> Vec<(&'static str, f64)> {
     let (depth_a, depth_b) = reverse_z_depth_constants();
-    std::collections::HashMap::from([
-        ("ambient_low".to_string(), lighting.ambient_low as f64),
-        ("ambient_high".to_string(), lighting.ambient_high as f64),
-        ("ao_floor".to_string(), lighting.ao_floor as f64),
-        ("diffuse_weight".to_string(), lighting.diffuse_weight as f64),
-        ("sun_dir_x".to_string(), lighting.sun_dir.x as f64),
-        ("sun_dir_y".to_string(), lighting.sun_dir.y as f64),
-        ("sun_dir_z".to_string(), lighting.sun_dir.z as f64),
-        ("sun_color_r".to_string(), lighting.sun_color.x as f64),
-        ("sun_color_g".to_string(), lighting.sun_color.y as f64),
-        ("sun_color_b".to_string(), lighting.sun_color.z as f64),
-        ("fog_color_r".to_string(), lighting.fog_color.x as f64),
-        ("fog_color_g".to_string(), lighting.fog_color.y as f64),
-        ("fog_color_b".to_string(), lighting.fog_color.z as f64),
-        ("fog_start".to_string(), lighting.fog_start as f64),
-        ("fog_end".to_string(), lighting.fog_end as f64),
-        ("depth_a".to_string(), depth_a as f64),
-        ("depth_b".to_string(), depth_b as f64),
-        ("viewport_width".to_string(), width as f64),
-        ("viewport_height".to_string(), height as f64),
-        ("aspect".to_string(), width as f64 / height as f64),
-    ])
+    vec![
+        ("ambient_low", lighting.ambient_low as f64),
+        ("ambient_high", lighting.ambient_high as f64),
+        ("ao_floor", lighting.ao_floor as f64),
+        ("diffuse_weight", lighting.diffuse_weight as f64),
+        ("sun_dir_x", lighting.sun_dir.x as f64),
+        ("sun_dir_y", lighting.sun_dir.y as f64),
+        ("sun_dir_z", lighting.sun_dir.z as f64),
+        ("sun_color_r", lighting.sun_color.x as f64),
+        ("sun_color_g", lighting.sun_color.y as f64),
+        ("sun_color_b", lighting.sun_color.z as f64),
+        ("fog_color_r", lighting.fog_color.x as f64),
+        ("fog_color_g", lighting.fog_color.y as f64),
+        ("fog_color_b", lighting.fog_color.z as f64),
+        ("fog_start", lighting.fog_start as f64),
+        ("fog_end", lighting.fog_end as f64),
+        ("depth_a", depth_a as f64),
+        ("depth_b", depth_b as f64),
+        ("viewport_width", width as f64),
+        ("viewport_height", height as f64),
+        ("aspect", width as f64 / height as f64),
+    ]
 }
 
 /// `mesh.wgsl`'s shader module, parsed from WGSL once and reused for every
@@ -1088,8 +1106,8 @@ pub fn build_mesh_layout(
 ) -> wgpu::PipelineLayout {
     device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("mesh-layout"),
-        bind_group_layouts: &[camera_bgl, origins_bgl, textures_bgl],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(camera_bgl), Some(origins_bgl), Some(textures_bgl)],
+        immediate_size: 0,
     })
 }
 
@@ -1103,7 +1121,7 @@ pub fn build_mesh_pipeline_from_module(
     format: wgpu::TextureFormat,
     shader: &wgpu::ShaderModule,
     layout: &wgpu::PipelineLayout,
-    constants: &std::collections::HashMap<String, f64>,
+    constants: &[(&str, f64)],
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("mesh-pipeline"),
@@ -1111,7 +1129,7 @@ pub fn build_mesh_pipeline_from_module(
         vertex: wgpu::VertexState {
             module: shader,
             entry_point: Some("vs_main"),
-            buffers: &[vertex_layout()],
+            buffers: &[Some(vertex_layout())],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -1136,14 +1154,14 @@ pub fn build_mesh_pipeline_from_module(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: true,
+            depth_write_enabled: Some(true),
             // Reversed-Z: nearer fragments have *greater* depth.
-            depth_compare: wgpu::CompareFunction::Greater,
+            depth_compare: Some(wgpu::CompareFunction::Greater),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }
@@ -1158,7 +1176,7 @@ pub fn build_pipeline(
     camera_bgl: &wgpu::BindGroupLayout,
     origins_bgl: &wgpu::BindGroupLayout,
     textures_bgl: &wgpu::BindGroupLayout,
-    constants: &std::collections::HashMap<String, f64>,
+    constants: &[(&str, f64)],
 ) -> (
     wgpu::ShaderModule,
     wgpu::PipelineLayout,
@@ -1222,8 +1240,8 @@ pub fn build_figure_pipeline(
 
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("figure-layout"),
-        bind_group_layouts: &[camera_bgl],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(camera_bgl)],
+        immediate_size: 0,
     });
 
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1232,7 +1250,7 @@ pub fn build_figure_pipeline(
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_main"),
-            buffers: &[figure_vertex_layout()],
+            buffers: &[Some(figure_vertex_layout())],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -1252,14 +1270,14 @@ pub fn build_figure_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: true,
+            depth_write_enabled: Some(true),
             // Reversed-Z, like the terrain: greater is nearer.
-            depth_compare: wgpu::CompareFunction::Greater,
+            depth_compare: Some(wgpu::CompareFunction::Greater),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }
@@ -1277,8 +1295,8 @@ pub fn build_outline_pipeline(
 
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("outline-layout"),
-        bind_group_layouts: &[camera_bgl, outline_bgl],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(camera_bgl), Some(outline_bgl)],
+        immediate_size: 0,
     });
 
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1287,7 +1305,7 @@ pub fn build_outline_pipeline(
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_main"),
-            buffers: &[outline_vertex_layout()],
+            buffers: &[Some(outline_vertex_layout())],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -1306,19 +1324,20 @@ pub fn build_outline_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: false,
+            depth_write_enabled: Some(false),
             // Reversed-Z counterpart of LessEqual -- the outline must draw
             // at exactly the depth of the face it outlines, not be rejected by it.
-            depth_compare: wgpu::CompareFunction::GreaterEqual,
+            depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
             stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState {
-                constant: -4,
-                slope_scale: -2.0,
-                clamp: 0.0,
-            },
+            // No bias: wgpu 29 rejects any depth bias on a non-triangle
+            // topology (validation, `DepthBiasWithIncompatibleTopology`) --
+            // this pipeline draws `LineList`. `GreaterEqual` above is what
+            // actually makes the outline win the z-fight against the face
+            // it outlines.
+            bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }
@@ -1394,23 +1413,32 @@ mod tests {
             ..Lighting::default()
         };
         let c = mesh_pipeline_constants(&lighting, 1920, 1080);
-        assert_eq!(c["ambient_low"], lighting.ambient_low as f64);
-        assert_eq!(c["ambient_high"], lighting.ambient_high as f64);
-        assert_eq!(c["ao_floor"], lighting.ao_floor as f64);
-        assert_eq!(c["diffuse_weight"], lighting.diffuse_weight as f64);
-        assert_eq!(c["sun_dir_x"], lighting.sun_dir.x as f64);
-        assert_eq!(c["sun_dir_y"], lighting.sun_dir.y as f64);
-        assert_eq!(c["sun_dir_z"], lighting.sun_dir.z as f64);
-        assert_eq!(c["sun_color_r"], lighting.sun_color.x as f64);
-        assert_eq!(c["fog_color_b"], lighting.fog_color.z as f64);
-        assert_eq!(c["fog_start"], 100.0);
-        assert_eq!(c["fog_end"], 200.0);
-        assert_eq!(c["viewport_width"], 1920.0);
-        assert_eq!(c["viewport_height"], 1080.0);
-        assert_eq!(c["aspect"], 1920.0 / 1080.0);
+        // `PipelineCompilationOptions::constants` is `&[(&str, f64)]`, not a
+        // map -- a plain lookup rather than indexing keeps this test honest
+        // about the same shape the real caller uses.
+        let get = |key: &str| {
+            c.iter()
+                .find(|(k, _)| *k == key)
+                .unwrap_or_else(|| panic!("no constant named {key}"))
+                .1
+        };
+        assert_eq!(get("ambient_low"), lighting.ambient_low as f64);
+        assert_eq!(get("ambient_high"), lighting.ambient_high as f64);
+        assert_eq!(get("ao_floor"), lighting.ao_floor as f64);
+        assert_eq!(get("diffuse_weight"), lighting.diffuse_weight as f64);
+        assert_eq!(get("sun_dir_x"), lighting.sun_dir.x as f64);
+        assert_eq!(get("sun_dir_y"), lighting.sun_dir.y as f64);
+        assert_eq!(get("sun_dir_z"), lighting.sun_dir.z as f64);
+        assert_eq!(get("sun_color_r"), lighting.sun_color.x as f64);
+        assert_eq!(get("fog_color_b"), lighting.fog_color.z as f64);
+        assert_eq!(get("fog_start"), 100.0);
+        assert_eq!(get("fog_end"), 200.0);
+        assert_eq!(get("viewport_width"), 1920.0);
+        assert_eq!(get("viewport_height"), 1080.0);
+        assert_eq!(get("aspect"), 1920.0 / 1080.0);
         let (depth_a, depth_b) = reverse_z_depth_constants();
-        assert_eq!(c["depth_a"], depth_a as f64);
-        assert_eq!(c["depth_b"], depth_b as f64);
+        assert_eq!(get("depth_a"), depth_a as f64);
+        assert_eq!(get("depth_b"), depth_b as f64);
     }
 
     #[test]
