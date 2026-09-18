@@ -83,6 +83,34 @@ fn entering_creative_does_not_touch_a_slot_that_already_has_something() {
 }
 
 #[test]
+fn leaving_creative_grants_nothing() {
+    let (mut s, who) = fixture();
+    assert!(
+        s.sim
+            .player(who)
+            .inventory
+            .slots()
+            .all(|slot| slot.is_none()),
+        "the fixture starts with an empty inventory"
+    );
+
+    // `SetCreative(false)` on an already-survival player: never entered
+    // creative, so there is nothing to leave, but the grant must still not
+    // fire on the `false` branch.
+    s.apply_as(who, Action::SetCreative(false));
+
+    assert!(!s.sim.player(who).is_creative());
+    assert!(
+        s.sim
+            .player(who)
+            .inventory
+            .slots()
+            .all(|slot| slot.is_none()),
+        "SetCreative(false) must grant nothing"
+    );
+}
+
+#[test]
 fn creative_placing_does_not_consume_the_stack() {
     let (mut s, who) = fixture();
     let stone = s
