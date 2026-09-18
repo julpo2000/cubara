@@ -765,6 +765,7 @@ impl Renderer {
             panel,
             health,
             crosshair,
+            menu,
         } = hud;
         crate::profiling::Profiler::new_frame();
         puffin::profile_function!();
@@ -802,7 +803,13 @@ impl Renderer {
 
         {
             puffin::profile_scope!("encode-pass");
-            let overlay = self.show_debug.then(|| self.debug_text(camera));
+            // The pause menu/console take priority over the F3 debug text --
+            // both are "read this instead of the world", and there is
+            // nothing useful about overlapping them.
+            let overlay = match menu {
+                Some(text) => Some(text.to_string()),
+                None => self.show_debug.then(|| self.debug_text(camera)),
+            };
             self.scene.encode_scene(
                 &self.device,
                 &self.queue,

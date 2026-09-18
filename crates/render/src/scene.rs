@@ -117,6 +117,13 @@ pub struct Hud<'a> {
     pub health: Option<HealthView>,
     /// See [`SceneFrame::crosshair`].
     pub crosshair: bool,
+    /// The pause menu or command console's text, drawn the same top-left
+    /// overlay the F3 debug text uses (`Renderer::render` picks one -- both
+    /// are "read this instead of looking at the world", so there is nothing
+    /// useful about showing both at once). `None` the rest of the time,
+    /// which is every existing call site (`Hud { .. }`'s `Default`-style
+    /// construction covers them, no golden image changes).
+    pub menu: Option<&'a str>,
 }
 
 /// What the renderer needs to draw hearts: two numbers.

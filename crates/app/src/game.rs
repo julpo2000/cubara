@@ -167,6 +167,16 @@ pub struct Game {
     /// The furnace whose screen is open, by world position. `None` when the
     /// open screen is the plain inventory or a bench.
     open_furnace: Option<[i32; 3]>,
+    /// The pause menu (owner's call, 2026-09-18 -- `ROADMAP.md`'s phase 3
+    /// note), open on `Escape` when nothing else is. Screen state, same as
+    /// [`Self::inventory_open`] -- what it switches (play mode) lives on the
+    /// player and reaches the server as an [`Action`].
+    pause_open: bool,
+    /// The command console's typed text, `Some` while it's open. Starts at
+    /// `"/"` the moment it opens (`/`'s own keypress isn't consumed as text,
+    /// it's the open trigger), so what's on screen always matches what
+    /// `console_submit` will strip and send.
+    console: Option<String>,
     /// Every smelting recipe, loaded alongside the items they name.
     /// Whether the break button is currently held. Read once per `advance`
     /// into [`InputFrame::breaking`].
@@ -379,6 +389,8 @@ impl Game {
             assets: None,
             inventory_open: false,
             open_furnace: None,
+            pause_open: false,
+            console: None,
             breaking: false,
             accumulator: 0.0,
             forward: false,
@@ -1538,6 +1550,95 @@ impl Game {
         // predict-and-be-corrected shape movement already uses.
         self.me.player_mut().inventory.select(index);
         self.act(Action::SelectHotbar(index));
+    }
+
+    /// Whether the pause menu is open.
+    pub fn pause_open(&self) -> bool {
+        self.pause_open
+    }
+
+    /// Open or close the pause menu. Refuses to open over the inventory or
+    /// the console -- there is one screen at a time, the same rule
+    /// [`Self::toggle_inventory`] already holds to.
+    pub fn toggle_pause(&mut self) {
+        if self.inventory_open || self.console.is_some() {
+            return;
+        }
+        self.pause_open = !self.pause_open;
+    }
+
+    /// Whether the command console is open, and its current text if so
+    /// (always starting with `/`).
+    pub fn console(&self) -> Option<&str> {
+        self.console.as_deref()
+    }
+
+    /// Open the console, pre-filled with `/` -- closes the pause menu first
+    /// if that's what was open (the key that opens the console is only read
+    /// while a screen -- including the pause menu -- is not already
+    /// consuming keystrokes some other way).
+    pub fn open_console(&mut self) {
+        if self.inventory_open {
+            return;
+        }
+        self.pause_open = false;
+        self.console = Some("/".to_string());
+    }
+
+    /// Append one character while the console is open. Control characters
+    /// (`Enter`, `Backspace`, ...) arrive as their own key events, not as
+    /// text, so this only ever sees what belongs on screen.
+    pub fn console_push(&mut self, c: char) {
+        if let Some(text) = self.console.as_mut() {
+            if !c.is_control() {
+                text.push(c);
+            }
+        }
+    }
+
+    /// Remove the last character, down to (but not past) the leading `/` --
+    /// deleting the console's own prompt would leave typing with nothing to
+    /// anchor to.
+    pub fn console_backspace(&mut self) {
+        if let Some(text) = self.console.as_mut() {
+            if text.len() > 1 {
+                text.pop();
+            }
+        }
+    }
+
+    /// Close the console without sending anything.
+    pub fn console_cancel(&mut self) {
+        self.console = None;
+    }
+
+    /// Send whatever the console holds and close it. Empty (just `/`, or
+    /// `/` followed by only whitespace) sends nothing -- an accidental Enter
+    /// should not roundtrip to the server for the command parser to reject.
+    pub fn console_submit(&mut self) {
+        let Some(text) = self.console.take() else {
+            return;
+        };
+        let command = text.trim_start_matches('/').trim();
+        if !command.is_empty() {
+            self.act(Action::Command(command.to_string()));
+        }
+    }
+
+    /// Whether the local player is in creative mode.
+    pub fn is_creative(&self) -> bool {
+        self.me.player().is_creative()
+    }
+
+    /// Switch play mode (the pause menu's "survival/creative", `ROADMAP.md`'s
+    /// phase 3 note).
+    ///
+    /// Predicted locally like [`Self::select_hotbar`], then sent: waiting on
+    /// a round trip to see your own flight mode change would feel exactly as
+    /// broken here as it would for the hotbar.
+    pub fn set_creative(&mut self, creative: bool) {
+        self.me.player_mut().set_creative(creative);
+        self.act(Action::SetCreative(creative));
     }
 }
 
@@ -4309,6 +4410,111 @@ mod tests {
             server_edits, client_edits,
             "the replica saw every edit the server made, and no others"
         );
+    }
+
+    #[test]
+    fn toggle_pause_refuses_while_the_inventory_or_console_is_open() {
+        let mut game = Game::new();
+        game.inventory_open = true;
+        game.toggle_pause();
+        assert!(!game.pause_open(), "the inventory was open");
+
+        game.inventory_open = false;
+        game.console = Some("/".to_string());
+        game.toggle_pause();
+        assert!(!game.pause_open(), "the console was open");
+
+        game.console = None;
+        game.toggle_pause();
+        assert!(game.pause_open(), "nothing else was open");
+        game.toggle_pause();
+        assert!(!game.pause_open(), "a second press closes it again");
+    }
+
+    #[test]
+    fn open_console_starts_at_the_prompt_and_closes_the_pause_menu() {
+        let mut game = Game::new();
+        game.pause_open = true;
+
+        game.open_console();
+
+        assert_eq!(game.console(), Some("/"));
+        assert!(
+            !game.pause_open(),
+            "the console replaces the pause menu, not stacks on top of it"
+        );
+    }
+
+    #[test]
+    fn open_console_refuses_while_the_inventory_is_open() {
+        let mut game = Game::new();
+        game.inventory_open = true;
+        game.open_console();
+        assert_eq!(
+            game.console(),
+            None,
+            "typing a command over the inventory would fight its own keys"
+        );
+    }
+
+    #[test]
+    fn console_backspace_never_deletes_the_prompt() {
+        let mut game = Game::new();
+        game.open_console();
+        game.console_push('t');
+        assert_eq!(game.console(), Some("/t"));
+        game.console_backspace();
+        assert_eq!(game.console(), Some("/"));
+        // One more: the prompt itself must survive.
+        game.console_backspace();
+        assert_eq!(game.console(), Some("/"));
+    }
+
+    #[test]
+    fn console_push_ignores_control_characters() {
+        let mut game = Game::new();
+        game.open_console();
+        game.console_push('\r'); // Enter's own text representation
+        game.console_push('t');
+        game.console_push('\u{8}'); // Backspace's control character
+        game.console_push('p');
+        assert_eq!(
+            game.console(),
+            Some("/tp"),
+            "only the printable characters a real key press adds should land"
+        );
+    }
+
+    #[test]
+    fn submitting_an_empty_console_sends_nothing() {
+        let mut game = Game::new();
+        game.open_console();
+        // Just the prompt, or the prompt plus whitespace: neither is a command.
+        game.console_submit();
+        assert_eq!(game.console(), None, "submit always closes the console");
+
+        game.open_console();
+        game.console_push(' ');
+        game.console_push(' ');
+        game.console_submit();
+        assert_eq!(game.console(), None);
+        // Nothing to assert about what was sent -- `link` is `None` in this
+        // fixture, so `act` is already a no-op; what this pins is that
+        // `console_submit` doesn't panic or leave stale text behind on an
+        // empty send.
+    }
+
+    #[test]
+    fn set_creative_predicts_locally() {
+        let mut game = Game::new();
+        assert!(!game.is_creative());
+        game.set_creative(true);
+        assert!(
+            game.is_creative(),
+            "creative should be visible immediately, not only after a round trip"
+        );
+        game.set_creative(false);
+        assert!(!game.is_creative());
     }
 }
 
