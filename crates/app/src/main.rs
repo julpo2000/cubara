@@ -3,10 +3,15 @@
 //! Owns the window and event loop; all GPU work lives in `cubara_render`. Forwards
 //! keyboard + mouse input to [`Game`] (WASD to move, Space to jump, mouse to look,
 //! F4 toggles the free-fly debug mode, 1-9 or the wheel pick a hotbar slot,
-//! Esc releases the cursor, a click takes it
+//! Esc opens the pause menu (or closes whatever screen is open -- inventory,
+//! pause, console), a click takes the cursor
 //! back, F11 or Alt+Enter toggles fullscreen). Walking under
 //! gravity is the default; free-fly (Space/Shift up/down, no collision) is a
 //! debug mode inside the same sim (`docs/PHASE1_ARCHITECTURE.md` §10).
+//!
+//! `/` opens the command console (`/tp x y z` so far, `ROADMAP.md`'s phase 3
+//! note); `C` in the pause menu switches survival/creative -- creative flies,
+//! takes no damage, and has unlimited blocks (owner's call, 2026-09-18).
 
 mod bench;
 mod caps;
@@ -27,7 +32,7 @@ use crate::streaming::NodeStreaming;
 
 use winit::application::ApplicationHandler;
 use winit::event::{
-    DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent,
+    DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent,
 };
 
 /// Touchpad scroll distance, in pixels, that counts as one wheel notch.
@@ -100,17 +105,131 @@ struct App {
     last_frame: Option<std::time::Instant>,
 }
 
+/// Whether *any* screen is up -- the inventory, the pause menu, or the
+/// command console. What `capture`'s free-the-mouse rule cares about is "is
+/// something other than the game asking for keys and clicks", not which one
+/// -- the same reason `capture::apply`/`follow_screen` take a plain `bool`
+/// rather than an enum.
+///
+/// A free function taking `&Game`, not an `App` method: a method borrows all
+/// of `self`, and every call site here runs while `self.renderer` is already
+/// borrowed mutably (`let Some(renderer) = self.renderer.as_mut() ...` at the
+/// top of `window_event`) -- borrowing only the one field this actually
+/// reads is what keeps those disjoint.
+fn any_screen_open(game: &Game) -> bool {
+    game.inventory_open() || game.pause_open() || game.console().is_some()
+}
+
+/// What pressing Escape does, decided from `Game`'s screen state alone -- no
+/// window, so it's a plain function of state and testable without one, the
+/// same shape as `capture::apply`.
+///
+/// **Priority order matters and is the whole of this function's contract:**
+/// the console can only be open once the pause menu already isn't
+/// (`Game::open_console` closes it), so checking pause first is enough to
+/// never mistake one screen for another when more than one flag happens to
+/// be set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscapeAction {
+    /// A screen was open; close it. The inventory's close may be *refused*
+    /// (a full grid cannot take the crafting cells back) -- the pause menu
+    /// and console never refuse.
+    CloseInventory,
+    ClosePauseMenu,
+    CancelConsole,
+    /// Nothing was open: pause the game rather than just letting go of the
+    /// mouse -- the ordinary FPS convention this project had no menu to
+    /// point Escape at until now.
+    OpenPauseMenu,
+}
+
+fn escape_action(game: &Game) -> EscapeAction {
+    if game.pause_open() {
+        EscapeAction::ClosePauseMenu
+    } else if game.console().is_some() {
+        EscapeAction::CancelConsole
+    } else if game.inventory_open() {
+        EscapeAction::CloseInventory
+    } else {
+        EscapeAction::OpenPauseMenu
+    }
+}
+
+/// The pause menu or command console's text, or `None` while neither is
+/// open -- see [`Hud::menu`].
+///
+/// Keyboard-driven rather than clickable: `ROADMAP.md`'s phase 3 note lists
+/// four rows (options, new world, play mode, commands), and only play mode
+/// does anything today. A hit-tested clickable layout for two stub rows and
+/// one real one is a lot of `cubara-render` machinery this doesn't yet earn
+/// -- `[C]` is the whole interaction, same shape as F3/F4/F5's single keys.
+fn menu_text(game: &Game) -> Option<String> {
+    if let Some(console) = game.console() {
+        return Some(format!("{console}_\n[Enter] send   [Esc] cancel"));
+    }
+    if game.pause_open() {
+        let mode = if game.is_creative() {
+            "Creative"
+        } else {
+            "Survival"
+        };
+        return Some(format!(
+            "-- PAUSED --\n\
+             [Esc] resume\n\
+             [C] play mode: {mode}\n\
+             Options -- coming soon\n\
+             New World -- coming soon\n\
+             Commands: press / to open the console (e.g. /tp 10 64 10)"
+        ));
+    }
+    None
+}
+
 impl App {
     /// Let go of the mouse when a screen has opened, take it back when one has
     /// closed -- see [`capture::follow_screen`].
     fn follow_screen(&mut self) {
-        let open = self.game.inventory_open();
+        let open = any_screen_open(&self.game);
         let want = capture::follow_screen(self.cursor_captured, self.screen_was_open, open);
         self.screen_was_open = open;
         if want != self.cursor_captured {
             self.cursor_captured = want;
             if let Some(renderer) = self.renderer.as_ref() {
                 grab_cursor(renderer.window(), want);
+            }
+        }
+    }
+
+    /// Route one key event to the open command console -- called instead of
+    /// every other key handling while [`Game::console`] is `Some`, so a
+    /// letter key never also strafes or opens another screen underneath.
+    ///
+    /// `code` (not `event.logical_key`) picks out Enter/Backspace/Escape,
+    /// same as the rest of this file's key handling -- physical position,
+    /// not the character it happens to produce this layout. Ordinary text
+    /// comes from `event.text` instead, which is what actually accounts for
+    /// layout and modifiers (Shift for `/`, an AZERTY `q` where QWERTY has
+    /// `a`, ...); `code` alone cannot spell a command.
+    fn console_key(&mut self, code: KeyCode, pressed: bool, event: &KeyEvent) {
+        if !pressed {
+            return;
+        }
+        match code {
+            KeyCode::Escape => {
+                self.game.console_cancel();
+                self.follow_screen();
+            }
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                self.game.console_submit();
+                self.follow_screen();
+            }
+            KeyCode::Backspace => self.game.console_backspace(),
+            _ => {
+                if let Some(text) = event.text.as_ref() {
+                    for c in text.chars() {
+                        self.game.console_push(c);
+                    }
+                }
             }
         }
     }
@@ -227,29 +346,46 @@ impl ApplicationHandler for App {
                         };
                         log::info!("fullscreen: {}", next.is_some());
                         window.set_fullscreen(next);
+                    } else if self.game.console().is_some() {
+                        // The console eats every key while it's open -- typing
+                        // "t" or "p" must not also strafe or open the panic
+                        // menu underneath it. Not an `else if` chain entry
+                        // alongside the rest: it has to come before anything
+                        // that reads a letter or digit key as a game control.
+                        self.console_key(code, pressed, &event);
                     } else if code == KeyCode::Escape && pressed {
-                        // Out of a screen if one is open; otherwise let go of
-                        // (or take back) the mouse so you can leave the window.
-                        let out = capture::apply(
-                            self.cursor_captured,
-                            self.game.inventory_open(),
-                            CaptureEvent::Escape,
-                        );
-                        if out.close_screen {
-                            // May be refused (a full inventory cannot take the
-                            // grid back); capture then stays with the screen.
-                            self.game.toggle_inventory();
-                        } else {
-                            log::info!("escape: mouse captured {}", out.captured);
-                            self.cursor_captured = out.captured;
-                            grab_cursor(renderer.window(), self.cursor_captured);
+                        // Capture is corrected by `follow_screen` below,
+                        // the same path E already uses: opening any screen
+                        // releases the mouse, closing (or staying open, on
+                        // a refused close) takes it back or leaves it be.
+                        match escape_action(&self.game) {
+                            EscapeAction::CloseInventory => self.game.toggle_inventory(),
+                            EscapeAction::ClosePauseMenu | EscapeAction::OpenPauseMenu => {
+                                self.game.toggle_pause()
+                            }
+                            EscapeAction::CancelConsole => self.game.console_cancel(),
                         }
+                        self.follow_screen();
                     } else if code == KeyCode::F3 && pressed {
                         renderer.toggle_debug();
                     } else if code == KeyCode::F5 && pressed {
                         // An explicit save as well as the one on exit: a crash
                         // or a lost window should not have to cost the session.
                         self.game.save();
+                    } else if code == KeyCode::Slash && pressed && !any_screen_open(&self.game) {
+                        self.game.open_console();
+                        self.follow_screen();
+                    } else if code == KeyCode::KeyC
+                        && pressed
+                        && self.game.pause_open()
+                        && !self.game.inventory_open()
+                    {
+                        // The pause menu's one real control today: switch
+                        // play mode. `ROADMAP.md`'s phase 3 note lists three
+                        // more rows (options, new world, a fuller command
+                        // set) that are display-only until they have
+                        // somewhere to write to.
+                        self.game.set_creative(!self.game.is_creative());
                     } else if code == KeyCode::KeyE && pressed {
                         // Toggling may be *refused* -- see
                         // `Game::toggle_inventory` -- so the mouse follows what
@@ -284,7 +420,7 @@ impl ApplicationHandler for App {
                 if state == ElementState::Pressed {
                     let out = capture::apply(
                         self.cursor_captured,
-                        self.game.inventory_open(),
+                        any_screen_open(&self.game),
                         CaptureEvent::Click,
                     );
                     if out.consumed {
@@ -380,6 +516,7 @@ impl ApplicationHandler for App {
                     gauges: self.game.furnace_gauges(),
                 });
                 let others = self.game.other_players();
+                let menu = menu_text(&self.game);
                 renderer.render(
                     camera,
                     self.game.selected_block(),
@@ -392,6 +529,7 @@ impl ApplicationHandler for App {
                         // Only while looking through the camera: over a
                         // screen it would mark nothing.
                         crosshair: self.cursor_captured && !self.game.inventory_open(),
+                        menu: menu.as_deref(),
                     },
                     streaming::render_radius_blocks(),
                 );
@@ -589,5 +727,60 @@ mod tests {
         assert_eq!(hand_for(MouseButton::Middle), None);
         assert_eq!(hand_for(MouseButton::Back), None);
         assert_eq!(hand_for(MouseButton::Other(9)), None);
+    }
+
+    #[test]
+    fn escape_opens_the_pause_menu_when_nothing_else_is_open() {
+        let game = Game::new();
+        assert_eq!(escape_action(&game), EscapeAction::OpenPauseMenu);
+    }
+
+    #[test]
+    fn escape_closes_whichever_screen_is_actually_open() {
+        let mut game = Game::new();
+        game.toggle_pause();
+        assert_eq!(escape_action(&game), EscapeAction::ClosePauseMenu);
+
+        game.toggle_pause(); // back to nothing open
+        game.open_console();
+        assert_eq!(escape_action(&game), EscapeAction::CancelConsole);
+
+        game.console_cancel();
+        game.toggle_inventory(); // opening needs no assets; see `Game::toggle_inventory`
+        assert_eq!(escape_action(&game), EscapeAction::CloseInventory);
+    }
+
+    #[test]
+    fn menu_text_is_none_with_nothing_open() {
+        let game = Game::new();
+        assert_eq!(menu_text(&game), None);
+    }
+
+    #[test]
+    fn menu_text_shows_the_current_play_mode() {
+        let mut game = Game::new();
+        game.toggle_pause();
+        assert!(
+            menu_text(&game).is_some_and(|t| t.contains("Survival")),
+            "a fresh game starts in survival"
+        );
+
+        game.set_creative(true);
+        assert!(
+            menu_text(&game).is_some_and(|t| t.contains("Creative")),
+            "the pause menu must reflect the switch, not just the game's own state"
+        );
+    }
+
+    #[test]
+    fn menu_text_shows_the_console_over_the_pause_menu() {
+        let mut game = Game::new();
+        game.toggle_pause();
+        game.open_console();
+        let text = menu_text(&game).expect("the console is open");
+        assert!(
+            text.starts_with('/'),
+            "the console's own text should be what's shown, not the pause menu underneath it"
+        );
     }
 }

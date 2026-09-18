@@ -102,6 +102,11 @@ struct SavedPlayer {
     pitch: i32,
     on_ground: bool,
     free_fly: bool,
+    /// Survival vs. creative. `#[serde(default)]`, like every field added
+    /// after the format existed: an old save has no opinion, so it loads
+    /// into survival.
+    #[serde(default)]
+    creative: bool,
     /// 36 entries, `None` for an empty slot. Block 2.8.
     #[serde(default)]
     inventory: Vec<Option<SavedStack>>,
@@ -353,6 +358,7 @@ fn saved_player(p: &Player, items: &ItemRegistry) -> SavedPlayer {
         pitch: p.pitch.raw(),
         on_ground: p.on_ground,
         free_fly: p.free_fly,
+        creative: p.creative,
         inventory: (0..crate::inventory::SLOT_COUNT)
             .map(|i| to_saved(p.inventory.slot(i), items))
             .collect(),
@@ -620,6 +626,7 @@ fn restore_player(s: &SavedPlayer, items: &ItemRegistry) -> Player {
         velocity: from_xyz(s.vel),
         on_ground: s.on_ground,
         free_fly: s.free_fly,
+        creative: s.creative,
         yaw: Angle::from_raw(s.yaw),
         pitch: Angle::from_raw(s.pitch),
         // Block 2.8: restored by name, so a registry that assigns different ids

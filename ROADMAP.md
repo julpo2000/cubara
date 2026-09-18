@@ -441,6 +441,25 @@ a system, from that rule. Candidates already on the books —
 GPU culling, shaders, multiplayer, the mod API — are engine work that will be
 scheduled against phase 3's needs rather than pursued on their own.
 
+### Recorded, 2026-09-18 — the owner's starting shape for the pause menu
+
+Not yet built, not yet an admitted feature per the rule above — recorded here
+because the owner dictated it directly, as the shape phase 3's menu work starts
+from once phase 3 is actually scoped:
+
+- A pause menu with: **Options** (empty for now — real settings come later),
+  **New World** (generates a fresh world on a new seed), **Play mode**
+  (Survival / Creative, for now — no third mode decided), and a **command
+  interface**, available in both play modes, with individual commands
+  toggleable off for survival later (none disabled yet). `/tp` is the one
+  command wanted now.
+
+Creative mode and the options-menu shell that exposes it are being built ahead
+of this list, directly from the owner's request ("chill to be able to fly
+before we get to worldgen") — not as a phase-3 admission, the same way the
+multiplayer goal finished phase 2 before phase 3 started. The rest of this
+list (new world, the fuller command set, real options) is phase-3 scope proper.
+
 ---
 
 ## Where the existing open issues land

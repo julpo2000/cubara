@@ -377,7 +377,12 @@ fn saving_the_same_world_twice_produces_byte_identical_files() {
 /// matters most, because it is the one the owner's existing worlds on disk take.
 /// This constant was updated by hand for that reason. A committed fixture is a
 /// golden; it does not get regenerated to make a test pass.
-const FIXTURE_HASH: u64 = 0xa36d_1558_a037_9fcb;
+// Updated 2026-09-18: `WorldHash::write_player` now hashes `Player::creative`
+// (see `crates/sim/tests/determinism.rs`'s `KNOWN_FIXTURE_HASH` note) -- the
+// fixture file itself is untouched (still `format_version: 4`; deliberately
+// not fast-forwarded to the current save format by this change, which is a
+// separate concern), only the hash this loads it to moves.
+const FIXTURE_HASH: u64 = 0x10b9_a9d8_d9a7_3463;
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/save_fixture")

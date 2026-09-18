@@ -191,7 +191,13 @@ pub(crate) fn step(
     if player.on_ground {
         let damage = Player::fall_damage_for(player.fall_distance);
         player.fall_distance = Fixed::ZERO;
-        player.take_damage(damage);
+        // Creative is invulnerable (owner's call, `ROADMAP.md`'s phase 3
+        // note) -- fall damage is the only thing that currently hurts
+        // (block 2.9b deferred hostiles/hunger to phase 3), so this is the
+        // whole of it today.
+        if !player.creative {
+            player.take_damage(damage);
+        }
     }
 }
 
@@ -621,6 +627,26 @@ mod respawn_tests {
         assert_eq!(
             p.pos, spawn,
             "but the position was left at the death site instead of spawn"
+        );
+    }
+
+    #[test]
+    fn creative_takes_no_fall_damage() {
+        let spawn = FixedVec3::from_blocks(100, 50, 100);
+        let mut p = Player::new(spawn, Angle::ZERO, Angle::ZERO);
+        p.creative = true;
+        // The same lethal setup as the test above -- would respawn a
+        // survival player.
+        p.pos = FixedVec3::from_f32([0.0, 1.9, 0.0]);
+        p.velocity = FixedVec3::from_f32([0.0, -60.0, 0.0]);
+        p.fall_distance = Fixed::from_blocks(100);
+
+        step(&mut p, &InputFrame::default(), floor);
+
+        assert_eq!(p.health, MAX_HEALTH, "creative is invulnerable to falls");
+        assert_ne!(
+            p.pos, spawn,
+            "and never respawned -- it landed where it fell, undamaged"
         );
     }
 }

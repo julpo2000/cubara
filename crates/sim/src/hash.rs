@@ -125,6 +125,7 @@ impl WorldHash {
         self.write_i64(p.velocity.z.raw());
         self.write_bool(p.on_ground);
         self.write_bool(p.free_fly);
+        self.write_bool(p.creative);
         self.write_i32(p.yaw.raw());
         self.write_i32(p.pitch.raw());
         // World state (§13.5): two worlds differing only in how hurt the player

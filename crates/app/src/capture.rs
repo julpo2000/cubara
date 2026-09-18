@@ -7,10 +7,19 @@
 use winit::keyboard::KeyCode;
 
 /// Something that can change whether the game holds the mouse.
+///
+/// **Not Escape.** It used to be here, deciding "close a screen" vs. "let go
+/// of/retake the mouse" from one `screen_open` bool. Once there were three
+/// kinds of screen (inventory, pause menu, console) with three different
+/// close actions -- a refusable `toggle_inventory`, a plain `toggle_pause`, a
+/// `console_cancel` that also matters for Enter/Backspace, not just Escape --
+/// that one bool stopped being enough to decide *which* to close, and Escape
+/// moved to `main.rs`'s `window_event`, which has `Game`'s actual screen
+/// methods. What's left here is capture alone: focus and clicks, which never
+/// needed to know which screen, only whether one is open at all
+/// (`App::any_screen_open`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureEvent {
-    /// Escape: let go, or take it back.
-    Escape,
     /// The window lost focus -- alt-tab, or a click outside it.
     FocusLost,
     /// A mouse button went down inside the window.
@@ -26,8 +35,6 @@ pub struct CaptureOutcome {
     /// world. The click that brings you back into the game is not a click
     /// *in* the game -- otherwise returning to the window places a block.
     pub consumed: bool,
-    /// Whether the open screen (inventory, bench, furnace) should close.
-    pub close_screen: bool,
 }
 
 /// Apply `event` to a mouse that is `captured` or not, with an inventory-style
@@ -42,27 +49,12 @@ pub struct CaptureOutcome {
 /// **A click takes it back**, rather than regaining focus: focus also comes
 /// back when somebody clicks the title bar to move or maximise the window, and
 /// grabbing the cursor in the middle of that is hostile.
-///
-/// **Escape closes a screen before it does anything else.** With a bench open,
-/// "let go of the mouse" is meaningless -- the mouse is already free -- and
-/// what somebody pressing Escape there wants is out.
 pub fn apply(captured: bool, screen_open: bool, event: CaptureEvent) -> CaptureOutcome {
     let keep = CaptureOutcome {
         captured,
         consumed: false,
-        close_screen: false,
     };
     match event {
-        CaptureEvent::Escape if screen_open => CaptureOutcome {
-            consumed: true,
-            close_screen: true,
-            ..keep
-        },
-        CaptureEvent::Escape => CaptureOutcome {
-            captured: !captured,
-            consumed: true,
-            ..keep
-        },
         CaptureEvent::FocusLost => CaptureOutcome {
             captured: false,
             ..keep
@@ -71,7 +63,6 @@ pub fn apply(captured: bool, screen_open: bool, event: CaptureEvent) -> CaptureO
         CaptureEvent::Click if !captured && !screen_open => CaptureOutcome {
             captured: true,
             consumed: true,
-            ..keep
         },
         CaptureEvent::Click => keep,
     }
@@ -112,16 +103,7 @@ mod tests {
     #[test]
     fn losing_focus_lets_go_of_the_mouse() {
         let out = apply(true, false, CaptureEvent::FocusLost);
-        assert!(!out.captured && !out.consumed && !out.close_screen);
-    }
-
-    #[test]
-    fn escape_on_an_open_screen_closes_it_and_leaves_capture_alone() {
-        let out = apply(false, true, CaptureEvent::Escape);
-        assert!(out.close_screen, "escape did not close the screen");
-        assert!(!out.captured, "capture is follow_screen's to restore");
-        assert!(out.consumed);
-        assert!(!apply(true, false, CaptureEvent::Escape).close_screen);
+        assert!(!out.captured && !out.consumed);
     }
 
     /// The bench bug: opened by a click, the mouse stayed captured.
@@ -160,7 +142,6 @@ mod tests {
             CaptureOutcome {
                 captured: true,
                 consumed: false,
-                close_screen: false,
             }
         );
     }
@@ -172,15 +153,8 @@ mod tests {
             CaptureOutcome {
                 captured: false,
                 consumed: false,
-                close_screen: false,
             }
         );
-    }
-
-    #[test]
-    fn escape_toggles() {
-        assert!(!apply(true, false, CaptureEvent::Escape).captured);
-        assert!(apply(false, false, CaptureEvent::Escape).captured);
     }
 
     #[test]

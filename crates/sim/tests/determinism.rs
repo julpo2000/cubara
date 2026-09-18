@@ -213,7 +213,12 @@ fn fixture_edits() -> Vec<(usize, [i32; 3], BlockId)> {
 /// sim follows, named in the PR that makes it, is the one other legitimate
 /// reason to re-pin -- the same script, a different gait, which is exactly
 /// what this hash exists to notice.
-const KNOWN_FIXTURE_HASH: u64 = 0x3972_1613_3f68_ecc0;
+// Updated 2026-09-18: `WorldHash::write_player` now hashes `Player::creative`
+// (creative mode, `ROADMAP.md`'s phase 3 note) -- a deliberate hash-format
+// change, the same shape as `free_fly` joining the hash originally, not a
+// regenerated golden hiding a real divergence. The fixture script never
+// touches creative mode, so this is the *only* reason the value moved.
+const KNOWN_FIXTURE_HASH: u64 = 0x605c_cd6d_4fa6_0bee;
 
 #[test]
 fn replay_of_the_same_seed_and_script_is_deterministic() {

@@ -163,7 +163,7 @@ pub struct Server {
 ///
 /// §3.4's rule -- a client "may never be believed" -- made structural rather
 /// than checked.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     /// Place the held block against whatever the player is looking at.
     Place,
@@ -217,6 +217,27 @@ pub enum Action {
     /// Out-of-range indices are ignored server-side rather than clamped:
     /// clamping invents an intention, and there is no ninth slot to mean.
     SelectSlot(u8),
+    /// Switch survival/creative (owner's call, 2026-09-18 -- `ROADMAP.md`'s
+    /// phase 3 note).
+    ///
+    /// An `Action`, not an `InputFrame` field like [`free_fly`
+    /// toggling](cubara_sim::InputFrame::toggle_fly): this is a discrete,
+    /// deliberate switch a menu click sends once, not a per-tick control, and
+    /// it needs the block/item registries (to grant the creative loadout)
+    /// that only this layer -- not `cubara-sim`'s tick -- has (Rule 3).
+    SetCreative(bool),
+    /// Run a typed command, text after the leading `/` (`"tp 10 64 10"`, not
+    /// `"/tp 10 64 10"`). Parsed and validated **here**, never on the client:
+    /// the same §3.4 reasoning as every other action -- a client that could
+    /// name the effect directly (rather than the text asking for it) is a
+    /// client that could grant itself anything a command can do.
+    ///
+    /// One variant for every command rather than one `Action` each, because
+    /// the set is expected to grow and a survival/creative allow-list
+    /// (`ROADMAP.md`'s phase 3 note: "the option to turn off certain commands
+    /// for survival mode later") is one match in [`Game::apply_command`]
+    /// rather than one per `Action` variant.
+    Command(String),
 }
 
 /// Which slot of a furnace a click landed on.
@@ -715,10 +736,20 @@ impl Server {
         let Some(hardness) = registry.hardness(target) else {
             return;
         };
-        let speed = match (held, self.items.as_ref()) {
-            (Some(item), Some(items)) => items.speed(item),
-            // An empty hand, or assets not yet wired: speed 1, §4.3's floor.
-            _ => 1,
+        // Creative breaks in exactly one tick, any tool, any hardness that
+        // isn't already unbreakable (the `hardness` check above still
+        // applies -- creative doesn't grant bedrock-breaking, only skips the
+        // wait). `hardness` itself as the speed is the smallest change that
+        // guarantees `progress >= hardness` below without a second branch
+        // duplicating what "finished" already means.
+        let speed = if p.is_creative() {
+            hardness
+        } else {
+            match (held, self.items.as_ref()) {
+                (Some(item), Some(items)) => items.speed(item),
+                // An empty hand, or assets not yet wired: speed 1, §4.3's floor.
+                _ => 1,
+            }
         };
 
         let fresh = Mining {
@@ -1304,6 +1335,57 @@ impl Server {
                     self.publish_self_items(who);
                 }
             }
+            Action::SetCreative(creative) => {
+                if self.sim.get(who).is_none() {
+                    return;
+                }
+                self.sim.player_mut(who).set_creative(creative);
+                if creative {
+                    if let (Some(blocks), Some(items)) =
+                        (self.blocks_registry.as_deref(), self.items.as_ref())
+                    {
+                        grant_creative_loadout(self.sim.player_mut(who), blocks, items);
+                    }
+                }
+                self.publish_self_items(who);
+            }
+            Action::Command(text) => self.apply_command(who, &text),
+        }
+    }
+
+    /// Run one typed command on `who`'s behalf, text already stripped of its
+    /// leading `/` (§ the `Action::Command` doc comment).
+    ///
+    /// Unknown or malformed commands are silently ignored rather than
+    /// reported back -- there is no chat/error channel yet (`ROADMAP.md`'s
+    /// phase 3 note has "a real options menu" and more commands than `/tp`
+    /// still to come; a feedback channel is exactly the kind of thing that
+    /// list, not this one command, should settle).
+    fn apply_command(&mut self, who: PlayerId, text: &str) {
+        let mut words = text.split_whitespace();
+        match words.next() {
+            Some("tp") => {
+                let coords: Option<[f32; 3]> = (|| {
+                    Some([
+                        words.next()?.parse().ok()?,
+                        words.next()?.parse().ok()?,
+                        words.next()?.parse().ok()?,
+                    ])
+                })();
+                let Some([x, y, z]) = coords else {
+                    log::debug!("/tp: expected 3 numbers, got {text:?}");
+                    return;
+                };
+                if self.sim.get(who).is_none() {
+                    return;
+                }
+                let player = self.sim.player_mut(who);
+                player.pos = FixedVec3::from_f32([x, y, z]);
+                player.velocity = FixedVec3::ZERO;
+                player.fall_distance = cubara_voxel::Fixed::ZERO;
+                player.on_ground = false;
+            }
+            _ => log::debug!("unknown command: {text:?}"),
         }
     }
 
@@ -1528,7 +1610,14 @@ impl Server {
             let held = self.sim.player_mut(who).inventory.selected_stack();
             let held_tier = held.map(|s| items.tier(s.item())).unwrap_or(0);
 
-            let drop = if held_tier < registry.requires_tier(broken) {
+            let drop = if self.sim.get(who).is_some_and(Player::is_creative) {
+                // Creative already has unlimited access (the loadout granted
+                // on entry, `grant_creative_loadout`) -- a drop on top of that
+                // would just clutter the inventory, and there is no tool to
+                // wear (the `Some(stack)` arm below is the only caller of
+                // `wear_held_tool`, so skipping the drop skips that too).
+                None
+            } else if held_tier < registry.requires_tier(broken) {
                 log::debug!(
                     "{} needs tier {}, holding tier {held_tier}: breaks, yields nothing",
                     registry.name_of(broken).unwrap_or("?"),
@@ -1885,9 +1974,13 @@ impl Server {
             hit.block[2] + hit.normal[2],
         ];
 
-        // Only now that the placement is certain to happen.
-        let slot = self.sim.player_mut(who).inventory.selected_slot() as usize;
-        self.sim.player_mut(who).inventory.take_one(slot, items)?;
+        // Only now that the placement is certain to happen. Creative doesn't
+        // spend it -- `held` above already proved the slot isn't empty, which
+        // is all creative needs; what's left keeps its full count.
+        if !self.sim.player_mut(who).is_creative() {
+            let slot = self.sim.player_mut(who).inventory.selected_slot() as usize;
+            self.sim.player_mut(who).inventory.take_one(slot, items)?;
+        }
 
         // A block that owns state gets it the moment it is placed, rather than
         // on first use -- so a furnace someone never opens still ticks, and the
@@ -1964,6 +2057,53 @@ fn block_of(pos: FixedVec3) -> [i32; 3] {
 fn drop_centre(b: [i32; 3]) -> FixedVec3 {
     let half = cubara_voxel::Fixed::from_raw(cubara_voxel::fixed::ONE / 2);
     FixedVec3::from_blocks(b[0], b[1], b[2]) + FixedVec3::new(half, half, half)
+}
+
+/// Fill `player`'s *empty* inventory slots with a full stack of every block
+/// the registry knows how to place, one stack each, in registry id order.
+///
+/// **Only empty slots.** Entering creative does not touch whatever survival
+/// already earned -- clobbering it would be destructive for no reason a menu
+/// click should carry, and Minecraft's own creative switch is non-destructive
+/// the same way. A player who already has a full inventory simply gets
+/// nothing new from this; what they already hold stops depleting instead
+/// (`place_held_as`'s creative branch).
+///
+/// Stops when either every placeable block has one, or the inventory runs
+/// out of empty slots -- there is no picker screen to fall back on
+/// (`ROADMAP.md`'s phase 3 note), so a registry with more placeable blocks
+/// than [`cubara_sim::SLOT_COUNT`] simply doesn't fit everything at once,
+/// same as a survival inventory that's too full to pick something up.
+fn grant_creative_loadout(player: &mut Player, blocks: &BlockRegistry, items: &ItemRegistry) {
+    let mut slot = 0usize;
+    for id in blocks.ids() {
+        if id == BlockId::AIR {
+            continue;
+        }
+        let Some(item) = blocks
+            .name_of(id)
+            .and_then(|name| items.id_of(name))
+            .and_then(|item| items.new_stack(item, items.max_stack(item)).ok())
+        else {
+            continue;
+        };
+        // `< SLOT_COUNT` here is redundant with the `>= SLOT_COUNT` break
+        // below, not load-bearing on its own -- `Inventory::slot` is
+        // bounds-checked (`self.slots.get(index)`), so `slot ==
+        // SLOT_COUNT` would just read `None` and the `&&` would stop the
+        // loop anyway. Left in because it says the same thing the break
+        // does, not because removing it would misbehave -- a mutation to
+        // `<=` here is inert and check-tests-can-fail.sh's survivor is
+        // this loop confirming exactly that, not a gap.
+        while slot < cubara_sim::SLOT_COUNT && player.inventory.slot(slot).is_some() {
+            slot += 1;
+        }
+        if slot >= cubara_sim::SLOT_COUNT {
+            break;
+        }
+        player.inventory.set_slot(slot, Some(item));
+        slot += 1;
+    }
 }
 
 #[cfg(test)]
