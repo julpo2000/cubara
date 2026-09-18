@@ -188,9 +188,9 @@ fn render_arena(
     shot: Shot,
     build_arena: impl FnOnce(&wgpu::Device, &wgpu::Queue, bool, &MeshContext) -> ChunkArena,
 ) -> Option<Frame> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,

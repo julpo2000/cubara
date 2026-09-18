@@ -540,9 +540,9 @@ impl Renderer {
     pub fn new(window: Arc<Window>, camera: CameraPose) -> (Self, MeshAssets) {
         let size = window.inner_size();
 
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
         let surface = instance
@@ -767,9 +767,15 @@ impl Renderer {
         self.update(camera);
 
         let frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            // Surface lost/outdated (e.g. during resize) — reconfigure and skip.
-            Err(_) => {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            // Surface lost/outdated/occluded/timed out (e.g. during resize) —
+            // reconfigure and skip.
+            wgpu::CurrentSurfaceTexture::Timeout
+            | wgpu::CurrentSurfaceTexture::Occluded
+            | wgpu::CurrentSurfaceTexture::Outdated
+            | wgpu::CurrentSurfaceTexture::Lost
+            | wgpu::CurrentSurfaceTexture::Validation => {
                 self.surface.configure(&self.device, &self.config);
                 return;
             }
@@ -1095,7 +1101,7 @@ pub fn build_mesh_layout(
 ) -> wgpu::PipelineLayout {
     device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("mesh-layout"),
-        bind_group_layouts: &[camera_bgl, origins_bgl, textures_bgl],
+        bind_group_layouts: &[Some(camera_bgl), Some(origins_bgl), Some(textures_bgl)],
         immediate_size: 0,
     })
 }
@@ -1143,9 +1149,9 @@ pub fn build_mesh_pipeline_from_module(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: true,
+            depth_write_enabled: Some(true),
             // Reversed-Z: nearer fragments have *greater* depth.
-            depth_compare: wgpu::CompareFunction::Greater,
+            depth_compare: Some(wgpu::CompareFunction::Greater),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
@@ -1229,7 +1235,7 @@ pub fn build_figure_pipeline(
 
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("figure-layout"),
-        bind_group_layouts: &[camera_bgl],
+        bind_group_layouts: &[Some(camera_bgl)],
         immediate_size: 0,
     });
 
@@ -1259,9 +1265,9 @@ pub fn build_figure_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: true,
+            depth_write_enabled: Some(true),
             // Reversed-Z, like the terrain: greater is nearer.
-            depth_compare: wgpu::CompareFunction::Greater,
+            depth_compare: Some(wgpu::CompareFunction::Greater),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
@@ -1284,7 +1290,7 @@ pub fn build_outline_pipeline(
 
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("outline-layout"),
-        bind_group_layouts: &[camera_bgl, outline_bgl],
+        bind_group_layouts: &[Some(camera_bgl), Some(outline_bgl)],
         immediate_size: 0,
     });
 
@@ -1313,16 +1319,17 @@ pub fn build_outline_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: false,
+            depth_write_enabled: Some(false),
             // Reversed-Z counterpart of LessEqual -- the outline must draw
             // at exactly the depth of the face it outlines, not be rejected by it.
-            depth_compare: wgpu::CompareFunction::GreaterEqual,
+            depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
             stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState {
-                constant: -4,
-                slope_scale: -2.0,
-                clamp: 0.0,
-            },
+            // No bias: wgpu 29 rejects any depth bias on a non-triangle
+            // topology (validation, `DepthBiasWithIncompatibleTopology`) --
+            // this pipeline draws `LineList`. `GreaterEqual` above is what
+            // actually makes the outline win the z-fight against the face
+            // it outlines.
+            bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
