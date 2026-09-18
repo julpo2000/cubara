@@ -120,6 +120,41 @@ fn any_screen_open(game: &Game) -> bool {
     game.inventory_open() || game.pause_open() || game.console().is_some()
 }
 
+/// What pressing Escape does, decided from `Game`'s screen state alone -- no
+/// window, so it's a plain function of state and testable without one, the
+/// same shape as `capture::apply`.
+///
+/// **Priority order matters and is the whole of this function's contract:**
+/// the console can only be open once the pause menu already isn't
+/// (`Game::open_console` closes it), so checking pause first is enough to
+/// never mistake one screen for another when more than one flag happens to
+/// be set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscapeAction {
+    /// A screen was open; close it. The inventory's close may be *refused*
+    /// (a full grid cannot take the crafting cells back) -- the pause menu
+    /// and console never refuse.
+    CloseInventory,
+    ClosePauseMenu,
+    CancelConsole,
+    /// Nothing was open: pause the game rather than just letting go of the
+    /// mouse -- the ordinary FPS convention this project had no menu to
+    /// point Escape at until now.
+    OpenPauseMenu,
+}
+
+fn escape_action(game: &Game) -> EscapeAction {
+    if game.pause_open() {
+        EscapeAction::ClosePauseMenu
+    } else if game.console().is_some() {
+        EscapeAction::CancelConsole
+    } else if game.inventory_open() {
+        EscapeAction::CloseInventory
+    } else {
+        EscapeAction::OpenPauseMenu
+    }
+}
+
 /// The pause menu or command console's text, or `None` while neither is
 /// open -- see [`Hud::menu`].
 ///
@@ -319,28 +354,16 @@ impl ApplicationHandler for App {
                         // that reads a letter or digit key as a game control.
                         self.console_key(code, pressed, &event);
                     } else if code == KeyCode::Escape && pressed {
-                        // Out of a screen if one is open. With nothing open,
-                        // Escape now opens the pause menu rather than just
-                        // letting go of the mouse -- the ordinary FPS
-                        // convention this project had no menu to point Escape
-                        // at until now. Either way capture is corrected by
-                        // `follow_screen` below, the same path E already
-                        // uses: opening any screen releases the mouse,
-                        // closing (or staying open, on a refused close)
-                        // takes it back or leaves it be.
-                        if any_screen_open(&self.game) {
-                            // The inventory's close may be *refused* (a full
-                            // grid cannot take the crafting cells back); the
-                            // pause menu and console never refuse.
-                            if self.game.pause_open() {
-                                self.game.toggle_pause();
-                            } else if self.game.console().is_some() {
-                                self.game.console_cancel();
-                            } else {
-                                self.game.toggle_inventory();
+                        // Capture is corrected by `follow_screen` below,
+                        // the same path E already uses: opening any screen
+                        // releases the mouse, closing (or staying open, on
+                        // a refused close) takes it back or leaves it be.
+                        match escape_action(&self.game) {
+                            EscapeAction::CloseInventory => self.game.toggle_inventory(),
+                            EscapeAction::ClosePauseMenu | EscapeAction::OpenPauseMenu => {
+                                self.game.toggle_pause()
                             }
-                        } else {
-                            self.game.toggle_pause();
+                            EscapeAction::CancelConsole => self.game.console_cancel(),
                         }
                         self.follow_screen();
                     } else if code == KeyCode::F3 && pressed {
@@ -704,5 +727,60 @@ mod tests {
         assert_eq!(hand_for(MouseButton::Middle), None);
         assert_eq!(hand_for(MouseButton::Back), None);
         assert_eq!(hand_for(MouseButton::Other(9)), None);
+    }
+
+    #[test]
+    fn escape_opens_the_pause_menu_when_nothing_else_is_open() {
+        let game = Game::new();
+        assert_eq!(escape_action(&game), EscapeAction::OpenPauseMenu);
+    }
+
+    #[test]
+    fn escape_closes_whichever_screen_is_actually_open() {
+        let mut game = Game::new();
+        game.toggle_pause();
+        assert_eq!(escape_action(&game), EscapeAction::ClosePauseMenu);
+
+        game.toggle_pause(); // back to nothing open
+        game.open_console();
+        assert_eq!(escape_action(&game), EscapeAction::CancelConsole);
+
+        game.console_cancel();
+        game.toggle_inventory(); // opening needs no assets; see `Game::toggle_inventory`
+        assert_eq!(escape_action(&game), EscapeAction::CloseInventory);
+    }
+
+    #[test]
+    fn menu_text_is_none_with_nothing_open() {
+        let game = Game::new();
+        assert_eq!(menu_text(&game), None);
+    }
+
+    #[test]
+    fn menu_text_shows_the_current_play_mode() {
+        let mut game = Game::new();
+        game.toggle_pause();
+        assert!(
+            menu_text(&game).is_some_and(|t| t.contains("Survival")),
+            "a fresh game starts in survival"
+        );
+
+        game.set_creative(true);
+        assert!(
+            menu_text(&game).is_some_and(|t| t.contains("Creative")),
+            "the pause menu must reflect the switch, not just the game's own state"
+        );
+    }
+
+    #[test]
+    fn menu_text_shows_the_console_over_the_pause_menu() {
+        let mut game = Game::new();
+        game.toggle_pause();
+        game.open_console();
+        let text = menu_text(&game).expect("the console is open");
+        assert!(
+            text.starts_with('/'),
+            "the console's own text should be what's shown, not the pause menu underneath it"
+        );
     }
 }

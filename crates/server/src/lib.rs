@@ -2087,6 +2087,14 @@ fn grant_creative_loadout(player: &mut Player, blocks: &BlockRegistry, items: &I
         else {
             continue;
         };
+        // `< SLOT_COUNT` here is redundant with the `>= SLOT_COUNT` break
+        // below, not load-bearing on its own -- `Inventory::slot` is
+        // bounds-checked (`self.slots.get(index)`), so `slot ==
+        // SLOT_COUNT` would just read `None` and the `&&` would stop the
+        // loop anyway. Left in because it says the same thing the break
+        // does, not because removing it would misbehave -- a mutation to
+        // `<=` here is inert and check-tests-can-fail.sh's survivor is
+        // this loop confirming exactly that, not a gap.
         while slot < cubara_sim::SLOT_COUNT && player.inventory.slot(slot).is_some() {
             slot += 1;
         }
