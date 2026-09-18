@@ -114,6 +114,13 @@ pub struct Shot {
     pub gauges: Option<(f32, f32)>,
     /// Item icons that [`crate::HotbarSlot::icon`] indexes into.
     pub icons: Vec<Option<Vec<u8>>>,
+    /// Static overlay text -- the pause menu or command console
+    /// (`crate::scene::Hud::menu`'s headless counterpart), not the live F3
+    /// debug text: that one is excluded on purpose (see this struct's
+    /// `overlay` handling in `render_arena`) because it shows real FPS,
+    /// which would make every golden non-deterministic. `menu` text is
+    /// static, so it carries no such risk.
+    pub menu: Option<String>,
     /// Sun, ambient and fog for this shot. `Lighting::default()` (fog off)
     /// keeps every existing golden byte-identical; a shot that wants to show
     /// fog (there is exactly one, for the fog feature itself) sets it
@@ -140,6 +147,7 @@ impl Default for Shot {
             tooltip: None,
             gauges: None,
             icons: Vec::new(),
+            menu: None,
             lighting: crate::render::Lighting::default(),
         }
     }
@@ -227,6 +235,7 @@ fn render_arena(
         tooltip,
         gauges,
         icons,
+        menu,
         lighting,
     } = shot;
     // Slot 0 held: a fixed choice, so a golden reference has a stable
@@ -324,9 +333,11 @@ fn render_arena(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("headless-encoder"),
     });
-    // No overlay: the debug HUD shows live FPS, which would make any golden
-    // reference differ on every run. `highlighted_block` does go through --
-    // a golden test needs to be able to show the outline.
+    // The live F3 debug HUD is excluded on purpose -- it shows real FPS,
+    // which would make any golden reference differ on every run. `menu`
+    // (the pause menu/console) is static text a caller supplies, so it
+    // carries none of that risk; `highlighted_block` goes through for the
+    // same reason -- a golden test needs to be able to show the outline.
     scene.encode_scene(
         &device,
         &queue,
@@ -338,7 +349,7 @@ fn render_arena(
             selected_block: highlighted_block,
             cracking,
             players: &players,
-            overlay: None,
+            overlay: menu.as_deref(),
             hotbar: hotbar.as_ref().map(|slots| crate::scene::HotbarView {
                 slots: slots.as_slice(),
                 selected: hotbar_selected,
