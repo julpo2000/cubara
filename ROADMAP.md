@@ -112,6 +112,16 @@ Passes only when **all** of the following hold, and it exits non-zero otherwise:
 - `cargo test --all`, `cargo clippy --all-targets --all-features`, `cargo fmt --check` green.
 - `./scripts/check-architecture.sh && ./scripts/check-single-render-path.sh` green.
 - `cargo run --release -- --bench 64` reports **≥ 1000 FPS sustained**.
+
+  *Amended 2026-09-26, the owner's call.* The criterion now measures what the
+  player sees: `cargo run --release -- --bench gate`, the owner's three
+  first-person eyes (ground y = 40, hill y = 300, flight y = 3,000) at the
+  game's own view distance, each at 1000 FPS or more. An eye with nothing in
+  view is reported, not counted, until the game draws something there (the
+  flight eye, until `docs/PROPOSAL_FAR_VIEW.md`'s block F3). The orbit this
+  used to be looked at the whole region from above at once, which no player
+  does, so the same code reads about 2.5× higher now (`BENCHMARKS.md` ⁶²).
+  That is why the change is recorded here rather than quietly made.
 - The determinism replay test passes single-threaded and multi-threaded with an
   identical world-state hash.
 - Golden-image tests cover: all three block types visible and textured, a cave

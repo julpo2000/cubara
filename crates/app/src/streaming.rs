@@ -49,11 +49,17 @@ const BLOCKS_PER_CHUNK: i32 = 16;
 /// hard an edge as before fog existed (`ARCHITECTURE.md` Rule 3: the render
 /// crate has no schedule of its own to derive this from).
 pub(crate) fn render_radius_blocks() -> f32 {
-    let outer_chunks = node::DEFAULT_RING_SCHEDULE
+    (render_radius_chunks() * BLOCKS_PER_CHUNK) as f32
+}
+
+/// The same, in chunks -- what the bench's gate eyes are measured at, so the
+/// gate grows with the view distance instead of being a second number to
+/// keep in step with it.
+pub(crate) fn render_radius_chunks() -> i32 {
+    node::DEFAULT_RING_SCHEDULE
         .last()
         .expect("the ring schedule is never empty")
-        .1;
-    (outer_chunks * BLOCKS_PER_CHUNK) as f32
+        .1
 }
 
 /// The nodes in `visible` that cover the same space `node` does: either its

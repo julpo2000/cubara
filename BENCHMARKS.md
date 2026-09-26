@@ -152,6 +152,10 @@ frames after 200 warmup.
 | 2026-09-16 | One FrameUniform, distance fog, one sun instead of two (cross-session review, package 2), radius 64 (orbit)⁵⁸ | 2,219 | 901,932 (480,547 drawn) | ~1,762 | 0.289 ms | 1.056 ms | `c34101e` |
 | 2026-09-16 | Mesh fog from a plain 1/w varying + flat face index, not a `world_pos` varying (fixes ⁵⁸'s regression), radius 64 (orbit)⁵⁹ | 2,219 | 901,932 (480,547 drawn) | **~1,126** | **0.656 ms** | -- | `28564f8` |
 | 2026-09-16 | Fog depth from `clip_pos.z`, zero varyings (recovers ⁵⁹'s M3 varying cost), radius 64 (orbit)⁶⁰ | 2,219 | 901,932 (480,547 drawn) | **~1,157** | **0.638 ms** | -- | `dad0dd6` |
+| 2026-09-26 | `main` after wgpu 30, creative mode and New World, radius 64 (orbit)⁶² | 2,219 | 901,932 (480,547 drawn) | ~1,341 | 0.478 ms | 1.975 ms | `feac659` |
+| 2026-09-26 | **Gate eye: ground** (y = 40), full view distance — the owner's criterion since today⁶² | 1,940 | 819,928 (167,988 drawn) | ~3,121 | 0.266 ms | 1.574 ms | `feac659` |
+| 2026-09-26 | **Gate eye: hill** (y = 300), full view distance⁶² | 869 | 436,690 (102,664 drawn) | ~3,530 | 0.189 ms | 0.875 ms | `feac659` |
+| 2026-09-26 | **Gate eye: flight** (y = 3,000) — nothing in view yet⁶² | 0 | 0 | -- | -- | -- | `feac659` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -2229,3 +2233,25 @@ did the interleaved M3 measurements for the rest of this package's research
 went offline partway through the owner's decision being made, and this
 session continued solo per the owner's instruction. Whoever next has the
 M3 available should add it here rather than leave the row Linux-only.
+
+⁶² **The gate measures what the player sees (owner's decision, 2026-09-26).**
+`--bench gate` runs the owner's three first-person eyes -- ground (y = 40),
+hill (y = 300), flight (y = 3,000), each at `(8, y, 8)` turning on the spot,
+pitched down about 14° -- at the game's own view distance
+(`streaming::render_radius_chunks`, 64 today), and prints one `GATE:` line
+that `check-phase-gate.sh` now reads in place of `--bench 64`'s `SUMMARY`.
+Measured on `feac659` plus that PR's bench changes, which do not touch
+rendering: one run each, uncontended.
+
+**The new criterion reads about 2.5x higher on this machine than the orbit
+did (1,341 at the same commit, row above).** Not because anything got
+faster: the orbit circles *above* the whole region and has all of it in view
+at once, which no player ever does. That is the point of the owner's
+decision, and it is recorded here so the jump is not read as a speedup. The
+orbit keeps its rows as the comparable series for the history; the gate eyes
+start their own.
+
+The flight eye draws nothing: from 3 km up the view reaches only 512 blocks
+downward (`docs/PROPOSAL_FAR_VIEW.md` §1). The gate reports it as `nothing in
+view yet` and does not count it; block F3 of that proposal gives it
+something to see and makes it count (`GateEye::must_see`).
