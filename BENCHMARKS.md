@@ -166,6 +166,10 @@ frames after 200 warmup.
 | 2026-09-16 | Mesh fog from a plain 1/w varying + flat face index, not a `world_pos` varying (M3 regression fix), radius 64⁵⁹ | 2,219 | 901,932 | ~2,062 | 0.266 ms | 0.980 ms | `28564f8` |
 | 2026-09-16 | Fog depth from `clip_pos.z`, zero varyings (recovers ⁵⁹'s M3 varying cost)⁶⁰ | 2,219 | 901,932 | ~1,940 | 0.274 ms | 1.021 ms | `dad0dd6` |
 | 2026-09-17 | Radial fog + lighting as pipeline overrides, background rebuild on change (owner's decision from the ⁶⁰ research)⁶¹ | 2,219 | 901,932 | ~1,933 | 0.270 ms | 1.145 ms | `e4e676a` |
+| 2026-09-26 | `main` after wgpu 30, creative mode, New World and the F1 gate, radius 64 (orbit)⁶³ | 2,219 | 901,932 (480,547 drawn) | ~2,049 | 0.362 ms | 1.080 ms | `ea67f2b` |
+| 2026-09-26 | **Gate eye: ground** (y = 40), full view distance — the owner's criterion since today⁶³ | 1,940 | 819,928 (167,988 drawn) | ~2,380 | 0.266 ms | 0.797 ms | `ea67f2b` |
+| 2026-09-26 | **Gate eye: hill** (y = 300), full view distance⁶³ | 869 | 436,690 (102,664 drawn) | ~3,439 | 0.173 ms | 0.687 ms | `ea67f2b` |
+| 2026-09-26 | **Gate eye: flight** (y = 3,000) — nothing in view yet⁶³ | 0 | 0 | -- | -- | -- | `ea67f2b` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -2255,3 +2259,30 @@ The flight eye draws nothing: from 3 km up the view reaches only 512 blocks
 downward (`docs/PROPOSAL_FAR_VIEW.md` §1). The gate reports it as `nothing in
 view yet` and does not count it; block F3 of that proposal gives it
 something to see and makes it count (`GateEye::must_see`).
+
+⁶³ **The owner's gate on Linux (GTX 1060 Max-Q, Vulkan), `ea67f2b`.** The
+same `--bench gate` as ⁶², on `main` with block F1 merged, run twice back to
+back, uncontended. The rows are the second run, which is the one with a full
+log. The first run gave ground 2,413 FPS (0.263 ms) and hill 3,536 FPS
+(0.179 ms), so the two runs agree within 3%.
+
+```
+SUMMARY: 2380 FPS | CPU/frame avg 0.266 ms (p99 0.797) | GPU/frame avg 0.363 ms (p99 0.487, 1024 samples) | 1325 draws (592/1940 nodes) | 1000-FPS gate MET
+SUMMARY: 3439 FPS | CPU/frame avg 0.173 ms (p99 0.687) | GPU/frame avg 0.235 ms (p99 0.256, 1024 samples) | 644 draws (277/869 nodes) | 1000-FPS gate MET
+GATE: MET | ground 2380 FPS | hill 3439 FPS | flight nothing in view yet
+```
+
+**The gate is met on this machine at 2.4x (ground) and 3.4x (hill).** The
+node and triangle counts match the M3's ⁶² rows exactly, which is expected:
+the scene is a pure function of the eye and the seed.
+
+**The orbit row, against this table's previous row (⁶¹, `e4e676a`):** FPS
+~1,933 → ~2,049 (+6%), p99 1.145 → 1.080 ms, but **CPU/frame 0.270 → 0.362 ms
+(+34%)**. GPU/frame is 0.435 ms, so this scene is GPU-bound here and the CPU
+rise does not reach FPS. It has not been bisected. The one change to the
+render path in between is the wgpu 24 → 30 upgrade (#275). The M3's orbit
+row after the same upgrade (⁶², 0.478 ms) sits between its ⁵⁸ and ⁶⁰ rows, so
+it gives no clear signal either way. The next Linux row on the render path
+should say whether this holds.
+
+The Windows rows for the gate are still to be run.
