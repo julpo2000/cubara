@@ -160,17 +160,41 @@ what he approved.
 The far terrain is the new system. It **does not extend the node tree**: table A
 shows that rings of cubes flatten the land and are made of rectangles. Instead:
 
-- **A quadtree of height-field patches (CDLOD, Strugar 2010),** each a fixed
-  grid of, say, 32 × 32 quads. A patch is split while its quads would appear
-  wider than about 2 px, so the number of triangles is bounded by the size of
-  the screen, not by the view distance. Rough budget: the part of the screen
-  below the horizon, at 2 px per quad, comes to 100–300k triangles whether the
-  view reaches 10 km or 262 km.
-- **Geomorphing:** a vertex slides smoothly toward its coarser neighbour's
-  height across each level boundary. There is no popping and there are no
-  cracks, so no skirts are needed.
+- **A quadtree of height-field patches**, each a grid of 32 × 32 quads
+  (`crates/world/src/far.rs`). A patch is split for two reasons:
+  - **by distance**, while its quads would look wider than 16 px. That caps
+    the triangle count by the screen, not by the view distance;
+  - **by height error**, while its own measured gap to the next finer patch
+    would look taller than 1 px. This puts fine patches where the land is
+    rough (mountains) and leaves flat land coarse. It stops at a floor of
+    2 px quads, because below that it only chases one-block steps, which a
+    smooth surface cannot follow anyway.
+- **Why not distance alone, as CDLOD does (*revised 2026-09-26, measured in
+  F3a*).** The first plan was CDLOD (Strugar 2010): distance-only splitting,
+  with geomorphing between levels. Measured from the hill eye out to 25 km,
+  against the ground each pixel covers:
+
+  | Quads by distance | Height bound | Mean error | p90 | Triangles, 262 km (all patches) |
+  |---|---|---|---|---|
+  | 16 px | none | 0.61 px | 1.58 px | 1.2M |
+  | 8 px | none | 0.39 px | 1.04 px | 3.3M |
+  | 4 px | none | 0.24 px | 0.61 px | ~13M |
+  | **16 px** | **1 px** | **0.30 px** | **0.75 px** | **3.7M** |
+  | 16 px | 2 px | 0.55 px | 1.42 px | 1.5M |
+
+  Under distance alone, getting nine columns in ten under a pixel takes 4 px
+  quads everywhere, which is about 13M triangles. The height bound gets the
+  same accuracy for about a quarter of that. The triangles in view at once
+  are about a quarter of "all patches", but the bench measures that with the
+  real frustum (F3c).
+- **Skirts, not geomorphing.** A split for roughness can leave a fine patch
+  beside one two levels coarser, and geomorphing cannot blend across that.
+  Each patch drops a skirt along its edges, as the voxel nodes already do
+  (`PHASE1_ARCHITECTURE.md` §6.4). The popping that geomorphing would have
+  hidden is kept under a pixel by the same height bound.
 - **Heights come from the generator, prefiltered.** A vertex's height is the
-  mean of `WorldGen::surface_height` over the footprint of its quad. The terrain
+  mean of `WorldGen::surface_height` over the footprint of its quad, sampled
+  on a grid of at most 4 × 4. The terrain
   is a height field with caves beneath it (§8.1), so from kilometres away the
   height field is the complete visible truth. The patches are generated on the
   existing worker threads, like today's mesh jobs, and hold 33 × 33 heights plus
@@ -265,7 +289,7 @@ Both come with images, not questions in the abstract.
 |---|---|---|
 | **F1** | **The gate first.** `--bench` gains the three eyes, and `check-phase-gate.sh` uses them. They are recorded on both machines before anything is built. | The same order as phase 1's block 1.0: measure the target first. The eyes' view distance grows with F3, and the gate grows with it. |
 | **F2** | **The criterion as tests.** The projected-cell-size function, with a test that today's rings fail it at 13–16 px, which proves the test can fail. Plus the brute-force staircase reference for 3.3. | So F3 and F4 are built against a check rather than a screenshot. |
-| **F3** | **Far terrain, plain-shaded.** The CDLOD patches, geomorphing, prefiltered heights, the infinite far plane, and the join at 1 km. | The core. Golden images at the three eyes, before and after. |
+| **F3** | **Far terrain, plain-shaded.** The patches, split by distance and by height error, with skirts and prefiltered heights; the infinite far plane; the join at 1 km. F3a (the GPU-free half: `crates/world/src/far.rs`) is first. | The core. Golden images at the three eyes, before and after. |
 | **F4** | **Block-aggregate shading** (3.3) | What makes it look like blocks. |
 | **F5** | **Haze** replaces the fog that hides the edge | Tuned by the owner from images. |
 | **F6** | Whatever F1–F5's measurements and images say is still missing | For example the 160 m – 1 km band, cave mouths, or forests. Written from evidence, as block 1.11 was. |
@@ -290,7 +314,10 @@ Both come with images, not questions in the abstract.
 
 - F. Strugar, *Continuous Distance-Dependent Level of Detail for Rendering
   Heightmaps*, JGT 2010 ([pdf](https://aggrobird.com/files/cdlod_latest.pdf)):
-  the quadtree, the distance-based split, and geomorphing without skirts.
+  the quadtree, the distance-based split, and geomorphing without skirts. It
+  was the first plan, and §3.2 records why the measurements replaced its
+  distance-only split with a height-error bound and skirts (the chunked-LOD
+  idea: split where the error would show, not everywhere at a distance).
 - A. Tevs, I. Ihrke, H.-P. Seidel, *Maximum mipmaps for fast, accurate, and
   scalable dynamic height field rendering*, I3D 2008
   ([ACM](https://dl.acm.org/doi/10.1145/1342250.1342279)). Ray-casting a height
