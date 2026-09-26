@@ -393,6 +393,13 @@ pub(crate) mod tests {
             if new.is_empty() {
                 return (keys, have);
             }
+            // A selection that never settles fails here rather than running
+            // until somebody notices (a broken distance splits to level 0).
+            assert!(
+                have.len() < 20_000,
+                "{} patches and still asking",
+                have.len()
+            );
             for k in new {
                 have.insert(k, generate(gen, k));
             }
@@ -545,6 +552,53 @@ pub(crate) mod tests {
             (ox..ox + k.size()).contains(&8) && (oz..oz + k.size()).contains(&8)
         });
         assert!(under, "nothing covers the ground under the eye");
+    }
+
+    /// At level 0 a vertex is one column, exactly: the top face of its surface
+    /// block. Every coarser level averages this, so an offset here is an
+    /// offset everywhere -- one block, which the pixel tests below would call
+    /// close enough at a kilometre.
+    #[test]
+    fn a_level_0_vertex_is_the_top_of_its_column() {
+        let gen = WorldGen::new(SEED);
+        for key in [PatchKey::new(0, 0, 0), PatchKey::new(0, -3, 7)] {
+            let patch = generate(&gen, key);
+            let [ox, oz] = key.origin();
+            for (i, j) in [(0, 0), (5, 17), (PATCH_QUADS, PATCH_QUADS)] {
+                let top = gen.surface_height((ox + i as i64) as i32, (oz + j as i64) as i32) + 1;
+                assert_eq!(
+                    patch.heights[j * PATCH_VERTS + i],
+                    top as f32,
+                    "{key:?} ({i}, {j})"
+                );
+            }
+            assert_eq!(patch.heights.len(), (PATCH_QUADS + 1) * (PATCH_QUADS + 1));
+        }
+    }
+
+    /// Two patches side by side share an edge, and must agree on it height
+    /// for height, or the seam between them opens. At every level.
+    #[test]
+    fn neighbouring_patches_agree_along_their_shared_edge() {
+        let gen = WorldGen::new(SEED);
+        for level in [0, 3, 7] {
+            let a = generate(&gen, PatchKey::new(level, 2, 5));
+            let east = generate(&gen, PatchKey::new(level, 3, 5));
+            let south = generate(&gen, PatchKey::new(level, 2, 6));
+            for k in 0..PATCH_VERTS {
+                let at = |p: &PatchHeights, i: usize, j: usize| p.heights[j * PATCH_VERTS + i];
+                assert_eq!(
+                    at(&a, PATCH_QUADS, k),
+                    at(&east, 0, k),
+                    "level {level}, east edge {k}"
+                );
+                assert_eq!(
+                    at(&a, k, PATCH_QUADS),
+                    at(&south, k, 0),
+                    "level {level}, south edge {k}"
+                );
+            }
+        }
     }
 
     /// Where the far terrain starts: the voxel rings draw everything nearer
