@@ -2259,8 +2259,9 @@ decision, and it is recorded here so the jump is not read as a speedup. The
 orbit keeps its rows as the comparable series for the history; the gate eyes
 start their own.
 
-The flight eye draws nothing: from 3 km up the view reaches only 512 blocks
-downward (`docs/PROPOSAL_FAR_VIEW.md` §1). The gate reports it as `nothing in
+The flight eye draws nothing: from 3 km up the voxels reach only 1,024
+blocks downward (`docs/PROPOSAL_FAR_VIEW.md` §1; this footnote first said
+512, which was wrong -- the drawn region is a cube). The gate reports it as `nothing in
 view yet` and does not count it; block F3 of that proposal gives it
 something to see and makes it count (`GateEye::must_see`).
 

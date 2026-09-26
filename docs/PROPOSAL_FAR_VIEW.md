@@ -36,7 +36,7 @@ built. This is that proposal.
 | Ring schedule | `crates/world/src/node.rs` `DEFAULT_RING_SCHEDULE` | levels 0–3, outer ring 64 chunks = **1,024 blocks** |
 | Far plane | `crates/render/src/render.rs` `FAR_PLANE` | 2,000 blocks |
 | Fog | `Lighting::fog_range(render_radius_blocks())` | ends inside 1,024 blocks, and exists to hide the edge |
-| Vertical reach | `VERTICAL_LOD_SQUASH` = 2 | 512 blocks up or down, so **from 3 km up nothing is drawn** |
+| Vertical reach | `desired_nodes_3d` | a cube: 1,024 blocks up or down (`VERTICAL_LOD_SQUASH` coarsens detail vertically, not reach), so **from 3 km up nothing is drawn** — *corrected 2026-09-26; this row first said 512* |
 
 ## §2 What the measurements say
 
@@ -288,8 +288,13 @@ into `far.wgsl`.
 ### 3.4 Joining the two
 
 - The far terrain starts where the voxel rings end. It is drawn after the voxels
-  with a depth test, and discards anything inside the voxel region, so the two
-  never draw the same ground.
+  with a depth test, and never draws the same ground they do. *As built (F3c):*
+  not by discarding fragments, which on a tile-based GPU turns off hidden-
+  surface removal for the whole pipeline, but in the vertex shader. Vertices
+  strictly inside the voxels' box sink to its floor. The box's edges fall on
+  multiples of 128 blocks, and so does every quad edge near them, so no
+  triangle straddles the edge. The triangles touching it from inside slope down
+  from it, and that slope is a wall that closes the seam between the two.
 - At the join, a block is about 1 px wide at 1080p (§2B). At 4K it is about
   2 px, so the join is slightly visible there. The join distance can be made to
   follow the resolution.

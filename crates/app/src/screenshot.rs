@@ -58,6 +58,11 @@ pub fn run(path: &str, view: Option<View>, menu: Option<String>) {
     let blocks = cubara_world::TerrainBlocks::from_registry(&registry)
         .with_oak(&crate::game::load_structure_registry(), &registry)
         .with_ores(&crate::game::load_ore_registry(), &registry);
+    // The far terrain, for a shot from an eye: what the player would see
+    // beyond the voxels (`docs/PROPOSAL_FAR_VIEW.md`). The orbit frames the
+    // voxel region from outside and gets none, as the bench's orbit does.
+    let mut far = Vec::new();
+    let mut far_params = None;
     let (shot, built) = match view {
         None => {
             let shot = Shot::default();
@@ -86,12 +91,37 @@ pub fn run(path: &str, view: Option<View>, menu: Option<String>) {
                 camera: Some((glam::Vec3::from(v.eye), glam::Vec3::from(v.look))),
                 ..Shot::default()
             };
-            (shot_with_fog(shot), built)
+            let (min, max) =
+                cubara_world::node::covered_box_3d(centre, &schedule_for_radius(v.radius));
+            let hole = cubara_world::far::Hole {
+                min: min.map(|c| (c * 16) as f64),
+                max: max.map(|c| (c * 16) as f64),
+            };
+            let view =
+                crate::far_streaming::far_view(v.eye.map(|c| c as f64), v.size.1, Some(hole));
+            far = cubara_world::far::build(&cubara_world::WorldGen::new(world.seed()), &view);
+            far_params = Some(crate::far_streaming::to_far_params(
+                hole,
+                crate::far_streaming::far_top_color(),
+            ));
+            // Fog at the far terrain's edge, as in the game.
+            let (fog_start, fog_end) =
+                Lighting::fog_range(crate::far_streaming::FAR_VIEW_RADIUS as f32);
+            let shot = Shot {
+                lighting: Lighting {
+                    fog_start,
+                    fog_end,
+                    ..Lighting::default()
+                },
+                ..shot
+            };
+            (shot, built)
         }
     };
     let shot = Shot { menu, ..shot };
     let meshed = built.into_iter().filter_map(to_meshed_node);
-    let Some(frame) = headless::render(meshed, shot) else {
+    let patches: Vec<_> = far.iter().map(crate::far_streaming::to_far_patch).collect();
+    let Some(frame) = headless::render_with_far(meshed, &patches, far_params, shot) else {
         log::error!("no suitable GPU adapter — cannot render a screenshot");
         return;
     };

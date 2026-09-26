@@ -431,7 +431,7 @@ mod tests {
             ..far_view(eye, 720, Some(voxel_hole(eye.map(|v| v as f32))))
         };
         let mut heights: HashMap<PatchKey, PatchHeights> = HashMap::new();
-        let mut converge = |view: &FarView, heights: &mut HashMap<PatchKey, PatchHeights>| loop {
+        let converge = |view: &FarView, heights: &mut HashMap<PatchKey, PatchHeights>| loop {
             let wanted = far::select(view, |k| heights.get(&k).map(|p| p.error));
             let new: Vec<_> = wanted
                 .iter()

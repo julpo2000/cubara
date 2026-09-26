@@ -1347,7 +1347,7 @@ pub fn far_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             storage(2),
             wgpu::BindGroupLayoutEntry {
                 binding: 3,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -1359,17 +1359,14 @@ pub fn far_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
-/// The far terrain's pipelines (`far.wgsl`): no vertex buffer, one instance
-/// per patch, depth-tested against the voxels drawn before it. Two, differing
-/// only in the fragment stage: `(whole, cut)`, where `cut` discards whatever
-/// falls inside the voxels' hole and `whole` never discards -- see
-/// `crate::far::FarTerrain::prepare` for which patch gets which.
+/// The far terrain's pipeline (`far.wgsl`): no vertex buffer, one instance
+/// per patch, depth-tested against the voxels drawn before it.
 pub fn build_far_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
     camera_bgl: &wgpu::BindGroupLayout,
     far_bgl: &wgpu::BindGroupLayout,
-) -> (wgpu::RenderPipeline, wgpu::RenderPipeline) {
+) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("far-shader"),
         source: wgpu::ShaderSource::Wgsl(include_str!("shaders/far.wgsl").into()),
@@ -1421,7 +1418,7 @@ pub fn build_far_pipeline(
             cache: None,
         })
     };
-    (build("fs_main"), build("fs_cut"))
+    build("fs_main")
 }
 
 pub fn build_outline_pipeline(
