@@ -40,6 +40,14 @@ hecs = "0.11"
 [profile.dev.package."*"]
 opt-level = 3
 
+# The world generator is the one workspace crate whose tests are
+# arithmetic-bound: the far terrain's accuracy tests evaluate the height field
+# hundreds of thousands of times (`crates/world/src/far.rs`), and took two
+# minutes unoptimised against seven seconds optimised. Debug assertions and
+# overflow checks stay on -- they belong to the profile, not the opt-level.
+[profile.dev.package.cubara-world]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
