@@ -186,7 +186,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // sentinel distance: `select` here means a disabled fog never evaluates
     // `smoothstep` on an equal-edges range, whose result WGSL leaves
     // unspecified.
-    let view_depth = depth_a / (in.clip_pos.z + depth_b);
+    let view_depth = 1.0 / in.clip_pos.w;
     let ndc_x = (in.clip_pos.x / viewport_width) * 2.0 - 1.0;
     let ndc_y = 1.0 - (in.clip_pos.y / viewport_height) * 2.0;
     let off_axis_x = ndc_x * TAN_HALF_FOV * aspect;
