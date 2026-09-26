@@ -1,28 +1,31 @@
 # Proposal: seeing hundreds of kilometres
 
-**Status: proposed 2026-09-26, waiting for the owner.** Nothing here is built.
-The experiment behind the numbers is the branch `exp/far-view-octree`
-(`0768426`): two constants changed and one probe added, not for merging.
+**Status: proposed 2026-09-26. The direction is set, and nothing is built yet.**
+The experiments behind the numbers are on the branch `exp/far-view-octree`: a
+few constants changed and one probe added, not for merging.
 
-**What the owner asked for.** On 2026-09-14, after climbing a mountain (#264):
-*"verder zie je nog wel de boundaries als je op de berg staat. zou chiller zijn
-als je echt oneindig ver kon kijken."* Asked on 2026-09-26 how far, the
-answer was:
+## What the owner asked for, and has already decided
 
-> *"daadwerkelijk oneindig. ik denk dat we er een nieuw systeem voor nodig
-> hebben, maar ik wil dat je daadwerkelijk honderden kilometers kan zien, als je
-> hoog genoeg bent en het landschap mee werkt. hiervoor is het dus nodig dat lod
-> extreem goed werkt"*
+On 2026-09-14, after climbing a mountain (#264): *"verder zie je nog wel de
+boundaries als je op de berg staat. zou chiller zijn als je echt oneindig ver
+kon kijken."* On 2026-09-26 the owner answered four questions:
 
-Asked in the same exchange whether the 1000-FPS gate should then measure the
-distance a player actually sees, rather than the 1,024 blocks it measures now,
-the owner chose **yes, measure what you see**. That changes a phase gate, which
-is the owner's call, and this is the record of them making it. Rewriting the
-gate is block F1 below, so the gate never measures less than the game draws.
+| Question | The owner's answer |
+|---|---|
+| How far? | *"daadwerkelijk oneindig … ik wil dat je daadwerkelijk honderden kilometers kan zien, als je hoog genoeg bent en het landschap mee werkt. hiervoor is het dus nodig dat lod extreem goed werkt"*. **262 km first**; go further only once that is measured. |
+| What does the distance look like? | *"het moeten geen grote rechthoeken lijnen. ze moeten wel bergvormig zijn, maar je moet natuurlijk niet elk blok renderen. ik zou ff kijken wat hier slim is. het moet er wel uitzien alsof elk blok gerenderd is"* |
+| Does the 1000-FPS gate measure what you see? | **Yes.** |
+| Measured how? | **Three fixed first-person eyes**, at ground (y = 40), on a hill (y = 300) and in flight (y = 3,000), each at the full view distance and each at 1,000 FPS or more on both machines. |
+
+The gate change is the owner's call, and this table is the record of him making
+it. `ROADMAP.md` notes it as well.
+
+The owner left one thing open on purpose: how to make distant terrain look as
+if every block were rendered without rendering every block. That is §3. It is an
+engineering choice, and the owner asked for it to be made well.
 
 `ROADMAP.md` requires a phase-3 feature to be proposed in writing before it is
-built. This is that proposal. It says what the measurements found and what they
-mean for "a new system", then lists the decisions that belong to the owner.
+built. This is that proposal.
 
 ---
 
@@ -33,209 +36,268 @@ mean for "a new system", then lists the decisions that belong to the owner.
 | Ring schedule | `crates/world/src/node.rs` `DEFAULT_RING_SCHEDULE` | levels 0–3, outer ring 64 chunks = **1,024 blocks** |
 | Far plane | `crates/render/src/render.rs` `FAR_PLANE` | 2,000 blocks |
 | Fog | `Lighting::fog_range(render_radius_blocks())` | ends inside 1,024 blocks, and exists to hide the edge |
-| Vertical reach | `VERTICAL_LOD_SQUASH` = 2 | the drawn cube is half as tall as it is wide: **512 blocks up or down** |
-
-The last row means a player 3 km up today sees **nothing at all**. The bench
-refuses that scene as empty (table A).
+| Vertical reach | `VERTICAL_LOD_SQUASH` = 2 | 512 blocks up or down, so **from 3 km up nothing is drawn** |
 
 ## §2 What the measurements say
 
-All measured on the M3 (Metal). The FPS figures carry the usual caveat
-(`BENCHMARKS.md`): at these scene sizes FPS is noisy between runs, and CPU per
-frame is the column to compare. The bench's fixed-eye camera turns a full
+All measured on the M3 (Metal) at 1920 × 1080 with a 60° vertical field of
+view. FPS at these scene sizes is noisy between runs (`BENCHMARKS.md`), so CPU
+per frame is the column to compare. The bench's fixed-eye camera turns a full
 circle, pitched down about 14°.
 
-### A. Cost: extending today's tree is affordable
+### A. The obvious approach: keep doubling the rings
 
-Rings keep doubling out to level 11, the far plane is moved out of the way, and
-nothing else changes:
+Rings extended to level 11, the far plane moved out of the way, nothing else
+changed:
 
-| Eye | View distance | Nodes drawn | Triangles | Vertex arena | FPS | CPU/frame | First fill (1 thread) | Visibility search |
-|---|---|---|---|---|---|---|---|---|
-| ground, y = 40 | 1 km (today) | 1,940 | 820k | 41% | 3,482 | 0.218 ms | 4.8 s | 36 ms |
-| ground, y = 40 | **262 km** | 4,955 | 1.30M | 65% | 2,309 | 0.329 ms | 11.6 s | 93 ms |
-| hill, y = 300 | 1 km (today) | 869 | 437k | 22% | 3,203 | 0.275 ms | 2.0 s | 60 ms |
-| hill, y = 300 | 16 km | 2,713 | 886k | 44% | 2,250 | 0.316 ms | 5.5 s | 90 ms |
-| hill, y = 300 | 65 km | 3,477 | 923k | 46% | 2,445 | 0.280 ms | 7.1 s | 99 ms |
-| hill, y = 300 | **262 km** | 3,963 | 928k | 46% | 2,401 | 0.280 ms | 8.7 s | 114 ms |
-| flight, y = 3,000 | 1 km (today) | **0 — nothing is drawn** | | | | | | |
-| flight, y = 3,000 | **262 km** | 2,545 | 283k | 14% | 5,558 | 0.157 ms | 5.5 s | 131 ms |
+| Eye | View distance | Nodes drawn | Triangles | Vertex arena | FPS | CPU/frame |
+|---|---|---|---|---|---|---|
+| ground, y = 40 | 1 km (today) | 1,940 | 820k | 41% | 3,482 | 0.218 ms |
+| ground, y = 40 | 262 km | 4,955 | 1.30M | 65% | 2,309 | 0.329 ms |
+| hill, y = 300 | 1 km (today) | 869 | 437k | 22% | 3,203 | 0.275 ms |
+| hill, y = 300 | 262 km | 3,963 | 928k | 46% | 2,401 | 0.280 ms |
+| flight, y = 3,000 | 1 km (today) | **0: nothing is drawn** | | | | |
+| flight, y = 3,000 | 262 km | 2,545 | 283k | 14% | 5,558 | 0.157 ms |
 
-Going from 1 km to 262 km, 256 times further, costs about 3,000 more nodes and
-a third of the frame rate at ground level. At the worst eye that still leaves
-2.3 times the gate. This is the octree doing what it was built to do: each ring
-is twice as coarse as the one inside it, so doubling the distance adds a roughly
-constant number of nodes, not four times as many. The first fill of 11.6 s on
-one thread comes to about 2 s across the worker pool, nearest node first.
+It is affordable, because each ring is twice as coarse as the one inside it. It
+is also **not what the owner asked for**, for two reasons.
 
-**So the structure does not need replacing.** Performance is not what stands
-between the game and hundreds of kilometres.
+**It flattens the world.** A node is a cube with the same cell size on every
+axis (`PHASE1_ARCHITECTURE.md` §6.2), so a surface can only sit at a cell
+boundary. The probe (`far_view_probe` on the experiment branch) asks how high
+two columns are drawn at each level. One is plain ground, truly at y = 28. The
+other is the tallest peak in a 16 km square, truly at y = 242.
 
-### B. Fidelity: far away, the mountains disappear
-
-The probe (`far_view_probe::peak_height_per_level` on the experiment branch)
-takes two columns of the default seed. One is the highest peak in a 16 km
-square, with its top at **y = 242**. The other is plain ground at the median
-height around it, **y = 28**. For each detail level, the probe asks how high
-each column is drawn:
-
-| Level | Cell size | Drawn at distance | Plain (true 28) | Peak (true 242) |
+| Level | Cell | Drawn at | Plain (true 28) | Peak (true 242) |
 |---|---|---|---|---|
-| 0–2 | 1–4 blocks | 0–512 m | 29–32 | 240–243 |
-| 3 | 8 | 0.5–1 km | 32 | 232 |
-| 4–5 | 16–32 | 1–4 km | **48–64** | 224 |
-| 6 | 64 | 4–8 km | **64** | **192** |
-| 7–8 | 128–256 | 8–32 km | **0** | **256**, a single box |
+| 0–3 | 1–8 blocks | 0–1 km | 29–32 | 232–243 |
+| 4–6 | 16–64 | 1–8 km | **48–64** | 192–224 |
+| 7–8 | 128–256 | 8–32 km | **0** | **256**, one box |
 | 9–11 | 512–2,048 | 32–262 km | **0** | **0** |
 
-Today's game stops at level 3, where both columns are still close. A node is a
-cube with the same cell size on every axis (`PHASE1_ARCHITECTURE.md` §6.2), so
-a surface can only be drawn at a cell boundary. Once cells are 16–64 blocks
-tall, the plain is drawn 20–36 blocks too high. Once they are 128 blocks tall,
-the plain falls inside a single cell whose centre is air, and **from 8 km out
-the land drops to a flat plane at y = 0**. Only what rises above half a cell
-survives, and that is why the peak lasts until 32 km, as one 256-block box.
-Beyond 32 km, nothing is left.
+From 8 km out, the land falls to a flat plane at y = 0. From 3 km up that plane
+is what you see:
 
 ![From 3 km up with the rings extended: past the fine centre, a grey plane of
-stone with islands of grass, and a hard edge between them](img/far-view-high-r16384.jpg)
+stone with islands of grass](img/far-view-high-r16384.jpg)
 
-*From 3 km up, rings extended to 262 km. The straight edge across the lower
-half is where level 6 meets level 7, at 8 km. Beyond it is the plane at y = 0
-the table describes: its stone tops show, and the green islands are the hills
-tall enough to survive a 128-block cell.*
+*The straight edge is where level 6 meets level 7, at 8 km. Beyond it are the
+stone tops of the y = 0 plane. The green islands are hills tall enough to
+survive a 128-block cell.*
 
-![From 300 blocks up, today: fog hides the edge at 1 km](img/far-view-down-r64.jpg)
-![The same view with the rings extended: land to the horizon, flat and busy](img/far-view-down-r16384.jpg)
+**It is made of big rectangles, by construction.** Level *L* is used from
+64 × 2^*L* blocks away, so every coarse cell appears at 1/64 of a radian, which
+is **about 16 pixels wide**. That holds at every level and every distance, and
+it is exactly the "grote rechthoeken" the owner does not want. The rectangles
+are already there today, between 160 m and 1 km:
 
-*From 300 blocks up. Top: today, with fog hiding the edge at 1 km. Bottom: rings
-extended, with land out to the horizon but no distant ranges, and no haze to
-show distance.*
+| Level | Starts at | One cell on screen | Today? |
+|---|---|---|---|
+| 1 | 160 blocks | 13 px | yes |
+| 2 | 288 | 14 px | yes |
+| 3 | 512 | 16 px | yes |
+| 4 and further | 64 × 2^*L* | 16 px | only in the experiment |
 
-### What the two tables mean together
+### B. When is a block smaller than a pixel?
 
-The owner's instinct that this needs a new system is right about *what a far
-node contains* and wrong only about *the tree*. The tree scales. What it holds
-at a distance does not: from 8 km out, it holds a flat plane.
+At 1080p a pixel is 0.97 milliradians. A block is therefore one pixel wide at
+**1,030 blocks**, and smaller than a pixel beyond that. At 1440p that distance
+is 1,375 blocks, and at 4K it is 2,060.
+
+This splits the problem in two:
+
+- **Beyond ~1 km no single block can be seen.** What can be seen is the shape of
+  the land (its silhouette and height), and the colour a pixel's worth of blocks
+  adds up to: grass tops, soil and stone on the steps between them, lit by the
+  sun from one side. Reproduce both and it is indistinguishable from rendering
+  every block. Neither needs a block to be drawn.
+- **Within ~1 km blocks are 1 to many pixels**, and there is no shortcut: a
+  block that can be seen has to be drawn as a block.
+
+### C. What drawing every visible block within 1 km costs
+
+The near field was given a schedule in which no cell is wider than 2 px: level
+0 out to 512 blocks and level 1 out to 1 km. The vertex arena had to be enlarged
+just to hold it.
+
+| Eye | Today: FPS / meshed triangles | ≤ 2 px cells: FPS / meshed triangles |
+|---|---|---|
+| ground, y = 40 | 3,482 / 0.82M | **955** / 4.86M |
+| hill, y = 300 | 3,203 / 0.44M | **695** / 3.98M |
+
+That is six times the geometry, and **below the gate** on the M3. So the band
+between 160 m and 1 km cannot be made pixel-exact by adding geometry. §3.5 says
+what this proposal does about it: nothing yet, deliberately.
+
+---
 
 ## §3 The design
 
-### 3.1 Far nodes are surface, not volume
+### 3.1 The criterion, made checkable
 
-The terrain is a height field with caves carved beneath it
-(`WorldGen::surface_height`, `density_at`). From kilometres away, the height
-field is the only part that can be seen. So from a switch level outwards (level
-4–6, settled below), a node is generated from **2D samples of the surface** at
-its own cell size, and meshed as columns whose tops sit at the sampled height.
-Vertical precision no longer depends on the cell size.
+*"Het moet eruitzien alsof elk blok gerenderd is"* becomes: **no simplification
+changes what a pixel shows by more than about a pixel of geometry, compared
+with drawing every block.** The two regimes in §2B meet it in different ways,
+and each way is a pure function that a unit test can check:
 
-- **The existing vertex format already has the precision.** A vertex's `y` is 10
-  bits across the node's 16 cells, so 64 steps per cell. Level *L* is only drawn
-  from at least 64 × 2^*L* blocks away, which caps the vertical error at 1/4096
-  of the viewing distance. That is about a quarter of a pixel at 1080p. No
-  format change and no re-mesh of anything nearer.
-- **The existing machinery stays:** the same rings, arena, skirts, draw path and
-  visibility links. A surface node is a node whose *contents* are made
-  differently. That keeps Rule 5 (one scene-render path) intact and adds no
-  second system beside the tree.
-- **Where the switch sits (level 4, 5 or 6) is a trade-off, and F3 settles it
-  by measuring.** Surface nodes from level 4 (1 km) would fix the plain being
-  drawn 20–36 blocks too high at 1–4 km (table B). But levels 4 and 5 are also
-  where distant cave mouths (#255) still show: they are carved 24 blocks deep,
-  and a 16- or 32-block cell can hold one. The owner asked to see those from a
-  mountain. From level 6, a cell is too coarse for a cave mouth, so nothing is
-  lost there. The candidates are surface nodes from level 6 with levels 4–5
-  left as volume, or surface nodes from level 4 that carry cave mouths as dips in
-  the height. Levels 0–3, which are all the game draws today, are unchanged
-  either way.
-- **It is cheaper than what it replaces:** 16 × 16 surface samples per node
-  instead of 16 × 16 × 16 density samples.
+- For geometry, the projected size of every cell drawn is at most *k* px. This
+  is a function of the schedule and the eye, and needs no GPU.
+- For colour, the aggregate block shading (3.3) of a staircase must match the
+  area-weighted colour of the actual blocks it stands for, computed by brute
+  force on the CPU for a set of slopes and view directions.
 
-### 3.2 The far plane goes, and fog becomes atmosphere
+The owner judges the result with his eyes, from golden images taken at the
+three gate eyes. The tests exist so that a later commit cannot quietly undo
+what he approved.
 
-Reverse-Z depth (already in place) makes an infinite far plane free. Fog today
-exists to hide the edge of the world. With the edge hundreds of kilometres away,
-it becomes **haze**: the colour fades toward the sky over tens of kilometres.
-That is what lets an eye read distance at all. The flat, busy horizon in the
-third picture has none.
+### 3.2 Two regimes, two representations, no overlap
 
-### 3.3 How far
+| Distance | What is drawn | How |
+|---|---|---|
+| **0 – ~1 km** | voxels, as today | the node tree, unchanged: rings capped at 1,024 blocks |
+| **~1 km – 262 km** | **far terrain**, new | a height-field mesh with block-aggregate shading (3.3) |
 
-Each level doubles the distance for roughly a constant number of nodes. Level 11
-is 262 km and level 13 is about 1,000 km. "Infinite" in practice means a level
-cap, and choosing it is decision 1 below.
+The far terrain is the new system. It **does not extend the node tree**: table A
+shows that rings of cubes flatten the land and are made of rectangles. Instead:
 
-### 3.4 What this does not solve, on purpose
+- **A quadtree of height-field patches (CDLOD, Strugar 2010),** each a fixed
+  grid of, say, 32 × 32 quads. A patch is split while its quads would appear
+  wider than about 2 px, so the number of triangles is bounded by the size of
+  the screen, not by the view distance. Rough budget: the part of the screen
+  below the horizon, at 2 px per quad, comes to 100–300k triangles whether the
+  view reaches 10 km or 262 km.
+- **Geomorphing:** a vertex slides smoothly toward its coarser neighbour's
+  height across each level boundary. There is no popping and there are no
+  cracks, so no skirts are needed.
+- **Heights come from the generator, prefiltered.** A vertex's height is the
+  mean of `WorldGen::surface_height` over the footprint of its quad. The terrain
+  is a height field with caves beneath it (§8.1), so from kilometres away the
+  height field is the complete visible truth. The patches are generated on the
+  existing worker threads, like today's mesh jobs, and hold 33 × 33 heights plus
+  a material summary each. That is small enough that the whole 262 km view fits
+  in a few megabytes.
+- **Vertical precision is not tied to cell size.** Heights are real numbers, not
+  lattice steps, which is exactly what table A's cubes lack.
 
-- **Your own builds in the distance.** Edits show only in the full-detail near
-  field, about 160 blocks out, and that is true today. A tower you built
-  disappears as you walk away from it. Changing that is a separate decision.
-- **Travelling hundreds of kilometres.** *Seeing* 262 km does not need anything
-  more. *Standing* 262 km from the origin does: at that distance `f32` world
-  positions jitter by about 0.03 of a block, and the fix is camera-relative
-  rendering. It is separate work, and nothing here depends on it.
-- **The planet is flat.** Nothing curves away. Past a point, the sight line is
-  limited by what the terrain hides, not by the curvature of the world.
+### 3.3 Block-aggregate shading: making it look like every block
+
+A slope made of blocks is a staircase. From far away, each pixel covers many
+steps, and the colour it shows is a mix of two kinds of face:
+
+- **top faces** (grass, snow and so on), normal straight up, lit by the sun
+  from above;
+- **side faces** (soil near the top of a step, stone on tall cliffs), normals
+  along ±x and ±z, lit or in shadow depending on which way they face the sun.
+
+For a slope with gradient (*g*ₓ, *g*_z) in blocks per block, every unit of
+ground carries one unit of top area and |*g*ₓ| and |*g*_z| units of side area.
+How much of each is visible depends on the view direction. The fragment shader
+knows the gradient (from the patch's heights), the view direction, the sun, and
+the materials, so it computes the **area-weighted, visibility-weighted mix of
+the faces the blocks really have**. A gentle hill comes out mostly grass. A
+cliff comes out stone-grey with its sunlit side brighter than its shaded side,
+and it reads as a cliff made of blocks rather than a smooth grey slope. This is
+what makes the distance look like blocks without a block being drawn.
+
+The CPU brute-force check in 3.1 is what keeps this honest: generate the actual
+staircase, render its faces' areas and lighting by counting, and compare.
+
+### 3.4 Joining the two
+
+- The far terrain starts where the voxel rings end. It is drawn after the voxels
+  with a depth test, and discards anything inside the voxel region, so the two
+  never draw the same ground.
+- At the join, a block is about 1 px wide at 1080p (§2B). At 4K it is about
+  2 px, so the join is slightly visible there. The join distance can be made to
+  follow the resolution.
+- It needs one new pipeline, built in `scene.rs` like every other one, inside
+  the one `encode_scene`. The window, the bench and the screenshot keep sharing
+  that single path, so Rule 5 and `check-single-render-path.sh` hold as they
+  are.
+- **The far plane becomes infinite** (free with reverse-Z), and **fog becomes
+  haze**: an atmosphere tens of kilometres thick rather than a wall hiding an
+  edge. The owner sets its strength by looking at it.
+
+### 3.5 What this does not solve, on purpose
+
+- **The band between 160 m and 1 km.** Its cells are 13–16 px wide today (§2A),
+  and making them pixel-exact costs six times the geometry and the gate (§2C).
+  Options for later, each to be judged from images: (a) leave it as it is; (b)
+  keep coarse geometry but give the tops of coarse cells the colours of their
+  actual blocks, so only the silhouette is coarse; (c) bring the far terrain
+  closer, which smooths blocks that are still 2–4 px wide. That choice is the
+  owner's, once F3 gives images to judge from.
+- **Caves, overhangs and trees beyond 1 km.** Caves and overhangs are not in a
+  height field. A 10-block cave mouth at 1 km is about 10 px, so a dark spot in
+  the material summary may be worth adding. Forests could be a darker, bumpier
+  green in the material summary. Both are for F6, if the images call for them.
+- **Your builds in the distance.** They show only in the voxel region, as they
+  do today.
+- **Travelling hundreds of kilometres.** Seeing 262 km needs nothing more.
+  Standing 262 km from the origin needs camera-relative rendering, because
+  `f32` positions jitter at that distance. That is separate work.
+- **The world is flat.** Nothing curves away. Past a point, how far you see
+  depends on what the land hides, not on the curvature of the world.
 
 ## §4 The admission rule
 
-- **(a) What it deepens.** The LOD tree (§6) gains the one property it lacks,
-  height at a distance. Mountain ranges (#259) and the unlimited height of the
-  world (#175) get a reason to be climbed, because the view is the reward. Flight
-  in creative mode stops being a flight over nothing.
+- **(a) What it deepens.** The worldgen: mountain ranges (#259) and the unlimited
+  height of the world (#175) become things you see from far away and navigate
+  by. Climbing and flying in creative mode now show you something. The generator
+  gets a second consumer, which uses the same pure function.
 - **(b) What it makes possible.** Finding your way by landmarks. Seeing the range
   you will walk to next. Building high in order to look out.
-- **(c) What it replaces.** The volumetric far node from the switch level
-  outwards (the thing table B shows failing) is *replaced*, not joined by
-  something new. The
-  fog that hides the edge, the `FAR_PLANE` constant and the 1,024-block cap on
-  the rings all go. So does the `--bench 64` orbit as the gate, which the owner
-  has already decided (above).
+- **(c) What it replaces.** The edge of the world: the fog wall, `FAR_PLANE`, and
+  the 1,024-block limit on what exists visually. It also replaces `--bench 64`'s
+  orbit as the gate (the owner's decision, above). The ring extension of §2A,
+  the obvious approach, is rejected rather than added alongside.
 
-## §5 Decisions for the owner
+## §5 Decisions left for the owner
 
-1. **How far?** 262 km (level 11), or about 1,000 km (level 13)?
-   *Recommendation: 262 km first, measured on both machines; then decide
-   whether to go further.*
-2. **What do distant mountains look like?** Blocky columns, the same visual
-   language the near field uses? Or smooth slopes in the distance?
-   *Recommendation: blocky, one look for the whole world. Past a few kilometres
-   a column is a pixel or less and the difference disappears anyway.*
-3. **How strong is the haze?** It is a matter of taste, and the owner decides
-   it by looking at it.
-   *Recommendation: build it with a single tunable distance and decide by
-   looking at golden images.*
-4. **What exactly does the gate measure?** The owner said *measure what you
-   see*. Concretely: three fixed first-person eyes (ground y = 40, hill y = 300,
-   flight y = 3,000) at the full view distance, each at 1,000 FPS or more on both
-   machines.
-   *Recommendation: those three eyes. They are the three rows of table A, so the
-   gate starts from numbers that already exist.*
+1. **The haze.** How thick, judged from golden images.
+2. **The band between 160 m and 1 km** (3.5), judged from F3's images.
+
+Both come with images, not questions in the abstract.
 
 ## §6 Plan, in order
 
 | # | Block | Why here |
 |---|---|---|
-| **F1** | **The gate first.** `--bench` measures the three eyes at the full view distance; `check-phase-gate.sh` uses it. It is recorded red or green before anything is built. | The same order as phase 1's block 1.0: measure the target before building toward it. |
-| **F2** | Far plane infinite, rings extended to the chosen level (volume, as measured) | The edge is gone, but past 8 km the land is the flat plane table B describes. F2 is kept only if F3 follows directly; on its own it is not an improvement to ship. |
-| **F3** | **Surface nodes from the switch level outwards** (§3.1) | The core. Pinned by the golden image and the unit test below. |
-| **F4** | Haze replaces the fog that hides the edge | What makes distance readable. Tuned by the owner, from images. |
-| **F5** | Whatever F1–F4's measurements say is still missing | For example, distant grass/soil/stone stripes aliasing into noise, if F3 does not already calm them. Written from a profile, as block 1.11 was. |
+| **F1** | **The gate first.** `--bench` gains the three eyes, and `check-phase-gate.sh` uses them. They are recorded on both machines before anything is built. | The same order as phase 1's block 1.0: measure the target first. The eyes' view distance grows with F3, and the gate grows with it. |
+| **F2** | **The criterion as tests.** The projected-cell-size function, with a test that today's rings fail it at 13–16 px, which proves the test can fail. Plus the brute-force staircase reference for 3.3. | So F3 and F4 are built against a check rather than a screenshot. |
+| **F3** | **Far terrain, plain-shaded.** The CDLOD patches, geomorphing, prefiltered heights, the infinite far plane, and the join at 1 km. | The core. Golden images at the three eyes, before and after. |
+| **F4** | **Block-aggregate shading** (3.3) | What makes it look like blocks. |
+| **F5** | **Haze** replaces the fog that hides the edge | Tuned by the owner from images. |
+| **F6** | Whatever F1–F5's measurements and images say is still missing | For example the 160 m – 1 km band, cave mouths, or forests. Written from evidence, as block 1.11 was. |
 
-**Windows numbers are needed at F1 and at F3** (the gate runs on both
-machines). That is when the Windows laptop has to be on.
+**The Windows laptop is needed at F1 and F3**: the gate runs on both machines.
 
 ## §7 How it is checked
 
-- **A unit test from the probe.** At every level from the switch outwards, the
-  drawn tops of both of the probe's columns are within one vertex step of their
-  true heights. It fails today at every level from 4 upward (table B), so it
-  cannot pass without the fix.
-- **A golden image:** a peak 30 km away, seen from a hill, keeps its silhouette.
-  It is taken before F3 and after, and both images go in the PR.
-- **The ring tests** (`node.rs`: every chunk is covered exactly once, and
-  neighbours differ by at most one level) are level-agnostic. Extending the
-  schedule re-runs them.
-- **A `BENCHMARKS.md` row per eye**, with vertex-arena occupancy. At 65% at
-  ground level, the arena, and no longer the node budget, is the constraint to
-  watch.
+- **Geometric error:** a unit test that every drawn far-terrain quad projects to
+  at most *k* px from each gate eye. It is a pure function, with no GPU.
+- **Colour:** a unit test that aggregate shading matches brute-force block
+  counting, within a tolerance, over a grid of slopes, view directions and sun
+  directions.
+- **Silhouette:** the probe's peak and plain, drawn by the far terrain within
+  one pixel of their true height at every distance. Today's rings fail this
+  from 1 km (§2A), so it is a test that can fail.
+- **Golden images** at the three gate eyes, looked at by the owner before
+  they are committed.
+- **A `BENCHMARKS.md` row per gate eye.**
+
+## §8 Sources
+
+- F. Strugar, *Continuous Distance-Dependent Level of Detail for Rendering
+  Heightmaps*, JGT 2010 ([pdf](https://aggrobird.com/files/cdlod_latest.pdf)):
+  the quadtree, the distance-based split, and geomorphing without skirts.
+- A. Tevs, I. Ihrke, H.-P. Seidel, *Maximum mipmaps for fast, accurate, and
+  scalable dynamic height field rendering*, I3D 2008
+  ([ACM](https://dl.acm.org/doi/10.1145/1342250.1342279)). Ray-casting a height
+  field is the alternative. It gives exact blocks at every distance, at a cost
+  per pixel. It was not chosen because that cost lands on a 1 ms frame budget,
+  and point-sampling sub-pixel blocks needs filtering anyway, which gives back
+  what 3.3 already does.
+- Voxel-game LOD mods (Distant Horizons, Voxy) render simplified voxel geometry
+  far away. That is the approach of §2A, and its cells are the rectangles the
+  owner rejected.
