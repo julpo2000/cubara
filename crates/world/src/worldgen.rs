@@ -830,6 +830,19 @@ impl WorldGen {
         self.density_at(x, y, z, surface, step) > 0.0
     }
 
+    /// The lowest and highest value [`surface_height`](Self::surface_height)
+    /// can return, from the constants that shape it: `base ± amplitude` for
+    /// the rolling land (fbm is normalised into [-1, 1]), and the mountains
+    /// only ever add, up to `uplift + peak`. What a far-terrain patch whose
+    /// heights are not generated yet is assumed to span (`crate::far`).
+    pub fn surface_range() -> (i32, i32) {
+        let amplitude = TERRAIN_AMPLITUDE.ceil() as i32;
+        (
+            TERRAIN_BASE_HEIGHT - amplitude,
+            TERRAIN_BASE_HEIGHT + amplitude + (MOUNTAIN_UPLIFT + MOUNTAIN_PEAK).ceil() as i32,
+        )
+    }
+
     /// No block the generator places is ever higher than this: the tallest
     /// surface the height field can produce, plus the tallest tree on it.
     ///
@@ -958,6 +971,31 @@ mod tests {
 
     /// `World::new`'s seed: the one a player gets.
     const DEFAULT_TEST_SEED: u64 = 0x005E_ED00_00C0_FFEE;
+
+    /// `surface_range` is what the far terrain trusts before it has generated
+    /// anything (`crate::far`), so a surface outside it would be a patch
+    /// culled or split on the wrong distance.
+    #[test]
+    fn the_surface_stays_inside_its_range() {
+        let gen = WorldGen::new(DEFAULT_TEST_SEED);
+        let (lo, hi) = WorldGen::surface_range();
+        let (mut seen_lo, mut seen_hi) = (i32::MAX, i32::MIN);
+        for x in (-20_000..20_000).step_by(97) {
+            for z in (-20_000..20_000).step_by(89) {
+                let h = gen.surface_height(x, z);
+                assert!(
+                    (lo..=hi).contains(&h),
+                    "{h} at ({x}, {z}) outside {lo}..={hi}"
+                );
+                seen_lo = seen_lo.min(h);
+                seen_hi = seen_hi.max(h);
+            }
+        }
+        // And the range is not so loose it means nothing: the sample reaches
+        // well into both ends of it.
+        assert!(seen_hi > hi - 60, "highest seen {seen_hi}, range to {hi}");
+        assert!(seen_lo < lo + 10, "lowest seen {seen_lo}, range from {lo}");
+    }
 
     fn test_blocks() -> TerrainBlocks {
         TerrainBlocks {
