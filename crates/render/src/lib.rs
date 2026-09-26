@@ -15,6 +15,7 @@
 mod arena;
 pub mod crack;
 pub mod culling;
+pub mod far;
 pub mod figure;
 mod gpu_timer;
 pub mod headless;
@@ -27,6 +28,7 @@ mod text;
 
 pub use arena::{ArenaUsage, ChunkArena, MeshedNode, NodeId};
 pub use culling::{Aabb, Frustum};
+pub use far::{FarParams, FarPatch, FarSlot, FarTerrain, FAR_QUADS, FAR_VERTS};
 pub use figure::{figure_vertices, FigureVertex, PlayerView};
 pub use gpu_timer::TimestampRing;
 pub use headless::{Frame, PanelLayout, Shot};

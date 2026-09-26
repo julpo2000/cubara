@@ -686,6 +686,7 @@ pub fn run(
                 selected_block: None,
                 cracking: None,
                 players: &[],
+                far: None,
                 overlay: overlay_text.as_deref(),
                 health: None,
                 hotbar: None,

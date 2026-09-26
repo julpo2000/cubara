@@ -329,7 +329,41 @@ fn finer_gap(gen: &WorldGen, heights: &[f32], ox: i64, oz: i64, q: i64) -> (f32,
     (gaps[gaps.len() - 1], gaps[gaps.len() * 9 / 10])
 }
 
+/// Everything a one-shot caller needs -- a screenshot, the bench, a golden
+/// test: select, generate what is new, select again, until nothing new is
+/// asked for. The patches drawn, in [`select`]'s order.
+///
+/// On one thread. A live game streams instead, spreading the same loop over
+/// frames and workers; a one-shot caller has one frame to be right in.
+pub fn build(gen: &WorldGen, view: &FarView) -> Vec<PatchHeights> {
+    let mut have: std::collections::HashMap<PatchKey, PatchHeights> =
+        std::collections::HashMap::new();
+    loop {
+        let keys = select(view, |k| have.get(&k).map(|p| p.error));
+        let new: Vec<PatchKey> = keys
+            .iter()
+            .copied()
+            .filter(|k| !have.contains_key(k))
+            .collect();
+        if new.is_empty() {
+            return keys.iter().filter_map(|k| have.remove(k)).collect();
+        }
+        for k in new {
+            have.insert(k, generate(gen, k));
+        }
+    }
+}
+
 impl PatchHeights {
+    /// How far the patch's skirt drops below its edge, in blocks: enough to
+    /// cover the gap to a neighbour two levels coarser (a split for roughness
+    /// can put one there), whose edge is a straight line across four of this
+    /// patch's quads -- a slope of one block per block opens at most that --
+    /// plus this patch's own worst gap to its finer self.
+    pub fn skirt(&self) -> f32 {
+        4.0 * self.key.quad() as f32 + self.error_max
+    }
+
     /// The drawn surface at block column `(x, z)`: the bilinear blend of the
     /// four vertices around it, which is what the rasterizer draws between
     /// them (to within the diagonal each quad is split along).
@@ -574,6 +608,41 @@ pub(crate) mod tests {
             }
             assert_eq!(patch.heights.len(), (PATCH_QUADS + 1) * (PATCH_QUADS + 1));
         }
+    }
+
+    /// `error_max` is the worst gap, found independently: at every quad
+    /// centre and edge midpoint, the finer footprint's mean against this
+    /// patch's blend. The skirt is sized from it, so a smaller number here is
+    /// a seam that opens on the roughest edge.
+    #[test]
+    fn error_max_is_the_worst_gap_there_is() {
+        let gen = WorldGen::new(SEED);
+        // A patch in the mountains, where the gaps are uneven.
+        let key = PatchKey::containing(5, -848, 4832);
+        let p = generate(&gen, key);
+        let [ox, oz] = key.origin();
+        let q = key.quad();
+        let h = |i: usize, j: usize| p.heights[j * PATCH_VERTS + i];
+        let mut worst = 0f32;
+        for j in 0..PATCH_QUADS {
+            for i in 0..PATCH_QUADS {
+                let (x, z) = (ox + i as i64 * q, oz + j as i64 * q);
+                let centre = (h(i, j) + h(i + 1, j) + h(i, j + 1) + h(i + 1, j + 1)) / 4.0;
+                for (fx, fz, blend) in [
+                    (x + q / 2, z, (h(i, j) + h(i + 1, j)) / 2.0),
+                    (x, z + q / 2, (h(i, j) + h(i, j + 1)) / 2.0),
+                    (x + q / 2, z + q / 2, centre),
+                ] {
+                    worst = worst.max((footprint_mean(&gen, fx, fz, q / 2) - blend).abs());
+                }
+            }
+        }
+        assert!(
+            worst > 1.0,
+            "a mountain patch with no gap to speak of: {worst}"
+        );
+        assert_eq!(p.error_max, worst);
+        assert!(p.error <= p.error_max);
     }
 
     /// Two patches side by side share an edge, and must agree on it height

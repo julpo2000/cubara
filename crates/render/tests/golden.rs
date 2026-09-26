@@ -203,7 +203,12 @@ fn save_png(path: &Path, w: u32, h: u32, pixels: &[u8]) {
 
 /// Render `shot` and compare against `tests/golden/<name>.png`.
 fn assert_golden(name: &str, world: &World, shot: Shot) {
-    let Some(frame) = render_world(world, shot) else {
+    assert_frame_golden(name, render_world(world, shot));
+}
+
+/// [`assert_golden`] for a frame already rendered.
+fn assert_frame_golden(name: &str, frame: Option<Frame>) {
+    let Some(frame) = frame else {
         // No adapter (a GPU-less CI runner). Skipping is honest here — the
         // alternative is a red build that says nothing about the code — but it is
         // reported loudly so a silently-never-running test is noticeable.
@@ -1339,4 +1344,116 @@ fn three_players_stand_in_front_of_the_camera() {
         lighting: Lighting::default(),
     };
     assert_golden("three_players", &world, shot);
+}
+
+/// The far terrain's patches around `eye`, reaching `radius` blocks, with the
+/// region [`render_world`] draws as voxels left to it: chunks `-r..=r` across,
+/// the three chunk-layers `0..=2` up.
+fn far_terrain(
+    world: &World,
+    eye: glam::Vec3,
+    region_radius: i32,
+    shot: &Shot,
+    radius: f64,
+) -> Vec<cubara_world::far::PatchHeights> {
+    use cubara_world::far::{build, split_ratio_for, FarView, Hole};
+    let fov = std::f64::consts::FRAC_PI_3;
+    let pixel = fov / shot.height as f64;
+    let edge = (region_radius * 16) as f64;
+    let view = FarView {
+        eye: [eye.x as f64, eye.y as f64, eye.z as f64],
+        split_ratio: split_ratio_for(16.0, shot.height as f64, fov),
+        max_error: pixel,
+        min_quad: 2.0 * pixel,
+        radius,
+        hole: Some(Hole {
+            min: [-edge, 0.0, -edge],
+            max: [edge + 16.0, 48.0, edge + 16.0],
+        }),
+    };
+    build(&cubara_world::WorldGen::new(world.seed()), &view)
+}
+
+fn render_world_with_far(
+    world: &World,
+    shot: Shot,
+    far: &[cubara_world::far::PatchHeights],
+) -> Option<Frame> {
+    use cubara_render::far::{FarParams, FarPatch};
+    let registry = real_registry();
+    let layers = TextureLayers::from_registry(&registry);
+    let layer_of = |name: &str| layers.layer_of(name);
+    let schedule = schedule_for_radius(shot.region_radius);
+    let meshed = mesh_region(
+        world,
+        &registry,
+        &layer_of,
+        ChunkCoord::new(0, 0, 0),
+        0..=2,
+        &schedule,
+        real_blocks(),
+    )
+    .into_iter()
+    .filter_map(|built| {
+        let geometry = built.geometry?;
+        Some(MeshedNode {
+            id: NodeId {
+                level: built.node.level,
+                pos: built.node.pos,
+            },
+            origin: geometry.origin,
+            scale: geometry.scale,
+            mesh: geometry.mesh,
+            aabb: geometry.aabb,
+        })
+    });
+    let patches: Vec<FarPatch> = far
+        .iter()
+        .map(|p| {
+            let [ox, oz] = p.key.origin();
+            FarPatch {
+                origin: [ox as f32, oz as f32],
+                quad: p.key.quad() as f32,
+                heights: &p.heights,
+                skirt: p.skirt(),
+            }
+        })
+        .collect();
+    let edge = (shot.region_radius * 16) as f32;
+    let params = FarParams {
+        hole: Some(([-edge, 0.0, -edge], [edge + 16.0, 48.0, edge + 16.0])),
+        top_color: cubara_render::materials::mean_color("grass_top").expect("grass_top.png"),
+    };
+    let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+    headless::render_with_far(meshed, &patches, Some(params), shot)
+}
+
+/// **The far terrain** (`docs/PROPOSAL_FAR_VIEW.md`, block F3b): past a small
+/// voxel region, the land goes on to the horizon -- as a height field, plain
+/// shaded, and without the flat plane the voxel LOD collapsed into (the
+/// proposal's table B).
+#[test]
+fn the_far_terrain_reaches_the_horizon() {
+    let world = World::new();
+    let eye = glam::Vec3::new(8.0, 120.0, 8.0);
+    let shot = Shot {
+        region_radius: 4,
+        camera: Some((eye, glam::Vec3::new(1.0, -0.12, 0.35))),
+        ..Shot::default()
+    };
+    let far = far_terrain(&world, eye, shot.region_radius, &shot, 20_000.0);
+    assert!(far.len() > 50, "only {} patches", far.len());
+    let with = render_world_with_far(&world, shot.clone(), &far);
+    // A golden of an empty sky would pass against itself forever. The same
+    // shot without the far terrain must look substantially different: that
+    // is the far terrain being drawn at all.
+    if let (Some(with), Some(without)) = (with.as_ref(), render_world(&world, shot.clone())) {
+        let diff = headless::compare(&with.pixels, &without.pixels, TOLERANCE);
+        assert!(
+            diff.differing_fraction > 0.2,
+            "the far terrain changed only {:.1}% of the image",
+            diff.differing_fraction * 100.0
+        );
+    }
+    assert_frame_golden("far_terrain_to_the_horizon", with);
 }

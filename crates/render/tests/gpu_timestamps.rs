@@ -123,6 +123,7 @@ fn gpu_timestamps_through_encode_scene_produce_a_real_reading() {
             selected_block: None,
             cracking: None,
             players: &[],
+            far: None,
             overlay: None,
             hotbar: None,
             panel: None,
