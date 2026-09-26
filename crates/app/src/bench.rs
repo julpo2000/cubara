@@ -369,6 +369,16 @@ fn gpu_stats_are_trustworthy(valid: usize, invalid: u64) -> bool {
     valid > 0 && valid as u64 >= invalid
 }
 
+/// What one [`run`] found.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Outcome {
+    /// It drew something, at this sustained frame rate.
+    Measured { fps: f64 },
+    /// There was nothing in view to draw -- no `SUMMARY` line, because the
+    /// frame rate of an empty scene would pass any gate and mean nothing.
+    NothingInView,
+}
+
 pub fn run(
     radius: i32,
     (width, height): (u32, u32),
@@ -376,7 +386,7 @@ pub fn run(
     overlay: bool,
     gpu_timing_mode: GpuTimingMode,
     fog: bool,
-) {
+) -> Outcome {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -508,11 +518,12 @@ pub fn run(
             .filter_map(to_meshed_node),
     );
     let total_nodes = arena.len();
-    // A scene with nothing in it renders very fast, and would pass the gate.
-    assert!(
-        total_nodes > 0,
-        "the bench scene drew nothing -- the measurement would mean nothing"
-    );
+    // A scene with nothing in it renders very fast, and would pass the gate --
+    // so it is reported as what it is, and never gets a SUMMARY line.
+    if total_nodes == 0 {
+        log::warn!("the bench scene drew nothing -- nothing in view, no measurement");
+        return Outcome::NothingInView;
+    }
     // Nor would a scene the arena could not hold: it skips what does not fit,
     // and the frame rate of a world with holes in it is not the one asked for.
     let full = arena.usage().exhausted();
@@ -796,7 +807,7 @@ pub fn run(
         triangles_sum as f64 / MEASURE_FRAMES as f64
     );
 
-    report(
+    let fps = report(
         MEASURE_FRAMES,
         wall_secs,
         cpu_ms,
@@ -807,6 +818,70 @@ pub fn run(
         avg_visible,
         total_nodes,
     );
+    Outcome::Measured { fps }
+}
+
+/// One of the gate's fixed first-person eyes (`ROADMAP.md`, recorded
+/// 2026-09-26: the 1000-FPS criterion measures what the player sees).
+#[derive(Clone, Copy, Debug)]
+pub struct GateEye {
+    pub name: &'static str,
+    pub eye: [f32; 3],
+    /// Whether an empty view from here fails the gate. `false` only where the
+    /// game is known not to draw anything yet, so the gate says so rather than
+    /// failing phases that were closed before the owner asked for it.
+    pub must_see: bool,
+}
+
+/// The owner's three eyes: on the ground, on a hill, and in flight -- each
+/// at the full view distance, each at 1,000 FPS or more.
+pub const GATE_EYES: [GateEye; 3] = [
+    GateEye {
+        name: "ground",
+        eye: [8.0, 40.0, 8.0],
+        must_see: true,
+    },
+    GateEye {
+        name: "hill",
+        eye: [8.0, 300.0, 8.0],
+        must_see: true,
+    },
+    // From 3 km up nothing is drawn today: the view reaches 512 blocks
+    // vertically (`docs/PROPOSAL_FAR_VIEW.md` §1). The far terrain (block F3)
+    // is what gives this eye something to see, and it turns `must_see` on.
+    GateEye {
+        name: "flight",
+        eye: [8.0, 3000.0, 8.0],
+        must_see: false,
+    },
+];
+
+/// The gate's answer over its eyes: whether it is met, and one line saying
+/// what each eye measured.
+///
+/// Every eye that drew something must reach 1,000 FPS. An eye with nothing in
+/// view fails when it `must_see`, and is reported, not counted, when it does
+/// not.
+pub fn gate_verdict(results: &[(GateEye, Outcome)]) -> (bool, String) {
+    let mut met = true;
+    let parts: Vec<String> = results
+        .iter()
+        .map(|(eye, outcome)| match *outcome {
+            Outcome::Measured { fps } => {
+                if fps < 1000.0 {
+                    met = false;
+                }
+                format!("{} {fps:.0} FPS", eye.name)
+            }
+            Outcome::NothingInView if eye.must_see => {
+                met = false;
+                format!("{} nothing in view (must see something)", eye.name)
+            }
+            Outcome::NothingInView => format!("{} nothing in view yet", eye.name),
+        })
+        .collect();
+    let tag = if met { "MET" } else { "NOT MET" };
+    (met, format!("GATE: {tag} | {}", parts.join(" | ")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -820,7 +895,7 @@ fn report(
     avg_draws: f64,
     avg_visible: f64,
     total_nodes: usize,
-) {
+) -> f64 {
     let throughput = frames as f64 / wall_secs;
 
     cpu_ms.sort_by(|a, b| a.partial_cmp(b).expect("no NaN frame times"));
@@ -898,6 +973,7 @@ fn report(
          {gpu_summary} | {avg_draws:.0} draws ({avg_visible:.0}/{total_nodes} nodes) | \
          1000-FPS gate {gate}"
     );
+    throughput
 }
 
 /// Peak resident set size since process start, in MiB -- `VmHWM` from
@@ -948,6 +1024,69 @@ pub fn parse_eye(text: &str) -> Option<[f32; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn eye(name: &'static str, must_see: bool) -> GateEye {
+        GateEye {
+            name,
+            eye: [0.0; 3],
+            must_see,
+        }
+    }
+
+    fn at(fps: f64) -> Outcome {
+        Outcome::Measured { fps }
+    }
+
+    #[test]
+    fn the_gate_is_met_only_when_every_measured_eye_reaches_1000() {
+        let (a, b) = (eye("ground", true), eye("hill", true));
+        let (met, line) = gate_verdict(&[(a, at(3482.0)), (b, at(3203.0))]);
+        assert!(met, "{line}");
+        assert_eq!(line, "GATE: MET | ground 3482 FPS | hill 3203 FPS");
+
+        let (met, line) = gate_verdict(&[(a, at(3482.0)), (b, at(999.0))]);
+        assert!(!met, "one eye under 1000 passed: {line}");
+        assert!(line.starts_with("GATE: NOT MET"), "{line}");
+        // Exactly 1000 is the gate, not under it.
+        assert!(gate_verdict(&[(a, at(1000.0))]).0);
+    }
+
+    #[test]
+    fn an_empty_view_fails_where_something_must_be_seen() {
+        let (met, line) = gate_verdict(&[(eye("ground", true), Outcome::NothingInView)]);
+        assert!(!met, "an eye that must see drew nothing and passed: {line}");
+    }
+
+    #[test]
+    fn an_empty_view_is_reported_not_counted_where_nothing_is_drawn_yet() {
+        let flight = eye("flight", false);
+        let (met, line) = gate_verdict(&[
+            (eye("ground", true), at(2000.0)),
+            (flight, Outcome::NothingInView),
+        ]);
+        assert!(met, "{line}");
+        assert!(line.contains("flight nothing in view yet"), "{line}");
+        // But once it draws something, it is held to the same 1000.
+        assert!(!gate_verdict(&[(flight, at(500.0))]).0);
+    }
+
+    /// The flight eye is the one the far terrain (block F3) exists for. When
+    /// that lands, this test is the reminder to hold it to the gate.
+    #[test]
+    fn the_gate_eyes_are_the_owners_three() {
+        let names: Vec<_> = GATE_EYES
+            .iter()
+            .map(|e| (e.name, e.eye[1], e.must_see))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("ground", 40.0, true),
+                ("hill", 300.0, true),
+                ("flight", 3000.0, false)
+            ]
+        );
+    }
 
     #[test]
     fn each_slots_timestamp_indices_are_adjacent_and_slots_never_overlap() {

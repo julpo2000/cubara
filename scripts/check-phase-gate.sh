@@ -38,6 +38,32 @@ run() {
     fi
 }
 
+# perf_gate <label> -- the 1000-FPS criterion. Since 2026-09-26 it measures
+# what the player sees: the owner's three first-person eyes (ground, hill,
+# flight) at the game's own view distance, each at 1000 FPS or more --
+# `--bench gate`, whose GATE line is parsed rather than its exit code trusted,
+# so a crash with no GATE line is a FAIL with the output shown, not a PASS.
+perf_gate() {
+    local label="$1" bench_out line
+    bench_out=$(cargo run --release -- --bench gate 2>&1 || true)
+    line=$(printf '%s\n' "$bench_out" | grep -oE 'GATE: .*' | tail -1)
+    case "$line" in
+        "GATE: MET "*)
+            echo "PASS  $label (${line#GATE: MET | })"
+            pass=$((pass + 1))
+            ;;
+        "GATE: NOT MET "*)
+            echo "FAIL  $label (${line#GATE: NOT MET | })"
+            fail=$((fail + 1))
+            ;;
+        *)
+            echo "FAIL  $label (no GATE line -- see output below)"
+            printf '%s\n' "$bench_out" | tail -20 | sed 's/^/      /'
+            fail=$((fail + 1))
+            ;;
+    esac
+}
+
 # not_implemented <label> -- always FAIL, explicitly, for a criterion whose test
 # does not exist in the repo yet.
 not_implemented() {
@@ -67,16 +93,7 @@ if [ "$phase" = "2" ]; then
     run "architecture rules (check-architecture.sh)" ./scripts/check-architecture.sh
     run "single render path (check-single-render-path.sh)" ./scripts/check-single-render-path.sh
 
-    bench_out=$(cargo run --release -- --bench 64 2>&1)
-    summary=$(printf '%s\n' "$bench_out" | grep 'SUMMARY:' | tail -1)
-    fps=$(printf '%s\n' "$summary" | sed -nE 's/.*SUMMARY: ([0-9]+) FPS.*/\1/p')
-    if [ -n "$fps" ] && [ "$fps" -ge 1000 ]; then
-        echo "PASS  phase 1 perf holds: --bench 64 >= 1000 FPS ($fps FPS)"
-        pass=$((pass + 1))
-    else
-        echo "FAIL  phase 1 perf holds: --bench 64 >= 1000 FPS (measured ${fps:-none})"
-        fail=$((fail + 1))
-    fi
+    perf_gate "phase 1 perf holds"
 
     run "determinism replay still passes single- vs multi-threaded" \
         cargo test -p cubara-sim --test determinism the_fixture_reaches_a_known_hash_regardless_of_worker_count
@@ -159,22 +176,7 @@ run "cargo fmt --all --check" cargo fmt --all --check
 run "architecture rules (check-architecture.sh)" ./scripts/check-architecture.sh
 run "single render path (check-single-render-path.sh)" ./scripts/check-single-render-path.sh
 
-# The perf criterion: parse --bench 64's SUMMARY line rather than trusting its
-# own exit code (bench always exits 0 whether or not the gate FPS was met).
-bench_out=$(cargo run --release -- --bench 64 2>&1)
-summary=$(printf '%s\n' "$bench_out" | grep 'SUMMARY:' | tail -1)
-fps=$(printf '%s\n' "$summary" | sed -nE 's/.*SUMMARY: ([0-9]+) FPS.*/\1/p')
-if [ -n "$fps" ] && [ "$fps" -ge 1000 ]; then
-    echo "PASS  --bench 64 reports >= 1000 FPS sustained ($fps FPS)"
-    pass=$((pass + 1))
-elif [ -n "$fps" ]; then
-    echo "FAIL  --bench 64 reports >= 1000 FPS sustained (measured $fps FPS)"
-    fail=$((fail + 1))
-else
-    echo "FAIL  --bench 64 reports >= 1000 FPS sustained (no SUMMARY line -- see output below)"
-    printf '%s\n' "$bench_out" | tail -20 | sed 's/^/      /'
-    fail=$((fail + 1))
-fi
+perf_gate "1000 FPS at every gate eye"
 
 run "determinism replay test: single- vs multi-threaded, identical world-state hash" \
     cargo test -p cubara-sim --test determinism the_fixture_reaches_a_known_hash_regardless_of_worker_count

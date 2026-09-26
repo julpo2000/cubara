@@ -704,6 +704,26 @@ fn main() {
                 std::process::exit(2);
             }
         };
+        // `--bench gate`: the owner's three eyes at the game's own view
+        // distance, and one GATE line -- what `check-phase-gate.sh` runs.
+        if args.get(i + 1).map(String::as_str) == Some("gate") {
+            let view_radius = streaming::render_radius_chunks();
+            let results: Vec<_> = bench::GATE_EYES
+                .iter()
+                .map(|gate_eye| {
+                    log::info!("gate eye {}: {:?}", gate_eye.name, gate_eye.eye);
+                    let view = bench::View {
+                        eye: Some(gate_eye.eye),
+                        squash: Some(streaming::VERTICAL_LOD_SQUASH),
+                    };
+                    let outcome = bench::run(view_radius, size, view, overlay, gpu_timing, fog);
+                    (*gate_eye, outcome)
+                })
+                .collect();
+            let (met, line) = bench::gate_verdict(&results);
+            log::info!("{line}");
+            std::process::exit(if met { 0 } else { 1 });
+        }
         bench::run(
             radius,
             size,
