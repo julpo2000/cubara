@@ -1747,6 +1747,23 @@ mod far_view_probe {
         around.sort();
         let base = around[around.len() / 2];
         println!("peak at ({px}, {pz}): true top y = {ph}, median ground within 1 km = {base}");
+        // And a column of plain ground, at the median height.
+        let (mut gx, mut gz) = (0, 0);
+        'find: for x in (0..4000).step_by(16) {
+            for z in (0..4000).step_by(16) {
+                if gen.surface_height(x, z) == base {
+                    (gx, gz) = (x, z);
+                    break 'find;
+                }
+            }
+        }
+        for (label, cx, cz, h) in [("plain", gx, gz, base), ("peak", px, pz, ph)] {
+            probe(&gen, blocks, label, cx, cz, h);
+        }
+    }
+
+    fn probe(gen: &WorldGen, blocks: TerrainBlocks, label: &str, px: i32, pz: i32, ph: i32) {
+        println!("{label} at ({px}, {pz}), true top y = {ph}");
         for level in 0..=11u32 {
             let step = 1i32 << level;
             let span = 16 * step;
