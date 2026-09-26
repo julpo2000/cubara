@@ -16,6 +16,7 @@
 mod bench;
 mod caps;
 mod capture;
+mod far_streaming;
 mod game;
 mod screenshot;
 mod streaming;
@@ -80,6 +81,9 @@ struct App {
     /// lifecycle (both created together in `resumed`, since streaming exists
     /// to feed the renderer and needs its own `MeshAssets`).
     streaming: Option<NodeStreaming>,
+    /// The far terrain beyond the voxels (`docs/PROPOSAL_FAR_VIEW.md`), same
+    /// lifecycle as `streaming`.
+    far: Option<far_streaming::FarStreaming>,
     /// A server to join instead of hosting one, from `--connect <addr>`.
     ///
     /// Acted on in `resumed`, not here: joining needs the client's registries,
@@ -311,6 +315,7 @@ impl ApplicationHandler for App {
             &ores,
             move |name: &str| layers.layer_of(name),
         ));
+        self.far = Some(far_streaming::FarStreaming::new(self.game.world().seed()));
         let mut renderer = renderer;
         renderer.set_icons(self.game.item_icons());
         self.renderer = Some(renderer);
@@ -560,6 +565,15 @@ impl ApplicationHandler for App {
                 };
                 let camera = self.game.camera_pose();
                 streaming.update(renderer, self.game.world(), camera.eye.to_array());
+                if let Some(far) = self.far.as_mut() {
+                    // Whatever changed the world -- New World, a load, a join --
+                    // changed its seed, and the far terrain follows the seed.
+                    let seed = self.game.world().seed();
+                    if far.seed() != seed {
+                        far.reset(seed, renderer);
+                    }
+                    far.update(renderer, camera.eye.to_array());
+                }
                 let slots = self.game.hotbar_slots();
                 let hotbar = slots.as_ref().map(|s| HotbarView {
                     slots: s,
@@ -594,7 +608,10 @@ impl ApplicationHandler for App {
                         crosshair: self.cursor_captured && !self.game.inventory_open(),
                         menu: menu.as_deref(),
                     },
-                    streaming::render_radius_blocks(),
+                    // Fog at the far terrain's edge, not the voxels': until the
+                    // haze (`PROPOSAL_FAR_VIEW.md` block F5), that is no fog in
+                    // anything a player can see.
+                    far_streaming::FAR_VIEW_RADIUS as f32,
                 );
                 // Immediately queue the next frame — we render continuously.
                 renderer.window().request_redraw();
@@ -719,6 +736,8 @@ fn main() {
                         let view = bench::View {
                             eye: Some(gate_eye.eye),
                             squash: Some(streaming::VERTICAL_LOD_SQUASH),
+                            // What the player sees includes the far terrain.
+                            far: true,
                         };
                         let outcome = bench::run(view_radius, size, view, overlay, gpu_timing, fog);
                         (*gate_eye, outcome)
@@ -732,7 +751,11 @@ fn main() {
         bench::run(
             radius,
             size,
-            bench::View { eye, squash },
+            bench::View {
+                eye,
+                squash,
+                far: args.iter().any(|a| a == "--far"),
+            },
             overlay,
             gpu_timing,
             fog,

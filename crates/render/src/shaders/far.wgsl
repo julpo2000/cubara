@@ -96,12 +96,27 @@ fn vs_main(
     return out;
 }
 
+// Most patches lie wholly outside the hole, and are drawn with this: no
+// discard, so the GPU may treat them as plain opaque geometry (on a
+// tile-based GPU, a discard turns off hidden-surface removal for the whole
+// pipeline).
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    return shade(in);
+}
+
+// The few patches that cross the hole's edge: the part inside is the voxels'.
+@fragment
+fn fs_cut(in: VertexOut) -> @location(0) vec4<f32> {
     let p = in.world_pos;
     if all(p >= params.hole_min.xyz) && all(p <= params.hole_max.xyz) {
         discard;
     }
+    return shade(in);
+}
+
+fn shade(in: VertexOut) -> vec4<f32> {
+    let p = in.world_pos;
     let n = normalize(in.normal);
     // The terrain's own lighting terms (`mesh.wgsl`): hemispheric ambient and
     // one sun. No ambient occlusion -- open ground from kilometres away has

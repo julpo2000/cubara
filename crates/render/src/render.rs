@@ -34,6 +34,11 @@ const NEAR_PLANE: f32 = 0.1;
 // the camera, where the near plane is, not out here.
 const FAR_PLANE: f32 = 1.0e7;
 
+/// Far-terrain patches the window holds at once. The measured selection at
+/// 262 km is about 1,800 (`crates/world/src/far.rs`'s measurement), plus the
+/// ones kept drawn while their replacements generate: room for twice that.
+const FAR_PATCH_CAPACITY: u32 = 4096;
+
 /// Depth cleared at the *far* plane, since [`reverse_z`] puts it at 0.
 pub const DEPTH_CLEAR: f64 = 0.0;
 
@@ -498,6 +503,10 @@ pub struct Renderer {
 
     /// All resident node geometry in shared buffers, drawn with one indirect submit.
     arena: ChunkArena,
+    /// The far terrain beyond the voxels (`docs/PROPOSAL_FAR_VIEW.md`): its
+    /// patches are the caller's to choose ([`far_insert`](Self::far_insert),
+    /// [`far_remove`](Self::far_remove)); this only culls and draws them.
+    far: crate::far::FarTerrain,
     /// Which node ids are currently meant to be resident (uploaded, or queued
     /// to become so) -- lets [`drain_uploads`](Self::drain_uploads) skip a
     /// queued upload for a node a newer [`apply_node_updates`](Self::apply_node_updates)
@@ -633,6 +642,7 @@ impl Renderer {
         let frustum = Frustum::from_view_proj(camera.view_proj(aspect));
 
         let arena = ChunkArena::new(&device, multi_draw);
+        let far = crate::far::FarTerrain::new(&device, &queue, FAR_PATCH_CAPACITY);
 
         let renderer = Self {
             window,
@@ -643,6 +653,7 @@ impl Renderer {
             scene,
             frustum,
             arena,
+            far,
             desired: HashSet::new(),
             upload_queue: VecDeque::new(),
             last_frame: Instant::now(),
@@ -685,6 +696,26 @@ impl Renderer {
     /// nodes to load/unload is the caller's decision (`ARCHITECTURE.md` §1);
     /// an edit is no different from ordinary streaming from here, just a
     /// single-node update.
+    /// Upload a far-terrain patch; `None` when every slot is taken.
+    pub fn far_insert(&mut self, patch: crate::far::FarPatch<'_>) -> Option<crate::far::FarSlot> {
+        self.far.insert(&self.queue, patch)
+    }
+
+    /// Stop drawing a far-terrain patch and free its slot.
+    pub fn far_remove(&mut self, slot: crate::far::FarSlot) {
+        self.far.remove(slot);
+    }
+
+    /// The far terrain's hole and colour.
+    pub fn set_far_params(&mut self, params: crate::far::FarParams) {
+        self.far.set_params(&self.queue, params);
+    }
+
+    /// Far-terrain patches drawn in the last frame.
+    pub fn far_drawn(&self) -> u32 {
+        self.far.drawn()
+    }
+
     pub fn apply_node_updates(
         &mut self,
         to_unload: impl IntoIterator<Item = NodeId>,
@@ -797,6 +828,7 @@ impl Renderer {
         // CPU frustum-cull + upload the indirect draw list before the pass begins.
         let draw_count = self.arena.prepare(&self.queue, &self.frustum);
         self.visible_chunks = self.arena.visible_nodes() as usize;
+        self.far.prepare(&self.queue, &self.frustum, camera.eye);
 
         let mut encoder = self
             .device
@@ -824,7 +856,7 @@ impl Renderer {
                     selected_block,
                     cracking,
                     players,
-                    far: None,
+                    far: Some(&self.far),
                     overlay: overlay.as_deref(),
                     hotbar,
                     panel,
@@ -1327,14 +1359,17 @@ pub fn far_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
-/// The far terrain's pipeline (`far.wgsl`): no vertex buffer, one instance per
-/// patch, depth-tested against the voxels drawn before it.
+/// The far terrain's pipelines (`far.wgsl`): no vertex buffer, one instance
+/// per patch, depth-tested against the voxels drawn before it. Two, differing
+/// only in the fragment stage: `(whole, cut)`, where `cut` discards whatever
+/// falls inside the voxels' hole and `whole` never discards -- see
+/// `crate::far::FarTerrain::prepare` for which patch gets which.
 pub fn build_far_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
     camera_bgl: &wgpu::BindGroupLayout,
     far_bgl: &wgpu::BindGroupLayout,
-) -> wgpu::RenderPipeline {
+) -> (wgpu::RenderPipeline, wgpu::RenderPipeline) {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("far-shader"),
         source: wgpu::ShaderSource::Wgsl(include_str!("shaders/far.wgsl").into()),
@@ -1344,44 +1379,49 @@ pub fn build_far_pipeline(
         bind_group_layouts: &[Some(camera_bgl), Some(far_bgl)],
         immediate_size: 0,
     });
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("far-pipeline"),
-        layout: Some(&layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            buffers: &[],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs_main"),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            // Skirts face both ways depending on the edge, and the ground can
-            // be seen from under an overhang: nothing is culled by winding.
-            cull_mode: None,
-            ..Default::default()
-        },
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
-            depth_write_enabled: Some(true),
-            // Reversed-Z, like the terrain: greater is nearer.
-            depth_compare: Some(wgpu::CompareFunction::Greater),
-            stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
-        }),
-        multisample: wgpu::MultisampleState::default(),
-        multiview_mask: None,
-        cache: None,
-    })
+    let build = |entry: &str| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(entry),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some(entry),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                // Tops face up and skirts face out (`far.rs`'s grid winds both
+                // counter-clockwise from outside), so what faces away is the
+                // underside of the ground: measured on the M3, +13-28% FPS at
+                // the gate eyes for nothing visible.
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                // Reversed-Z, like the terrain: greater is nearer.
+                depth_compare: Some(wgpu::CompareFunction::Greater),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    (build("fs_main"), build("fs_cut"))
 }
 
 pub fn build_outline_pipeline(

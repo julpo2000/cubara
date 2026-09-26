@@ -282,6 +282,10 @@ pub struct View {
     /// streams with. `None` is the old ±2-layer band, kept so the rows measured
     /// with it can still be compared against (`--band`).
     pub squash: Option<i32>,
+    /// Draw the far terrain beyond the voxels too, as the game does
+    /// (`docs/PROPOSAL_FAR_VIEW.md`). Only with an `eye`: the orbit frames
+    /// the voxel region from outside, which no player's view does.
+    pub far: bool,
 }
 
 /// `--gpu-timing off|auto|on`. Found necessary on Metal: attaching
@@ -536,9 +540,41 @@ pub fn run(
             .filter_map(to_meshed_node),
     );
     let total_nodes = arena.len();
+    // The far terrain beyond the voxels, for the eye the game would draw it
+    // for: every patch its selection settles on, built up front like the
+    // voxel region is.
+    let mut far_terrain = match (view.far, view.eye) {
+        (true, Some(eye)) => {
+            let (min, max) = cubara_world::node::covered_box_3d(center, &schedule);
+            let hole = cubara_world::far::Hole {
+                min: min.map(|c| (c * 16) as f64),
+                max: max.map(|c| (c * 16) as f64),
+            };
+            let building = Instant::now();
+            let view = crate::far_streaming::far_view(eye.map(|v| v as f64), height, Some(hole));
+            let patches =
+                cubara_world::far::build(&cubara_world::WorldGen::new(world.seed()), &view);
+            log::info!(
+                "far terrain: {} patches, built in {:.2} s (single thread)",
+                patches.len(),
+                building.elapsed().as_secs_f64()
+            );
+            let mut terrain =
+                cubara_render::FarTerrain::new(&device, &queue, patches.len().max(1) as u32);
+            for p in &patches {
+                terrain.insert(&queue, crate::far_streaming::to_far_patch(p));
+            }
+            terrain.set_params(
+                &queue,
+                crate::far_streaming::to_far_params(hole, crate::far_streaming::far_top_color()),
+            );
+            Some(terrain)
+        }
+        _ => None,
+    };
     // A scene with nothing in it renders very fast, and would pass the gate --
     // so it is reported as what it is, and never gets a SUMMARY line.
-    if total_nodes == 0 {
+    if total_nodes == 0 && far_terrain.as_ref().is_none_or(|f| f.is_empty()) {
         log::warn!("the bench scene drew nothing -- nothing in view, no measurement");
         return Outcome::NothingInView;
     }
@@ -601,6 +637,7 @@ pub fn run(
     // plane extractions), and excluding them understated what "CPU/frame" claims
     // to measure.
     let submit_frame = |arena: &mut ChunkArena,
+                        far: &mut Option<cubara_render::FarTerrain>,
                         scene: &mut SceneRenderer,
                         vt: f32,
                         gpu_timer: Option<&GpuTimer>,
@@ -633,7 +670,13 @@ pub fn run(
         // noise (15-40% swings, already documented for this scene) buried
         // it. A same-commit flag flip has none of that noise.
         let lighting = if fog {
-            let (fog_start, fog_end) = cubara_render::Lighting::fog_range(view_radius);
+            // With the far terrain, fog belongs at its edge, as in the game.
+            let fog_radius = if far.is_some() {
+                crate::far_streaming::FAR_VIEW_RADIUS as f32
+            } else {
+                view_radius
+            };
+            let (fog_start, fog_end) = cubara_render::Lighting::fog_range(fog_radius);
             cubara_render::Lighting {
                 fog_start,
                 fog_end,
@@ -654,6 +697,9 @@ pub fn run(
 
         // CPU cull + indirect-list upload — the per-frame work we're measuring.
         let draw_count = arena.prepare(&queue, &frustum);
+        if let Some(f) = far.as_mut() {
+            f.prepare(&queue, &frustum, eye);
+        }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("bench-encoder"),
         });
@@ -686,7 +732,7 @@ pub fn run(
                 selected_block: None,
                 cracking: None,
                 players: &[],
-                far: None,
+                far: far.as_ref(),
                 overlay: overlay_text.as_deref(),
                 health: None,
                 hotbar: None,
@@ -715,6 +761,7 @@ pub fn run(
     for _ in 0..WARMUP_FRAMES {
         submit_frame(
             &mut arena,
+            &mut far_terrain,
             &mut scene,
             virtual_t,
             gpu_timer.as_ref(),
@@ -767,11 +814,14 @@ pub fn run(
     let mut draws_sum = 0u64;
     let mut visible_sum = 0u64;
     let mut triangles_sum = 0u64;
+    let mut far_patches_sum = 0u64;
+    let mut far_triangles_sum = 0u64;
     let wall_start = Instant::now();
     for _ in 0..MEASURE_FRAMES {
         cubara_render::Profiler::new_frame();
         let (ms, draws, visible) = submit_frame(
             &mut arena,
+            &mut far_terrain,
             &mut scene,
             virtual_t,
             gpu_timer.as_ref(),
@@ -781,6 +831,10 @@ pub fn run(
         draws_sum += draws as u64;
         visible_sum += visible as u64;
         triangles_sum += arena.visible_triangles();
+        if let Some(f) = far_terrain.as_ref() {
+            far_patches_sum += f.drawn() as u64;
+            far_triangles_sum += f.drawn_triangles();
+        }
         let _ = device.poll(wgpu::PollType::Poll);
         // One slot per frame, round-robin, not all `GPU_TIMER_DEPTH` of them:
         // scanning every slot every frame was measured to slow down
@@ -825,6 +879,13 @@ pub fn run(
         "triangles drawn: avg {:.0} (faces turned away from the camera left out)",
         triangles_sum as f64 / MEASURE_FRAMES as f64
     );
+    if far_terrain.is_some() {
+        log::info!(
+            "far terrain drawn: avg {:.0} patches, {:.0} triangles (skirts included)",
+            far_patches_sum as f64 / MEASURE_FRAMES as f64,
+            far_triangles_sum as f64 / MEASURE_FRAMES as f64
+        );
+    }
 
     let fps = report(
         MEASURE_FRAMES,
@@ -865,13 +926,12 @@ pub const GATE_EYES: [GateEye; 3] = [
         eye: [8.0, 300.0, 8.0],
         must_see: true,
     },
-    // From 3 km up nothing is drawn today: the view reaches 512 blocks
-    // vertically (`docs/PROPOSAL_FAR_VIEW.md` §1). The far terrain (block F3)
-    // is what gives this eye something to see, and it turns `must_see` on.
+    // The voxels reach 1,024 blocks down from here and the ground is further;
+    // the far terrain (`docs/PROPOSAL_FAR_VIEW.md`, F3) is what this eye sees.
     GateEye {
         name: "flight",
         eye: [8.0, 3000.0, 8.0],
-        must_see: false,
+        must_see: true,
     },
 ];
 
@@ -1111,7 +1171,7 @@ mod tests {
             [
                 ("ground", 40.0, true),
                 ("hill", 300.0, true),
-                ("flight", 3000.0, false)
+                ("flight", 3000.0, true)
             ]
         );
     }

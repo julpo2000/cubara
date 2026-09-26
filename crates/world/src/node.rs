@@ -158,6 +158,27 @@ pub fn desired_nodes_3d(center: ChunkCoord, squash: i32, schedule: &RingSchedule
     select_nodes(center, Vertical::Squash(squash.max(1)), schedule)
 }
 
+/// The box of chunks [`desired_nodes_3d`] fills around `center`, as
+/// `(min, max)` with `max` exclusive: every chunk inside is covered by exactly
+/// one node, and nothing outside it is. What the far terrain leaves alone
+/// (`crate::far::Hole`), because the voxel nodes draw it themselves.
+///
+/// Not a cube of the schedule's radius exactly: the coarsest nodes sit on
+/// their own grid, and every one of them within reach is kept whole.
+pub fn covered_box_3d(center: ChunkCoord, schedule: &RingSchedule) -> ([i32; 3], [i32; 3]) {
+    let Some(&(top, radius)) = schedule.last() else {
+        let c = [center.x, center.y, center.z];
+        return (c, c);
+    };
+    let extent = 1i32 << top;
+    let lo = |c: i32| (c - radius).div_euclid(extent) * extent;
+    let hi = |c: i32| ((c + radius).div_euclid(extent) + 1) * extent;
+    (
+        [lo(center.x), lo(center.y), lo(center.z)],
+        [hi(center.x), hi(center.y), hi(center.z)],
+    )
+}
+
 /// How [`select_nodes`] treats the vertical axis.
 enum Vertical {
     /// Only nodes overlapping these chunk-layers, at any height distance.
@@ -430,6 +451,37 @@ mod tests {
     }
 
     /// Which node covers each chunk, for chunks within the band.
+    /// The far terrain's hole is this box, so it must be exactly what the
+    /// nodes cover: a chunk inside it that no node covers is a hole in the
+    /// world, and a node outside it is ground drawn twice.
+    #[test]
+    fn covered_box_3d_is_exactly_what_the_nodes_cover() {
+        let schedule = [(0u32, 3i32), (1, 6), (2, 12)];
+        for centre in [
+            ChunkCoord::new(0, 0, 0),
+            ChunkCoord::new(-5, 3, 9),
+            ChunkCoord::new(13, -7, -2),
+        ] {
+            let nodes = desired_nodes_3d(centre, 2, &schedule);
+            let map = coverage(&nodes);
+            let (min, max) = covered_box_3d(centre, &schedule);
+            for x in min[0]..max[0] {
+                for y in min[1]..max[1] {
+                    for z in min[2]..max[2] {
+                        let n = map.get(&(x, y, z)).map_or(0, Vec::len);
+                        assert_eq!(n, 1, "{centre:?}: chunk ({x}, {y}, {z}) covered {n} times");
+                    }
+                }
+            }
+            let inside = (max[0] - min[0]) * (max[1] - min[1]) * (max[2] - min[2]);
+            assert_eq!(
+                map.len() as i32,
+                inside,
+                "{centre:?}: nodes reach outside the box"
+            );
+        }
+    }
+
     fn coverage(nodes: &[NodeKey]) -> std::collections::HashMap<(i32, i32, i32), Vec<NodeKey>> {
         let mut map: std::collections::HashMap<(i32, i32, i32), Vec<NodeKey>> = Default::default();
         for &n in nodes {

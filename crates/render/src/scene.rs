@@ -239,8 +239,10 @@ pub struct SceneRenderer {
     /// vertex buffer of unit-cube edges uploaded once here.
     figure_pipeline: wgpu::RenderPipeline,
     /// The far terrain's (`far.wgsl`), drawn after the voxels so they win
-    /// wherever both could be.
+    /// wherever both could be: `far_pipeline` for the patches clear of the
+    /// voxels' hole, `far_cut_pipeline` for the few crossing its edge.
     far_pipeline: wgpu::RenderPipeline,
+    far_cut_pipeline: wgpu::RenderPipeline,
     /// Rebuilt every frame from the players in sight, and grown when it has to
     /// be. A figure is 216 vertices, so this stays small enough that reusing
     /// one buffer beats managing per-player ones.
@@ -291,7 +293,7 @@ impl SceneRenderer {
             materials::bind_group(device, &textures_bgl, texture_view, texture_sampler);
 
         let figure_pipeline = build_figure_pipeline(device, format, &camera_bgl);
-        let far_pipeline =
+        let (far_pipeline, far_cut_pipeline) =
             build_far_pipeline(device, format, &camera_bgl, &far_bind_group_layout(device));
         let figure_capacity = crate::figure::VERTICES_PER_FIGURE * 8;
         let figure_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -352,6 +354,7 @@ impl SceneRenderer {
             texture_bind_group,
             figure_pipeline,
             far_pipeline,
+            far_cut_pipeline,
             figure_vertex_buffer,
             figure_capacity,
             outline_pipeline,
@@ -645,9 +648,8 @@ impl SceneRenderer {
             // The far terrain, after the voxels: where both could draw, the
             // depth test and the hole leave it to them.
             if let Some(far) = far.filter(|f| f.drawn() > 0) {
-                pass.set_pipeline(&self.far_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                far.encode(&mut pass);
+                far.encode(&mut pass, &self.far_pipeline, &self.far_cut_pipeline);
             }
 
             // Other players, same pass so a figure behind a hill is behind it.

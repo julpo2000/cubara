@@ -93,6 +93,11 @@ pub struct FarTerrain {
     capacity: u32,
     /// Slots not holding a patch, handed out last-freed first.
     free: Vec<u32>,
+    /// The voxels' hole, from the last [`set_params`](Self::set_params).
+    hole: Option<Aabb>,
+    /// How many of the drawn slots cross the hole's edge, and are drawn first
+    /// with the pipeline that discards inside it.
+    drawn_cut: u32,
     /// Each occupied slot's box, for culling; `None` where the slot is free.
     boxes: Vec<Option<Aabb>>,
     /// How many slots [`prepare`](Self::prepare) found in view.
@@ -180,6 +185,8 @@ impl FarTerrain {
             free: (0..capacity).rev().collect(),
             boxes: vec![None; capacity as usize],
             drawn: 0,
+            hole: None,
+            drawn_cut: 0,
         }
     }
 
@@ -219,18 +226,32 @@ impl FarTerrain {
         }
     }
 
-    pub fn set_params(&self, queue: &wgpu::Queue, params: FarParams) {
+    pub fn set_params(&mut self, queue: &wgpu::Queue, params: FarParams) {
+        self.hole = params.hole.map(|(min, max)| Aabb {
+            min: Vec3::from(min),
+            max: Vec3::from(max),
+        });
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&ParamsGpu::new(params)));
     }
 
     /// Decide what is drawn this frame: every occupied slot whose box the
-    /// frustum can see. Returns how many.
-    pub fn prepare(&mut self, queue: &wgpu::Queue, frustum: &Frustum) -> u32 {
+    /// frustum can see, nearest to `eye` first -- so near ground fills the
+    /// depth buffer before the distant ground it hides is drawn. Returns how
+    /// many.
+    ///
+    /// Patches wholly inside the voxels' hole are not drawn at all; the few
+    /// crossing its edge are drawn first, with the pipeline that discards the
+    /// part inside; everything else after them, with the one that never
+    /// discards.
+    pub fn prepare(&mut self, queue: &wgpu::Queue, frustum: &Frustum, eye: Vec3) -> u32 {
         let visible = visible_slots(&self.boxes, frustum);
-        if !visible.is_empty() {
-            queue.write_buffer(&self.draw_slots, 0, bytemuck::cast_slice(&visible));
+        let (cut, whole) = split_by_hole(&self.boxes, visible, self.hole.as_ref(), eye);
+        let order: Vec<u32> = cut.iter().chain(&whole).copied().collect();
+        if !order.is_empty() {
+            queue.write_buffer(&self.draw_slots, 0, bytemuck::cast_slice(&order));
         }
-        self.drawn = visible.len() as u32;
+        self.drawn_cut = cut.len() as u32;
+        self.drawn = order.len() as u32;
         self.drawn
     }
 
@@ -257,13 +278,28 @@ impl FarTerrain {
         self.drawn as u64 * (self.index_count / 3) as u64
     }
 
-    pub(crate) fn encode(&self, pass: &mut wgpu::RenderPass<'_>) {
+    /// Draw this frame's patches: the ones crossing the hole with `cut`, the
+    /// rest with `whole` (`render.rs`'s `build_far_pipeline`). Bind group 0
+    /// (the camera) is the caller's to set.
+    pub(crate) fn encode(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        whole: &wgpu::RenderPipeline,
+        cut: &wgpu::RenderPipeline,
+    ) {
         if self.drawn == 0 {
             return;
         }
         pass.set_bind_group(1, &self.bind_group, &[]);
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint16);
-        pass.draw_indexed(0..self.index_count, 0, 0..self.drawn);
+        if self.drawn_cut > 0 {
+            pass.set_pipeline(cut);
+            pass.draw_indexed(0..self.index_count, 0, 0..self.drawn_cut);
+        }
+        if self.drawn > self.drawn_cut {
+            pass.set_pipeline(whole);
+            pass.draw_indexed(0..self.index_count, 0, self.drawn_cut..self.drawn);
+        }
     }
 }
 
@@ -294,6 +330,43 @@ fn visible_slots(boxes: &[Option<Aabb>], frustum: &Frustum) -> Vec<u32> {
                 .map(|_| slot as u32)
         })
         .collect()
+}
+
+/// Sort `visible` into the slots crossing the hole's edge and the ones clear
+/// of it, each nearest to `eye` first; slots wholly inside the hole are
+/// dropped.
+fn split_by_hole(
+    boxes: &[Option<Aabb>],
+    visible: Vec<u32>,
+    hole: Option<&Aabb>,
+    eye: Vec3,
+) -> (Vec<u32>, Vec<u32>) {
+    let (mut cut, mut whole) = (Vec::new(), Vec::new());
+    for slot in visible {
+        let b = boxes[slot as usize]
+            .as_ref()
+            .expect("a visible slot is occupied");
+        match hole {
+            Some(h) if contains(h, b) => {}
+            Some(h) if intersects(h, b) => cut.push(slot),
+            _ => whole.push(slot),
+        }
+    }
+    let distance = |slot: &u32| {
+        let b = boxes[*slot as usize].as_ref().expect("occupied");
+        (eye.clamp(b.min, b.max) - eye).length_squared()
+    };
+    cut.sort_by(|a, b| distance(a).total_cmp(&distance(b)));
+    whole.sort_by(|a, b| distance(a).total_cmp(&distance(b)));
+    (cut, whole)
+}
+
+fn contains(outer: &Aabb, inner: &Aabb) -> bool {
+    outer.min.cmple(inner.min).all() && inner.max.cmple(outer.max).all()
+}
+
+fn intersects(a: &Aabb, b: &Aabb) -> bool {
+    a.min.cmplt(b.max).all() && b.min.cmplt(a.max).all()
 }
 
 /// The index list for one patch's [`GRID`] x [`GRID`] vertices: two triangles
@@ -353,6 +426,31 @@ mod tests {
         });
         assert_eq!(b.min, Vec3::new(64.0, 2.0, -128.0));
         assert_eq!(b.max, Vec3::new(64.0 + 128.0, 16.0, 0.0));
+    }
+
+    /// Patches crossing the voxels' hole get the pipeline that discards;
+    /// patches clear of it do not, and patches wholly inside are not drawn.
+    /// Each group nearest first.
+    #[test]
+    fn patches_are_sorted_by_the_hole_and_then_by_distance() {
+        let b = |x: f32| {
+            Some(Aabb {
+                min: Vec3::new(x, 0.0, 0.0),
+                max: Vec3::new(x + 10.0, 10.0, 10.0),
+            })
+        };
+        let hole = Aabb {
+            min: Vec3::new(-100.0, -100.0, -100.0),
+            max: Vec3::new(100.0, 100.0, 100.0),
+        };
+        //           inside  crosses  clear   clear   crosses
+        let boxes = [b(0.0), b(95.0), b(300.0), b(150.0), b(-105.0)];
+        let (cut, whole) = split_by_hole(&boxes, vec![0, 1, 2, 3, 4], Some(&hole), Vec3::ZERO);
+        assert_eq!(cut, vec![1, 4], "crossing ones, nearest first");
+        assert_eq!(whole, vec![3, 2], "clear ones, nearest first");
+        let (cut, whole) = split_by_hole(&boxes, vec![0, 1, 2], None, Vec3::ZERO);
+        assert!(cut.is_empty());
+        assert_eq!(whole, vec![0, 1, 2], "no hole: everything is whole");
     }
 
     #[test]
