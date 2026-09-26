@@ -368,6 +368,49 @@ go in the PR for him to see, and the tests still pin what was chosen.
 
 **The Windows laptop is needed at F1 and F3**: the gate runs on both machines.
 
+## §6b Where F3 stands (2026-09-26)
+
+Built: F3a (patches and heights), F3b (the renderer), F3c (streaming in the
+window, the bench, screenshots). The same two views as table B, now:
+
+![From 300 blocks up: voxels near, the far terrain's mountains to the horizon](img/far-view-f3c-hill.jpg)
+![From 3 km up: land to the horizon instead of a grey plane](img/far-view-f3c-high.jpg)
+
+**The gate is not met on the M3** at the ground and hill eyes. Measured at
+the shipped settings (16 px quads, 2 px bound on each patch's 99th-percentile
+gap, 4 px floor), repeated runs on a warm machine:
+
+| Eye | Without the far terrain | With it (262 km) | Far triangles drawn |
+|---|---|---|---|
+| ground, y = 40 | ~3,100 FPS | **826–873 FPS** | ~720k |
+| hill, y = 300 | ~3,500 FPS | **878–1,105 FPS** | ~730k |
+| flight, y = 3,000 | nothing in view | 1,546–1,634 FPS | ~550k |
+
+The spread on the same code is ±15–20%, which is this machine's thermal state
+(see `BENCHMARKS.md`, "the gate measures a hot machine"). The far terrain
+costs about 0.9 ms a frame on the M3.
+
+Tried, with the measured effect at the gate eyes:
+
+- **Kept:** back-face culling (+13–28%); patches nearest first (+20% at the
+  ground eye); vertices sunk into the hole instead of fragments discarded
+  (+3–12%, and it closes the seam at the join); a 4 px floor for splits
+  (−45% patches, p99 1.80 → 2.72 px).
+- **Dropped, no measurable gain:** a coarser distance rule (32–128 px; the
+  height bound decides the count); terrain horizon culling (8 of 312 patches
+  at the ground eye, because from 12 blocks up the distant band really is
+  visible); skirts only where needed (within noise); normals from screen
+  derivatives (within noise, and it looks worse).
+- **Trades quality:** a 3 px or 4 px bound instead of 2 px (fewer triangles;
+  its FPS effect was inside this machine's noise in single runs).
+
+What is left is the owner's choice (§5): accept a coarser far terrain, accept
+the M3 below 1,000 FPS with it, or have the next piece of work be the
+renderer's cost per triangle. Seen almost edge-on from a low eye, the far
+terrain puts several triangles in each pixel. The fix for that is geometry
+that is coarser along the line of sight than across it, which is a bigger
+change. Windows has not been measured yet.
+
 ## §7 How it is checked
 
 - **Geometric error:** a unit test that every drawn far-terrain quad projects to
