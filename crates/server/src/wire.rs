@@ -422,6 +422,10 @@ impl Effect {
                 out.push(items.grid_width as u8);
                 put_stack(out, items.held);
             }
+            Effect::CommandReply(text) => {
+                out.push(9);
+                put_str(out, text);
+            }
         }
     }
 
@@ -464,6 +468,7 @@ impl Effect {
                 grid_width: c.u8()? as usize,
                 held: get_stack(c)?,
             })),
+            9 => Effect::CommandReply(c.str()?),
             t => return Err(WireError::BadTag(t)),
         })
     }
@@ -900,6 +905,8 @@ mod tests {
             grid_width: 3,
             held: Some(ItemStack::new(ItemId(5), 8, ItemState::None, 64).unwrap()),
         })));
+        round_trip_effect(Effect::CommandReply("seed: 1234 -- ünïcode".to_string()));
+        round_trip_effect(Effect::CommandReply(String::new()));
     }
 
     /// Every field of a correction survives, checked one at a time.
