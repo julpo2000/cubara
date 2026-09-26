@@ -243,3 +243,43 @@ fn a_malformed_tp_is_ignored_rather_than_panicking() {
     s.apply_as(who, Action::Command("nonsense".to_string()));
     assert_eq!(s.sim.player(who).pos, before);
 }
+
+/// New World carries each player's play mode across, one by one: a creative
+/// player lands creative with the loadout again, and a survival player next
+/// to them lands in survival with nothing -- not both made whichever the
+/// first one was.
+#[test]
+fn a_new_world_keeps_each_players_own_play_mode() {
+    let (mut s, builder) = fixture();
+    s.apply_as(builder, Action::SetCreative(true));
+    let walker = s.sim.join(Player::new(
+        FixedVec3::from_blocks(4, SKY, 0),
+        Angle::ZERO,
+        Angle::ZERO,
+    ));
+    s.open_view(walker);
+    let seed = s.world.seed() ^ 0xFEED;
+
+    s.new_world(seed);
+
+    assert_eq!(s.world.seed(), seed);
+    let filled = |s: &Server, who| s.sim.player(who).inventory.slots().flatten().count();
+    assert!(
+        s.sim.player(builder).is_creative(),
+        "creative became survival"
+    );
+    assert!(filled(&s, builder) > 1, "creative with nothing to place");
+    assert!(
+        !s.sim.player(walker).is_creative(),
+        "a survival player was made creative"
+    );
+    assert_eq!(filled(&s, walker), 0, "a survival player was handed blocks");
+    let spawn = s.world_spawn().expect("a spawn");
+    for who in [builder, walker] {
+        assert_eq!(
+            s.sim.player(who).pos,
+            spawn,
+            "{who:?} is not on the new ground"
+        );
+    }
+}
