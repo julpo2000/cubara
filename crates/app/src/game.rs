@@ -177,6 +177,10 @@ pub struct Game {
     /// it's the open trigger), so what's on screen always matches what
     /// `console_submit` will strip and send.
     console: Option<String>,
+    /// The pause menu's New World was pressed once and is waiting for the
+    /// second press that confirms it. Cleared by anything else the menu does,
+    /// and by the menu closing.
+    new_world_armed: bool,
     /// Every smelting recipe, loaded alongside the items they name.
     /// Whether the break button is currently held. Read once per `advance`
     /// into [`InputFrame::breaking`].
@@ -391,6 +395,7 @@ impl Game {
             open_furnace: None,
             pause_open: false,
             console: None,
+            new_world_armed: false,
             breaking: false,
             accumulator: 0.0,
             forward: false,
@@ -1565,6 +1570,7 @@ impl Game {
             return;
         }
         self.pause_open = !self.pause_open;
+        self.new_world_armed = false;
     }
 
     /// Whether the command console is open, and its current text if so
@@ -1582,6 +1588,7 @@ impl Game {
             return;
         }
         self.pause_open = false;
+        self.new_world_armed = false;
         self.console = Some("/".to_string());
     }
 
@@ -1637,8 +1644,101 @@ impl Game {
     /// a round trip to see your own flight mode change would feel exactly as
     /// broken here as it would for the hotbar.
     pub fn set_creative(&mut self, creative: bool) {
+        self.new_world_armed = false;
         self.me.player_mut().set_creative(creative);
         self.act(Action::SetCreative(creative));
+    }
+
+    /// Whether this client runs the world it is in, rather than having joined
+    /// one elsewhere. Only the host can replace the world.
+    pub fn hosting(&self) -> bool {
+        self.host.is_some()
+    }
+
+    /// Whether New World has been pressed once and waits for a second press.
+    pub fn new_world_armed(&self) -> bool {
+        self.new_world_armed
+    }
+
+    /// The pause menu's New World key: the first press asks, the second
+    /// answers. Returns `true` on the press that confirms, and the caller
+    /// then does it -- [`Self::new_world`] needs a seed and a date, which are
+    /// the window's to supply, not the game's.
+    ///
+    /// Two presses because one key replacing the world is one key too easy to
+    /// hit by accident, even with the old world kept. Refused outright on a
+    /// joined client: the world is somebody else's.
+    pub fn press_new_world(&mut self) -> bool {
+        if !self.pause_open || !self.hosting() {
+            self.new_world_armed = false;
+            return false;
+        }
+        if self.new_world_armed {
+            self.new_world_armed = false;
+            return true;
+        }
+        self.new_world_armed = true;
+        false
+    }
+
+    /// Replace the world with a fresh one on `seed`, keeping the old one as
+    /// `saves/world-<label>-<n>` -- see [`Self::new_world_in`].
+    pub fn new_world(&mut self, seed: u64, label: &str) -> Option<std::path::PathBuf> {
+        self.new_world_in(&save_dir(), seed, label)
+    }
+
+    /// [`new_world`](Self::new_world), with the save at `dir`.
+    ///
+    /// **The old world is kept, or nothing happens.** It is saved first, so
+    /// what is kept is what was being played rather than the last `F5`, then
+    /// moved aside to the first free `<dir>-<label>-<n>`. If either step fails
+    /// the world stays exactly as it was: a New World that loses the old one
+    /// is the thing the owner chose against.
+    ///
+    /// The new world is saved straight away, so its seed survives a crash
+    /// before the next save -- without that, the next start would find no
+    /// save and quietly open the default seed instead.
+    ///
+    /// Returns where the old world went, or `None` when nothing changed.
+    pub fn new_world_in(
+        &mut self,
+        dir: &std::path::Path,
+        seed: u64,
+        label: &str,
+    ) -> Option<std::path::PathBuf> {
+        self.new_world_armed = false;
+        if !self.hosting() {
+            return None;
+        }
+        if !self.server().save_to(dir) {
+            log::error!("new world refused: the current one could not be saved");
+            return None;
+        }
+        let kept = match cubara_server::set_aside_as(dir, label) {
+            Ok(kept) => kept,
+            Err(e) => {
+                log::error!("new world refused: could not keep the current one ({e})");
+                return None;
+            }
+        };
+        log::info!("kept the old world as {}", kept.display());
+        self.server_mut().new_world(seed);
+        self.server().save_to(dir);
+        // The replica is rebuilt, the same way a load rebuilds it: terrain
+        // from the seed, and nothing else, since a fresh world has no edits.
+        self.world = Arc::new(World::with_seed(seed));
+        self.others = OtherPlayers::new();
+        self.resync();
+        // One host tick, so the client hears where it now stands through
+        // `SelfState` -- the way it learns everything -- rather than drawing a
+        // frame at the old world's position first.
+        self.settle_after_assets();
+        self.pause_open = false;
+        self.inventory_open = false;
+        self.open_furnace = None;
+        self.breaking = false;
+        log::info!("new world, seed {seed}");
+        Some(kept)
     }
 }
 
@@ -4199,6 +4299,176 @@ mod tests {
         );
     }
 
+    /// A directory nobody else's test uses, and nothing is in yet.
+    fn scratch_dir(what: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cubara-{what}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Open the save at `dir` the way a fresh start would, to see what is in it.
+    fn read_save(dir: &std::path::Path) -> Option<cubara_server::Server> {
+        let mut server = cubara_server::Server::new();
+        let items = load_item_registry();
+        let recipes = load_recipe_book(&items);
+        server.set_assets(
+            std::sync::Arc::new(cubara_render::load_registry()),
+            items,
+            recipes,
+        );
+        server.load_from(dir).then_some(server)
+    }
+
+    /// **New World: a fresh world on the new seed, and the old one kept.** The
+    /// owner chose "set it aside" over "throw it away", so the half that
+    /// matters most is the second: the kept world is read back and must be
+    /// the one that was being played, edit and all.
+    #[test]
+    fn new_world_starts_fresh_and_keeps_the_old_one() {
+        let dir = scratch_dir("new-world");
+        let mut game = game_with_assets();
+        let old_seed = game.world().seed();
+        let new_seed = old_seed ^ 0x9E37_79B9_7F4A_7C15;
+        // Two things of the old world's that must not come along.
+        let dug = [3, -30, 3];
+        game.server_mut().set_block(dug, cubara_voxel::BlockId::AIR);
+        hold(&mut game, "cubara:stick");
+        assert!(
+            game.world().edits().any(|(p, _)| p == dug),
+            "the replica never had the edit, so losing it proves nothing"
+        );
+
+        game.toggle_pause();
+        let kept = game
+            .new_world_in(&dir, new_seed, "test")
+            .expect("the world was not replaced");
+
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(kept, dir.with_file_name(format!("{name}-test-1")));
+        assert_eq!(game.server().world.seed(), new_seed);
+        assert_eq!(game.world().seed(), new_seed, "the replica is the old seed");
+        assert_eq!(game.server().world.edits().count(), 0);
+        assert_eq!(
+            game.world().edits().count(),
+            0,
+            "the replica kept an edit from the old world"
+        );
+        let empty = |p: &Player| (0..cubara_sim::SLOT_COUNT).all(|i| p.inventory.slot(i).is_none());
+        assert!(empty(game.host_player()), "the inventory came along");
+        assert!(
+            empty(game.me.player()),
+            "the client still shows the old inventory"
+        );
+        assert!(
+            !game.host_player().is_creative(),
+            "survival became creative"
+        );
+        let spawn = game.server().world_spawn().unwrap();
+        assert_eq!(
+            game.host_player().spawn,
+            spawn,
+            "not stood on the new ground"
+        );
+        assert_eq!(
+            game.me.player().pos,
+            game.host_player().pos,
+            "the client is still where the old world had it"
+        );
+        assert!(
+            !game.pause_open(),
+            "the menu stayed open over the new world"
+        );
+
+        let old = read_save(&kept).expect("the kept world does not load");
+        assert_eq!(old.world.seed(), old_seed);
+        assert!(
+            old.world.edits().any(|(p, _)| p == dug),
+            "what was kept is not what was being played"
+        );
+        let new = read_save(&dir).expect("the new world was not saved");
+        assert_eq!(
+            new.world.seed(),
+            new_seed,
+            "a restart would open another world"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&kept);
+    }
+
+    /// Play mode is a setting from the same menu, not something found in the
+    /// world -- so it comes along, and so does the loadout creative grants,
+    /// since the old one stayed behind with the old inventory.
+    #[test]
+    fn new_world_keeps_creative_and_grants_its_loadout_again() {
+        let dir = scratch_dir("new-world-creative");
+        let mut game = game_with_assets();
+        game.set_creative(true);
+        game.settle();
+        let seed = game.world().seed().wrapping_add(1);
+        let kept = game.new_world_in(&dir, seed, "test").expect("replaced");
+
+        assert!(game.host_player().is_creative(), "creative became survival");
+        assert!(game.is_creative(), "the client shows survival");
+        assert!(
+            (0..cubara_sim::SLOT_COUNT).any(|i| game.me.player().inventory.slot(i).is_some()),
+            "creative in the new world with nothing to place"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&kept);
+    }
+
+    /// **Nothing happens unless the old world is safe.** A save that cannot be
+    /// written is the case to test: a directory that is really a file.
+    #[test]
+    fn new_world_is_refused_when_the_old_one_cannot_be_kept() {
+        let dir = scratch_dir("new-world-unwritable");
+        std::fs::write(&dir, b"not a directory").unwrap();
+        let mut game = game_with_assets();
+        let seed = game.world().seed();
+        assert_eq!(game.new_world_in(&dir, seed ^ 1, "test"), None);
+        assert_eq!(
+            game.server().world.seed(),
+            seed,
+            "replaced with nothing kept"
+        );
+        assert_eq!(game.world().seed(), seed);
+        assert_eq!(std::fs::read(&dir).unwrap(), b"not a directory");
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// Two presses, the second confirming; anything else the menu does in
+    /// between forgets the first.
+    #[test]
+    fn new_world_takes_two_presses_in_the_pause_menu() {
+        let mut game = game_with_assets();
+        assert!(!game.press_new_world(), "outside the pause menu");
+        assert!(!game.new_world_armed());
+
+        game.toggle_pause();
+        assert!(!game.press_new_world(), "one press replaced the world");
+        assert!(game.new_world_armed());
+        assert!(game.press_new_world(), "the second press did not confirm");
+        assert!(!game.new_world_armed());
+
+        game.press_new_world();
+        game.set_creative(true);
+        assert!(
+            !game.press_new_world(),
+            "switching play mode did not cancel"
+        );
+
+        game.toggle_pause();
+        game.toggle_pause();
+        assert!(!game.press_new_world(), "closing the menu did not cancel");
+    }
+
     // ── The client's replica world (RESEARCH_MULTIPLAYER §8.2) ──────────────
 
     /// The claim the whole section rests on: **terrain is generated, never
@@ -4536,6 +4806,26 @@ mod connect_tests {
             ..Config::default()
         };
         (Session::open(&cfg), cfg)
+    }
+
+    /// A joined client is in somebody else's world. It cannot replace it, and
+    /// it writes nothing to its own saves trying.
+    #[test]
+    fn a_joined_client_cannot_start_a_new_world() {
+        let (mut remote, _cfg) = hosted_elsewhere();
+        let mut game = a_client();
+        game.join_over(remote.attach()).expect("joined");
+        game.toggle_pause();
+        assert!(!game.press_new_world());
+        assert!(
+            !game.press_new_world(),
+            "a joined client confirmed a new world"
+        );
+        let dir = std::env::temp_dir().join("cubara-new-world-joined-client");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(game.new_world_in(&dir, 7, "test"), None);
+        assert!(!dir.exists(), "a joined client wrote a save");
+        assert_eq!(game.world().seed(), remote.server.world.seed());
     }
 
     fn a_client() -> Game {

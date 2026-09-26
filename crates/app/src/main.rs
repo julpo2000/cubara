@@ -159,10 +159,10 @@ fn escape_action(game: &Game) -> EscapeAction {
 /// open -- see [`Hud::menu`].
 ///
 /// Keyboard-driven rather than clickable: `ROADMAP.md`'s phase 3 note lists
-/// four rows (options, new world, play mode, commands), and only play mode
-/// does anything today. A hit-tested clickable layout for two stub rows and
-/// one real one is a lot of `cubara-render` machinery this doesn't yet earn
-/// -- `[C]` is the whole interaction, same shape as F3/F4/F5's single keys.
+/// four rows (options, new world, play mode, commands), and Options is still
+/// empty. A hit-tested clickable layout is a lot of `cubara-render` machinery
+/// for two keys -- `[C]` and `[N]` are the whole interaction, the same shape
+/// as F3/F4/F5's single keys.
 fn menu_text(game: &Game) -> Option<String> {
     if let Some(console) = game.console() {
         return Some(format!("{console}_\n[Enter] send   [Esc] cancel"));
@@ -173,16 +173,57 @@ fn menu_text(game: &Game) -> Option<String> {
         } else {
             "Survival"
         };
+        let new_world = if !game.hosting() {
+            "New World -- only whoever runs the world can"
+        } else if game.new_world_armed() {
+            "[N] again to confirm New World -- this world is kept as a backup"
+        } else {
+            "[N] New World"
+        };
         return Some(format!(
             "-- PAUSED --\n\
              [Esc] resume\n\
              [C] play mode: {mode}\n\
              Options -- coming soon\n\
-             New World -- coming soon\n\
+             {new_world}\n\
              Commands: press / to open the console (e.g. /tp 10 64 10)"
         ));
     }
     None
+}
+
+/// A seed for a world nobody has played yet.
+///
+/// Chosen here, in the window, because it is a *choice* rather than
+/// simulation: once made it is world state like any other (Rule 1), saved in
+/// the header and handed to every client. `RandomState` is std's own
+/// randomly keyed hasher -- no new dependency for one number -- and hashing
+/// the clock through it means two New Worlds in one run still differ.
+fn fresh_seed() -> u64 {
+    use std::hash::BuildHasher;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::hash::RandomState::new().hash_one(nanos)
+}
+
+/// `YYYY-MM-DD` (UTC) for `secs` since the Unix epoch -- the date in a kept
+/// world's folder name, `saves/world-2026-09-26-1`.
+///
+/// The civil-from-days conversion (Howard Hinnant's), written out rather than
+/// pulling in a date crate for one folder name.
+fn date_label(secs: u64) -> String {
+    let days = (secs / 86_400) as i64 + 719_468;
+    let era = days.div_euclid(146_097);
+    let doe = days.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 impl App {
@@ -386,6 +427,28 @@ impl ApplicationHandler for App {
                         // set) that are display-only until they have
                         // somewhere to write to.
                         self.game.set_creative(!self.game.is_creative());
+                    } else if code == KeyCode::KeyN
+                        && pressed
+                        && !event.repeat
+                        && self.game.pause_open()
+                    {
+                        // Two presses -- `Game::press_new_world` -- and then
+                        // the world goes, so whatever was streamed from it
+                        // goes too.
+                        if self.game.press_new_world() {
+                            let today = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            if self
+                                .game
+                                .new_world(fresh_seed(), &date_label(today))
+                                .is_some()
+                            {
+                                streaming.reset(renderer);
+                            }
+                            self.follow_screen();
+                        }
                     } else if code == KeyCode::KeyE && pressed {
                         // Toggling may be *refused* -- see
                         // `Game::toggle_inventory` -- so the mouse follows what
@@ -775,6 +838,42 @@ mod tests {
             menu_text(&game).is_some_and(|t| t.contains("Creative")),
             "the pause menu must reflect the switch, not just the game's own state"
         );
+    }
+
+    #[test]
+    fn menu_text_offers_new_world_and_asks_before_doing_it() {
+        let mut game = Game::new();
+        game.toggle_pause();
+        let first = menu_text(&game).unwrap();
+        assert!(first.contains("[N] New World"), "{first}");
+        game.press_new_world();
+        let armed = menu_text(&game).unwrap();
+        assert!(
+            armed.contains("again to confirm") && armed.contains("kept"),
+            "the second press is not asked for: {armed}"
+        );
+    }
+
+    #[test]
+    fn date_label_is_the_utc_calendar_date() {
+        assert_eq!(date_label(0), "1970-01-01");
+        assert_eq!(date_label(946_598_400), "1999-12-31");
+        assert_eq!(date_label(1_709_208_000), "2024-02-29", "a leap day");
+        assert_eq!(
+            date_label(1_790_467_199),
+            "2026-09-26",
+            "the last second of a day"
+        );
+        assert_eq!(
+            date_label(1_790_467_200),
+            "2026-09-27",
+            "and the first of the next"
+        );
+    }
+
+    #[test]
+    fn fresh_seeds_differ() {
+        assert_ne!(fresh_seed(), fresh_seed());
     }
 
     #[test]

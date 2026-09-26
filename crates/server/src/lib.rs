@@ -886,17 +886,26 @@ impl Server {
         }
     }
 
-    pub fn save_to(&self, dir: &std::path::Path) {
+    ///
+    /// Returns whether the world was written, for the one caller that must not
+    /// carry on if it was not (the client's New World, keeping the old one).
+    pub fn save_to(&self, dir: &std::path::Path) -> bool {
         let (Some(registry), Some(items), Some(blocks)) = (
             self.blocks_registry.as_deref(),
             self.items.as_ref(),
             self.terrain,
         ) else {
-            return;
+            return false;
         };
         match cubara_sim::save_world(dir, &self.sim, &self.world, registry, items, blocks) {
-            Ok(()) => log::info!("world saved to {}", dir.display()),
-            Err(e) => log::error!("could not save the world: {e}"),
+            Ok(()) => {
+                log::info!("world saved to {}", dir.display());
+                true
+            }
+            Err(e) => {
+                log::error!("could not save the world: {e}");
+                false
+            }
         }
     }
 
@@ -968,17 +977,76 @@ impl Server {
             }
         }
     }
+
+    /// Replace this world with a fresh one on `seed` -- the pause menu's New
+    /// World (`ROADMAP.md`, the owner's starting shape for the menu).
+    ///
+    /// What [`load_from`](Self::load_from) does with a save, done with nothing:
+    /// a new `World` and a new `Sim`, and everybody watching keeps an id and
+    /// gets a fresh body on the new world's ground. Nothing of the old world
+    /// comes along -- not the inventory, not the dropped items, not a dig in
+    /// progress -- because all of it belongs to the world it was found in,
+    /// and that world is kept on disk, not destroyed (the caller's half).
+    ///
+    /// **Play mode does come along.** It is a setting chosen from the same
+    /// menu, not something found in the world, so a player in creative lands
+    /// in creative -- with the loadout [`Action::SetCreative`] grants, since
+    /// the one they had stayed behind with the old inventory.
+    ///
+    /// Writes nothing to disk. The old world is the caller's to keep, because
+    /// where it goes is a question about the player's saves directory rather
+    /// than about this world.
+    pub fn new_world(&mut self, seed: u64) {
+        let watching: Vec<(PlayerId, bool)> = self
+            .views
+            .keys()
+            .filter_map(|&who| self.sim.get(who).map(|p| (who, p.is_creative())))
+            .collect();
+        let fresh = || {
+            Player::new(
+                FixedVec3::from_blocks(0, 48, 0),
+                Angle::from_radians(0.6),
+                Angle::from_radians(-0.3),
+            )
+        };
+        // The same `Sim` `Server::new` starts from: player 0 is seated by
+        // `Sim::new` itself, so it is the one id not re-seated below.
+        let mut sim = Sim::new(0, fresh());
+        for &(who, _) in &watching {
+            sim.keep(who, fresh());
+        }
+        self.sim = sim;
+        self.world = Arc::new(World::with_seed(seed));
+        self.sim_centre = None;
+        self.mining.clear();
+        for &(who, creative) in &watching {
+            self.place_on_ground_as(who);
+            if creative {
+                self.apply_as(who, Action::SetCreative(true));
+            }
+        }
+    }
 }
 
 /// Rename a save that could not be loaded to the first free
 /// `<name>-unloaded-<n>` beside it, and return where it went.
 fn set_aside(dir: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    set_aside_as(dir, "unloaded")
+}
+
+/// Rename the save at `dir` to the first free `<name>-<label>-<n>` beside it,
+/// and return where it went.
+///
+/// Never over anything: a name already taken, by a world kept earlier the
+/// same way, moves on to the next `n`. A world someone played is only ever
+/// moved, never written over or removed.
+pub fn set_aside_as(dir: &std::path::Path, label: &str) -> std::io::Result<std::path::PathBuf> {
     let name = dir
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "world".to_string());
     let kept = (1..)
-        .map(|n| dir.with_file_name(format!("{name}-unloaded-{n}")))
+        .map(|n| dir.with_file_name(format!("{name}-{label}-{n}")))
         .find(|p| !p.exists())
         .expect("some suffix is free");
     std::fs::rename(dir, &kept)?;
