@@ -9,8 +9,8 @@
 //! gravity is the default; free-fly (Space/Shift up/down, no collision) is a
 //! debug mode inside the same sim (`docs/PHASE1_ARCHITECTURE.md` §10).
 //!
-//! `/` opens the command console (`/tp x y z` so far, `ROADMAP.md`'s phase 3
-//! note); `C` in the pause menu switches survival/creative -- creative flies,
+//! `/` opens the command console (`/tp`, `/give`, `/gamemode`, `/seed` --
+//! `ROADMAP.md`'s phase 3 note); `C` in the pause menu switches survival/creative -- creative flies,
 //! takes no damage, and has unlimited blocks (owner's call, 2026-09-18).
 
 mod bench;
@@ -155,8 +155,8 @@ fn escape_action(game: &Game) -> EscapeAction {
     }
 }
 
-/// The pause menu or command console's text, or `None` while neither is
-/// open -- see [`Hud::menu`].
+/// The pause menu or command console's text -- or, with neither open, the last
+/// command's answer while it lasts -- or `None` -- see [`Hud::menu`].
 ///
 /// Keyboard-driven rather than clickable: `ROADMAP.md`'s phase 3 note lists
 /// four rows (options, new world, play mode, commands), and Options is still
@@ -186,10 +186,10 @@ fn menu_text(game: &Game) -> Option<String> {
              [C] play mode: {mode}\n\
              Options -- coming soon\n\
              {new_world}\n\
-             Commands: press / to open the console (e.g. /tp 10 64 10)"
+             Commands: press / -- /tp x y z, /give item [count], /gamemode, /seed"
         ));
     }
-    None
+    game.console_reply().map(str::to_string)
 }
 
 /// A seed for a world nobody has played yet.
@@ -910,6 +910,26 @@ mod tests {
         assert!(
             text.starts_with('/'),
             "the console's own text should be what's shown, not the pause menu underneath it"
+        );
+    }
+
+    #[test]
+    fn menu_text_shows_a_commands_answer_while_nothing_else_is_open() {
+        let mut game = Game::new();
+        game.open_console();
+        for c in "seed".chars() {
+            game.console_push(c);
+        }
+        game.console_submit();
+        game.advance(cubara_sim::TICK_DT);
+        let shown = menu_text(&game).expect("the answer is on screen");
+        assert!(shown.starts_with("seed: "), "{shown:?}");
+
+        game.open_console();
+        assert_eq!(
+            menu_text(&game).as_deref(),
+            Some("/_\n[Enter] send   [Esc] cancel"),
+            "while typing the next command, the console is what is shown"
         );
     }
 }

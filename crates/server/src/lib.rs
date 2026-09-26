@@ -358,6 +358,14 @@ pub enum Effect {
     /// motionless player is not re-sent: an inventory is large and changes
     /// rarely.
     SelfItems(Box<ClientItems>),
+    /// **What a typed command answered**, for the client that typed it: a
+    /// seed, what was given, or why nothing happened.
+    ///
+    /// Text rather than a variant per answer. The client only shows it, and a
+    /// client that had to know every command's result would have to change
+    /// with every new command -- the reason [`Action::Command`] is one
+    /// variant too.
+    CommandReply(String),
 }
 
 /// The item half of a client's own state.
@@ -1284,7 +1292,8 @@ impl Server {
     }
 
     /// Queue an effect for one named client -- for effects that are about a
-    /// *client* rather than about a place. Opening a screen is the only one.
+    /// *client* rather than about a place: opening a screen, and a command's
+    /// answer.
     fn publish_to(&mut self, who: PlayerId, effect: Effect) {
         if let Some(view) = self.views.get_mut(&who) {
             view.push(effect);
@@ -1403,35 +1412,41 @@ impl Server {
                     self.publish_self_items(who);
                 }
             }
-            Action::SetCreative(creative) => {
-                if self.sim.get(who).is_none() {
-                    return;
-                }
-                self.sim.player_mut(who).set_creative(creative);
-                if creative {
-                    if let (Some(blocks), Some(items)) =
-                        (self.blocks_registry.as_deref(), self.items.as_ref())
-                    {
-                        grant_creative_loadout(self.sim.player_mut(who), blocks, items);
-                    }
-                }
-                self.publish_self_items(who);
-            }
+            Action::SetCreative(creative) => self.set_creative_as(who, creative),
             Action::Command(text) => self.apply_command(who, &text),
         }
+    }
+
+    /// Switch `who`'s play mode: the pause menu's `[C]`, and `/gamemode`.
+    fn set_creative_as(&mut self, who: PlayerId, creative: bool) {
+        if self.sim.get(who).is_none() {
+            return;
+        }
+        self.sim.player_mut(who).set_creative(creative);
+        if creative {
+            if let (Some(blocks), Some(items)) =
+                (self.blocks_registry.as_deref(), self.items.as_ref())
+            {
+                grant_creative_loadout(self.sim.player_mut(who), blocks, items);
+            }
+        }
+        self.publish_self_items(who);
     }
 
     /// Run one typed command on `who`'s behalf, text already stripped of its
     /// leading `/` (§ the `Action::Command` doc comment).
     ///
-    /// Unknown or malformed commands are silently ignored rather than
-    /// reported back -- there is no chat/error channel yet (`ROADMAP.md`'s
-    /// phase 3 note has "a real options menu" and more commands than `/tp`
-    /// still to come; a feedback channel is exactly the kind of thing that
-    /// list, not this one command, should settle).
+    /// The set is the owner's (`ROADMAP.md`'s phase 3 note, 2026-09-26):
+    /// `/tp`, `/give`, `/gamemode` and `/seed`, in both play modes. Whatever
+    /// a command has to say goes back to whoever typed it as an
+    /// [`Effect::CommandReply`] -- including why nothing happened, since a
+    /// command that is silently ignored looks the same as one that worked.
     fn apply_command(&mut self, who: PlayerId, text: &str) {
+        if self.sim.get(who).is_none() {
+            return;
+        }
         let mut words = text.split_whitespace();
-        match words.next() {
+        let reply = match words.next() {
             Some("tp") => {
                 let coords: Option<[f32; 3]> = (|| {
                     Some([
@@ -1441,20 +1456,92 @@ impl Server {
                     ])
                 })();
                 let Some([x, y, z]) = coords else {
-                    log::debug!("/tp: expected 3 numbers, got {text:?}");
+                    self.reply(who, "usage: /tp x y z".to_string());
                     return;
                 };
-                if self.sim.get(who).is_none() {
-                    return;
-                }
                 let player = self.sim.player_mut(who);
                 player.pos = FixedVec3::from_f32([x, y, z]);
                 player.velocity = FixedVec3::ZERO;
                 player.fall_distance = cubara_voxel::Fixed::ZERO;
                 player.on_ground = false;
+                return;
             }
-            _ => log::debug!("unknown command: {text:?}"),
+            Some("seed") => format!("seed: {}", self.world.seed()),
+            Some("gamemode") => match words.next() {
+                Some("creative") => {
+                    self.set_creative_as(who, true);
+                    "play mode: creative".to_string()
+                }
+                Some("survival") => {
+                    self.set_creative_as(who, false);
+                    "play mode: survival".to_string()
+                }
+                _ => "usage: /gamemode survival|creative".to_string(),
+            },
+            Some("give") => self.give_as(who, words.next(), words.next()),
+            // Asked for with the rest, and not built: there is no time of day
+            // to set. `Lighting::time_of_day` is plumbing for a day/night cycle
+            // nobody has designed, and a cycle is a gameplay system -- the
+            // owner's to shape, not a side effect of a command.
+            Some("time") => "/time: the world has no time of day yet".to_string(),
+            Some(other) => {
+                format!("unknown command /{other} -- try /tp, /give, /gamemode or /seed")
+            }
+            None => return,
+        };
+        self.reply(who, reply);
+    }
+
+    /// `/give <item> [count]`: `count` of `item` (default one) into `who`'s
+    /// inventory, by [`Inventory::add`](cubara_sim::Inventory::add)'s own rules.
+    /// What does not fit is not given, and the reply says so. `item` may leave
+    /// off the `cubara:` every shipped item starts with.
+    fn give_as(&mut self, who: PlayerId, item: Option<&str>, count: Option<&str>) -> String {
+        const USAGE: &str = "usage: /give <item> [count]";
+        let Some(name) = item else {
+            return USAGE.to_string();
+        };
+        let count: u32 = match count.map(str::parse) {
+            None => 1,
+            Some(Ok(n)) if n > 0 => n,
+            Some(_) => return USAGE.to_string(),
+        };
+        let Some(items) = self.items.as_ref() else {
+            return "no items are loaded".to_string();
+        };
+        let full_name = if name.contains(':') {
+            name.to_string()
+        } else {
+            format!("cubara:{name}")
+        };
+        let Some(id) = items.id_of(&full_name) else {
+            return format!("no item called {name}");
+        };
+        let max = items.max_stack(id) as u32;
+        let inventory = &mut self.sim.player_mut(who).inventory;
+        let mut given = 0;
+        while given < count {
+            let batch = (count - given).min(max) as u8;
+            let Ok(stack) = items.new_stack(id, batch) else {
+                break;
+            };
+            let left = inventory.add(stack, items).map_or(0, |s| s.count()) as u32;
+            given += batch as u32 - left;
+            if left > 0 {
+                break;
+            }
         }
+        self.publish_self_items(who);
+        if given == count {
+            format!("gave {given} {full_name}")
+        } else {
+            format!("gave {given} of {count} {full_name} -- the inventory is full")
+        }
+    }
+
+    /// Queue a command's answer for the one client that asked.
+    fn reply(&mut self, who: PlayerId, text: String) {
+        self.publish_to(who, Effect::CommandReply(text));
     }
 
     /// Everything a client needs to bring an empty replica up to date: every

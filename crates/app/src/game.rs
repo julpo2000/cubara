@@ -40,6 +40,9 @@ use winit::keyboard::KeyCode;
 /// locking up trying to chase it.
 const MAX_TICKS_PER_FRAME: u32 = 5;
 
+/// How long a command's answer stays on screen: five seconds of ticks.
+const REPLY_TICKS: u32 = (5.0 / TICK_DT) as u32;
+
 /// Everything the player *is* and *does*: the world they're in and the simulation
 /// running against it.
 /// The asset loaders and the world directory, re-exported from the crate that
@@ -177,6 +180,9 @@ pub struct Game {
     /// it's the open trigger), so what's on screen always matches what
     /// `console_submit` will strip and send.
     console: Option<String>,
+    /// The last command's answer ([`Effect::CommandReply`]), and how many
+    /// more ticks it stays on screen.
+    console_reply: Option<(String, u32)>,
     /// The pause menu's New World was pressed once and is waiting for the
     /// second press that confirms it. Cleared by anything else the menu does,
     /// and by the menu closing.
@@ -395,6 +401,7 @@ impl Game {
             open_furnace: None,
             pause_open: false,
             console: None,
+            console_reply: None,
             new_world_armed: false,
             breaking: false,
             accumulator: 0.0,
@@ -841,6 +848,12 @@ impl Game {
             input.look_delta = [Angle::ZERO, Angle::ZERO];
             self.accumulator -= TICK_DT as f64;
             ticks += 1;
+            if let Some((_, left)) = &mut self.console_reply {
+                *left -= 1;
+                if *left == 0 {
+                    self.console_reply = None;
+                }
+            }
             if ticks >= MAX_TICKS_PER_FRAME {
                 // Spiral-of-death guard: fall behind wall-clock time rather than
                 // trying to fully catch up, which would only make the next
@@ -1205,6 +1218,7 @@ impl Game {
                 // effect silently dropped by the replica is the kind of bug that
                 // shows up as a desync weeks later.
                 Effect::SelfItems(items) => items.apply_to(self.me.player_mut()),
+                Effect::CommandReply(text) => self.console_reply = Some((text, REPLY_TICKS)),
                 Effect::SelfState { seq, state } => {
                     let blocks = self.terrain();
                     self.me
@@ -1612,6 +1626,11 @@ impl Game {
                 text.pop();
             }
         }
+    }
+
+    /// What the last command answered, while it is still on screen.
+    pub fn console_reply(&self) -> Option<&str> {
+        self.console_reply.as_ref().map(|(text, _)| text.as_str())
     }
 
     /// Close the console without sending anything.
@@ -4785,6 +4804,34 @@ mod tests {
         );
         game.set_creative(false);
         assert!(!game.is_creative());
+    }
+
+    /// `/seed` typed into the console comes back as a line on screen, and the
+    /// line goes away again on its own.
+    #[test]
+    fn a_commands_answer_reaches_the_screen_and_then_leaves_it() {
+        let mut game = game_with_assets();
+        for c in "seed".chars() {
+            // The console opens on `/` itself, so only what follows is typed.
+            if game.console().is_none() {
+                game.open_console();
+            }
+            game.console_push(c);
+        }
+        game.console_submit();
+        assert_eq!(game.console_reply(), None, "nothing before the round trip");
+
+        game.advance(TICK_DT);
+        let seed = game.server().world.seed();
+        assert_eq!(game.console_reply(), Some(format!("seed: {seed}").as_str()));
+
+        for _ in 0..REPLY_TICKS - 2 {
+            game.advance(TICK_DT);
+        }
+        assert!(game.console_reply().is_some(), "gone before five seconds");
+        game.advance(TICK_DT);
+        game.advance(TICK_DT);
+        assert_eq!(game.console_reply(), None, "still there after five seconds");
     }
 }
 

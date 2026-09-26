@@ -476,8 +476,18 @@ away** — moved aside as `saves/world-<date>-<n>` — chosen over deleting it a
 over a world list. There is no screen to load a kept world yet; one can be
 added later without anything else changing. Play mode carries over to the
 new world, since it is a setting from the same menu rather than something
-found in the world. Which commands join `/tp` is still the owner's to name;
-none have been added on a guess.
+found in the world.
+
+**2026-09-26, later: the commands.** Asked which commands join `/tp`, with
+`/seed`, `/time`, `/give` and `/gamemode` offered as examples, the owner said
+*"qua console commands mogen de paar suggesties die gegeven waren"*: the
+suggestions stand. `/give <item> [count]`, `/gamemode survival|creative` (the
+pause menu's `[C]`, by the same server path) and `/seed` are built, and a
+command's answer now comes back to whoever typed it, on screen for five
+seconds (`Effect::CommandReply`). **`/time` is not built**, because there is no
+time of day to set. `Lighting::time_of_day` is plumbing for a day/night cycle
+nobody has designed, and a cycle is a gameplay system, not a side effect of a
+command. `/time` answers with exactly that until the owner shapes one.
 
 ### Recorded, 2026-09-26 — how far the world is drawn
 
