@@ -111,7 +111,7 @@ pub type RingSchedule = [(u32, i32)];
 /// across world positions and seeds this table wasn't measured against; not
 /// used for exactly that reason. See `BENCHMARKS.md`'s issue-#109 rows for
 /// the full `--bench 64` numbers this table produces.
-pub const DEFAULT_RING_SCHEDULE: &[(u32, i32)] = &[(0, 10), (1, 18), (2, 32), (3, 64), (4, 128), (5, 256), (6, 512), (7, 1024), (8, 2048), (9, 4096), (10, 8192), (11, 16384)];
+pub const DEFAULT_RING_SCHEDULE: &[(u32, i32)] = &[(0, 32), (1, 64)];
 
 /// Every node that should be resident around `center`, across the vertical
 /// band `y_range` (in chunks, same convention as

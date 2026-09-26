@@ -53,11 +53,11 @@ pub struct NodeId {
 /// picked early and left to absorb terrain growth since; measured against
 /// the real worst case for the first time here, it's still comfortably
 /// covered without needing to move.
-const VERTEX_CAPACITY: u32 = 4_000_000;
+const VERTEX_CAPACITY: u32 = 16_000_000;
 /// Index-arena capacity, in indices (4 bytes/index). Same story as
 /// `VERTEX_CAPACITY`: measured radius-64 peak is 2,488,824 indices used, so
 /// 6,000,000 is ~2.4× headroom, unchanged from #89.
-const INDEX_CAPACITY: u32 = 6_000_000;
+const INDEX_CAPACITY: u32 = 24_000_000;
 /// Max nodes the indirect-args buffer can hold (upper bound on *visible*
 /// nodes in one frame). Node-based streaming (§6.1) is what finally lets
 /// this shrink: the tuned ring schedule (#109) measured 1,341 of 1,585
