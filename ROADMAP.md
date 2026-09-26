@@ -460,6 +460,15 @@ before we get to worldgen") — not as a phase-3 admission, the same way the
 multiplayer goal finished phase 2 before phase 3 started. The rest of this
 list (new world, the fuller command set, real options) is phase-3 scope proper.
 
+**2026-09-26, the owner asked for the menu to be finished next**, and settled
+what New World does with the world it replaces: **it is kept, not thrown
+away** — moved aside as `saves/world-<date>-<n>` — chosen over deleting it and
+over a world list. There is no screen to load a kept world yet; one can be
+added later without anything else changing. Play mode carries over to the
+new world, since it is a setting from the same menu rather than something
+found in the world. Which commands join `/tp` is still the owner's to name;
+none have been added on a guess.
+
 ---
 
 ## Where the existing open issues land

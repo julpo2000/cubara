@@ -353,6 +353,46 @@ impl NodeStreaming {
             .request(world, &self.registry, &self.layer_of, node, self.blocks);
     }
 
+    /// Drop everything streamed from the world that was just replaced -- the
+    /// pause menu's New World -- so the next [`update`](Self::update) streams
+    /// the new one in from nothing.
+    ///
+    /// **Not** the #262 swap, which keeps a node drawn until what replaces it
+    /// has arrived: that is right for a change of detail over the *same*
+    /// terrain, and wrong here, where every resident mesh is of terrain that
+    /// no longer exists. A frame of sky while the new world meshes is correct;
+    /// the old world's hills standing in for it are not.
+    pub fn reset(&mut self, renderer: &mut Renderer) {
+        let unload = self.forget_world();
+        renderer.apply_node_updates(unload, std::iter::empty());
+    }
+
+    /// [`reset`](Self::reset)'s bookkeeping, apart from the GPU: forget every
+    /// node, every link and every search, and return what the renderer must
+    /// drop.
+    fn forget_world(&mut self) -> Vec<NodeId> {
+        // `held` is a subset of `resident` (still drawn, already superseded),
+        // so draining `resident` unloads both.
+        let unload = self.resident.drain().map(to_node_id).collect();
+        self.held.clear();
+        let in_flight: Vec<NodeKey> = self.mesh_pool.in_flight().collect();
+        for node in in_flight {
+            self.mesh_pool.cancel(node);
+        }
+        // What the old world's air joined says nothing about the new one's.
+        self.links = Arc::new(HashMap::new());
+        self.visible.clear();
+        self.visibility_stale = false;
+        // A search still running was for the old world's links; moving the
+        // generation on is what makes its answer land ignored.
+        self.generation += 1;
+        self.searching = false;
+        // No centre means the next update starts a search wherever the camera
+        // is, the same way the very first frame does.
+        self.center = None;
+        unload
+    }
+
     /// Hand the search thread the camera's chunk and what is known now.
     fn start_search(&mut self, center: ChunkCoord) {
         self.generation += 1;
@@ -509,6 +549,68 @@ mod tests {
         assert!(
             fog_end < render_radius_blocks(),
             "fog must finish inside the render radius, not past it"
+        );
+    }
+
+    fn real_streaming() -> NodeStreaming {
+        let registry = Arc::new(cubara_render::load_registry());
+        NodeStreaming::new(
+            registry,
+            &cubara_server::assets::load_structure_registry(),
+            &cubara_server::assets::load_ore_registry(),
+            |_: &str| 0,
+        )
+    }
+
+    /// New World replaces every block: nothing streamed from the old world may
+    /// survive into the new one, or the old hills are drawn over the new
+    /// terrain -- a resident node the new world also wants is never meshed
+    /// again, because it looks already there.
+    #[test]
+    fn forgetting_the_world_leaves_nothing_of_it() {
+        let mut s = real_streaming();
+        let world = Arc::new(World::new());
+        let (drawn, superseded, meshing) = (
+            NodeKey::new(0, [0, 0, 0]),
+            NodeKey::new(1, [1, 0, 0]),
+            NodeKey::new(0, [5, 0, 5]),
+        );
+        s.resident.insert(drawn);
+        s.resident.insert(superseded);
+        s.held.insert(superseded);
+        s.visible.insert(drawn);
+        s.mesh_pool
+            .request(&world, &s.registry, &s.layer_of, meshing, s.blocks);
+        let built =
+            cubara_world::mesh::build_node(&world, &s.registry, &|_: &str| 0, drawn, s.blocks);
+        Arc::make_mut(&mut s.links).insert(drawn, built.links);
+        s.center = Some(ChunkCoord::new(0, 0, 0));
+        s.searching = true;
+        let generation = s.generation;
+
+        let unloaded: HashSet<NodeId> = s.forget_world().into_iter().collect();
+
+        assert_eq!(
+            unloaded,
+            HashSet::from([to_node_id(drawn), to_node_id(superseded)]),
+            "the renderer keeps drawing the old world"
+        );
+        assert!(
+            s.resident.is_empty(),
+            "the new world's meshes would be skipped"
+        );
+        assert!(s.held.is_empty());
+        assert!(s.visible.is_empty());
+        assert!(s.links.is_empty(), "the search walks the old world's caves");
+        assert!(
+            !s.mesh_pool.is_in_flight(meshing),
+            "an old-world mesh can land"
+        );
+        assert_eq!(s.center, None, "the next update would not search again");
+        assert!(!s.searching, "waiting on a search that no longer counts");
+        assert!(
+            s.generation > generation,
+            "an old-world search can still land"
         );
     }
 
