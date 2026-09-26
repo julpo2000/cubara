@@ -15,7 +15,7 @@
 //! inputs are meshes, origins and a camera, nothing that knows what a `World`
 //! or a `NodeKey` is. See issue #38's tracking arc, sub-issue #110.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -326,6 +326,8 @@ type Job = (
     // worker re-deriving it from the registry per node -- which is what this
     // used to do, and which also had no way to know about structures.
     TerrainBlocks,
+    // Which request this is -- see `MeshPool::in_flight`.
+    u64,
 );
 
 /// A pool of worker threads that mesh nodes off the main thread.
@@ -338,8 +340,14 @@ type Job = (
 /// different key entirely, not a re-request of the same one.
 pub struct MeshPool {
     job_tx: Sender<Job>,
-    result_rx: Receiver<BuiltNode>,
-    in_flight: HashSet<NodeKey>,
+    result_rx: Receiver<(u64, BuiltNode)>,
+    /// Each wanted node, and the ticket of the one request whose result is
+    /// wanted for it. **The ticket, not the node, is what a result is checked
+    /// against:** a cancelled job still runs to the end and sends a result
+    /// that names the same node, so after cancel-and-request-again the node
+    /// alone cannot tell the stale mesh from its replacement.
+    in_flight: HashMap<NodeKey, u64>,
+    next_ticket: u64,
     _workers: Vec<JoinHandle<()>>,
 }
 
@@ -355,7 +363,7 @@ impl MeshPool {
 
     fn with_workers(workers: usize) -> Self {
         let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
-        let (result_tx, result_rx) = std::sync::mpsc::channel::<BuiltNode>();
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<(u64, BuiltNode)>();
         // One receiver shared by all workers: each grabs the next job under the lock,
         // then releases it and meshes in parallel with the others.
         let job_rx = Arc::new(Mutex::new(job_rx));
@@ -367,7 +375,7 @@ impl MeshPool {
                 std::thread::Builder::new()
                     .name("cubara-mesher".into())
                     .spawn(move || loop {
-                        let (world, registry, layer_of, node, blocks) = {
+                        let (world, registry, layer_of, node, blocks, ticket) = {
                             let rx = jobs.lock().expect("mesher job lock");
                             match rx.recv() {
                                 Ok(job) => job,
@@ -376,7 +384,7 @@ impl MeshPool {
                             }
                         };
                         let built = build_node(&world, &registry, &*layer_of, node, blocks);
-                        if results.send(built).is_err() {
+                        if results.send((ticket, built)).is_err() {
                             break; // caller gone
                         }
                     })
@@ -387,7 +395,8 @@ impl MeshPool {
         Self {
             job_tx,
             result_rx,
-            in_flight: HashSet::new(),
+            in_flight: HashMap::new(),
+            next_ticket: 0,
             _workers,
         }
     }
@@ -405,7 +414,10 @@ impl MeshPool {
         node: NodeKey,
         blocks: TerrainBlocks,
     ) {
-        if self.in_flight.insert(node) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.in_flight.entry(node) {
+            let ticket = self.next_ticket;
+            self.next_ticket += 1;
+            slot.insert(ticket);
             // Send can only fail if all workers died; nothing useful to do if so.
             let _ = self.job_tx.send((
                 Arc::clone(world),
@@ -413,6 +425,7 @@ impl MeshPool {
                 Arc::clone(layer_of),
                 node,
                 blocks,
+                ticket,
             ));
         }
     }
@@ -425,21 +438,22 @@ impl MeshPool {
 
     /// Whether `node` is currently being meshed.
     pub fn is_in_flight(&self, node: NodeKey) -> bool {
-        self.in_flight.contains(&node)
+        self.in_flight.contains_key(&node)
     }
 
     /// The nodes currently being meshed (so the caller can unload ones that
     /// fell out of range before their mesh was ready).
-    pub fn in_flight(&self) -> &HashSet<NodeKey> {
-        &self.in_flight
+    pub fn in_flight(&self) -> impl ExactSizeIterator<Item = NodeKey> + '_ {
+        self.in_flight.keys().copied()
     }
 
     /// Take all finished results that are still wanted, clearing them from the
     /// in-flight set. Non-blocking.
     pub fn poll(&mut self) -> Vec<BuiltNode> {
         let mut done = Vec::new();
-        while let Ok(built) = self.result_rx.try_recv() {
-            if self.in_flight.remove(&built.node) {
+        while let Ok((ticket, built)) = self.result_rx.try_recv() {
+            if self.in_flight.get(&built.node) == Some(&ticket) {
+                self.in_flight.remove(&built.node);
                 done.push(built);
             }
         }
@@ -730,7 +744,7 @@ mod tests {
         }
 
         let mut got: HashMap<NodeKey, Option<usize>> = HashMap::new();
-        while !pool.in_flight().is_empty() {
+        while pool.in_flight().next().is_some() {
             for built in pool.poll() {
                 got.insert(built.node, built.geometry.map(|g| g.mesh.triangle_count()));
             }
@@ -767,11 +781,61 @@ mod tests {
         );
         pool.cancel(n);
         // Give the worker time to finish and enqueue its (now unwanted) result.
-        while !pool.in_flight().is_empty() {
+        while pool.in_flight().next().is_some() {
             std::thread::yield_now();
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
         assert!(pool.poll().is_empty(), "cancelled result must not surface");
+    }
+
+    /// Cancel a node, then ask for it again against a newer world: what comes
+    /// back must be the newer mesh. The cancelled job still runs, and its result
+    /// names the same node -- so "is this node wanted?" cannot tell the two
+    /// apart, and taking the stale one also drops the right one when it lands.
+    /// That is two blocks broken in one chunk before the first re-mesh returns,
+    /// with the second hole never drawn, and it is every node of the old world
+    /// when the whole world is replaced.
+    #[test]
+    fn a_cancelled_result_is_not_taken_for_its_replacement() {
+        let registry = test_registry();
+        let layer_of = zero_layer();
+        let blocks = TerrainBlocks::from_registry(&registry);
+        let rock = [5, -40, 5];
+        let node = NodeKey::containing(ChunkCoord::from_block(rock[0], rock[1], rock[2]), 0);
+        let old = Arc::new(World::new());
+        assert!(
+            old.is_solid_at(rock[0], rock[1], rock[2], blocks),
+            "not rock"
+        );
+        let mut dug = World::new();
+        dug.set_block(rock[0], rock[1], rock[2], cubara_voxel::BlockId::AIR);
+        let new = Arc::new(dug);
+        let tris = |w: &World| {
+            mesh_node(w, &registry, &*layer_of, node, blocks).map(|g| g.mesh.triangle_count())
+        };
+        assert_ne!(
+            tris(&old),
+            tris(&new),
+            "the two worlds must mesh differently"
+        );
+
+        // One worker, so the jobs run in the order they were queued: the stale
+        // one always finishes first, which is the case that goes wrong.
+        let mut pool = MeshPool::with_workers(1);
+        pool.request(&old, &registry, &layer_of, node, blocks);
+        pool.cancel(node);
+        pool.request(&new, &registry, &layer_of, node, blocks);
+        let mut got = Vec::new();
+        while pool.is_in_flight(node) {
+            got.extend(pool.poll());
+            std::thread::yield_now();
+        }
+        assert_eq!(got.len(), 1, "one result for one wanted node");
+        assert_eq!(
+            got[0].geometry.as_ref().map(|g| g.mesh.triangle_count()),
+            tris(&new),
+            "the cancelled job's mesh was taken for the one that replaced it"
+        );
     }
 
     #[test]
@@ -800,7 +864,7 @@ mod tests {
             TerrainBlocks::from_registry(&registry),
         );
         let mut results = Vec::new();
-        while !pool.in_flight().is_empty() {
+        while pool.in_flight().next().is_some() {
             results.extend(pool.poll());
             std::thread::yield_now();
         }

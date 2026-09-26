@@ -387,9 +387,9 @@ impl NodeStreaming {
         let stale: Vec<NodeKey> = self
             .resident
             .iter()
-            .chain(self.mesh_pool.in_flight().iter())
-            .filter(|n| !self.visible.contains(n))
             .copied()
+            .chain(self.mesh_pool.in_flight())
+            .filter(|n| !self.visible.contains(n))
             .collect();
         // Nothing in flight is worth finishing once it has left the visible
         // set -- that is work, not geometry, and cancelling it is what keeps
