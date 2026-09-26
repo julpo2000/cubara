@@ -469,6 +469,27 @@ new world, since it is a setting from the same menu rather than something
 found in the world. Which commands join `/tp` is still the owner's to name;
 none have been added on a guess.
 
+### Recorded, 2026-09-26 — how far the world is drawn
+
+The owner's answer to #264 (*how far should the world be drawn?*):
+*"daadwerkelijk oneindig … ik wil dat je daadwerkelijk honderden kilometers kan
+zien, als je hoog genoeg bent en het landschap mee werkt."* The same day he
+settled 262 km first, and set the look: *"het moet er wel uitzien alsof elk
+blok gerenderd is"*, without rendering every block. The measurements and the
+design are in [`docs/PROPOSAL_FAR_VIEW.md`](docs/PROPOSAL_FAR_VIEW.md): a new
+far-terrain renderer from 1 km out, with the voxel rings left where they are.
+The haze, and the band between 160 m and 1 km, are left for him to judge from
+images.
+
+**A gate decision, recorded here because gates only move with a note:** asked
+whether the 1000-FPS criterion should measure the distance a player actually
+sees rather than a fixed 1,024 blocks, the owner said yes. Today those are the
+same distance, so nothing changes yet. He also settled how it is measured:
+three fixed first-person eyes (ground y = 40, hill y = 300, flight y = 3,000),
+each at the full view distance and each at 1,000 FPS or more on both machines.
+The criterion's command changes in the proposal's block F1, *before* the view
+distance grows, so the gate never measures less than the game draws.
+
 ---
 
 ## Where the existing open issues land
