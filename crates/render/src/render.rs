@@ -29,7 +29,10 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Camera near/far planes. The far plane covers radius 64's diagonal
 /// (64 chunks x 16 blocks = 1,024, so ~1,448 corner to corner) with room over.
 const NEAR_PLANE: f32 = 0.1;
-const FAR_PLANE: f32 = 2000.0;
+// Far enough for the far terrain (`docs/PROPOSAL_FAR_VIEW.md`), which reaches
+// hundreds of kilometres. Free with reversed-Z: depth precision is spent near
+// the camera, where the near plane is, not out here.
+const FAR_PLANE: f32 = 1.0e7;
 
 /// Depth cleared at the *far* plane, since [`reverse_z`] puts it at 0.
 pub const DEPTH_CLEAR: f64 = 0.0;
@@ -821,6 +824,7 @@ impl Renderer {
                     selected_block,
                     cracking,
                     players,
+                    far: None,
                     overlay: overlay.as_deref(),
                     hotbar,
                     panel,
@@ -1273,6 +1277,97 @@ pub fn build_figure_pipeline(
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
             cull_mode: Some(wgpu::Face::Back),
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            // Reversed-Z, like the terrain: greater is nearer.
+            depth_compare: Some(wgpu::CompareFunction::Greater),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// `@group(1)` in `far.wgsl`: the far terrain's heights, patches, the slots
+/// drawn this frame, and its parameters (`crate::far::FarTerrain` owns all
+/// four).
+pub fn far_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let storage = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::VERTEX,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("far-bind-group-layout"),
+        entries: &[
+            storage(0),
+            storage(1),
+            storage(2),
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+/// The far terrain's pipeline (`far.wgsl`): no vertex buffer, one instance per
+/// patch, depth-tested against the voxels drawn before it.
+pub fn build_far_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    camera_bgl: &wgpu::BindGroupLayout,
+    far_bgl: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("far-shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/far.wgsl").into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("far-layout"),
+        bind_group_layouts: &[Some(camera_bgl), Some(far_bgl)],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("far-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            // Skirts face both ways depending on the edge, and the ground can
+            // be seen from under an overhang: nothing is culled by winding.
+            cull_mode: None,
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {

@@ -165,9 +165,26 @@ const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// result here. Returns `None` if no GPU adapter is available, so callers can
 /// decide whether that is a skip or a failure.
 pub fn render(meshed: impl IntoIterator<Item = MeshedNode>, shot: Shot) -> Option<Frame> {
-    render_arena(shot, |device, queue, multi_draw, _ctx| {
-        ChunkArena::from_meshed(device, queue, multi_draw, meshed)
-    })
+    render_with_far(meshed, &[], None, shot)
+}
+
+/// [`render`], with the far terrain beyond the voxels
+/// (`docs/PROPOSAL_FAR_VIEW.md`): `far` are its patches and `far_params` its
+/// hole and colour. A separate function rather than [`Shot`] fields because
+/// `Shot` is `Copy` and a far terrain is a few hundred patches of heights.
+pub fn render_with_far(
+    meshed: impl IntoIterator<Item = MeshedNode>,
+    far: &[crate::far::FarPatch<'_>],
+    far_params: Option<crate::far::FarParams>,
+    shot: Shot,
+) -> Option<Frame> {
+    render_arena(
+        shot,
+        (far, far_params),
+        |device, queue, multi_draw, _ctx| {
+            ChunkArena::from_meshed(device, queue, multi_draw, meshed)
+        },
+    )
 }
 
 /// Render explicit `(coord, chunk)` pairs offscreen -- for scenes worldgen
@@ -177,7 +194,7 @@ pub fn render(meshed: impl IntoIterator<Item = MeshedNode>, shot: Shot) -> Optio
 /// chunk is its own level-0 node (`scale` 1.0, one lattice cell = one world
 /// block), placed at its own `ChunkCoord::world_offset`.
 pub fn render_chunks(chunks: &[(ChunkCoord, Chunk)], shot: Shot) -> Option<Frame> {
-    render_arena(shot, |device, queue, multi_draw, ctx| {
+    render_arena(shot, (&[], None), |device, queue, multi_draw, ctx| {
         let mut arena = ChunkArena::new(device, multi_draw);
         for (coord, chunk) in chunks {
             let id = NodeId {
@@ -194,6 +211,7 @@ pub fn render_chunks(chunks: &[(ChunkCoord, Chunk)], shot: Shot) -> Option<Frame
 /// [`render_chunks`]; `build_arena` is the one part that differs between them.
 fn render_arena(
     shot: Shot,
+    (far, far_params): (&[crate::far::FarPatch<'_>], Option<crate::far::FarParams>),
     build_arena: impl FnOnce(&wgpu::Device, &wgpu::Queue, bool, &MeshContext) -> ChunkArena,
 ) -> Option<Frame> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -254,7 +272,7 @@ fn render_arena(
         layer_of: &layer_of,
     };
     let mut arena = build_arena(&device, &queue, multi_draw, &ctx);
-    let (min, max) = arena.bounds()?;
+    let bounds = arena.bounds();
 
     let (vp, eye) = match camera {
         Some((eye, look_dir)) => (
@@ -262,6 +280,8 @@ fn render_arena(
             eye,
         ),
         None => {
+            // The orbit frames the voxels; with none there is nothing to frame.
+            let (min, max) = bounds?;
             let look_target = [
                 (min[0] + max[0]) * 0.5,
                 (min[1] + max[1]) * 0.5,
@@ -278,7 +298,19 @@ fn render_arena(
             (vp, eye)
         }
     };
-    let draw_count = arena.prepare(&queue, &Frustum::from_view_proj(vp));
+    let frustum = Frustum::from_view_proj(vp);
+    let draw_count = arena.prepare(&queue, &frustum);
+    let far_terrain = (!far.is_empty()).then(|| {
+        let mut terrain = crate::far::FarTerrain::new(&device, &queue, far.len() as u32);
+        for patch in far {
+            terrain.insert(&queue, *patch);
+        }
+        if let Some(params) = far_params {
+            terrain.set_params(&queue, params);
+        }
+        terrain.prepare(&queue, &frustum);
+        terrain
+    });
 
     let mut scene = SceneRenderer::new(
         &device,
@@ -349,6 +381,7 @@ fn render_arena(
             selected_block: highlighted_block,
             cracking,
             players: &players,
+            far: far_terrain.as_ref(),
             overlay: menu.as_deref(),
             hotbar: hotbar.as_ref().map(|slots| crate::scene::HotbarView {
                 slots: slots.as_slice(),

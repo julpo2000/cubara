@@ -191,6 +191,23 @@ pub fn load_icon(name: &str) -> Option<Vec<u8>> {
     load_tile(&dir, name)
 }
 
+/// The average colour of the texture `name`, in linear light -- what a patch
+/// of that material looks like from far enough away that its texels are
+/// smaller than a pixel (the far terrain, `docs/PROPOSAL_FAR_VIEW.md`).
+/// Averaged in linear light for the same reason [`downsample`] is. `None`
+/// when there is no such texture.
+pub fn mean_color(name: &str) -> Option<[f32; 3]> {
+    let tile = load_icon(name)?;
+    let mut sum = [0f32; 3];
+    let texels = tile.len() / 4;
+    for texel in tile.as_chunks::<4>().0 {
+        for (c, acc) in sum.iter_mut().enumerate() {
+            *acc += srgb_to_linear(texel[c]);
+        }
+    }
+    Some(sum.map(|c| c / texels as f32))
+}
+
 /// `{textures_dir}/{name}.png` as raw RGBA8 tile bytes, or `None` if the file
 /// doesn't exist or isn't exactly [`TILE_SIZE`]-square -- either way, the
 /// caller falls back to a placeholder rather than failing to start, since a
@@ -454,6 +471,25 @@ mod tests {
             127
         );
         assert_eq!(out[3], 255, "alpha is averaged as-is and stays opaque");
+    }
+
+    #[test]
+    fn a_textures_mean_colour_is_its_linear_average() {
+        // Grass tops are green: more green than red or blue, and not black.
+        let [r, g, b] = mean_color("grass_top").expect("grass_top.png ships");
+        assert!(g > r && g > b && g > 0.05, "{r} {g} {b}");
+        // Exactly the last mip level's colour, which averages the same way.
+        let tile = load_icon("grass_top").unwrap();
+        let smallest = mip_chain(tile).pop().unwrap();
+        for c in 0..3 {
+            let mip = srgb_to_linear(smallest[c]);
+            let mean = [r, g, b][c];
+            assert!(
+                (mip - mean).abs() < 0.01,
+                "channel {c}: mip {mip}, mean {mean}"
+            );
+        }
+        assert_eq!(mean_color("no_such_texture"), None);
     }
 
     #[test]

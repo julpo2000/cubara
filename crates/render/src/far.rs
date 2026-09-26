@@ -1,0 +1,374 @@
+//! The far terrain's GPU half (`docs/PROPOSAL_FAR_VIEW.md` §3.2): where the
+//! patches' heights live on the GPU, which of them are drawn this frame, and
+//! the parameters `far.wgsl` reads.
+//!
+//! Which patches exist and what heights they hold is decided elsewhere
+//! (`cubara_world::far`), and handed over as plain numbers -- this crate does
+//! not depend on the world crate (Rule 3), so a patch arrives as a
+//! [`FarPatch`] and leaves as a [`FarSlot`].
+
+use crate::culling::{Aabb, Frustum};
+use crate::render::far_bind_group_layout;
+use glam::Vec3;
+
+/// Quads along one side of a patch. Must match `far.wgsl`'s `QUADS` and
+/// `cubara_world::far::PATCH_QUADS`; the app asserts the second.
+pub const FAR_QUADS: usize = 32;
+
+/// Heights along one side of a patch.
+pub const FAR_VERTS: usize = FAR_QUADS + 1;
+
+/// The vertex grid one patch is drawn with: its own vertices plus a ring
+/// around them that `far.wgsl` drops into the skirt.
+const GRID: u32 = FAR_VERTS as u32 + 2;
+
+/// One patch, as the renderer needs it: where it is, how coarse, and its
+/// heights row by row (`z` outer, `x` inner), [`FAR_VERTS`] a side.
+#[derive(Clone, Copy, Debug)]
+pub struct FarPatch<'a> {
+    /// The lowest `(x, z)` corner, in blocks.
+    pub origin: [f32; 2],
+    /// The width of one quad, in blocks.
+    pub quad: f32,
+    pub heights: &'a [f32],
+    /// How far the skirt drops below the edge, in blocks: deep enough to
+    /// cover the gap to a coarser neighbour.
+    pub skirt: f32,
+}
+
+/// Where a patch was put, to remove it by later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FarSlot(u32);
+
+/// What `far.wgsl` reads besides the heights.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FarParams {
+    /// The box the voxel rings draw themselves, `(min, max)` in blocks.
+    /// Nothing of the far terrain is drawn inside it. `None`: no hole.
+    pub hole: Option<([f32; 3], [f32; 3])>,
+    /// The average colour of the ground's top, in linear light
+    /// ([`crate::materials::mean_color`]).
+    pub top_color: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct PatchGpu {
+    origin: [f32; 2],
+    quad: f32,
+    skirt: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ParamsGpu {
+    hole_min: [f32; 4],
+    hole_max: [f32; 4],
+    top_color: [f32; 4],
+}
+
+impl ParamsGpu {
+    fn new(p: FarParams) -> Self {
+        // No hole: an empty box, min above max, which nothing is inside.
+        let (min, max) = p.hole.unwrap_or(([f32::MAX; 3], [f32::MIN; 3]));
+        let [r, g, b] = p.top_color;
+        Self {
+            hole_min: [min[0], min[1], min[2], 0.0],
+            hole_max: [max[0], max[1], max[2], 0.0],
+            top_color: [r, g, b, 1.0],
+        }
+    }
+}
+
+/// The far terrain on the GPU: a fixed number of patch slots, and the list of
+/// them drawn this frame.
+pub struct FarTerrain {
+    heights: wgpu::Buffer,
+    patches: wgpu::Buffer,
+    draw_slots: wgpu::Buffer,
+    params: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    index_count: u32,
+    bind_group: wgpu::BindGroup,
+    capacity: u32,
+    /// Slots not holding a patch, handed out last-freed first.
+    free: Vec<u32>,
+    /// Each occupied slot's box, for culling; `None` where the slot is free.
+    boxes: Vec<Option<Aabb>>,
+    /// How many slots [`prepare`](Self::prepare) found in view.
+    drawn: u32,
+}
+
+impl FarTerrain {
+    /// Room for `capacity` patches.
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, capacity: u32) -> Self {
+        let storage = |label, size: u64| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: size.max(16),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let per_patch = (FAR_VERTS * FAR_VERTS * std::mem::size_of::<f32>()) as u64;
+        let heights = storage("far-heights", per_patch * capacity as u64);
+        let patches = storage(
+            "far-patches",
+            std::mem::size_of::<PatchGpu>() as u64 * capacity as u64,
+        );
+        let draw_slots = storage("far-draw-slots", 4 * capacity as u64);
+        let params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("far-params"),
+            size: std::mem::size_of::<ParamsGpu>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(
+            &params,
+            0,
+            bytemuck::bytes_of(&ParamsGpu::new(FarParams {
+                hole: None,
+                top_color: [0.2, 0.4, 0.15],
+            })),
+        );
+
+        let grid = grid_indices();
+        let indices = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("far-grid-indices"),
+            // A multiple of 4, as a buffer write must be; the padding is
+            // never indexed.
+            size: (std::mem::size_of_val(grid.as_slice()) as u64).next_multiple_of(4),
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut bytes = bytemuck::cast_slice::<u16, u8>(&grid).to_vec();
+        bytes.resize(bytes.len().next_multiple_of(4), 0);
+        queue.write_buffer(&indices, 0, &bytes);
+
+        let layout = far_bind_group_layout(device);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("far-bind-group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: heights.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: patches.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: draw_slots.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params.as_entire_binding(),
+                },
+            ],
+        });
+        Self {
+            heights,
+            patches,
+            draw_slots,
+            params,
+            indices,
+            index_count: grid.len() as u32,
+            bind_group,
+            capacity,
+            free: (0..capacity).rev().collect(),
+            boxes: vec![None; capacity as usize],
+            drawn: 0,
+        }
+    }
+
+    /// Upload a patch. `None` when every slot is taken -- the caller decides
+    /// what gives way, since it is the one that knows which patches matter.
+    pub fn insert(&mut self, queue: &wgpu::Queue, patch: FarPatch<'_>) -> Option<FarSlot> {
+        assert_eq!(
+            patch.heights.len(),
+            FAR_VERTS * FAR_VERTS,
+            "a patch's heights"
+        );
+        let slot = self.free.pop()?;
+        let per_patch = (FAR_VERTS * FAR_VERTS * std::mem::size_of::<f32>()) as u64;
+        queue.write_buffer(
+            &self.heights,
+            per_patch * slot as u64,
+            bytemuck::cast_slice(patch.heights),
+        );
+        queue.write_buffer(
+            &self.patches,
+            std::mem::size_of::<PatchGpu>() as u64 * slot as u64,
+            bytemuck::bytes_of(&PatchGpu {
+                origin: patch.origin,
+                quad: patch.quad,
+                skirt: patch.skirt,
+            }),
+        );
+        self.boxes[slot as usize] = Some(patch_box(&patch));
+        Some(FarSlot(slot))
+    }
+
+    /// Free a slot. The patch in it stops being drawn from the next
+    /// [`prepare`](Self::prepare).
+    pub fn remove(&mut self, slot: FarSlot) {
+        if self.boxes[slot.0 as usize].take().is_some() {
+            self.free.push(slot.0);
+        }
+    }
+
+    pub fn set_params(&self, queue: &wgpu::Queue, params: FarParams) {
+        queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&ParamsGpu::new(params)));
+    }
+
+    /// Decide what is drawn this frame: every occupied slot whose box the
+    /// frustum can see. Returns how many.
+    pub fn prepare(&mut self, queue: &wgpu::Queue, frustum: &Frustum) -> u32 {
+        let visible = visible_slots(&self.boxes, frustum);
+        if !visible.is_empty() {
+            queue.write_buffer(&self.draw_slots, 0, bytemuck::cast_slice(&visible));
+        }
+        self.drawn = visible.len() as u32;
+        self.drawn
+    }
+
+    /// Patches held.
+    pub fn len(&self) -> usize {
+        self.boxes.iter().filter(|b| b.is_some()).count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
+    /// Patches drawn this frame, from the last [`prepare`](Self::prepare).
+    pub fn drawn(&self) -> u32 {
+        self.drawn
+    }
+
+    /// Triangles drawn this frame, skirts included.
+    pub fn drawn_triangles(&self) -> u64 {
+        self.drawn as u64 * (self.index_count / 3) as u64
+    }
+
+    pub(crate) fn encode(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if self.drawn == 0 {
+            return;
+        }
+        pass.set_bind_group(1, &self.bind_group, &[]);
+        pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint16);
+        pass.draw_indexed(0..self.index_count, 0, 0..self.drawn);
+    }
+}
+
+/// A patch's box: its square of ground, from the bottom of its skirt to its
+/// highest vertex.
+fn patch_box(patch: &FarPatch<'_>) -> Aabb {
+    let size = patch.quad * FAR_QUADS as f32;
+    let lo = patch.heights.iter().copied().fold(f32::INFINITY, f32::min) - patch.skirt;
+    let hi = patch
+        .heights
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    Aabb {
+        min: Vec3::new(patch.origin[0], lo, patch.origin[1]),
+        max: Vec3::new(patch.origin[0] + size, hi, patch.origin[1] + size),
+    }
+}
+
+/// The occupied slots the frustum can see, in slot order.
+fn visible_slots(boxes: &[Option<Aabb>], frustum: &Frustum) -> Vec<u32> {
+    boxes
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, b)| {
+            b.as_ref()
+                .filter(|b| frustum.intersects_aabb(b))
+                .map(|_| slot as u32)
+        })
+        .collect()
+}
+
+/// The index list for one patch's [`GRID`] x [`GRID`] vertices: two triangles
+/// per cell, every cell -- including the skirt ring's.
+fn grid_indices() -> Vec<u16> {
+    let mut out = Vec::with_capacity(((GRID - 1) * (GRID - 1) * 6) as usize);
+    for z in 0..GRID - 1 {
+        for x in 0..GRID - 1 {
+            let a = (z * GRID + x) as u16;
+            let b = a + 1;
+            let c = a + GRID as u16;
+            let d = c + 1;
+            out.extend_from_slice(&[a, c, b, b, c, d]);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_grid_covers_every_cell_with_two_triangles() {
+        let idx = grid_indices();
+        let cells = (GRID - 1) * (GRID - 1);
+        assert_eq!(idx.len() as u32, cells * 6);
+        assert!(idx.iter().all(|&i| (i as u32) < GRID * GRID));
+        // Every vertex is used: none of the skirt ring is left out.
+        let mut used = vec![false; (GRID * GRID) as usize];
+        for &i in &idx {
+            used[i as usize] = true;
+        }
+        assert!(used.iter().all(|u| *u));
+    }
+
+    /// The shader's `VERTS`/`GRID` and this module's must agree, or every
+    /// patch reads its neighbour's heights.
+    #[test]
+    fn the_shader_agrees_on_the_patch_size() {
+        let wgsl = include_str!("shaders/far.wgsl");
+        assert!(wgsl.contains(&format!("const QUADS: i32 = {FAR_QUADS};")));
+        assert!(wgsl.contains(&format!("const VERTS: u32 = {FAR_VERTS}u;")));
+        assert!(wgsl.contains(&format!("const GRID: u32 = {GRID}u;")));
+    }
+
+    #[test]
+    fn a_patch_box_spans_its_ground_and_its_skirt() {
+        let heights: Vec<f32> = (0..FAR_VERTS * FAR_VERTS)
+            .map(|i| 10.0 + (i % 7) as f32)
+            .collect();
+        let b = patch_box(&FarPatch {
+            origin: [64.0, -128.0],
+            quad: 4.0,
+            heights: &heights,
+            skirt: 8.0,
+        });
+        assert_eq!(b.min, Vec3::new(64.0, 2.0, -128.0));
+        assert_eq!(b.max, Vec3::new(64.0 + 128.0, 16.0, 0.0));
+    }
+
+    #[test]
+    fn only_what_the_frustum_sees_is_drawn() {
+        let proj = glam::Mat4::perspective_rh(60f32.to_radians(), 1.0, 0.1, 10_000.0);
+        let view = glam::Mat4::look_at_rh(Vec3::ZERO, Vec3::new(0.0, 0.0, -1.0), Vec3::Y);
+        let frustum = Frustum::from_view_proj(proj * view);
+        let ahead = Aabb {
+            min: Vec3::new(-10.0, -10.0, -110.0),
+            max: Vec3::new(10.0, 10.0, -90.0),
+        };
+        let behind = Aabb {
+            min: Vec3::new(-10.0, -10.0, 90.0),
+            max: Vec3::new(10.0, 10.0, 110.0),
+        };
+        let boxes = vec![Some(behind), None, Some(ahead), Some(ahead)];
+        assert_eq!(visible_slots(&boxes, &frustum), vec![2, 3]);
+    }
+}

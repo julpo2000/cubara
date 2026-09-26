@@ -17,10 +17,10 @@ use crate::arena::ChunkArena;
 use crate::materials;
 use crate::panel::{InventoryPanel, PanelSlotKind};
 use crate::render::{
-    build_figure_pipeline, build_mesh_pipeline_from_module, build_outline_pipeline, build_pipeline,
-    camera_bind_group_layout, create_depth_view, mesh_pipeline_constants,
-    origins_bind_group_layout, outline_bind_group_layout, FrameUniform, Lighting, OutlineUniform,
-    OUTLINE_CUBE_EDGES,
+    build_far_pipeline, build_figure_pipeline, build_mesh_pipeline_from_module,
+    build_outline_pipeline, build_pipeline, camera_bind_group_layout, create_depth_view,
+    far_bind_group_layout, mesh_pipeline_constants, origins_bind_group_layout,
+    outline_bind_group_layout, FrameUniform, Lighting, OutlineUniform, OUTLINE_CUBE_EDGES,
 };
 use crate::text::font;
 use crate::text::TextRenderer;
@@ -61,6 +61,10 @@ pub struct SceneFrame<'a> {
     /// Empty in singleplayer and in every headless shot that does not ask for
     /// one. The local player is **not** in here: you are the camera.
     pub players: &'a [crate::figure::PlayerView],
+    /// The far terrain beyond the voxel rings (`docs/PROPOSAL_FAR_VIEW.md`),
+    /// already [`prepare`](crate::far::FarTerrain::prepare)d for this frame's
+    /// camera, or `None` for none.
+    pub far: Option<&'a crate::far::FarTerrain>,
     /// Health in **points**, or `None` to draw no hearts.
     ///
     /// Points, not hearts, and not a fraction: this crate is told the number
@@ -234,6 +238,9 @@ pub struct SceneRenderer {
     /// uniform for the highlighted voxel's world position and a static
     /// vertex buffer of unit-cube edges uploaded once here.
     figure_pipeline: wgpu::RenderPipeline,
+    /// The far terrain's (`far.wgsl`), drawn after the voxels so they win
+    /// wherever both could be.
+    far_pipeline: wgpu::RenderPipeline,
     /// Rebuilt every frame from the players in sight, and grown when it has to
     /// be. A figure is 216 vertices, so this stays small enough that reusing
     /// one buffer beats managing per-player ones.
@@ -284,6 +291,8 @@ impl SceneRenderer {
             materials::bind_group(device, &textures_bgl, texture_view, texture_sampler);
 
         let figure_pipeline = build_figure_pipeline(device, format, &camera_bgl);
+        let far_pipeline =
+            build_far_pipeline(device, format, &camera_bgl, &far_bind_group_layout(device));
         let figure_capacity = crate::figure::VERTICES_PER_FIGURE * 8;
         let figure_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("figure-vertices"),
@@ -342,6 +351,7 @@ impl SceneRenderer {
             camera_bind_group,
             texture_bind_group,
             figure_pipeline,
+            far_pipeline,
             figure_vertex_buffer,
             figure_capacity,
             outline_pipeline,
@@ -528,6 +538,7 @@ impl SceneRenderer {
             selected_block,
             cracking,
             players,
+            far,
             overlay,
             hotbar,
             panel,
@@ -630,6 +641,14 @@ impl SceneRenderer {
             pass.set_bind_group(1, arena.origins_bind_group(), &[]);
             pass.set_bind_group(2, &self.texture_bind_group, &[]);
             arena.encode(&mut pass, draw_count);
+
+            // The far terrain, after the voxels: where both could draw, the
+            // depth test and the hole leave it to them.
+            if let Some(far) = far.filter(|f| f.drawn() > 0) {
+                pass.set_pipeline(&self.far_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                far.encode(&mut pass);
+            }
 
             // Other players, same pass so a figure behind a hill is behind it.
             if figure_vertices_count > 0 {

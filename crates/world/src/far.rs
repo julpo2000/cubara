@@ -329,7 +329,41 @@ fn finer_gap(gen: &WorldGen, heights: &[f32], ox: i64, oz: i64, q: i64) -> (f32,
     (gaps[gaps.len() - 1], gaps[gaps.len() * 9 / 10])
 }
 
+/// Everything a one-shot caller needs -- a screenshot, the bench, a golden
+/// test: select, generate what is new, select again, until nothing new is
+/// asked for. The patches drawn, in [`select`]'s order.
+///
+/// On one thread. A live game streams instead, spreading the same loop over
+/// frames and workers; a one-shot caller has one frame to be right in.
+pub fn build(gen: &WorldGen, view: &FarView) -> Vec<PatchHeights> {
+    let mut have: std::collections::HashMap<PatchKey, PatchHeights> =
+        std::collections::HashMap::new();
+    loop {
+        let keys = select(view, |k| have.get(&k).map(|p| p.error));
+        let new: Vec<PatchKey> = keys
+            .iter()
+            .copied()
+            .filter(|k| !have.contains_key(k))
+            .collect();
+        if new.is_empty() {
+            return keys.iter().filter_map(|k| have.remove(k)).collect();
+        }
+        for k in new {
+            have.insert(k, generate(gen, k));
+        }
+    }
+}
+
 impl PatchHeights {
+    /// How far the patch's skirt drops below its edge, in blocks: enough to
+    /// cover the gap to a neighbour two levels coarser (a split for roughness
+    /// can put one there), whose edge is a straight line across four of this
+    /// patch's quads -- a slope of one block per block opens at most that --
+    /// plus this patch's own worst gap to its finer self.
+    pub fn skirt(&self) -> f32 {
+        4.0 * self.key.quad() as f32 + self.error_max
+    }
+
     /// The drawn surface at block column `(x, z)`: the bilinear blend of the
     /// four vertices around it, which is what the rasterizer draws between
     /// them (to within the diagonal each quad is split along).
