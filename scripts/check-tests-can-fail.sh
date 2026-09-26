@@ -47,6 +47,12 @@
 #   ./scripts/check-tests-can-fail.sh [base-ref] [max-mutations]
 #
 # Defaults: base `origin/main`, at most 8 mutations.
+#
+# A mutation that makes a test loop forever is caught -- by hanging. Twice on
+# 2026-09-26 one did, and the run sat there until someone killed it by hand. So
+# each mutated run has a time limit and counts as caught when it runs out:
+# four times the unmutated run of the same crate, and at least a minute.
+# MUTATION_TIMEOUT=<seconds> overrides it.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -92,6 +98,39 @@ mutate_line() {
     esac
     echo ""
 }
+
+# Stops a process and everything it started. Children first, with the parent
+# stopped so it cannot start more meanwhile: killing only cargo would leave the
+# test binary it launched still spinning.
+kill_tree() {
+    local pid="$1" child
+    kill -STOP "$pid" 2>/dev/null
+    for child in $(pgrep -P "$pid" 2>/dev/null); do
+        kill_tree "$child"
+    done
+    kill -KILL "$pid" 2>/dev/null
+}
+
+# Runs "$@" for at most $1 seconds, and returns 124 if it had to be stopped (as
+# GNU timeout does -- macOS ships no timeout, so this is plain bash).
+run_with_timeout() {
+    local secs="$1" start="$SECONDS" pid
+    shift
+    "$@" &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ $((SECONDS - start)) -ge "$secs" ]; then
+            kill_tree "$pid"
+            wait "$pid" 2>/dev/null
+            return 124
+        fi
+        sleep 1
+    done
+    wait "$pid"
+}
+
+build_tests() { RUSTFLAGS="-D warnings" cargo test -p "$1" --no-run --quiet >/dev/null 2>&1; }
+run_tests() { RUSTFLAGS="-D warnings" cargo test -p "$1" --quiet >/dev/null 2>&1; }
 
 # The cargo package that owns a path under crates/<dir>/src.
 package_of() {
@@ -203,6 +242,22 @@ while [ "$i" -lt "$total" ] && [ "$tried" -lt "$budget" ]; do
 
     pkg="$(package_of "$file")"
     [ -n "$pkg" ] || continue
+
+    # Each crate's tests run once unmutated first. That run gives the time
+    # limit, and it has to pass: against a suite that is already red, every
+    # mutation would read as caught.
+    limit_var="limit_$(echo "$pkg" | tr -c 'A-Za-z0-9\n' '_')"
+    if [ -z "${!limit_var:-}" ]; then
+        if ! build_tests "$pkg" || ! { start="$SECONDS"; run_tests "$pkg"; }; then
+            echo "$pkg's tests fail before any mutation, so nothing here would mean"
+            echo "anything. Make them pass first."
+            exit 2
+        fi
+        limit=$(( (SECONDS - start) * 4 ))
+        [ "$limit" -lt 60 ] && limit=60
+        printf -v "$limit_var" '%s' "${MUTATION_TIMEOUT:-$limit}"
+    fi
+    limit="${!limit_var}"
     tried=$((tried + 1))
 
     python3 - "$file" "$line" "$after" <<'PY'
@@ -213,12 +268,22 @@ lines[n - 1] = new
 io.open(path, "w", encoding="utf-8").write("\n".join(lines))
 PY
 
-    if RUSTFLAGS="-D warnings" cargo test -p "$pkg" --quiet >/dev/null 2>&1; then
+    # Built outside the limit, so a slow compile is never taken for a hang.
+    if ! build_tests "$pkg"; then
+        echo "caught    $file:$line  ($pkg, does not build)"
+        restore_all
+        continue
+    fi
+    run_with_timeout "$limit" run_tests "$pkg"
+    status=$?
+    if [ "$status" -eq 0 ]; then
         survivors=$((survivors + 1))
         echo "SURVIVED  $file:$line  ($pkg)"
         echo "    was: $(echo "$before" | sed 's/^[[:space:]]*//')"
         echo "    now: $(echo "$after" | sed 's/^[[:space:]]*//')"
         echo
+    elif [ "$status" -eq 124 ]; then
+        echo "caught    $file:$line  ($pkg, timed out after ${limit}s)"
     else
         echo "caught    $file:$line  ($pkg)"
     fi
