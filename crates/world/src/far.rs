@@ -610,6 +610,41 @@ pub(crate) mod tests {
         }
     }
 
+    /// `error_max` is the worst gap, found independently: at every quad
+    /// centre and edge midpoint, the finer footprint's mean against this
+    /// patch's blend. The skirt is sized from it, so a smaller number here is
+    /// a seam that opens on the roughest edge.
+    #[test]
+    fn error_max_is_the_worst_gap_there_is() {
+        let gen = WorldGen::new(SEED);
+        // A patch in the mountains, where the gaps are uneven.
+        let key = PatchKey::containing(5, -848, 4832);
+        let p = generate(&gen, key);
+        let [ox, oz] = key.origin();
+        let q = key.quad();
+        let h = |i: usize, j: usize| p.heights[j * PATCH_VERTS + i];
+        let mut worst = 0f32;
+        for j in 0..PATCH_QUADS {
+            for i in 0..PATCH_QUADS {
+                let (x, z) = (ox + i as i64 * q, oz + j as i64 * q);
+                let centre = (h(i, j) + h(i + 1, j) + h(i, j + 1) + h(i + 1, j + 1)) / 4.0;
+                for (fx, fz, blend) in [
+                    (x + q / 2, z, (h(i, j) + h(i + 1, j)) / 2.0),
+                    (x, z + q / 2, (h(i, j) + h(i, j + 1)) / 2.0),
+                    (x + q / 2, z + q / 2, centre),
+                ] {
+                    worst = worst.max((footprint_mean(&gen, fx, fz, q / 2) - blend).abs());
+                }
+            }
+        }
+        assert!(
+            worst > 1.0,
+            "a mountain patch with no gap to speak of: {worst}"
+        );
+        assert_eq!(p.error_max, worst);
+        assert!(p.error <= p.error_max);
+    }
+
     /// Two patches side by side share an edge, and must agree on it height
     /// for height, or the seam between them opens. At every level.
     #[test]
