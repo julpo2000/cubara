@@ -29,7 +29,7 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Camera near/far planes. The far plane covers radius 64's diagonal
 /// (64 chunks x 16 blocks = 1,024, so ~1,448 corner to corner) with room over.
 const NEAR_PLANE: f32 = 0.1;
-const FAR_PLANE: f32 = 2000.0;
+const FAR_PLANE: f32 = 1.0e7;
 
 /// Depth cleared at the *far* plane, since [`reverse_z`] puts it at 0.
 pub const DEPTH_CLEAR: f64 = 0.0;

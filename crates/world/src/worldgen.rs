@@ -1711,3 +1711,60 @@ mod tests {
         assert!(any, "no ore in an LOD node -- §6 wants ore at every level");
     }
 }
+
+#[cfg(test)]
+mod far_view_probe {
+    use super::*;
+
+    /// Experiment only (exp/far-view-octree): how tall the highest peak in
+    /// a 16 km square is drawn at each LOD level.
+    #[test]
+    #[ignore]
+    fn peak_height_per_level() {
+        let gen = WorldGen::new(0x005E_ED00_00C0_FFEE);
+        let blocks = TerrainBlocks {
+            oak: None,
+            ores: OreSet::EMPTY,
+            grass: BlockId(1),
+            soil: BlockId(2),
+            stone: BlockId(3),
+        };
+        let (mut px, mut pz, mut ph) = (0, 0, i32::MIN);
+        for x in (-8000..8000).step_by(16) {
+            for z in (-8000..8000).step_by(16) {
+                let h = gen.surface_height(x, z);
+                if h > ph {
+                    (px, pz, ph) = (x, z, h);
+                }
+            }
+        }
+        // The plain around it: the median surface over a 2 km square.
+        let mut around: Vec<i32> = (-1000..1000)
+            .step_by(50)
+            .flat_map(|dx| (-1000..1000).step_by(50).map(move |dz| (dx, dz)))
+            .map(|(dx, dz)| gen.surface_height(px + dx, pz + dz))
+            .collect();
+        around.sort();
+        let base = around[around.len() / 2];
+        println!("peak at ({px}, {pz}): true top y = {ph}, median ground within 1 km = {base}");
+        for level in 0..=11u32 {
+            let step = 1i32 << level;
+            let span = 16 * step;
+            let ox = px.div_euclid(span) * span;
+            let oz = pz.div_euclid(span) * span;
+            let lx = ((px - ox) / step) as usize;
+            let lz = ((pz - oz) / step) as usize;
+            let mut top = None;
+            for oy in [ph.div_euclid(span) * span + span, ph.div_euclid(span) * span, ph.div_euclid(span) * span - span] {
+                let chunk = gen.generate([ox, oy, oz], step, blocks);
+                for ly in (0..Chunk::SIZE).rev() {
+                    if chunk.get(lx, ly, lz) != BlockId::AIR {
+                        top = top.max(Some(oy + (ly as i32 + 1) * step));
+                        break;
+                    }
+                }
+            }
+            println!("level {level:2} (cell {step:4} blocks): drawn top y = {top:?}");
+        }
+    }
+}
