@@ -826,9 +826,16 @@ mod tests {
         pool.cancel(node);
         pool.request(&new, &registry, &layer_of, node, blocks);
         let mut got = Vec::new();
+        // A bounded wait, so a pool that never answers fails here rather than
+        // hanging the test run (and `check-tests-can-fail.sh` with it). Counted
+        // in sleeps, not read off the clock: Rule 1's check keeps
+        // the wall clock out of this crate, tests included.
+        let mut waited_ms = 0;
         while pool.is_in_flight(node) {
+            assert!(waited_ms < 30_000, "no result in 30 s");
             got.extend(pool.poll());
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            waited_ms += 1;
         }
         assert_eq!(got.len(), 1, "one result for one wanted node");
         assert_eq!(
