@@ -648,7 +648,7 @@ fn main() {
     // Headless benchmark mode:
     // `cargo run --release -- --bench [radius] [--size WIDTHxHEIGHT]`.
     if let Some(i) = args.iter().position(|a| a == "--bench") {
-        let radius = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(12);
+        let target = bench::parse_target(args.get(i + 1).map(String::as_str));
         let size = match args.iter().position(|a| a == "--size") {
             // Refused rather than defaulted: a typo silently measuring 1080p
             // would be recorded as the size that was asked for.
@@ -706,24 +706,29 @@ fn main() {
         };
         // `--bench gate`: the owner's three eyes at the game's own view
         // distance, and one GATE line -- what `check-phase-gate.sh` runs.
-        if args.get(i + 1).map(String::as_str) == Some("gate") {
-            let view_radius = streaming::render_radius_chunks();
-            let results: Vec<_> = bench::GATE_EYES
-                .iter()
-                .map(|gate_eye| {
-                    log::info!("gate eye {}: {:?}", gate_eye.name, gate_eye.eye);
-                    let view = bench::View {
-                        eye: Some(gate_eye.eye),
-                        squash: Some(streaming::VERTICAL_LOD_SQUASH),
-                    };
-                    let outcome = bench::run(view_radius, size, view, overlay, gpu_timing, fog);
-                    (*gate_eye, outcome)
-                })
-                .collect();
-            let (met, line) = bench::gate_verdict(&results);
-            log::info!("{line}");
-            std::process::exit(if met { 0 } else { 1 });
-        }
+        // Exits 0 either way, like every `--bench`: the GATE line is the
+        // answer, and the script reads that rather than trusting a code.
+        let radius = match target {
+            bench::Target::Radius(radius) => radius,
+            bench::Target::Gate => {
+                let view_radius = streaming::render_radius_chunks();
+                let results: Vec<_> = bench::GATE_EYES
+                    .iter()
+                    .map(|gate_eye| {
+                        log::info!("gate eye {}: {:?}", gate_eye.name, gate_eye.eye);
+                        let view = bench::View {
+                            eye: Some(gate_eye.eye),
+                            squash: Some(streaming::VERTICAL_LOD_SQUASH),
+                        };
+                        let outcome = bench::run(view_radius, size, view, overlay, gpu_timing, fog);
+                        (*gate_eye, outcome)
+                    })
+                    .collect();
+                let (_, line) = bench::gate_verdict(&results);
+                log::info!("{line}");
+                return;
+            }
+        };
         bench::run(
             radius,
             size,

@@ -307,6 +307,24 @@ pub enum GpuTimingMode {
     On,
 }
 
+/// What `--bench <x>` measures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// `--bench gate`: the three [`GATE_EYES`] at the game's own view distance.
+    Gate,
+    /// `--bench <radius>`: one scene of this chunk radius -- 12, a
+    /// realistically heavy world, when none is given.
+    Radius(i32),
+}
+
+/// Parse the word after `--bench`.
+pub fn parse_target(word: Option<&str>) -> Target {
+    match word {
+        Some("gate") => Target::Gate,
+        other => Target::Radius(other.and_then(|w| w.parse().ok()).unwrap_or(12)),
+    }
+}
+
 /// Parse a `--gpu-timing` value: `off`, `auto`, or `on` (case-insensitive).
 pub fn parse_gpu_timing_mode(text: &str) -> Option<GpuTimingMode> {
     match text.to_ascii_lowercase().as_str() {
@@ -1072,6 +1090,15 @@ mod tests {
 
     /// The flight eye is the one the far terrain (block F3) exists for. When
     /// that lands, this test is the reminder to hold it to the gate.
+    #[test]
+    fn bench_gate_is_the_gate_and_anything_else_is_a_radius() {
+        assert_eq!(parse_target(Some("gate")), Target::Gate);
+        assert_eq!(parse_target(Some("64")), Target::Radius(64));
+        assert_eq!(parse_target(None), Target::Radius(12));
+        // A flag straight after `--bench` is not a radius.
+        assert_eq!(parse_target(Some("--eye")), Target::Radius(12));
+    }
+
     #[test]
     fn the_gate_eyes_are_the_owners_three() {
         let names: Vec<_> = GATE_EYES
