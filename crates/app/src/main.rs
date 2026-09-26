@@ -677,7 +677,12 @@ fn main() {
                     .and_then(bench::parse_size)
                     .unwrap_or((1920, 1080)),
             });
-        screenshot::run(path, view);
+        // Static overlay text -- the pause menu or console, for a review
+        // screenshot of `Hud::menu` with no window (`--screenshot menu.png
+        // --menu "line one\nline two"`, `\n` unescaped since a shell arg
+        // can't carry a real newline).
+        let menu = value("--menu").map(|m| m.replace("\\n", "\n"));
+        screenshot::run(path, view, menu);
         return;
     }
 

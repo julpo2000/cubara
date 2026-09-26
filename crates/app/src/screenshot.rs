@@ -50,7 +50,7 @@ fn shot_with_fog(shot: Shot) -> Shot {
     }
 }
 
-pub fn run(path: &str, view: Option<View>) {
+pub fn run(path: &str, view: Option<View>, menu: Option<String>) {
     let world = World::new();
     let registry = load_registry();
     let layers = TextureLayers::from_registry(&registry);
@@ -89,6 +89,7 @@ pub fn run(path: &str, view: Option<View>) {
             (shot_with_fog(shot), built)
         }
     };
+    let shot = Shot { menu, ..shot };
     let meshed = built.into_iter().filter_map(to_meshed_node);
     let Some(frame) = headless::render(meshed, shot) else {
         log::error!("no suitable GPU adapter — cannot render a screenshot");
