@@ -118,8 +118,15 @@ grep -rn --include='*.rs' --exclude='instance.rs' -E "wgpu::Instance::new|Instan
 
 # Release builds run without indirect-call validation (instance.rs), and on
 # D3D12 that makes an indirectly drawn shader's vertex_index ignore base_vertex
-# and its instance_index ignore first_instance. mesh.wgsl is the shader
-# ChunkArena draws indirectly; it must read neither.
+# and its instance_index ignore first_instance. (Direct draws are unaffected:
+# wgpu-hal's D3D12 backend passes both to the shader itself on every direct
+# draw -- `prepare_draw` -- and only rewrites indirect ones when validation is
+# on.) So: indirect draws are issued in exactly one file, arena.rs, whose shader
+# is mesh.wgsl, and mesh.wgsl reads neither. far.wgsl does read both -- its
+# patches find their slot by instance_index -- which is sound only while the far
+# terrain's draw stays direct; the first check keeps it that way.
+grep -rn --include='*.rs' --exclude='arena.rs' -E "\.(multi_)?draw(_indexed)?_indirect(_count)?\(" crates \
+    | report "Rule 5" "an indirect draw outside arena.rs -- its shader must not read vertex_index/instance_index (D3D12, instance.rs); check it, then extend this rule to it"
 grep -n -E "^[^/]*@builtin\((vertex_index|instance_index)\)" crates/render/src/shaders/mesh.wgsl \
     | sed 's|^|crates/render/src/shaders/mesh.wgsl:|' \
     | report "Rule 5" "an indirectly drawn shader reads vertex_index/instance_index -- wrong on D3D12 without indirect validation (instance.rs)"

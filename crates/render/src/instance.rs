@@ -19,9 +19,12 @@
 //!
 //! Two consequences of running without it, both on D3D12 only: an
 //! indirectly drawn shader's `@builtin(vertex_index)` ignores `base_vertex`,
-//! and its `@builtin(instance_index)` ignores `first_instance`. `mesh.wgsl` —
-//! the one indirectly drawn shader — uses neither, and
-//! `check-architecture.sh` keeps it that way.
+//! and its `@builtin(instance_index)` ignores `first_instance`. Direct draws
+//! are unaffected — wgpu-hal's D3D12 backend hands both to the shader itself on
+//! every direct draw — so `far.wgsl`, which finds its patch by
+//! `instance_index`, is sound while its draw stays direct. `mesh.wgsl` — the
+//! one indirectly drawn shader — uses neither. `check-architecture.sh` keeps
+//! indirect draws in `arena.rs` alone and `mesh.wgsl` off both built-ins.
 //!
 //! `WGPU_VALIDATION_INDIRECT_CALL=1` (and wgpu's other `WGPU_*` flag
 //! variables) still switch it on at run time, for diagnosing a bad draw.
