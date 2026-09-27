@@ -12,6 +12,7 @@
 //! movement (`ARCHITECTURE.md` Rule 3; camera movement is `cubara-sim`'s job as of
 //! block 1.6).
 
+pub mod aggregate;
 mod arena;
 pub mod crack;
 pub mod culling;
