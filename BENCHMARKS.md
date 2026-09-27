@@ -83,6 +83,9 @@ frames after 200 warmup.
 | 2026-09-27 | **Gate eye: ground** (y = 40), full view distance⁶⁴ | 1,940 | 819,928 | ~5,084 | 0.156 ms | 0.540 ms | `da21d01` |
 | 2026-09-27 | **Gate eye: hill** (y = 300), full view distance⁶⁴ | 869 | 436,690 | ~4,520 | 0.180 ms | 0.732 ms | `da21d01` |
 | 2026-09-27 | **Gate eye: flight** (y = 3,000) — nothing in view yet⁶⁴ | 0 | 0 | -- | -- | -- | `da21d01` |
+| 2026-09-27 | **Gate eye: ground + far terrain (High, 262 km)** — F3c⁶⁶ | 1,940 | 819,928 voxel + 720,819 far drawn | ~3,620 | 0.199 ms | 0.550 ms | `41bdab0` |
+| 2026-09-27 | **Gate eye: hill + far terrain (High)**⁶⁶ | 869 | 436,690 voxel + 727,521 far drawn | ~3,669 | 0.194 ms | 0.573 ms | `41bdab0` |
+| 2026-09-27 | **Gate eye: flight + far terrain (High)** — sees something now⁶⁶ | 0 | 547,649 far drawn | ~4,089 | 0.171 ms | 0.528 ms | `41bdab0` |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -160,6 +163,9 @@ frames after 200 warmup.
 | 2026-09-26 | **Gate eye: ground** (y = 40), full view distance — the owner's criterion since today⁶² | 1,940 | 819,928 (167,988 drawn) | ~3,121 | 0.266 ms | 1.574 ms | `feac659` |
 | 2026-09-26 | **Gate eye: hill** (y = 300), full view distance⁶² | 869 | 436,690 (102,664 drawn) | ~3,530 | 0.189 ms | 0.875 ms | `feac659` |
 | 2026-09-26 | **Gate eye: flight** (y = 3,000) — nothing in view yet⁶² | 0 | 0 | -- | -- | -- | `feac659` |
+| 2026-09-27 | **Gate eye: ground + far terrain** — High / Medium / **Low** (F3c)⁶⁷ | 1,940 | 819,928 voxel + far | 597 / 907 / **1,090** | -- | -- | `44c62b0` |
+| 2026-09-27 | **Gate eye: hill + far terrain** — High / Medium / **Low**⁶⁷ | 869 | 436,690 voxel + far | 809 / 1,225 / **1,563** | -- | -- | `44c62b0` |
+| 2026-09-27 | **Gate eye: flight + far terrain** — High / Medium / **Low**⁶⁷ | 0 | far only | 1,542 / 2,175 / **4,039** | -- | -- | `44c62b0` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -174,6 +180,9 @@ frames after 200 warmup.
 | 2026-09-26 | **Gate eye: ground** (y = 40), full view distance — the owner's criterion since today⁶³ | 1,940 | 819,928 (167,988 drawn) | ~2,380 | 0.266 ms | 0.797 ms | `ea67f2b` |
 | 2026-09-26 | **Gate eye: hill** (y = 300), full view distance⁶³ | 869 | 436,690 (102,664 drawn) | ~3,439 | 0.173 ms | 0.687 ms | `ea67f2b` |
 | 2026-09-26 | **Gate eye: flight** (y = 3,000) — nothing in view yet⁶³ | 0 | 0 | -- | -- | -- | `ea67f2b` |
+| 2026-09-27 | **Gate eye: ground + far terrain (High, 262 km)** — F3c⁶⁵ | 1,940 | 819,928 voxel + 720,819 far drawn | ~1,610 | 0.340 ms | 1.018 ms | `41bdab0` |
+| 2026-09-27 | **Gate eye: hill + far terrain (High)**⁶⁵ | 869 | 436,690 voxel + 727,521 far drawn | ~1,765 | 0.280 ms | 1.013 ms | `41bdab0` |
+| 2026-09-27 | **Gate eye: flight + far terrain (High)** — sees something now⁶⁵ | 0 | 547,649 far drawn | ~2,435 | 0.167 ms | 0.734 ms | `41bdab0` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -2259,8 +2268,9 @@ decision, and it is recorded here so the jump is not read as a speedup. The
 orbit keeps its rows as the comparable series for the history; the gate eyes
 start their own.
 
-The flight eye draws nothing: from 3 km up the view reaches only 512 blocks
-downward (`docs/PROPOSAL_FAR_VIEW.md` §1). The gate reports it as `nothing in
+The flight eye draws nothing: from 3 km up the voxels reach only 1,024
+blocks downward (`docs/PROPOSAL_FAR_VIEW.md` §1; this footnote first said
+512, which was wrong -- the drawn region is a cube). The gate reports it as `nothing in
 view yet` and does not count it; block F3 of that proposal gives it
 something to see and makes it count (`GateEye::must_see`).
 
@@ -2323,3 +2333,38 @@ It points the same way as Linux's unexplained +34% (⁶³), and wgpu 24 → 30
 (#275) is again the one render-path change in the window. Two machines now
 show it; it has not been bisected.
 
+⁶⁵ **The far terrain on Linux (GTX 1060 Max-Q, Vulkan, NVIDIA 580.178.04),
+`41bdab0` (#289, F3c).** Measured by the Linux session with the lid closed; the
+bench renders offscreen and needs no display. `--bench gate`: **met at High**,
+the best-looking far-terrain quality, on the first try. GPU/frame, which works
+on this backend: ground 0.573 ms, hill 0.531, flight 0.362. Against ⁶³ on the
+same machine without the far terrain: ground 2,380 → 1,610 FPS (−32%, GPU
+0.363 → 0.573 ms), hill 3,439 → 1,765 (−49%, GPU 0.235 → 0.531 ms). So the far
+terrain costs about 0.2–0.3 ms of GPU a frame here, and the weakest discrete GPU
+of the three machines holds High with 1.6× headroom at its worst eye.
+`--bench tune --target 60` chose High as well. Building the patches took
+17–22 s single-threaded on this CPU (i7-8750H), against 4–5 s on the M3; that is
+one-shot bench cost, and the game streams them on worker threads.
+
+⁶⁶ **The far terrain on Windows (RTX 4060 Laptop, Vulkan), `41bdab0` (#289,
+F3c).** Measured by the Windows session, uncontended, one run each.
+`--bench gate`: **met at High** on the first try. GPU/frame: ground 0.251 ms,
+hill 0.256, flight 0.270 (p99 2.216 — a ~2 ms p99 spike that sat on the hill
+eye on `main` (#290) moved to the flight eye here; both are the eye with the
+least voxel geometry, not yet investigated). Against #290's rows on `main`
+without the far terrain: ground 5,084 → 3,620 FPS (−29%), hill 4,520 → 3,669
+(−19%). `--bench tune --target 144` (the internal panel; the external one is
+120 Hz, and the stricter was chosen) picked High. Patches built in 8–10 s
+single-threaded.
+
+⁶⁷ **The far terrain on the M3 (Metal), `44c62b0` (#289, F3c), per
+quality.** `--bench gate` tried High, then Medium, then Low: **met at Low**
+(ground 1,090, hill 1,563, flight 4,039 FPS). The only machine of the three
+that does not hold High at 1,000 -- an integrated GPU sharing its memory
+bandwidth with the CPU, as the rest of this table shows. Measured with the
+battery at 19% and charging, a few hours after it had run down to 1%; at 1%
+the same High scene read 218 / 240 / 383, so these may still be depressed
+and are to be re-measured on a full charge. Earlier warm-machine runs at High
+(`PROPOSAL_FAR_VIEW.md` §6b) read ground 826–873, hill 878–1,105. For play,
+the game tunes to the monitor instead: this M3 runs its window at 60 Hz
+(footnote ⁴⁵), and `--bench tune --target 60` chose High.

@@ -238,8 +238,7 @@ pub struct SceneRenderer {
     /// uniform for the highlighted voxel's world position and a static
     /// vertex buffer of unit-cube edges uploaded once here.
     figure_pipeline: wgpu::RenderPipeline,
-    /// The far terrain's (`far.wgsl`), drawn after the voxels so they win
-    /// wherever both could be.
+    /// The far terrain's (`far.wgsl`), drawn after the voxels.
     far_pipeline: wgpu::RenderPipeline,
     /// Rebuilt every frame from the players in sight, and grown when it has to
     /// be. A figure is 216 vertices, so this stays small enough that reusing
@@ -645,8 +644,8 @@ impl SceneRenderer {
             // The far terrain, after the voxels: where both could draw, the
             // depth test and the hole leave it to them.
             if let Some(far) = far.filter(|f| f.drawn() > 0) {
-                pass.set_pipeline(&self.far_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_pipeline(&self.far_pipeline);
                 far.encode(&mut pass);
             }
 

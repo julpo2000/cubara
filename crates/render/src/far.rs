@@ -93,6 +93,8 @@ pub struct FarTerrain {
     capacity: u32,
     /// Slots not holding a patch, handed out last-freed first.
     free: Vec<u32>,
+    /// The voxels' hole, from the last [`set_params`](Self::set_params).
+    hole: Option<Aabb>,
     /// Each occupied slot's box, for culling; `None` where the slot is free.
     boxes: Vec<Option<Aabb>>,
     /// How many slots [`prepare`](Self::prepare) found in view.
@@ -180,6 +182,7 @@ impl FarTerrain {
             free: (0..capacity).rev().collect(),
             boxes: vec![None; capacity as usize],
             drawn: 0,
+            hole: None,
         }
     }
 
@@ -219,18 +222,26 @@ impl FarTerrain {
         }
     }
 
-    pub fn set_params(&self, queue: &wgpu::Queue, params: FarParams) {
+    pub fn set_params(&mut self, queue: &wgpu::Queue, params: FarParams) {
+        self.hole = params.hole.map(|(min, max)| Aabb {
+            min: Vec3::from(min),
+            max: Vec3::from(max),
+        });
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&ParamsGpu::new(params)));
     }
 
     /// Decide what is drawn this frame: every occupied slot whose box the
-    /// frustum can see. Returns how many.
-    pub fn prepare(&mut self, queue: &wgpu::Queue, frustum: &Frustum) -> u32 {
+    /// frustum can see, nearest to `eye` first -- so near ground fills the
+    /// depth buffer before the distant ground it hides is drawn. Returns how
+    /// many.
+    /// Patches wholly inside the voxels' hole are not drawn at all.
+    pub fn prepare(&mut self, queue: &wgpu::Queue, frustum: &Frustum, eye: Vec3) -> u32 {
         let visible = visible_slots(&self.boxes, frustum);
-        if !visible.is_empty() {
-            queue.write_buffer(&self.draw_slots, 0, bytemuck::cast_slice(&visible));
+        let order = draw_order(&self.boxes, visible, self.hole.as_ref(), eye);
+        if !order.is_empty() {
+            queue.write_buffer(&self.draw_slots, 0, bytemuck::cast_slice(&order));
         }
-        self.drawn = visible.len() as u32;
+        self.drawn = order.len() as u32;
         self.drawn
     }
 
@@ -257,6 +268,8 @@ impl FarTerrain {
         self.drawn as u64 * (self.index_count / 3) as u64
     }
 
+    /// Draw this frame's patches. The pipeline and bind group 0 (the camera)
+    /// are the caller's to set.
     pub(crate) fn encode(&self, pass: &mut wgpu::RenderPass<'_>) {
         if self.drawn == 0 {
             return;
@@ -267,16 +280,20 @@ impl FarTerrain {
     }
 }
 
+fn min_max(heights: &[f32]) -> (f32, f32) {
+    heights
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &h| {
+            (lo.min(h), hi.max(h))
+        })
+}
+
 /// A patch's box: its square of ground, from the bottom of its skirt to its
 /// highest vertex.
 fn patch_box(patch: &FarPatch<'_>) -> Aabb {
     let size = patch.quad * FAR_QUADS as f32;
-    let lo = patch.heights.iter().copied().fold(f32::INFINITY, f32::min) - patch.skirt;
-    let hi = patch
-        .heights
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
+    let (lo, hi) = min_max(patch.heights);
+    let lo = lo - patch.skirt;
     Aabb {
         min: Vec3::new(patch.origin[0], lo, patch.origin[1]),
         max: Vec3::new(patch.origin[0] + size, hi, patch.origin[1] + size),
@@ -294,6 +311,36 @@ fn visible_slots(boxes: &[Option<Aabb>], frustum: &Frustum) -> Vec<u32> {
                 .map(|_| slot as u32)
         })
         .collect()
+}
+
+/// The visible slots to draw, nearest to `eye` first -- so near ground fills
+/// the depth buffer before the distant ground it hides -- leaving out any
+/// wholly inside the voxels' hole.
+fn draw_order(
+    boxes: &[Option<Aabb>],
+    visible: Vec<u32>,
+    hole: Option<&Aabb>,
+    eye: Vec3,
+) -> Vec<u32> {
+    let bx = |slot: &u32| {
+        boxes[*slot as usize]
+            .as_ref()
+            .expect("a visible slot is occupied")
+    };
+    let mut order: Vec<u32> = visible
+        .into_iter()
+        .filter(|slot| !hole.is_some_and(|h| contains(h, bx(slot))))
+        .collect();
+    let distance = |slot: &u32| {
+        let b = bx(slot);
+        (eye.clamp(b.min, b.max) - eye).length_squared()
+    };
+    order.sort_by(|a, b| distance(a).total_cmp(&distance(b)));
+    order
+}
+
+fn contains(outer: &Aabb, inner: &Aabb) -> bool {
+    outer.min.cmple(inner.min).all() && inner.max.cmple(outer.max).all()
 }
 
 /// The index list for one patch's [`GRID`] x [`GRID`] vertices: two triangles
@@ -353,6 +400,28 @@ mod tests {
         });
         assert_eq!(b.min, Vec3::new(64.0, 2.0, -128.0));
         assert_eq!(b.max, Vec3::new(64.0 + 128.0, 16.0, 0.0));
+    }
+
+    /// Patches wholly inside the voxels' hole are not drawn; the rest are,
+    /// nearest first.
+    #[test]
+    fn patches_are_drawn_nearest_first_and_none_inside_the_hole() {
+        let b = |x: f32| {
+            Some(Aabb {
+                min: Vec3::new(x, 0.0, 0.0),
+                max: Vec3::new(x + 10.0, 10.0, 10.0),
+            })
+        };
+        let hole = Aabb {
+            min: Vec3::new(-100.0, -100.0, -100.0),
+            max: Vec3::new(100.0, 100.0, 100.0),
+        };
+        //           inside  crosses  clear     clear     crosses
+        let boxes = [b(0.0), b(95.0), b(300.0), b(150.0), b(-105.0)];
+        let order = draw_order(&boxes, vec![0, 1, 2, 3, 4], Some(&hole), Vec3::ZERO);
+        assert_eq!(order, vec![1, 4, 3, 2]);
+        let order = draw_order(&boxes, vec![2, 0, 1], None, Vec3::ZERO);
+        assert_eq!(order, vec![0, 1, 2], "no hole: everything, nearest first");
     }
 
     #[test]

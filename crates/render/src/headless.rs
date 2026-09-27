@@ -308,7 +308,7 @@ fn render_arena(
         if let Some(params) = far_params {
             terrain.set_params(&queue, params);
         }
-        terrain.prepare(&queue, &frustum);
+        terrain.prepare(&queue, &frustum, eye);
         terrain
     });
 

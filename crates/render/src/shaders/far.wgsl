@@ -76,11 +76,21 @@ fn vs_main(
     if skirt {
         y = y - tile.skirt;
     }
-    let world = vec3<f32>(
+    var world = vec3<f32>(
         tile.origin.x + f32(i) * tile.quad,
         y,
         tile.origin.y + f32(j) * tile.quad,
     );
+    // Strictly inside the voxels' box, the ground is theirs: sink it to the
+    // box's floor, under everything they draw. The box's edges fall on
+    // multiples of 128 blocks and every quad edge near them does too, so no
+    // triangle straddles the edge -- the ones touching it from inside slope
+    // down from it, and that slope is a wall closing the seam between the
+    // two. No fragment is ever discarded (on a tile-based GPU a discard turns
+    // off hidden-surface removal for the whole pipeline).
+    if all(world > params.hole_min.xyz) && all(world < params.hole_max.xyz) {
+        world.y = params.hole_min.y - 1.0;
+    }
     // The surface's slope from the neighbouring heights, one-sided at the edge.
     let il = max(i - 1, 0);
     let ir = min(i + 1, QUADS);
@@ -99,9 +109,6 @@ fn vs_main(
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let p = in.world_pos;
-    if all(p >= params.hole_min.xyz) && all(p <= params.hole_max.xyz) {
-        discard;
-    }
     let n = normalize(in.normal);
     // The terrain's own lighting terms (`mesh.wgsl`): hemispheric ambient and
     // one sun. No ambient occlusion -- open ground from kilometres away has

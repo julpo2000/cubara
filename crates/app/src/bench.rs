@@ -282,6 +282,10 @@ pub struct View {
     /// streams with. `None` is the old ±2-layer band, kept so the rows measured
     /// with it can still be compared against (`--band`).
     pub squash: Option<i32>,
+    /// Draw the far terrain beyond the voxels too, at this quality, as the
+    /// game does (`docs/PROPOSAL_FAR_VIEW.md`). Only with an `eye`: the orbit
+    /// frames the voxel region from outside, which no player's view does.
+    pub far: Option<crate::far_streaming::FarQuality>,
 }
 
 /// `--gpu-timing off|auto|on`. Found necessary on Metal: attaching
@@ -310,8 +314,12 @@ pub enum GpuTimingMode {
 /// What `--bench <x>` measures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
-    /// `--bench gate`: the three [`GATE_EYES`] at the game's own view distance.
+    /// `--bench gate`: the three [`GATE_EYES`] at the game's own view
+    /// distance, at the best far-terrain quality that holds 1,000 FPS.
     Gate,
+    /// `--bench tune`: the best quality that holds this PC's target frame
+    /// rate, written to its settings (`crate::settings`).
+    Tune,
     /// `--bench <radius>`: one scene of this chunk radius -- 12, a
     /// realistically heavy world, when none is given.
     Radius(i32),
@@ -321,6 +329,7 @@ pub enum Target {
 pub fn parse_target(word: Option<&str>) -> Target {
     match word {
         Some("gate") => Target::Gate,
+        Some("tune") => Target::Tune,
         other => Target::Radius(other.and_then(|w| w.parse().ok()).unwrap_or(12)),
     }
 }
@@ -536,9 +545,55 @@ pub fn run(
             .filter_map(to_meshed_node),
     );
     let total_nodes = arena.len();
+    // The far terrain beyond the voxels, for the eye the game would draw it
+    // for: every patch its selection settles on, built up front like the
+    // voxel region is.
+    let (hole, far_view) = match (view.far, view.eye) {
+        (Some(quality), Some(eye)) => {
+            let (min, max) = cubara_world::node::covered_box_3d(center, &schedule);
+            let hole = cubara_world::far::Hole {
+                min: min.map(|c| (c * 16) as f64),
+                max: max.map(|c| (c * 16) as f64),
+            };
+            let far_view =
+                crate::far_streaming::far_view(eye.map(|v| v as f64), height, Some(hole), quality);
+            (Some(hole), far_view)
+        }
+        _ => (None, None),
+    };
+    let mut far_terrain = match (hole, far_view) {
+        (Some(hole), Some(view)) => {
+            let building = Instant::now();
+            let patches =
+                cubara_world::far::build(&cubara_world::WorldGen::new(world.seed()), &view);
+            log::info!(
+                "far terrain: {} patches, built in {:.2} s (single thread)",
+                patches.len(),
+                building.elapsed().as_secs_f64()
+            );
+            let mut terrain =
+                cubara_render::FarTerrain::new(&device, &queue, patches.len().max(1) as u32);
+            for p in &patches {
+                terrain.insert(&queue, crate::far_streaming::to_far_patch(p));
+            }
+            // As with the arena below: a far terrain with patches missing is
+            // not the view that was asked for, and its frame rate means nothing.
+            assert_eq!(
+                terrain.len(),
+                patches.len(),
+                "the far terrain did not fit -- the bench would measure a view with parts missing"
+            );
+            terrain.set_params(
+                &queue,
+                crate::far_streaming::to_far_params(hole, crate::far_streaming::far_top_color()),
+            );
+            Some(terrain)
+        }
+        _ => None,
+    };
     // A scene with nothing in it renders very fast, and would pass the gate --
     // so it is reported as what it is, and never gets a SUMMARY line.
-    if total_nodes == 0 {
+    if total_nodes == 0 && far_terrain.as_ref().is_none_or(|f| f.is_empty()) {
         log::warn!("the bench scene drew nothing -- nothing in view, no measurement");
         return Outcome::NothingInView;
     }
@@ -601,6 +656,7 @@ pub fn run(
     // plane extractions), and excluding them understated what "CPU/frame" claims
     // to measure.
     let submit_frame = |arena: &mut ChunkArena,
+                        far: &mut Option<cubara_render::FarTerrain>,
                         scene: &mut SceneRenderer,
                         vt: f32,
                         gpu_timer: Option<&GpuTimer>,
@@ -633,7 +689,13 @@ pub fn run(
         // noise (15-40% swings, already documented for this scene) buried
         // it. A same-commit flag flip has none of that noise.
         let lighting = if fog {
-            let (fog_start, fog_end) = cubara_render::Lighting::fog_range(view_radius);
+            // With the far terrain, fog belongs at its edge, as in the game.
+            let fog_radius = if far.is_some() {
+                crate::far_streaming::FAR_VIEW_RADIUS as f32
+            } else {
+                view_radius
+            };
+            let (fog_start, fog_end) = cubara_render::Lighting::fog_range(fog_radius);
             cubara_render::Lighting {
                 fog_start,
                 fog_end,
@@ -654,6 +716,9 @@ pub fn run(
 
         // CPU cull + indirect-list upload — the per-frame work we're measuring.
         let draw_count = arena.prepare(&queue, &frustum);
+        if let Some(f) = far.as_mut() {
+            f.prepare(&queue, &frustum, eye);
+        }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("bench-encoder"),
         });
@@ -686,7 +751,7 @@ pub fn run(
                 selected_block: None,
                 cracking: None,
                 players: &[],
-                far: None,
+                far: far.as_ref(),
                 overlay: overlay_text.as_deref(),
                 health: None,
                 hotbar: None,
@@ -715,6 +780,7 @@ pub fn run(
     for _ in 0..WARMUP_FRAMES {
         submit_frame(
             &mut arena,
+            &mut far_terrain,
             &mut scene,
             virtual_t,
             gpu_timer.as_ref(),
@@ -767,11 +833,14 @@ pub fn run(
     let mut draws_sum = 0u64;
     let mut visible_sum = 0u64;
     let mut triangles_sum = 0u64;
+    let mut far_patches_sum = 0u64;
+    let mut far_triangles_sum = 0u64;
     let wall_start = Instant::now();
     for _ in 0..MEASURE_FRAMES {
         cubara_render::Profiler::new_frame();
         let (ms, draws, visible) = submit_frame(
             &mut arena,
+            &mut far_terrain,
             &mut scene,
             virtual_t,
             gpu_timer.as_ref(),
@@ -781,6 +850,10 @@ pub fn run(
         draws_sum += draws as u64;
         visible_sum += visible as u64;
         triangles_sum += arena.visible_triangles();
+        if let Some(f) = far_terrain.as_ref() {
+            far_patches_sum += f.drawn() as u64;
+            far_triangles_sum += f.drawn_triangles();
+        }
         let _ = device.poll(wgpu::PollType::Poll);
         // One slot per frame, round-robin, not all `GPU_TIMER_DEPTH` of them:
         // scanning every slot every frame was measured to slow down
@@ -825,6 +898,13 @@ pub fn run(
         "triangles drawn: avg {:.0} (faces turned away from the camera left out)",
         triangles_sum as f64 / MEASURE_FRAMES as f64
     );
+    if far_terrain.is_some() {
+        log::info!(
+            "far terrain drawn: avg {:.0} patches, {:.0} triangles (skirts included)",
+            far_patches_sum as f64 / MEASURE_FRAMES as f64,
+            far_triangles_sum as f64 / MEASURE_FRAMES as f64
+        );
+    }
 
     let fps = report(
         MEASURE_FRAMES,
@@ -838,6 +918,100 @@ pub fn run(
         total_nodes,
     );
     Outcome::Measured { fps }
+}
+
+/// The far-terrain qualities tried against `target_fps`, best-looking first,
+/// each at every gate eye -- stopping at the first that holds it everywhere.
+/// What `--bench gate` (at 1,000) and `--bench tune` (at the monitor's
+/// refresh rate) both run.
+pub fn try_qualities(
+    target_fps: f64,
+    size: (u32, u32),
+    overlay: bool,
+    gpu_timing: GpuTimingMode,
+    fog: bool,
+) -> Vec<(crate::far_streaming::FarQuality, Vec<(GateEye, Outcome)>)> {
+    let view_radius = crate::streaming::render_radius_chunks();
+    let mut tries = Vec::new();
+    for quality in crate::far_streaming::FarQuality::BEST_FIRST {
+        let results: Vec<_> = GATE_EYES
+            .iter()
+            .map(|gate_eye| {
+                log::info!(
+                    "{}, gate eye {}: {:?}",
+                    quality.name(),
+                    gate_eye.name,
+                    gate_eye.eye
+                );
+                let view = View {
+                    eye: Some(gate_eye.eye),
+                    squash: Some(crate::streaming::VERTICAL_LOD_SQUASH),
+                    far: Some(quality),
+                };
+                (
+                    *gate_eye,
+                    run(view_radius, size, view, overlay, gpu_timing, fog),
+                )
+            })
+            .collect();
+        let (met, line) = verdict_at(&results, target_fps);
+        log::info!("TRY {}: {line}", quality.name());
+        tries.push((quality, results));
+        if met {
+            break;
+        }
+    }
+    tries
+}
+
+/// The gate's line over [`try_qualities`]' results: met at the best-looking
+/// quality that held `target_fps` everywhere, or not met, with what each
+/// quality tried measured. `Off` can never meet it -- the flight eye must see
+/// something, and without the far terrain it sees nothing.
+pub fn gate_line(
+    tries: &[(crate::far_streaming::FarQuality, Vec<(GateEye, Outcome)>)],
+    target_fps: f64,
+) -> (bool, String) {
+    for (quality, results) in tries {
+        let (met, parts) = verdict_at(results, target_fps);
+        if met {
+            return (true, format!("GATE: MET at {} | {parts}", quality.name()));
+        }
+    }
+    let tried: Vec<String> = tries
+        .iter()
+        .map(|(q, r)| format!("{}: {}", q.name(), verdict_at(r, target_fps).1))
+        .collect();
+    (false, format!("GATE: NOT MET | {}", tried.join(" ; ")))
+}
+
+/// The GPU a benchmark here would run on, by name -- what a tuned setting is
+/// recorded against (`crate::settings::Tuned`).
+pub fn adapter_name() -> Option<String> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))
+    .ok()?;
+    Some(adapter.get_info().name)
+}
+
+/// The best quality that held `target_fps` at every eye, from
+/// [`try_qualities`]' results -- or `None` when none did.
+pub fn best_quality(
+    tries: &[(crate::far_streaming::FarQuality, Vec<(GateEye, Outcome)>)],
+    target_fps: f64,
+) -> Option<crate::far_streaming::FarQuality> {
+    tries
+        .iter()
+        .find(|(_, results)| verdict_at(results, target_fps).0)
+        .map(|(q, _)| *q)
 }
 
 /// One of the gate's fixed first-person eyes (`ROADMAP.md`, recorded
@@ -865,29 +1039,24 @@ pub const GATE_EYES: [GateEye; 3] = [
         eye: [8.0, 300.0, 8.0],
         must_see: true,
     },
-    // From 3 km up nothing is drawn today: the view reaches 512 blocks
-    // vertically (`docs/PROPOSAL_FAR_VIEW.md` §1). The far terrain (block F3)
-    // is what gives this eye something to see, and it turns `must_see` on.
+    // The voxels reach 1,024 blocks down from here and the ground is further;
+    // the far terrain (`docs/PROPOSAL_FAR_VIEW.md`, F3) is what this eye sees.
     GateEye {
         name: "flight",
         eye: [8.0, 3000.0, 8.0],
-        must_see: false,
+        must_see: true,
     },
 ];
 
-/// The gate's answer over its eyes: whether it is met, and one line saying
-/// what each eye measured.
-///
-/// Every eye that drew something must reach 1,000 FPS. An eye with nothing in
-/// view fails when it `must_see`, and is reported, not counted, when it does
-/// not.
-pub fn gate_verdict(results: &[(GateEye, Outcome)]) -> (bool, String) {
+/// Whether every eye in `results` held `target_fps` -- an empty view failing
+/// where the eye must see something -- and what each measured.
+pub fn verdict_at(results: &[(GateEye, Outcome)], target_fps: f64) -> (bool, String) {
     let mut met = true;
     let parts: Vec<String> = results
         .iter()
         .map(|(eye, outcome)| match *outcome {
             Outcome::Measured { fps } => {
-                if fps < 1000.0 {
+                if fps < target_fps {
                     met = false;
                 }
                 format!("{} {fps:.0} FPS", eye.name)
@@ -899,8 +1068,7 @@ pub fn gate_verdict(results: &[(GateEye, Outcome)]) -> (bool, String) {
             Outcome::NothingInView => format!("{} nothing in view yet", eye.name),
         })
         .collect();
-    let tag = if met { "MET" } else { "NOT MET" };
-    (met, format!("GATE: {tag} | {}", parts.join(" | ")))
+    (met, parts.join(" | "))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1043,6 +1211,7 @@ pub fn parse_eye(text: &str) -> Option<[f32; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::far_streaming::FarQuality;
 
     fn eye(name: &'static str, must_see: bool) -> GateEye {
         GateEye {
@@ -1057,36 +1226,99 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_is_met_only_when_every_measured_eye_reaches_1000() {
+    fn every_measured_eye_must_reach_the_target() {
         let (a, b) = (eye("ground", true), eye("hill", true));
-        let (met, line) = gate_verdict(&[(a, at(3482.0)), (b, at(3203.0))]);
+        let (met, line) = verdict_at(&[(a, at(3482.0)), (b, at(3203.0))], 1000.0);
         assert!(met, "{line}");
-        assert_eq!(line, "GATE: MET | ground 3482 FPS | hill 3203 FPS");
-
-        let (met, line) = gate_verdict(&[(a, at(3482.0)), (b, at(999.0))]);
+        assert_eq!(line, "ground 3482 FPS | hill 3203 FPS");
+        let (met, line) = verdict_at(&[(a, at(3482.0)), (b, at(999.0))], 1000.0);
         assert!(!met, "one eye under 1000 passed: {line}");
-        assert!(line.starts_with("GATE: NOT MET"), "{line}");
-        // Exactly 1000 is the gate, not under it.
-        assert!(gate_verdict(&[(a, at(1000.0))]).0);
+        // Exactly the target is the target, not under it.
+        assert!(verdict_at(&[(a, at(1000.0))], 1000.0).0);
+        // And the target is whatever is asked: a 144 Hz monitor's.
+        assert!(verdict_at(&[(a, at(150.0))], 144.0).0);
+        assert!(!verdict_at(&[(a, at(140.0))], 144.0).0);
     }
 
     #[test]
     fn an_empty_view_fails_where_something_must_be_seen() {
-        let (met, line) = gate_verdict(&[(eye("ground", true), Outcome::NothingInView)]);
+        let (met, line) = verdict_at(&[(eye("ground", true), Outcome::NothingInView)], 1000.0);
         assert!(!met, "an eye that must see drew nothing and passed: {line}");
     }
 
     #[test]
     fn an_empty_view_is_reported_not_counted_where_nothing_is_drawn_yet() {
-        let flight = eye("flight", false);
-        let (met, line) = gate_verdict(&[
-            (eye("ground", true), at(2000.0)),
-            (flight, Outcome::NothingInView),
-        ]);
+        let quiet = eye("quiet", false);
+        let (met, line) = verdict_at(
+            &[
+                (eye("ground", true), at(2000.0)),
+                (quiet, Outcome::NothingInView),
+            ],
+            1000.0,
+        );
         assert!(met, "{line}");
-        assert!(line.contains("flight nothing in view yet"), "{line}");
-        // But once it draws something, it is held to the same 1000.
-        assert!(!gate_verdict(&[(flight, at(500.0))]).0);
+        assert!(line.contains("quiet nothing in view yet"), "{line}");
+        assert!(
+            !verdict_at(&[(quiet, at(500.0))], 1000.0).0,
+            "once it draws, it counts"
+        );
+    }
+
+    fn tries(fps: &[(FarQuality, f64)]) -> Vec<(FarQuality, Vec<(GateEye, Outcome)>)> {
+        fps.iter()
+            .map(|&(q, f)| {
+                (
+                    q,
+                    vec![
+                        (eye("ground", true), at(f)),
+                        (eye("flight", true), at(f + 100.0)),
+                    ],
+                )
+            })
+            .collect()
+    }
+
+    /// The gate is met at the best-looking quality that holds 1,000, and says
+    /// which; the benchmark picks the same way at any target.
+    #[test]
+    fn the_best_looking_quality_that_holds_the_target_is_chosen() {
+        let t = tries(&[(FarQuality::High, 850.0), (FarQuality::Medium, 1050.0)]);
+        let (met, line) = gate_line(&t, 1000.0);
+        assert!(met);
+        assert!(
+            line.starts_with("GATE: MET at Medium | ground 1050 FPS"),
+            "{line}"
+        );
+        assert_eq!(best_quality(&t, 1000.0), Some(FarQuality::Medium));
+        assert_eq!(
+            best_quality(&t, 60.0),
+            Some(FarQuality::High),
+            "a 60 Hz monitor takes High"
+        );
+
+        let t = tries(&[(FarQuality::High, 850.0), (FarQuality::Low, 900.0)]);
+        let (met, line) = gate_line(&t, 1000.0);
+        assert!(!met);
+        assert!(
+            line.starts_with("GATE: NOT MET | High: ground 850 FPS"),
+            "{line}"
+        );
+        assert!(line.contains("Low: ground 900 FPS"), "{line}");
+        assert_eq!(best_quality(&t, 1000.0), None);
+    }
+
+    /// `Off` cannot pass the gate: without the far terrain the flight eye
+    /// sees nothing, and it must see something.
+    #[test]
+    fn off_never_meets_the_gate() {
+        let off = vec![(
+            FarQuality::Off,
+            vec![
+                (eye("ground", true), at(5000.0)),
+                (GATE_EYES[2], Outcome::NothingInView),
+            ],
+        )];
+        assert!(!gate_line(&off, 1000.0).0);
     }
 
     /// The flight eye is the one the far terrain (block F3) exists for. When
@@ -1094,6 +1326,7 @@ mod tests {
     #[test]
     fn bench_gate_is_the_gate_and_anything_else_is_a_radius() {
         assert_eq!(parse_target(Some("gate")), Target::Gate);
+        assert_eq!(parse_target(Some("tune")), Target::Tune);
         assert_eq!(parse_target(Some("64")), Target::Radius(64));
         assert_eq!(parse_target(None), Target::Radius(12));
         // A flag straight after `--bench` is not a radius.
@@ -1111,7 +1344,7 @@ mod tests {
             [
                 ("ground", 40.0, true),
                 ("hill", 300.0, true),
-                ("flight", 3000.0, false)
+                ("flight", 3000.0, true)
             ]
         );
     }

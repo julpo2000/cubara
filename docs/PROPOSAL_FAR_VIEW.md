@@ -36,7 +36,7 @@ built. This is that proposal.
 | Ring schedule | `crates/world/src/node.rs` `DEFAULT_RING_SCHEDULE` | levels 0–3, outer ring 64 chunks = **1,024 blocks** |
 | Far plane | `crates/render/src/render.rs` `FAR_PLANE` | 2,000 blocks |
 | Fog | `Lighting::fog_range(render_radius_blocks())` | ends inside 1,024 blocks, and exists to hide the edge |
-| Vertical reach | `VERTICAL_LOD_SQUASH` = 2 | 512 blocks up or down, so **from 3 km up nothing is drawn** |
+| Vertical reach | `desired_nodes_3d` | a cube: 1,024 blocks up or down (`VERTICAL_LOD_SQUASH` coarsens detail vertically, not reach), so **from 3 km up nothing is drawn** — *corrected 2026-09-26; this row first said 512* |
 
 ## §2 What the measurements say
 
@@ -288,8 +288,13 @@ into `far.wgsl`.
 ### 3.4 Joining the two
 
 - The far terrain starts where the voxel rings end. It is drawn after the voxels
-  with a depth test, and discards anything inside the voxel region, so the two
-  never draw the same ground.
+  with a depth test, and never draws the same ground they do. *As built (F3c):*
+  not by discarding fragments, which on a tile-based GPU turns off hidden-
+  surface removal for the whole pipeline, but in the vertex shader. Vertices
+  strictly inside the voxels' box sink to its floor. The box's edges fall on
+  multiples of 128 blocks, and so does every quad edge near them, so no
+  triangle straddles the edge. The triangles touching it from inside slope down
+  from it, and that slope is a wall that closes the seam between the two.
 - At the join, a block is about 1 px wide at 1080p (§2B). At 4K it is about
   2 px, so the join is slightly visible there. The join distance can be made to
   follow the resolution.
@@ -362,6 +367,82 @@ go in the PR for him to see, and the tests still pin what was chosen.
 | **F6** | Whatever F1–F5's measurements and images say is still missing | For example the 160 m – 1 km band, cave mouths, or forests. Written from evidence, as block 1.11 was. |
 
 **The Windows laptop is needed at F1 and F3**: the gate runs on both machines.
+
+## §6b Where F3 stands (2026-09-26)
+
+Built: F3a (patches and heights), F3b (the renderer), F3c (streaming in the
+window, the bench, screenshots). The same two views as table B, now:
+
+![From 300 blocks up: voxels near, the far terrain's mountains to the horizon](img/far-view-f3c-hill.jpg)
+![From 3 km up: land to the horizon instead of a grey plane](img/far-view-f3c-high.jpg)
+
+**The gate is not met on the M3** at the ground and hill eyes. Measured at
+the shipped settings (16 px quads, 2 px bound on each patch's 99th-percentile
+gap, 4 px floor), repeated runs on a warm machine:
+
+| Eye | Without the far terrain | With it (262 km) | Far triangles drawn |
+|---|---|---|---|
+| ground, y = 40 | ~3,100 FPS | **826–873 FPS** | ~720k |
+| hill, y = 300 | ~3,500 FPS | **878–1,105 FPS** | ~730k |
+| flight, y = 3,000 | nothing in view | 1,546–1,634 FPS | ~550k |
+
+The spread on the same code is ±15–20%, which is this machine's thermal state
+(see `BENCHMARKS.md`, "the gate measures a hot machine"). The far terrain
+costs about 0.9 ms a frame on the M3.
+
+Tried, with the measured effect at the gate eyes:
+
+- **Kept:** back-face culling (+13–28%); patches nearest first (+20% at the
+  ground eye); vertices sunk into the hole instead of fragments discarded
+  (+3–12%, and it closes the seam at the join); a 4 px floor for splits
+  (−45% patches, p99 1.80 → 2.72 px).
+- **Dropped, no measurable gain:** a coarser distance rule (32–128 px; the
+  height bound decides the count); terrain horizon culling (8 of 312 patches
+  at the ground eye, because from 12 blocks up the distant band really is
+  visible); skirts only where needed (within noise); normals from screen
+  derivatives (within noise, and it looks worse).
+- **Trades quality:** a 3 px or 4 px bound instead of 2 px (fewer triangles;
+  its FPS effect was inside this machine's noise in single runs).
+
+What is left is the owner's choice (§5): accept a coarser far terrain, accept
+the M3 below 1,000 FPS with it, or have the next piece of work be the
+renderer's cost per triangle. Seen almost edge-on from a low eye, the far
+terrain puts several triangles in each pixel. The fix for that is geometry
+that is coarser along the line of sight than across it, which is a bigger
+change. Windows has not been measured yet.
+
+## §6c Quality per PC (the owner's answer to §6b)
+
+The owner chose not to pick one setting for every machine: a benchmark decides
+per PC, the player can choose looks or frame rate, and the frame rate to hold
+is the monitor's refresh rate (`ROADMAP.md` has his words). What was built:
+
+| Quality | Quads (distance) | Height bound | Floor | Measured on the hill eye (§3.2) |
+|---|---|---|---|---|
+| High | 16 px | 2 px | 4 px | p99 2.72 px |
+| Medium | 16 px | 4 px | 4 px | p99 3.39 px |
+| Low | 32 px | 6 px | 8 px | coarser |
+| Off | the voxels only, 1 km | | | |
+
+- **The benchmark** (`cubara --bench tune --target <fps>`) runs the three gate
+  eyes at each quality, best first, and keeps the first that holds the target
+  at all of them. It writes the answer to `saves/settings.ron`, with the target
+  and the GPU it was measured for.
+- **The game** reads that file at start. If this PC has not been benchmarked
+  for its monitor's refresh rate and GPU, the game runs the benchmark itself in
+  a child process and switches quality when the answer lands.
+- **In play**, a frame waiting for the display takes a whole number of
+  refreshes, so a missed refresh shows as a frame of about twice the budget.
+  When a fifth of the frames in three seconds miss, the quality steps down one
+  level and the file remembers it. It never steps up: a frame waiting on the
+  display cannot tell how much faster it could have been, so finding headroom
+  is the benchmark's job.
+- **The options** (pause menu, O): keys 1–4 pick a quality, which is then the
+  player's own, so no benchmark or step-down overrules it. A gives the choice
+  back to the benchmark, and B runs it now.
+- **The gate** (`--bench gate`) reports the best quality that holds 1,000 FPS
+  at every eye. `Off` can never pass it, because the flight eye must see
+  something.
 
 ## §7 How it is checked
 

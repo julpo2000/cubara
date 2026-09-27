@@ -1362,9 +1362,10 @@ fn far_terrain(
     let edge = (region_radius * 16) as f64;
     let view = FarView {
         eye: [eye.x as f64, eye.y as f64, eye.z as f64],
+        // The settings the game ships (`cubara-app`'s `far_streaming`).
         split_ratio: split_ratio_for(16.0, shot.height as f64, fov),
-        max_error: pixel,
-        min_quad: 2.0 * pixel,
+        max_error: 2.0 * pixel,
+        min_quad: 4.0 * pixel,
         radius,
         hole: Some(Hole {
             min: [-edge, 0.0, -edge],
