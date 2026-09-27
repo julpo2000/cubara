@@ -598,9 +598,10 @@ mod tests {
 
     /// Gradients from flat to cliff, both signs, both axes: with the
     /// azimuths below, every arrangement of facing and hiding.
-    const GRADIENTS: [[f32; 2]; 8] = [
+    const GRADIENTS: [[f32; 2]; 9] = [
         [0.0, 0.0],
         [0.3, 0.0],
+        [0.0, -0.3],
         [2.5, 0.0],
         [0.1, 0.07],
         [0.5, 0.5],
