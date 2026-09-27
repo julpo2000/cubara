@@ -83,6 +83,9 @@ frames after 200 warmup.
 | 2026-09-27 | **Gate eye: ground** (y = 40), full view distance⁶⁴ | 1,940 | 819,928 | ~5,084 | 0.156 ms | 0.540 ms | `da21d01` |
 | 2026-09-27 | **Gate eye: hill** (y = 300), full view distance⁶⁴ | 869 | 436,690 | ~4,520 | 0.180 ms | 0.732 ms | `da21d01` |
 | 2026-09-27 | **Gate eye: flight** (y = 3,000) — nothing in view yet⁶⁴ | 0 | 0 | -- | -- | -- | `da21d01` |
+| 2026-09-27 | **Gate eye: ground + far terrain (High, 262 km)** — F3c⁶⁶ | 1,940 | 819,928 voxel + 720,819 far drawn | ~3,620 | 0.199 ms | 0.550 ms | `41bdab0` |
+| 2026-09-27 | **Gate eye: hill + far terrain (High)**⁶⁶ | 869 | 436,690 voxel + 727,521 far drawn | ~3,669 | 0.194 ms | 0.573 ms | `41bdab0` |
+| 2026-09-27 | **Gate eye: flight + far terrain (High)** — sees something now⁶⁶ | 0 | 547,649 far drawn | ~4,089 | 0.171 ms | 0.528 ms | `41bdab0` |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -2339,3 +2342,14 @@ of the three machines holds High with 1.6× headroom at its worst eye.
 `--bench tune --target 60` chose High as well. Building the patches took
 17–22 s single-threaded on this CPU (i7-8750H), against 4–5 s on the M3; that is
 one-shot bench cost, and the game streams them on worker threads.
+
+⁶⁶ **The far terrain on Windows (RTX 4060 Laptop, Vulkan), `41bdab0` (#289,
+F3c).** Measured by the Windows session, uncontended, one run each.
+`--bench gate`: **met at High** on the first try. GPU/frame: ground 0.251 ms,
+hill 0.256, flight 0.270 (p99 2.216 — a ~2 ms p99 spike that sat on the hill
+eye on `main` (#290) moved to the flight eye here; both are the eye with the
+least voxel geometry, not yet investigated). Against #290's rows on `main`
+without the far terrain: ground 5,084 → 3,620 FPS (−29%), hill 4,520 → 3,669
+(−19%). `--bench tune --target 144` (the internal panel; the external one is
+120 Hz, and the stricter was chosen) picked High. Patches built in 8–10 s
+single-threaded.
