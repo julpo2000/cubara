@@ -90,6 +90,10 @@ frames after 200 warmup.
 | 2026-09-27 | No indirect-call validation in release — gate eye: ground + far terrain (High)⁶⁸ | 1,940 | 819,928 voxel + 720,819 far drawn | ~3,672 | **0.179 ms** | 0.445 ms | *(this PR)* |
 | 2026-09-27 | No indirect-call validation in release — gate eye: hill + far terrain (High)⁶⁸ | 869 | 436,690 voxel + 727,521 far drawn | ~3,792 | **0.177 ms** | 0.454 ms | *(this PR)* |
 | 2026-09-27 | No indirect-call validation in release — gate eye: flight + far terrain (High)⁶⁸ | 0 | 547,649 far drawn | ~4,569 | 0.154 ms | 0.453 ms | *(this PR)* |
+| 2026-09-27 | *Experiment, not the gate's setting:* gate eye ground, **2,000** warm-up frames instead of 200⁶⁹ | 1,940 | 819,928 voxel + far | ~4,136 | 0.109 ms | 0.359 ms | `b533a70` |
+| 2026-09-27 | *Experiment:* gate eye hill, 2,000 warm-up frames⁶⁹ | 869 | 436,690 voxel + far | ~4,324 | 0.096 ms | 0.305 ms | `b533a70` |
+| 2026-09-27 | *Experiment:* gate eye flight, 2,000 warm-up frames⁶⁹ | 0 | far only | ~5,439 | 0.084 ms | 0.371 ms | `b533a70` |
+| 2026-09-27 | *Experiment:* radius 64 (orbit), 2,000 warm-up frames⁶⁹ | 2,219 | 901,932 (595,323 drawn) | ~3,641 | 0.141 ms | 0.402 ms | `b533a70` |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -2420,3 +2424,48 @@ The saving follows the number of indirect draws -- 4,975 in the orbit, 1,325
 and 644 at the eyes, none in flight -- which is what a per-draw check predicts.
 Linux saw the same rise after wgpu 30 (⁶³, +34%) and is expected to get the
 same back.
+
+⁶⁹ **The GPU p99 spike is the bench measuring a machine that has not reached
+speed -- and so is about 12-15% of every gate number on this laptop.**
+Windows (RTX 4060 Laptop, Vulkan), `b533a70`, uncontended. Recorded as
+evidence, not acted on: the warm-up is part of what the gate measures, and
+#261's rule holds -- what a gate asserts is the project owner's to change.
+
+*The spike.* The gate eyes' GPU p99 read ~1-2.2 ms in some runs (⁶⁴, ⁶⁶, ⁶⁸)
+against averages of ~0.2 ms, on whichever eye it happened to be. Logging
+every sample with its frame (a local change, not committed) shows it is not
+scattered noise but **one contiguous burst at the start of the timed
+window**: the first ~58 timed frames take a steady ~0.92 ms of GPU each, with
+~2.5 ms every fifth frame, and then it is gone for the remaining ~1,900
+frames. A GPU still clocking up, not a hitch a player would see. It shows up
+when the eye's warm-up happens to be too short -- flight's 200 warm-up frames
+pass in ~40 ms, after 8 s of CPU-only far-terrain building.
+
+*The warm-up.* The same binary with 2,000 warm-up frames instead of 200
+(`XP_WARMUP`, local), alternating, three gate runs each:
+
+```
+                 warm-up 200                         warm-up 2,000
+ground   GPU p99 0.313-0.316, avg 0.26 ms   ->   0.218-0.259, avg 0.21 ms
+hill     GPU p99 0.321-1.160, avg 0.26 ms   ->   0.229-0.250, avg 0.195 ms
+flight   GPU p99 0.225-1.953, avg 0.19-0.26 ->   0.166-0.188, avg 0.15 ms
+spike runs (p99 > 0.5 ms)   3 of 3                  0 of 3
+
+two of those runs in full:
+ground   3,685 / 3,670 FPS, CPU 0.176 / 0.184 ms  ->  4,118 / 4,154 FPS, CPU 0.104 / 0.113 ms
+hill     3,788 / 3,743 FPS, CPU 0.173 / 0.181 ms  ->  4,320 / 4,328 FPS, CPU 0.104 / 0.087 ms
+flight   4,960 / 5,012 FPS, CPU 0.150 / 0.144 ms  ->  5,415 / 5,462 FPS, CPU 0.079 / 0.088 ms
+orbit    3,115 FPS, CPU 0.204 ms                   ->  3,641 FPS, CPU 0.141 ms
+```
+
+So on this machine **200 warm-up frames (~50 ms) measure CPU and GPU still
+boosting**: CPU/frame reads ~40% high and FPS ~12-15% low, at every eye and in
+the orbit, and the p99 spike is the tail of the same thing. `CLAUDE.md` already
+says the warm-up is too short to reach steady clocks; this is the size of it.
+
+It is the opposite direction from ⁵⁵'s M3, where a *hot* machine read 2.3x
+slower (throttling and paging). A longer warm-up could therefore raise this
+laptop's numbers and lower the M3's -- which is why the choice (frames or wall
+time, how long, whether the gate's single run should follow it) goes to the
+owner with these numbers rather than into the bench quietly. The rows of this
+table so far all used 200 and stay comparable with each other.
