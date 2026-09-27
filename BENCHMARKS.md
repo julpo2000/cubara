@@ -163,6 +163,9 @@ frames after 200 warmup.
 | 2026-09-26 | **Gate eye: ground** (y = 40), full view distance — the owner's criterion since today⁶² | 1,940 | 819,928 (167,988 drawn) | ~3,121 | 0.266 ms | 1.574 ms | `feac659` |
 | 2026-09-26 | **Gate eye: hill** (y = 300), full view distance⁶² | 869 | 436,690 (102,664 drawn) | ~3,530 | 0.189 ms | 0.875 ms | `feac659` |
 | 2026-09-26 | **Gate eye: flight** (y = 3,000) — nothing in view yet⁶² | 0 | 0 | -- | -- | -- | `feac659` |
+| 2026-09-27 | **Gate eye: ground + far terrain** — High / Medium / **Low** (F3c)⁶⁷ | 1,940 | 819,928 voxel + far | 597 / 907 / **1,090** | -- | -- | `44c62b0` |
+| 2026-09-27 | **Gate eye: hill + far terrain** — High / Medium / **Low**⁶⁷ | 869 | 436,690 voxel + far | 809 / 1,225 / **1,563** | -- | -- | `44c62b0` |
+| 2026-09-27 | **Gate eye: flight + far terrain** — High / Medium / **Low**⁶⁷ | 0 | far only | 1,542 / 2,175 / **4,039** | -- | -- | `44c62b0` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -2353,3 +2356,15 @@ without the far terrain: ground 5,084 → 3,620 FPS (−29%), hill 4,520 → 3,6
 (−19%). `--bench tune --target 144` (the internal panel; the external one is
 120 Hz, and the stricter was chosen) picked High. Patches built in 8–10 s
 single-threaded.
+
+⁶⁷ **The far terrain on the M3 (Metal), `44c62b0` (#289, F3c), per
+quality.** `--bench gate` tried High, then Medium, then Low: **met at Low**
+(ground 1,090, hill 1,563, flight 4,039 FPS). The only machine of the three
+that does not hold High at 1,000 -- an integrated GPU sharing its memory
+bandwidth with the CPU, as the rest of this table shows. Measured with the
+battery at 19% and charging, a few hours after it had run down to 1%; at 1%
+the same High scene read 218 / 240 / 383, so these may still be depressed
+and are to be re-measured on a full charge. Earlier warm-machine runs at High
+(`PROPOSAL_FAR_VIEW.md` §6b) read ground 826–873, hill 878–1,105. For play,
+the game tunes to the monitor instead: this M3 runs its window at 60 Hz
+(footnote ⁴⁵), and `--bench tune --target 60` chose High.
