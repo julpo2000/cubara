@@ -269,7 +269,7 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
     // The settled pass: the same eyes, each loaded completely.
     let mut settled = Streamed::new(flight)?;
     let mut samples = Vec::with_capacity(kept.len());
-    let mut worst: Option<(f64, Frame, Frame)> = None;
+    let mut worst: Option<(f64, (Frame, Frame))> = None;
     for (t, eye, frame) in kept {
         settled.far.reselect();
         settled.settle(flight, eye);
@@ -284,12 +284,23 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
                 save(&dir.join(format!("t{:05.2}-{kind}.png", t)), f);
             }
         }
-        if worst.as_ref().is_none_or(|(l, _, _)| loading > *l) {
-            worst = Some((loading, frame, reference));
-        }
+        keep_worst(&mut worst, loading, (frame, reference));
         samples.push(Sample { t, eye, loading });
     }
-    if let (Some(dir), Some((_, live, settled))) = (frames, worst) {
+    // The measurement's own zero. The first kept frame is at the start, which
+    // the live pass loaded completely before it set off, so it must match its
+    // finished frame exactly; a difference is the two passes disagreeing about
+    // something other than loading -- the camera, the far terrain's selection,
+    // the lighting -- and every number here would carry it. (Checked by
+    // flying at speed 0: every kept frame 0.00%.)
+    if let Some(first) = samples.first().filter(|s| s.loading > 0.0) {
+        log::warn!(
+            "flight: the start, loaded completely, differs from itself by {:.2}% -- \
+             every number below includes that",
+            first.loading * 100.0
+        );
+    }
+    if let (Some(dir), Some((_, (live, settled)))) = (frames, worst) {
         for (name, frame) in [("worst-live.png", live), ("worst-settled.png", settled)] {
             save(&dir.join(name), &frame);
         }
@@ -298,6 +309,13 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
         samples,
         work_times,
     })
+}
+
+/// Keep `candidate` as the worst so far if it is: more of it was loading.
+fn keep_worst<T>(worst: &mut Option<(f64, T)>, loading: f64, candidate: T) {
+    if worst.as_ref().is_none_or(|(l, _)| loading > *l) {
+        *worst = Some((loading, candidate));
+    }
 }
 
 fn save(path: &Path, frame: &Frame) {
@@ -372,5 +390,14 @@ mod tests {
         assert_eq!(r.frames_over(0.01), 0.5);
         assert!((r.mean() - 0.03125).abs() < 1e-12);
         assert_eq!(r.worst().unwrap().loading, 0.1);
+    }
+
+    #[test]
+    fn the_frames_kept_are_the_worst_ones() {
+        let mut worst = None;
+        for (loading, name) in [(0.02, "a"), (0.3, "b"), (0.1, "c"), (0.3, "d")] {
+            keep_worst(&mut worst, loading, name);
+        }
+        assert_eq!(worst, Some((0.3, "b")), "kept a later or a lesser frame");
     }
 }

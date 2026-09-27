@@ -1231,13 +1231,13 @@ terrain at High. Details in ⁷⁴.
 
 | Date | Change | Flight | Loading mean | Worst frame | Frames > 1% loading | Work/frame p99 | Commit |
 |---|---|---|---|---|---|---|---|
-| 2026-09-27 | before⁷⁴ | low: from (8, 120, 8) along (1, −0.15, 0.3), 20 s | 3.75% | 25.5% | 48% | 1.9 ms | `f3d5124` |
+| 2026-09-27 | before⁷⁴ | low: from (8, 120, 8) along (1, −0.15, 0.3), 20 s | 3.75% | 25.5% | 48% | 1.9 ms | `bench/flight-before` |
 | 2026-09-27 | **stand-in links, drops behind uploads, upload budget**⁷⁴ | low | **0.16%** | **3.3%** | **5%** | 2.9 ms | this PR |
-| 2026-09-27 | before⁷⁴ | high: from (8, 400, 8) along (1, −0.35, 0.3), 20 s | 1.67% | 44.1% | 16% | 2.2 ms | `f3d5124` |
+| 2026-09-27 | before⁷⁴ | high: from (8, 400, 8) along (1, −0.35, 0.3), 20 s | 1.67% | 44.1% | 16% | 2.2 ms | `bench/flight-before` |
 | 2026-09-27 | **the same three**⁷⁴ | high | **0.11%** | **5.0%** | **2%** | 2.1 ms | this PR |
-| 2026-09-27 | before⁷⁴ | down: from (8, 450, 8) along (0.4, −0.8, 0.2), 15 s | 18.97% | 97.4% | 35% | 2.0 ms | `f3d5124` |
+| 2026-09-27 | before⁷⁴ | down: from (8, 450, 8) along (0.4, −0.8, 0.2), 15 s | 18.97% | 97.4% | 35% | 2.0 ms | `bench/flight-before` |
 | 2026-09-27 | **the same three**⁷⁴ | down | **0.35%** | **20.8%** | **2%** | 2.7 ms | this PR |
-| 2026-09-27 | before / after⁷⁴ | up: from (8, 80, 8) along (0.4, 0.8, 0.2), 15 s | 0.00% / 0.00% | 0% / 0% | 0% / 0% | 2.0 / 2.3 ms | `f3d5124` / this PR |
+| 2026-09-27 | before / after⁷⁴ | up: from (8, 80, 8) along (0.4, 0.8, 0.2), 15 s | 0.00% / 0.00% | 0% / 0% | 0% / 0% | 2.0 / 2.3 ms | `bench/flight-before` / this PR |
 
 ## Detailed run logs
 
@@ -2519,9 +2519,12 @@ the gate at Low with ground at 1,090. It should be re-measured there.
 2026-09-27 and saw "veel inladen". `--bench flight` (this PR) measures it:
 both passes run the game's `NodeStreaming`, `FarStreaming` and `Renderer`, the
 last pointed at a texture (`Renderer::offscreen`). The first pass starts from a
-loaded world, as a player who has been standing there does. "Before" is `main`
-at `f3d5124` with the measurement added and nothing else, built as a separate
-binary and run alternately with "after", battery 86–93%, not charging.
+loaded world, as a player who has been standing there does. "Before" is this
+PR with its three fixes switched back off and the measurement left as it is
+(branch `bench/flight-before`), built as a separate binary and run alternately
+with "after", battery 86–93%, not charging. Its first kept frame is the
+measurement's own zero -- the start, loaded completely -- and read 0.00% in
+every run here; flying at speed 0, so did every kept frame.
 
 Three causes, in the order they were found:
 
