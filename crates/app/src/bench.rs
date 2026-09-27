@@ -414,10 +414,7 @@ pub fn run(
     gpu_timing_mode: GpuTimingMode,
     fog: bool,
 ) -> Outcome {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
-        ..wgpu::InstanceDescriptor::new_without_display_handle()
-    });
+    let instance = cubara_render::new_instance();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
@@ -988,10 +985,7 @@ pub fn gate_line(
 /// The GPU a benchmark here would run on, by name -- what a tuned setting is
 /// recorded against (`crate::settings::Tuned`).
 pub fn adapter_name() -> Option<String> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
-        ..wgpu::InstanceDescriptor::new_without_display_handle()
-    });
+    let instance = cubara_render::new_instance();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
@@ -1371,10 +1365,7 @@ mod tests {
     /// whose driver lacks `TIMESTAMP_QUERY`) -- the same
     /// skip-loudly convention `mesh_arena_integration.rs` uses.
     fn test_gpu_timer_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
+        let instance = cubara_render::new_instance();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,

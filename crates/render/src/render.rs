@@ -555,10 +555,7 @@ impl Renderer {
     pub fn new(window: Arc<Window>, camera: CameraPose) -> (Self, MeshAssets) {
         let size = window.inner_size();
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
+        let instance = crate::new_instance();
 
         let surface = instance
             .create_surface(window.clone())
