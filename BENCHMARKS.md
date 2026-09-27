@@ -79,6 +79,10 @@ frames after 200 warmup.
 | 2026-09-13 | **Caves near the surface at every level of detail**; coarse cells take the majority of their blocks; visibility in sub-blocks, off-thread; radius 64 (orbit)⁵¹ | 2,219 | 901,932 (480,547 drawn) | ~3,920 | 0.125 ms | ~0.41 ms | *(this PR)* |
 | 2026-09-13 | **Faces turned away from the camera left out** — meshes grouped by direction, radius 64 (orbit)⁵² | 4,377 | 1,015,554 (573,298 drawn) | ~3,592 | 0.168 ms | ~0.48 ms | *(this PR)* |
 | 2026-09-13 | **Mountains** — ridged ranges up to ~y 240, radius 64 (orbit)⁵³ | 4,506 | 1,110,830 (592,540 drawn) | ~3,451 | 0.169 ms | ~0.43 ms | *(this PR)* |
+| 2026-09-27 | `main` after wgpu 30, creative mode, New World, F1 and F3a/b, radius 64 (orbit)⁶⁴ | 2,219 | 901,932 (595,323 drawn) | ~3,146 | 0.264 ms | 0.734 ms | `da21d01` |
+| 2026-09-27 | **Gate eye: ground** (y = 40), full view distance⁶⁴ | 1,940 | 819,928 | ~5,084 | 0.156 ms | 0.540 ms | `da21d01` |
+| 2026-09-27 | **Gate eye: hill** (y = 300), full view distance⁶⁴ | 869 | 436,690 | ~4,520 | 0.180 ms | 0.732 ms | `da21d01` |
+| 2026-09-27 | **Gate eye: flight** (y = 3,000) — nothing in view yet⁶⁴ | 0 | 0 | -- | -- | -- | `da21d01` |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -2285,4 +2289,37 @@ row after the same upgrade (⁶², 0.478 ms) sits between its ⁵⁸ and ⁶⁰ 
 it gives no clear signal either way. The next Linux row on the render path
 should say whether this holds.
 
-The Windows rows for the gate are still to be run.
+The Windows rows for the gate are ⁶⁴.
+
+⁶⁴ **The owner's gate on Windows (RTX 4060 Laptop, Vulkan), `da21d01`.** The
+same `--bench gate` as ⁶², on `main` with F1, F3a and F3b merged (F3b draws the
+far terrain only where F3c puts it in the game, so the eyes' scene is still the
+⁶² one: node counts match the M3 and Linux rows exactly). Two gate runs back to
+back, then the orbit, uncontended. The rows are the second run:
+
+```
+run 1:  GATE: MET | ground 6029 FPS | hill 4710 FPS | flight nothing in view yet
+        ground CPU 0.135 ms (p99 0.449) GPU 0.136 ms (p99 0.184)
+        hill   CPU 0.168 ms (p99 0.728) GPU 0.219 ms (p99 2.052)
+run 2:  SUMMARY: 5084 FPS | CPU/frame avg 0.156 ms (p99 0.540) | GPU/frame avg 0.178 ms (p99 0.737, 1024 samples) | 1325 draws (592/1940 nodes) | 1000-FPS gate MET
+        SUMMARY: 4520 FPS | CPU/frame avg 0.180 ms (p99 0.732) | GPU/frame avg 0.229 ms (p99 1.962, 1024 samples) | 644 draws (277/869 nodes) | 1000-FPS gate MET
+        GATE: MET | ground 5084 FPS | hill 4520 FPS | flight nothing in view yet
+orbit:  SUMMARY: 3146 FPS | CPU/frame avg 0.264 ms (p99 0.734) | GPU/frame avg 0.288 ms (p99 0.340, 1024 samples) | 4975 draws (2208/2219 nodes) | 1000-FPS gate MET
+```
+
+**The gate is met on this machine at 5.1x (ground) and 4.5x (hill)**, so it
+is now recorded on all three machines. Ground varies 16% between the two
+runs, which is the usual small-scene noise; hill agrees within 4%. The hill
+eye's **GPU p99 is ~2 ms in both runs** while its average is 0.23 ms: a
+repeatable spike, not noise, and the one number here that sits above the
+1 ms budget. Not investigated; the other machines do not report it.
+
+**The orbit, against this table's previous row (⁵³, `39c1930`, 13 days and
+~30 PRs earlier):** FPS ~3,451 → ~3,146 (-9%), **CPU/frame 0.169 → 0.264 ms
+(+56%)**, p99 0.43 → 0.73 ms. The node and triangle counts differ from ⁵³
+(4,506 → 2,219 nodes) and match the other machines' ⁶²/⁶³ rows, so the
+scene changed in between as well, and the rise is not per-node cost alone.
+It points the same way as Linux's unexplained +34% (⁶³), and wgpu 24 → 30
+(#275) is again the one render-path change in the window. Two machines now
+show it; it has not been bisected.
+
