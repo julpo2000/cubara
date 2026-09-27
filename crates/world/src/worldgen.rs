@@ -1394,7 +1394,7 @@ mod tests {
     }
 
     /// The top of a coarse column is the surface block, as the top of every
-    /// real column is. Seen from far away, those tops are most of what the
+    /// real column is, and only the top. Seen from far away, those tops are most of what the
     /// ground is; when a third of them wore soil (the cell's own top block
     /// sits under the surface), the distant fields came out patched with
     /// brown.
@@ -1403,7 +1403,7 @@ mod tests {
         let gen = WorldGen::new(0xCAFE);
         let blocks = test_blocks();
         for step in [2, 4, 8] {
-            let (mut tops, mut soil) = (0u32, 0u32);
+            let (mut tops, mut soil, mut buried_grass) = (0u32, 0u32, 0u32);
             for (ox, oz) in [(0, 0), (-300, 170), (500, 20), (-700, -640), (1200, 900)] {
                 let x0 = ox;
                 let z0 = oz;
@@ -1432,6 +1432,11 @@ mod tests {
                         if block != blocks.grass {
                             soil += 1;
                         }
+                        // And only the top: the cell under it, where a lower
+                        // neighbour bares its side, is soil or stone.
+                        if ly > 0 && node.get(lx, ly - 1, lz) == blocks.grass {
+                            buried_grass += 1;
+                        }
                     }
                 }
             }
@@ -1439,6 +1444,10 @@ mod tests {
             assert_eq!(
                 soil, 0,
                 "step {step}: {soil} of {tops} coarse tops are not the surface block"
+            );
+            assert_eq!(
+                buried_grass, 0,
+                "step {step}: {buried_grass} cells under a coarse top wear the surface block"
             );
         }
     }
