@@ -107,7 +107,7 @@ pub fn run(path: &str, view: Option<View>, menu: Option<String>) {
             }
             far_params = Some(crate::far_streaming::to_far_params(
                 hole,
-                crate::far_streaming::far_top_color(),
+                crate::far_streaming::far_materials(),
             ));
             // Fog at the far terrain's edge, as in the game.
             let (fog_start, fog_end) =

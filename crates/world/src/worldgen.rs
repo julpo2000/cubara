@@ -236,8 +236,9 @@ impl TerrainBlocks {
 /// How many blocks of soil separate the grass surface from stone beneath --
 /// a simple, fixed depth rule (carried over from block 1.4c). Real layered
 /// biomes with varying depth are out of phase 1's scope (§8's own "out of
-/// scope" list).
-const SOIL_DEPTH: i32 = 3;
+/// scope" list). Public because the far terrain's colours follow it: a tall
+/// riser shows soil, then stone (`cubara_render::aggregate::riser_colour`).
+pub const SOIL_DEPTH: i32 = 3;
 
 // Terrain shape. Frequency is in noise-cycles-per-block; a smaller number is
 // broader, gentler hills. Tuned by eye against the old rolling-hills formula

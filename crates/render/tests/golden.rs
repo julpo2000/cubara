@@ -1375,6 +1375,12 @@ fn far_terrain(
     build(&cubara_world::WorldGen::new(world.seed()), &view)
 }
 
+/// The far terrain's materials as the game sets them (`cubara-app`'s
+/// `far_streaming::far_materials`).
+fn far_materials() -> cubara_render::aggregate::Materials {
+    cubara_render::far::ground_materials(cubara_world::SOIL_DEPTH as f32)
+}
+
 fn render_world_with_far(
     world: &World,
     shot: Shot,
@@ -1423,7 +1429,7 @@ fn render_world_with_far(
     let edge = (shot.region_radius * 16) as f32;
     let params = FarParams {
         hole: Some(([-edge, 0.0, -edge], [edge + 16.0, 48.0, edge + 16.0])),
-        top_color: cubara_render::materials::mean_color("grass_top").expect("grass_top.png"),
+        materials: far_materials(),
     };
     let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
     headless::render_with_far(meshed, &patches, Some(params), shot)
@@ -1457,4 +1463,130 @@ fn the_far_terrain_reaches_the_horizon() {
         );
     }
     assert_frame_golden("far_terrain_to_the_horizon", with);
+}
+
+/// **The far terrain's shader is the CPU reference** (`aggregate.rs`, block
+/// F4). A patch that is a plane of known gradient is rendered from a known
+/// direction, and the pixel at the centre of the image, whose ray is exactly
+/// the look direction, must be the colour `aggregate_colour` computes for that
+/// slope and view.
+///
+/// The cases cover every branch of `far.wgsl`'s `visible_weights` (risers
+/// facing, none facing, and one axis hiding the other, both ways round, which
+/// goes through the masking-table texture), and `riser_colour` from a
+/// one-block step to a stone cliff. This is what pins the texture's layout and
+/// the hand-blended fourth axis: get either wrong and the table cases come out
+/// a different colour.
+#[test]
+fn far_shading_is_the_aggregate_reference() {
+    use cubara_render::aggregate::{aggregate_colour, face_light, MaskingTable};
+    use cubara_render::far::{FarParams, FarPatch, FAR_VERTS};
+    use cubara_render::Lighting;
+
+    let srgb = |c: f32| {
+        let v = if c <= 0.0031308 {
+            c * 12.92
+        } else {
+            1.055 * c.powf(1.0 / 2.4) - 0.055
+        };
+        (v.clamp(0.0, 1.0) * 255.0).round() as i32
+    };
+    let view = |elevation: f32, azimuth: f32| {
+        let (e, a) = (elevation.to_radians(), azimuth.to_radians());
+        glam::Vec3::new(e.cos() * a.cos(), e.sin(), e.cos() * a.sin())
+    };
+    let table = MaskingTable::committed();
+    let materials = far_materials();
+    let lighting = Lighting::default();
+    // (gradient, elevation, azimuth): what each exercises.
+    let cases: [([f32; 2], f32, f32); 11] = [
+        // x-risers face the eye, nothing hides.
+        ([0.4, 0.0], 10.0, 180.0),
+        // No riser faces the eye: tops only.
+        ([0.3, 0.2], 40.0, 30.0),
+        // x faces, z hides: the table.
+        ([0.5, 0.35], 8.0, 150.0),
+        // z faces, x hides: the table, the other way round.
+        ([0.3, -0.7], 12.0, 60.0),
+        // Both face, on a cliff: soil in the risers.
+        ([2.5, 0.2], 5.0, 190.0),
+        // Steeper than the soil is deep: stone.
+        ([6.0, 0.0], 20.0, 180.0),
+        // Grazing, gentle, one axis hiding: the far terrain's commonest view.
+        ([0.12, 0.08], 2.0, 115.0),
+        // More of the table, where it changes fastest: slopes seen nearly
+        // edge-on, and in between its samples on every axis.
+        ([0.5, 0.5], 5.0, 130.0),
+        ([1.2, 0.6], 15.0, 160.0),
+        ([0.2, 0.6], 45.0, 110.0),
+        ([-0.9, 0.25], 30.0, 20.0),
+    ];
+    let mut plain_would_fail = false;
+    for (g, elevation, azimuth) in cases {
+        let v = view(elevation, azimuth);
+        let expected = aggregate_colour(&table, g, v, &lighting, &materials)
+            .expect("every case faces the eye");
+        // One patch, a plane through the origin. `far.wgsl` shades per
+        // vertex, so the quads are made tiny: the four vertices around the
+        // centre pixel then see it from the same direction, and the pixel is
+        // the shading function itself rather than a blend of its neighbours.
+        let quad = 0.05;
+        let origin = [-16.0 * quad; 2];
+        let heights: Vec<f32> = (0..FAR_VERTS * FAR_VERTS)
+            .map(|k| {
+                let (i, j) = ((k % FAR_VERTS) as f32, (k / FAR_VERTS) as f32);
+                g[0] * (origin[0] + i * quad) + g[1] * (origin[1] + j * quad)
+            })
+            .collect();
+        let patch = FarPatch {
+            origin,
+            quad,
+            heights: &heights,
+            skirt: 0.0,
+        };
+        let shot = Shot {
+            // Odd, so the centre pixel's ray is the look direction itself.
+            width: 65,
+            height: 65,
+            camera: Some((v * 40.0, -v)),
+            lighting,
+            ..Shot::default()
+        };
+        let params = FarParams {
+            hole: None,
+            materials,
+        };
+        let frame = {
+            let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+            headless::render_with_far(Vec::new(), &[patch], Some(params), shot)
+        };
+        let Some(frame) = frame else {
+            eprintln!("SKIP far_shading_is_the_aggregate_reference: no GPU adapter");
+            return;
+        };
+        let at = ((32 * frame.width + 32) * 4) as usize;
+        let got = &frame.pixels[at..at + 3];
+        let want = expected.to_array().map(srgb);
+        // Exact on the machine this was written on; one step of slack for
+        // another GPU's filtering precision. A wrong texture layout or blend
+        // is off by more (the PR's mutation table).
+        for c in 0..3 {
+            assert!(
+                (got[c] as i32 - want[c]).abs() <= 1,
+                "g {g:?}, {elevation}° up, {azimuth}°: rendered {got:?}, reference {want:?}"
+            );
+        }
+        // The plain shading F3 drew: the top colour lit by the smooth normal.
+        let n = glam::Vec3::new(-g[0], 1.0, -g[1]).normalize();
+        let plain = (materials.top * face_light(n, &lighting))
+            .to_array()
+            .map(srgb);
+        if (0..3).any(|c| (plain[c] - want[c]).abs() > 12) {
+            plain_would_fail = true;
+        }
+    }
+    assert!(
+        plain_would_fail,
+        "no case tells the aggregate shading from plain shading"
+    );
 }

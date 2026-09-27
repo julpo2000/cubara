@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender};
 
+use cubara_render::aggregate::Materials;
 use cubara_render::{FarParams, FarPatch, FarSlot, Renderer};
 use cubara_voxel::ChunkCoord;
 use cubara_world::far::{self, FarView, Hole, PatchHeights, PatchKey};
@@ -136,16 +137,17 @@ pub fn to_far_patch(p: &PatchHeights) -> FarPatch<'_> {
 }
 
 /// The renderer's form of a hole.
-pub fn to_far_params(hole: Hole, top_color: [f32; 3]) -> FarParams {
+pub fn to_far_params(hole: Hole, materials: Materials) -> FarParams {
     FarParams {
         hole: Some((hole.min.map(|v| v as f32), hole.max.map(|v| v as f32))),
-        top_color,
+        materials,
     }
 }
 
-/// The grass colour the far terrain is drawn in: the texture's own average.
-pub fn far_top_color() -> [f32; 3] {
-    cubara_render::materials::mean_color("grass_top").unwrap_or([0.2, 0.4, 0.15])
+/// What the far terrain is made of: each block face's texture averaged, and
+/// this world's soil depth, so a far riser shows what a near one would.
+pub fn far_materials() -> Materials {
+    cubara_render::far::ground_materials(cubara_world::SOIL_DEPTH as f32)
 }
 
 /// Every coarser patch holding `key`, up to `top_level`.
@@ -280,7 +282,7 @@ pub struct FarStreaming {
     selected_at: Option<[f64; 3]>,
     /// New patches arrived since then.
     stale: bool,
-    top_color: [f32; 3],
+    materials: Materials,
     /// Said once when the renderer runs out of slots, not every frame.
     warned_full: bool,
 }
@@ -298,7 +300,7 @@ impl FarStreaming {
             slots: HashMap::new(),
             selected_at: None,
             stale: false,
-            top_color: far_top_color(),
+            materials: far_materials(),
             warned_full: false,
         }
     }
@@ -355,7 +357,7 @@ impl FarStreaming {
             d > RESELECT_BLOCKS
         });
         let hole = voxel_hole(eye);
-        renderer.set_far_params(to_far_params(hole, self.top_color));
+        renderer.set_far_params(to_far_params(hole, self.materials));
         if !(moved || self.stale) {
             return;
         }
