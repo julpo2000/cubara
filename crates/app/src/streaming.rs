@@ -59,29 +59,26 @@ pub(crate) fn render_radius_chunks() -> i32 {
 /// it, or the visibility search stopped reaching it. Those unload at once;
 /// only a *replacement* is worth waiting for.
 fn replacements_of(node: NodeKey, visible: &HashSet<NodeKey>) -> Vec<NodeKey> {
-    let mut found = Vec::new();
-    if let Some(finer) = node.level.checked_sub(1) {
-        let [x, y, z] = node.pos;
-        for dx in 0..2 {
-            for dy in 0..2 {
-                for dz in 0..2 {
-                    let child = NodeKey::new(finer, [2 * x + dx, 2 * y + dy, 2 * z + dz]);
-                    if visible.contains(&child) {
-                        found.push(child);
-                    }
-                }
-            }
-        }
-    }
-    let [x, y, z] = node.pos;
-    let parent = NodeKey::new(
-        node.level + 1,
-        [x.div_euclid(2), y.div_euclid(2), z.div_euclid(2)],
-    );
-    if visible.contains(&parent) {
-        found.push(parent);
-    }
-    found
+    node.children()
+        .into_iter()
+        .chain([node.parent()])
+        .filter(|n| visible.contains(n))
+        .collect()
+}
+
+/// Whether what `node` joins is worth keeping while `desired` is the render
+/// distance.
+///
+/// What a node joins does not depend on where the camera is, but a node
+/// outside the render distance is not worth remembering -- except one level
+/// either side of it: a node that has just split or merged is searched through
+/// as what drew its space before, until its own links arrive
+/// (`cubara_world::visibility`'s stand-in). Forgetting the parent the moment
+/// it split made the new children walls again, one search later.
+fn worth_remembering(node: NodeKey, desired: &HashSet<NodeKey>) -> bool {
+    desired.contains(&node)
+        || desired.contains(&node.parent())
+        || node.children().iter().any(|c| desired.contains(c))
 }
 
 /// Whether `node` can leave the arena this frame without leaving a hole.
@@ -407,10 +404,8 @@ impl NodeStreaming {
     /// its links arrive, so the visible set grows outward along what can be
     /// seen as meshes come in.
     fn follow_visibility(&mut self, renderer: &mut Renderer, world: &Arc<World>, done: SearchDone) {
-        // What a node joins does not depend on where the camera is, but a node
-        // outside the render distance is not worth remembering.
         let desired = done.desired;
-        Arc::make_mut(&mut self.links).retain(|n, _| desired.contains(n));
+        Arc::make_mut(&mut self.links).retain(|&n, _| worth_remembering(n, &desired));
         self.visible = done.visible;
 
         let stale: Vec<NodeKey> = self
@@ -452,6 +447,27 @@ impl NodeStreaming {
             self.mesh_pool
                 .request(world, &self.registry, &self.layer_of, node, self.blocks);
         }
+    }
+
+    /// How many nodes are drawn, held for a replacement, being meshed, and
+    /// seen -- for a measurement's log (`crate::flight`).
+    pub fn counts(&self) -> (usize, usize, usize, usize) {
+        (
+            self.resident.len(),
+            self.held.len(),
+            self.mesh_pool.in_flight().count(),
+            self.visible.len(),
+        )
+    }
+
+    /// Nothing left to do for this camera: no search running or due, nothing
+    /// being meshed, nothing drawn in place of what replaces it. What a
+    /// finished frame waits for (`crate::flight`).
+    pub fn settled(&self) -> bool {
+        !self.searching
+            && !self.visibility_stale
+            && self.held.is_empty()
+            && self.mesh_pool.in_flight().next().is_none()
     }
 
     /// Where `node` is in the rendering lifecycle (§11.1).
@@ -664,6 +680,23 @@ mod tests {
     /// Only *replacement* is worth waiting for. A node the camera has simply
     /// left behind must go at once, or the render distance stops bounding
     /// anything and the arena fills with the world behind you.
+    #[test]
+    fn what_split_or_merged_is_remembered_until_its_replacement_is_known() {
+        let node = NodeKey::new(1, [2, -1, 5]);
+        let desired: HashSet<NodeKey> = [node].into_iter().collect();
+        assert!(worth_remembering(node, &desired));
+        assert!(
+            worth_remembering(node.parent(), &desired),
+            "forgot the parent it split from"
+        );
+        assert!(
+            worth_remembering(node.children()[3], &desired),
+            "forgot a child it merged from"
+        );
+        assert!(!worth_remembering(node.parent().parent(), &desired));
+        assert!(!worth_remembering(NodeKey::new(1, [9, 9, 9]), &desired));
+    }
+
     #[test]
     fn a_node_nothing_is_replacing_leaves_immediately() {
         let gone = NodeKey::new(1, [40, 0, 40]);

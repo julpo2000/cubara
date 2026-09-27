@@ -184,14 +184,105 @@ impl<'a> Index<'a> {
     }
 }
 
+/// What joins what in a whole node, from its sub-blocks: face `a` joins face
+/// `b` when air joins a sub-block on side `a` to one on side `b`, through the
+/// sub-blocks between.
+fn whole(subs: &NodeLinks) -> FaceLinks {
+    let at = |i: usize| [i % GRAIN, i / GRAIN % GRAIN, i / GRAIN / GRAIN];
+    let axis = |f: Face| (0..3).find(|&k| step_of(f)[k] != 0).expect("an axis");
+    let on_side = |i: usize, f: Face| {
+        let k = axis(f);
+        if step_of(f)[k] > 0 {
+            at(i)[k] == GRAIN - 1
+        } else {
+            at(i)[k] == 0
+        }
+    };
+    FaceLinks::from_fn(|a, b| {
+        let mut seen = [[false; 6]; GRAIN * GRAIN * GRAIN];
+        let mut stack: Vec<(usize, Face)> = (0..subs.len())
+            .filter(|&i| on_side(i, a))
+            .map(|i| (i, a))
+            .collect();
+        while let Some((i, entered)) = stack.pop() {
+            if std::mem::replace(&mut seen[i][entered as usize], true) {
+                continue;
+            }
+            for out in FACES {
+                if !subs[i].joins(entered, out) {
+                    continue;
+                }
+                if on_side(i, out) {
+                    if out == b {
+                        return true;
+                    }
+                    continue;
+                }
+                let mut c = at(i);
+                let k = axis(out);
+                c[k] = (c[k] as i32 + step_of(out)[k]) as usize;
+                stack.push(((c[2] * GRAIN + c[1]) * GRAIN + c[0], opposite(out)));
+            }
+        }
+        false
+    })
+}
+
+/// What to search a node through while its own links are not known yet: what
+/// the nodes that drew the same space before it said.
+///
+/// **Why this exists: the holes of 2026-09-27.** An unknown node used to be a
+/// wall. Flying forward, every node crossing the edge of a ring splits into
+/// eight new ones, so a whole curtain of unknown nodes stood across the view --
+/// and everything behind it left the visible set, and was unloaded, until the
+/// curtain had been meshed. Hundreds of blocks of ground vanished and came
+/// back every few seconds (`crate`'s caller measures it: `--bench flight`).
+///
+/// - **It split** (its parent, or a coarser ancestor, is known): the part of
+///   the ancestor it is, as the ancestor drew it -- one of the ancestor's
+///   sub-blocks, for every sub-block of this node.
+/// - **It merged** (some of its children are known): each sub-block is one
+///   child, as that child drew it whole; a child not known yet is taken as
+///   open.
+/// - **Neither**: new ground, at the edge of what is streamed or on the first
+///   frame. It stays a wall, so what is generated grows outward along what can
+///   be seen.
+fn stand_in(node: NodeKey, links: &impl Fn(NodeKey) -> Option<NodeLinks>) -> Option<NodeLinks> {
+    // A child is exactly one of its parent's sub-blocks only at grain 2.
+    const _: () = assert!(GRAIN == 2, "stand_in takes a sub-block to be a child");
+    let mut ancestor = node;
+    for up in 1..=3 {
+        ancestor = ancestor.parent();
+        if let Some(known) = links(ancestor) {
+            // The ancestor's sub-block holding this node: the bit `up - 1` of
+            // its position along each axis.
+            let bit = |p: i32| ((p >> (up - 1)) & 1) as usize;
+            let [x, y, z] = node.pos.map(bit);
+            return Some([known[(z * GRAIN + y) * GRAIN + x]; GRAIN * GRAIN * GRAIN]);
+        }
+    }
+    let children: Vec<Option<NodeLinks>> = node.children().into_iter().map(links).collect();
+    if children.iter().any(Option::is_some) {
+        let mut merged = OPEN;
+        for (i, child) in children.iter().enumerate() {
+            if let Some(child) = child {
+                merged[i] = whole(child);
+            }
+        }
+        return Some(merged);
+    }
+    None
+}
+
 /// Every node in `nodes` a line of sight from anywhere in `camera`'s node could
 /// reach.
 ///
 /// `links(node)` is what joins what inside each of a node's sub-blocks; `None`
 /// means not known yet (not generated). An unknown node is included -- it may
-/// well be seen -- but not searched through until it is known, which is what
-/// lets a caller generate outward along what can be seen instead of generating
-/// everything.
+/// well be seen -- and searched through as what drew its space before it did
+/// ([`stand_in`]); only a node nothing is known about is not searched through,
+/// which is what lets a caller generate outward along what can be seen instead
+/// of generating everything.
 ///
 /// The search starts from **every** sub-block of the camera's node, not only
 /// the one the camera is in, so the result holds for any position in that
@@ -210,7 +301,11 @@ pub fn visible_nodes(
     }
     let index = Index::new(nodes, start.is_none());
     let subs = GRAIN * GRAIN * GRAIN;
-    let known: Vec<Option<NodeLinks>> = index.nodes.iter().map(|&n| links(n)).collect();
+    let known: Vec<Option<NodeLinks>> = index
+        .nodes
+        .iter()
+        .map(|&n| links(n).or_else(|| stand_in(n, &links)))
+        .collect();
     let mut seen = vec![false; index.nodes.len()];
     // For each (node, sub-block, face entered by): the directions taken to get
     // there, kept as the intersection over every path that has arrived.
@@ -428,6 +523,129 @@ mod tests {
     /// **Nothing a straight line of sight reaches is left out.** About 1,200
     /// rays each from a camera above the ground, one inside a cave and one high in
     /// the air, through a real world with caves and levels of detail.
+    /// Links joining exactly `a` and `b`.
+    fn pair(a: Face, b: Face) -> FaceLinks {
+        FaceLinks::from_fn(|x, y| (x, y) == (a, b) || (x, y) == (b, a))
+    }
+
+    #[test]
+    fn a_whole_node_joins_what_its_sub_blocks_join_between_them() {
+        assert_eq!(whole(&OPEN), FaceLinks::ALL);
+        assert_eq!(whole(&[FaceLinks::NONE; 8]), FaceLinks::NONE);
+        // In at -x through sub-block 0, on into sub-block 1, up into 3, and
+        // out at +y: -x joins +y, and nothing else joins anything.
+        let mut subs = [FaceLinks::NONE; 8];
+        subs[0] = pair(Face::NegX, Face::PosX);
+        subs[1] = pair(Face::NegX, Face::PosY);
+        subs[3] = pair(Face::NegY, Face::PosY);
+        let w = whole(&subs);
+        for a in FACES {
+            for b in FACES {
+                let want = matches!((a, b), (Face::NegX, Face::PosY) | (Face::PosY, Face::NegX));
+                assert_eq!(w.joins(a, b), want, "{a:?} {b:?}");
+            }
+        }
+        // A sub-block that joins nothing breaks the path.
+        subs[1] = FaceLinks::NONE;
+        assert_eq!(whole(&subs), FaceLinks::NONE);
+    }
+
+    #[test]
+    fn a_split_node_is_searched_as_its_ancestor_drew_it() {
+        let parent = NodeKey::new(2, [3, -1, 0]);
+        // Only the sub-block at x 1, y 0, z 1 (index 5) is open.
+        let mut drawn = [FaceLinks::NONE; 8];
+        drawn[5] = FaceLinks::ALL;
+        let links = |n: NodeKey| (n == parent).then_some(drawn);
+        let children = parent.children();
+        assert_eq!(stand_in(children[5], &links), Some(OPEN));
+        assert_eq!(stand_in(children[0], &links), Some([FaceLinks::NONE; 8]));
+        // Two levels down, inside the open half and outside it.
+        let inside = children[5].children()[2];
+        let outside = children[4].children()[1];
+        assert_eq!(stand_in(inside, &links), Some(OPEN));
+        assert_eq!(stand_in(outside, &links), Some([FaceLinks::NONE; 8]));
+    }
+
+    #[test]
+    fn a_merged_node_is_searched_as_its_children_drew_it() {
+        let node = NodeKey::new(1, [0, 2, -3]);
+        let children = node.children();
+        let solid = children[3];
+        let unknown = children[6];
+        let links = |n: NodeKey| {
+            if n == solid {
+                Some([FaceLinks::NONE; 8])
+            } else if n == unknown || !children.contains(&n) {
+                None
+            } else {
+                Some(OPEN)
+            }
+        };
+        let merged = stand_in(node, &links).expect("its children are known");
+        assert_eq!(merged[3], FaceLinks::NONE);
+        assert_eq!(merged[6], FaceLinks::ALL, "an unknown child is a wall");
+        assert_eq!(merged[0], FaceLinks::ALL);
+        assert_eq!(
+            stand_in(NodeKey::new(1, [50, 50, 50]), &links),
+            None,
+            "new ground stands in for nothing"
+        );
+    }
+
+    /// Whether all of `node` lies below the ground's surface.
+    fn underground(world: &World, node: NodeKey) -> bool {
+        let [x, y, z] = node.world_origin();
+        let size = node.extent_chunks() * Chunk::SIZE as i32;
+        (x..x + size)
+            .flat_map(|x| (z..z + size).map(move |z| (x, z)))
+            .all(|(x, z)| world.surface_height(x, z) >= y + size)
+    }
+
+    /// **The holes of 2026-09-27.** The moment the camera crosses into another
+    /// chunk, some nodes around it split and some merge, and none of those is
+    /// meshed yet. Everything the camera could see before and still can must
+    /// stay in the set meanwhile -- dropping it unloads it, and that was
+    /// hundreds of blocks of ground vanishing while flying.
+    #[test]
+    fn a_node_split_or_merged_since_the_last_search_hides_nothing_behind_it() {
+        let registry = registry();
+        let world = World::new();
+        let surface = world.surface_height(8, 8);
+        let before = ChunkCoord::from_world_pos([8.3, surface as f32 + 20.7, 8.1]);
+        let known = Scene::around(&world, before, &registry);
+        for step in [[1, 0, 0], [0, -2, 0], [0, 2, 0], [-2, 0, 1]] {
+            let after = ChunkCoord::new(before.x + step[0], before.y + step[1], before.z + step[2]);
+            let now = Scene::around(&world, after, &registry);
+            assert!(
+                now.nodes.iter().any(|n| !known.links.contains_key(n)),
+                "{step:?} split or merged nothing, so this proves nothing"
+            );
+            let full = visible_nodes(after, &now.nodes, |n| now.links.get(&n).copied());
+            // What the streamer knows the moment the camera has moved: the
+            // links of everything from before, and nothing of what is new.
+            let partial = visible_nodes(after, &now.nodes, |n| known.links.get(&n).copied());
+            // Lost is allowed in two places only. New ground at the edge of
+            // the region, which nothing drew before -- it is generated as the
+            // search reaches it. And inside a cave, where a node's parent drew
+            // a passage too narrow for its coarser blocks: a glimpse into the
+            // dark for the moment the node takes to mesh, never open ground.
+            let stand_in_of = |n: NodeKey| stand_in(n, &|k| known.links.get(&k).copied());
+            let lost: Vec<NodeKey> = full
+                .iter()
+                .filter(|n| !partial.contains(n))
+                .filter(|&&n| stand_in_of(n).is_some() && !underground(&world, n))
+                .copied()
+                .collect();
+            assert!(
+                lost.is_empty(),
+                "{step:?}: {} of {} visible nodes dropped until the new ones are meshed: {lost:?}",
+                lost.len(),
+                full.len()
+            );
+        }
+    }
+
     #[test]
     fn every_node_a_line_of_sight_hits_is_visible() {
         let registry = registry();

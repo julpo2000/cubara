@@ -320,6 +320,9 @@ pub enum Target {
     /// `--bench tune`: the best quality that holds this PC's target frame
     /// rate, written to its settings (`crate::settings`).
     Tune,
+    /// `--bench flight`: how much of the screen is still loading while
+    /// flying (`crate::flight`).
+    Flight,
     /// `--bench <radius>`: one scene of this chunk radius -- 12, a
     /// realistically heavy world, when none is given.
     Radius(i32),
@@ -330,6 +333,7 @@ pub fn parse_target(word: Option<&str>) -> Target {
     match word {
         Some("gate") => Target::Gate,
         Some("tune") => Target::Tune,
+        Some("flight") => Target::Flight,
         other => Target::Radius(other.and_then(|w| w.parse().ok()).unwrap_or(12)),
     }
 }
@@ -1321,6 +1325,7 @@ mod tests {
     fn bench_gate_is_the_gate_and_anything_else_is_a_radius() {
         assert_eq!(parse_target(Some("gate")), Target::Gate);
         assert_eq!(parse_target(Some("tune")), Target::Tune);
+        assert_eq!(parse_target(Some("flight")), Target::Flight);
         assert_eq!(parse_target(Some("64")), Target::Radius(64));
         assert_eq!(parse_target(None), Target::Radius(12));
         // A flag straight after `--bench` is not a radius.

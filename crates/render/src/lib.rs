@@ -27,6 +27,7 @@ pub mod profiling;
 mod render;
 mod scene;
 mod text;
+mod uploads;
 
 pub use arena::{ArenaUsage, ChunkArena, MeshedNode, NodeId};
 pub use culling::{Aabb, Frustum};

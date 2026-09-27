@@ -51,6 +51,19 @@ impl FaceLinks {
         a != b && self.0 & pair_bit(a, b) != 0
     }
 
+    /// The links for which `joined(a, b)` holds, asked once per pair.
+    pub fn from_fn(joined: impl Fn(Face, Face) -> bool) -> Self {
+        let mut links = 0u16;
+        for (i, &a) in ALL_FACES.iter().enumerate() {
+            for &b in &ALL_FACES[i + 1..] {
+                if joined(a, b) {
+                    links |= pair_bit(a, b);
+                }
+            }
+        }
+        Self(links)
+    }
+
     /// Worked out from `chunk`'s blocks at the chunk's own resolution.
     pub fn of_chunk(chunk: &Chunk, registry: &BlockRegistry) -> Self {
         Self::of_region(chunk, registry, [0, 0, 0], Chunk::SIZE)
@@ -143,6 +156,21 @@ impl FaceLinks {
 mod tests {
     use super::*;
     use crate::registry::{DropRule, Faces, Interact, Material, Shape};
+
+    #[test]
+    fn from_fn_sets_exactly_the_pairs_asked_for() {
+        let links = FaceLinks::from_fn(|a, b| {
+            matches!((a, b), (Face::PosX, Face::NegY) | (Face::NegY, Face::PosX))
+        });
+        for a in ALL_FACES {
+            for b in ALL_FACES {
+                let want = matches!((a, b), (Face::PosX, Face::NegY) | (Face::NegY, Face::PosX));
+                assert_eq!(links.joins(a, b), want, "{a:?} {b:?}");
+            }
+        }
+        assert_eq!(FaceLinks::from_fn(|_, _| true), FaceLinks::ALL);
+        assert_eq!(FaceLinks::from_fn(|_, _| false), FaceLinks::NONE);
+    }
 
     fn registry() -> BlockRegistry {
         BlockRegistry::from_materials(vec![(

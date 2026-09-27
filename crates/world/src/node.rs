@@ -39,6 +39,29 @@ impl NodeKey {
         Self { level, pos }
     }
 
+    /// The node one level coarser that contains this one.
+    pub fn parent(self) -> Self {
+        Self::new(self.level + 1, self.pos.map(|p| p.div_euclid(2)))
+    }
+
+    /// The eight nodes one level finer that tile this one, in the order of
+    /// their sub-block in it (`x` fastest, then `y`, then `z` -- the order
+    /// `visibility::NodeLinks` is in). Empty at level 0.
+    pub fn children(self) -> Vec<Self> {
+        let Some(finer) = self.level.checked_sub(1) else {
+            return Vec::new();
+        };
+        let [x, y, z] = self.pos;
+        (0..8)
+            .map(|i| {
+                Self::new(
+                    finer,
+                    [2 * x + (i & 1), 2 * y + (i >> 1 & 1), 2 * z + (i >> 2)],
+                )
+            })
+            .collect()
+    }
+
     /// How many chunks this node spans on each axis: `2^level`.
     pub fn extent_chunks(self) -> i32 {
         1 << self.level
@@ -376,6 +399,23 @@ fn node_dist_sq(node: NodeKey, center: ChunkCoord) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn children_tile_their_parent_in_sub_block_order() {
+        for node in [NodeKey::new(2, [0, 0, 0]), NodeKey::new(1, [-3, 5, -1])] {
+            let children = node.children();
+            assert_eq!(children.len(), 8);
+            let o = node.chunk_origin();
+            let half = node.extent_chunks() / 2;
+            for (i, child) in children.iter().enumerate() {
+                assert_eq!(child.parent(), node, "{child:?}");
+                let c = child.chunk_origin();
+                let at = [(c.x - o.x) / half, (c.y - o.y) / half, (c.z - o.z) / half];
+                assert_eq!(at[0] as usize + 2 * at[1] as usize + 4 * at[2] as usize, i);
+            }
+        }
+        assert!(NodeKey::new(0, [4, 4, 4]).children().is_empty());
+    }
 
     #[test]
     fn extent_chunks_doubles_per_level() {

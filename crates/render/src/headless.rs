@@ -153,7 +153,7 @@ impl Default for Shot {
     }
 }
 
-const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+pub(crate) const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 /// Render an already-meshed scene offscreen and read the pixels back.
 ///
@@ -348,17 +348,6 @@ fn render_arena(
     });
     let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
 
-    // Readback rows must be a multiple of 256 bytes.
-    let unpadded_bpr = width * 4;
-    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-    let padded_bpr = unpadded_bpr.div_ceil(align) * align;
-    let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("headless-readback"),
-        size: (padded_bpr * height) as u64,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("headless-encoder"),
     });
@@ -403,9 +392,35 @@ fn render_arena(
             gpu_timestamps: None,
         },
     );
+    queue.submit(std::iter::once(encoder.finish()));
+    Some(read_texture(&device, &queue, &color, width, height))
+}
+
+/// Read `color` (`width` x `height`, [`COLOR_FORMAT`]) back as tightly-packed
+/// pixels, once everything submitted before has drawn into it.
+pub(crate) fn read_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    color: &wgpu::Texture,
+    width: u32,
+    height: u32,
+) -> Frame {
+    // Readback rows must be a multiple of 256 bytes.
+    let unpadded_bpr = width * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded_bpr = unpadded_bpr.div_ceil(align) * align;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("headless-readback"),
+        size: (padded_bpr * height) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("headless-readback-encoder"),
+    });
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
-            texture: &color,
+            texture: color,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
@@ -439,11 +454,11 @@ fn render_arena(
     drop(data);
     readback.unmap();
 
-    Some(Frame {
+    Frame {
         width,
         height,
         pixels,
-    })
+    }
 }
 
 /// How two frames differ.
