@@ -460,6 +460,7 @@ impl ApplicationHandler for App {
             self.settings.far,
         ));
         let mut renderer = renderer;
+        renderer.set_haze(far_streaming::HAZE, far_streaming::HAZE_HEIGHT);
         renderer.set_icons(self.game.item_icons());
         self.renderer = Some(renderer);
         // Capture the mouse for first-person look (Esc releases it). A window
@@ -990,6 +991,7 @@ fn main() {
                 size: value("--size")
                     .and_then(bench::parse_size)
                     .unwrap_or((1920, 1080)),
+                haze: value("--haze").and_then(|h| h.parse().ok()),
             });
         // Static overlay text -- the pause menu or console, for a review
         // screenshot of `Hud::menu` with no window (`--screenshot menu.png

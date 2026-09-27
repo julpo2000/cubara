@@ -27,6 +27,9 @@ pub struct View {
     /// Render distance in chunks.
     pub radius: i32,
     pub size: (u32, u32),
+    /// The haze, in blocks, if not the game's own
+    /// ([`crate::far_streaming::HAZE`]) -- for comparing thicknesses.
+    pub haze: Option<f32>,
 }
 
 /// Fog for `shot`'s own `region_radius` -- not `streaming::render_radius_blocks()`
@@ -116,6 +119,8 @@ pub fn run(path: &str, view: Option<View>, menu: Option<String>) {
                 lighting: Lighting {
                     fog_start,
                     fog_end,
+                    haze: v.haze.unwrap_or(crate::far_streaming::HAZE),
+                    haze_height: crate::far_streaming::HAZE_HEIGHT,
                     ..Lighting::default()
                 },
                 ..shot

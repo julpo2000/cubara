@@ -472,6 +472,29 @@ is the monitor's refresh rate (`ROADMAP.md` has his words). What was built:
   at every eye. `Off` can never pass it, because the flight eye must see
   something.
 
+## §6d Haze (F5, 2026-09-27)
+
+The fog that hid the edge became air. `Lighting::haze` is the distance over
+which the air hides 63% of what lies behind it (`1 - e^(-d/haze)`), at y = 0.
+`Lighting::haze_height` thins it by `e` every so many blocks up, integrated
+along each line of sight in closed form. With one thickness everywhere, the
+view from 3 km up read as fog: every line of sight crossed as much air as one
+along the ground. The edge fade stays; the two combine as the larger of the
+two.
+
+Shipped at **40 km, thinning every 1.5 km up** (`far_streaming::HAZE`,
+`HAZE_HEIGHT`). That value was chosen by looking, as the owner asked
+("doe wat je goed lijkt"; images in the PR at 0, 20, 40 and 60 km). Distant
+ranges fade toward the sky from a hill, the horizon softens, and from 3 km up
+the land stays clear. The far terrain and the figures integrate over height.
+The voxels, all within a kilometre and reading nothing per frame by design,
+take the thickness at y = 0; their share of haze is a few percent either way,
+so the join does not show.
+
+Cost: inside the noise on the M3 (`BENCHMARKS.md` ⁷³). That row also records
+that **the M3 now holds 1,000 FPS at High**, after #292 and F4's per-vertex
+shading, so all three machines run the far terrain at High.
+
 ## §7 How it is checked
 
 - **Geometric error:** a unit test that every drawn far-terrain quad projects to

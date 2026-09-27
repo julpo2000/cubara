@@ -61,7 +61,33 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // ring fades the way the ground under them does, rather than staying a
     // crisp silhouette against faded terrain.
     let dist = distance(in.world_pos, frame.eye.xyz);
-    let fog_amount = select(0.0, smoothstep(frame.fog.x, frame.fog.y, dist), frame.fog.y > frame.fog.x);
+    // The edge of what is drawn fading out, and the air in between (`.w`,
+    // `Lighting::haze`) -- the same two as `mesh.wgsl`.
+    let edge = select(0.0, smoothstep(frame.fog.x, frame.fog.y, dist), frame.fog.y > frame.fog.x);
+    let air = haze(frame.eye.xyz, in.world_pos, dist);
+    let fog_amount = max(edge, air);
     let color = mix(lit, frame.fog_color.rgb, fog_amount);
     return vec4<f32>(color, 1.0);
+}
+
+// How much of what lies at `p` the air hides, seen from `eye` at `dist`:
+// `Lighting::haze` is the air's thickness at y = 0 (`frame.fog.w`), and it
+// thins by `e` every `Lighting::haze_height` blocks up (`frame.fog_color.w`).
+// The density is integrated along the line of sight in closed form -- the
+// mean of an exponential between two heights -- so a look down from a
+// flight crosses little air and a look along the ground crosses a lot.
+fn haze(eye: vec3<f32>, p: vec3<f32>, dist: f32) -> f32 {
+    let thickness = frame.fog.w;
+    if thickness <= 0.0 {
+        return 0.0;
+    }
+    let scale = frame.fog_color.w;
+    var mean = 1.0;
+    if scale > 0.0 {
+        let a = exp(-max(eye.y, 0.0) / scale);
+        let b = exp(-max(p.y, 0.0) / scale);
+        let rise = (max(p.y, 0.0) - max(eye.y, 0.0)) / scale;
+        mean = select((a - b) / rise, a, abs(rise) < 1e-3);
+    }
+    return 1.0 - exp(-dist * mean / thickness);
 }

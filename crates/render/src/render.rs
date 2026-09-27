@@ -244,6 +244,22 @@ pub struct Lighting {
     /// starting behind the camera" -- see the type's doc comment.
     pub fog_start: f32,
     pub fog_end: f32,
+    /// Haze: the distance, in blocks, over which the air hides 63% of what
+    /// lies behind it (`1 - e^(-d / haze)`), fading toward `fog_color`. Not
+    /// an edge being hidden, as `fog_start`/`fog_end` are, but air between
+    /// the eye and the distance -- what lets an eye read how far away a
+    /// mountain is (`docs/PROPOSAL_FAR_VIEW.md` §3.4, block F5). `0.0` is
+    /// none, which is the default, so nothing that does not ask for it
+    /// changes. This is the air's thickness at `y = 0`; see `haze_height`.
+    pub haze: f32,
+    /// How quickly the air thins with height: its density falls by `e` every
+    /// this many blocks up (a scale height). Integrated along each line of
+    /// sight, so looking down from a mountain or a flight crosses little air
+    /// and looking along the ground crosses a lot -- without it, 3 km up
+    /// reads as fog. `0.0` is air of one thickness at every height. Honoured
+    /// by the far terrain and figures; the voxels, all within a kilometre,
+    /// take `haze` as is (their share of haze is a few percent either way).
+    pub haze_height: f32,
     /// `0.0..1.0` around a day; unused (fixed at `0.0`) until a later
     /// package turns on the day/night cycle this only carries the plumbing
     /// for.
@@ -265,6 +281,8 @@ impl Default for Lighting {
             fog_color: glam::vec3(0.45, 0.62, 0.80),
             fog_start: 0.0,
             fog_end: 0.0,
+            haze: 0.0,
+            haze_height: 0.0,
             time_of_day: 0.0,
         }
     }
@@ -305,8 +323,10 @@ pub struct FrameUniform {
     sun_color: [f32; 4],
     /// `.x` [`Lighting::ambient_low`], `.y` `ambient_high`, `.z` `ao_floor`.
     ambient: [f32; 4],
+    /// `.rgb` [`Lighting::fog_color`], `.w` `haze_height`.
     fog_color: [f32; 4],
-    /// `.x` [`Lighting::fog_start`], `.y` `fog_end`, `.z` `time_of_day`.
+    /// `.x` [`Lighting::fog_start`], `.y` `fog_end`, `.z` `time_of_day`,
+    /// `.w` `haze`.
     fog: [f32; 4],
 }
 
@@ -337,13 +357,13 @@ impl FrameUniform {
                 lighting.fog_color.x,
                 lighting.fog_color.y,
                 lighting.fog_color.z,
-                0.0,
+                lighting.haze_height,
             ],
             fog: [
                 lighting.fog_start,
                 lighting.fog_end,
                 lighting.time_of_day,
-                0.0,
+                lighting.haze,
             ],
         }
     }
@@ -538,6 +558,10 @@ pub struct Renderer {
     /// the fog past where anything is, leaving the old hard edge exactly as
     /// visible as before this existed.
     render_radius_blocks: f32,
+    /// [`Lighting::haze`] and [`Lighting::haze_height`] for the window -- the
+    /// caller's choice of how thick the air is ([`set_haze`](Self::set_haze)),
+    /// none until it says.
+    haze: (f32, f32),
 }
 
 impl Renderer {
@@ -675,6 +699,7 @@ impl Renderer {
             // the first `render()` call tells this how far streaming
             // actually reaches.
             render_radius_blocks: 0.0,
+            haze: (0.0, 0.0),
         };
         (renderer, mesh_assets)
     }
@@ -969,9 +994,17 @@ impl Renderer {
             Lighting {
                 fog_start,
                 fog_end,
+                haze: self.haze.0,
+                haze_height: self.haze.1,
                 ..Default::default()
             },
         );
+    }
+
+    /// How thick the air is ([`Lighting::haze`]) and how quickly it thins
+    /// with height ([`Lighting::haze_height`]), in blocks.
+    pub fn set_haze(&mut self, haze: f32, haze_height: f32) {
+        self.haze = (haze, haze_height);
     }
 
     /// Report frames-per-second roughly once per second.
@@ -1123,6 +1156,7 @@ pub fn mesh_pipeline_constants(
         ("fog_color_b", lighting.fog_color.z as f64),
         ("fog_start", lighting.fog_start as f64),
         ("fog_end", lighting.fog_end as f64),
+        ("haze", lighting.haze as f64),
         ("depth_a", depth_a as f64),
         ("depth_b", depth_b as f64),
         ("viewport_width", width as f64),
@@ -1563,6 +1597,36 @@ mod tests {
         assert_eq!(f.ambient, [0.28, 0.42, 0.4, 0.0]);
         assert_eq!(f.fog[0], 0.0, "fog_start");
         assert_eq!(f.fog[1], 0.0, "fog_end");
+    }
+
+    /// Haze reaches every shader: `.w` of `fog` and `fog_color` in the frame
+    /// uniform (far terrain, figures) and the `haze` override (voxels). A
+    /// field dropped here reads as clear air, silently.
+    #[test]
+    fn haze_is_carried_to_every_shader() {
+        let lighting = Lighting {
+            haze: 40_000.0,
+            haze_height: 1_500.0,
+            ..Lighting::default()
+        };
+        let u = FrameUniform::new(glam::Mat4::IDENTITY, glam::Vec3::ZERO, lighting);
+        assert_eq!(u.fog[3], 40_000.0);
+        assert_eq!(u.fog_color[3], 1_500.0);
+        let constants = mesh_pipeline_constants(&lighting, 1920, 1080);
+        assert!(constants
+            .iter()
+            .any(|(k, v)| *k == "haze" && *v == 40_000.0));
+        // And the shaders read them where they are put.
+        for (name, wgsl) in [
+            ("far.wgsl", include_str!("shaders/far.wgsl")),
+            ("figure.wgsl", include_str!("shaders/figure.wgsl")),
+        ] {
+            assert!(
+                wgsl.contains("frame.fog.w") && wgsl.contains("frame.fog_color.w"),
+                "{name}"
+            );
+        }
+        assert!(include_str!("shaders/mesh.wgsl").contains("override haze: f32"));
     }
 
     #[test]

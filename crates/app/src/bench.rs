@@ -696,6 +696,13 @@ pub fn run(
             cubara_render::Lighting {
                 fog_start,
                 fog_end,
+                // The air between, as the game draws it, with the far terrain.
+                haze: if far.is_some() {
+                    crate::far_streaming::HAZE
+                } else {
+                    0.0
+                },
+                haze_height: crate::far_streaming::HAZE_HEIGHT,
                 ..Default::default()
             }
         } else {

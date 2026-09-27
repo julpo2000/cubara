@@ -174,6 +174,9 @@ frames after 200 warmup.
 | 2026-09-27 | **Gate eye: ground + far terrain** — High / Medium / **Low** (F3c)⁶⁷ | 1,940 | 819,928 voxel + far | 597 / 907 / **1,090** | -- | -- | `44c62b0` |
 | 2026-09-27 | **Gate eye: hill + far terrain** — High / Medium / **Low**⁶⁷ | 869 | 436,690 voxel + far | 809 / 1,225 / **1,563** | -- | -- | `44c62b0` |
 | 2026-09-27 | **Gate eye: flight + far terrain** — High / Medium / **Low**⁶⁷ | 0 | far only | 1,542 / 2,175 / **4,039** | -- | -- | `44c62b0` |
+| 2026-09-27 | **Gate eye: ground + far terrain (High)** — after #292, F4 and haze⁷³ | 1,940 | 819,928 voxel + 720,819 far drawn | ~1,755 | -- | -- | `feat/haze` |
+| 2026-09-27 | **Gate eye: hill + far terrain (High)**⁷³ | 869 | 436,690 voxel + 727,521 far drawn | ~2,014 | -- | -- | `feat/haze` |
+| 2026-09-27 | **Gate eye: flight + far terrain (High)**⁷³ | 0 | 547,649 far drawn | ~2,299 | -- | -- | `feat/haze` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -2494,3 +2497,15 @@ quality (flight at High 2,450 → 1,254 FPS), and the table's arctangents
 another 0.035 ms at ground. Both measurements are in
 `docs/PROPOSAL_FAR_VIEW.md` §3.3. The M3 is where this matters most: it met
 the gate at Low with ground at 1,090. It should be re-measured there.
+
+⁷³ **The M3 holds High now (F5's branch, on `f3d5124` + haze).** `--bench
+gate`: **met at High** on the first try, twice: ground 1,745 / 1,755, hill
+2,055 / 2,014, flight 2,311 / 2,299 FPS -- battery 98% and not charging, a
+cool machine. The same scene at High read 597 / 809 / 1,542 in ⁶⁷ (battery
+19%, charging) and 826–873 / 878–1,105 / 1,546–1,634 warm the evening before.
+Between ⁶⁷ and this row: #292 (no indirect-call validation in release) and
+#295 (F4: the far terrain shaded per vertex, its fragment stage now passing a
+colour through). The haze itself is inside the noise: `main` at `f3d5124`
+without it read 1,773 / 2,066 / 2,325 in the same sitting. So all three
+machines now hold 1,000 at High. The warm-up is still the 200-frame one; the
+wall-time warm-up (Windows session, pending) will move all series again.

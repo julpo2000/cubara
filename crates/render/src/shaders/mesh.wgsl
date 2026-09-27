@@ -39,6 +39,9 @@ override fog_color_b: f32 = 0.80;
 // fog_end <= fog_start means fog is off.
 override fog_start: f32 = 0.0;
 override fog_end: f32 = 0.0;
+// Haze (`Lighting::haze`): the distance, in blocks, over which the air hides
+// 63% of what lies behind it. 0 is none.
+override haze: f32 = 0.0;
 // (A, B) such that view_depth = A / (clip_pos.z + B) -- see the derivation
 // on `render.rs`'s `reverse_z_depth_constants`, which this is fed from.
 override depth_a: f32 = 0.1000050002500125;
@@ -192,7 +195,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let off_axis_x = ndc_x * TAN_HALF_FOV * aspect;
     let off_axis_y = ndc_y * TAN_HALF_FOV;
     let radial = view_depth * sqrt(1.0 + off_axis_x * off_axis_x + off_axis_y * off_axis_y);
-    let fog_amount = select(0.0, smoothstep(fog_start, fog_end, radial), fog_end > fog_start);
+    let edge = select(0.0, smoothstep(fog_start, fog_end, radial), fog_end > fog_start);
+    let air = select(0.0, 1.0 - exp(-radial / haze), haze > 0.0);
+    let fog_amount = max(edge, air);
     let fog_color = vec3<f32>(fog_color_r, fog_color_g, fog_color_b);
     let color = mix(lit, fog_color, fog_amount);
     return vec4<f32>(color, 1.0);

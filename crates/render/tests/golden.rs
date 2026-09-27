@@ -1465,6 +1465,42 @@ fn the_far_terrain_reaches_the_horizon() {
     assert_frame_golden("far_terrain_to_the_horizon", with);
 }
 
+/// **Haze** (`docs/PROPOSAL_FAR_VIEW.md` block F5): the same view with the air
+/// thickened, so distant ranges fade toward the sky. Thicker here than the
+/// game's so it shows inside this shot's 20 km, and checked against the same
+/// shot without it -- the far half of the image must change, or the haze was
+/// never applied.
+#[test]
+fn haze_fades_the_distance_toward_the_sky() {
+    let world = World::new();
+    let eye = glam::Vec3::new(8.0, 120.0, 8.0);
+    let clear = Shot {
+        region_radius: 4,
+        camera: Some((eye, glam::Vec3::new(1.0, -0.12, 0.35))),
+        ..Shot::default()
+    };
+    let hazy = Shot {
+        lighting: cubara_render::Lighting {
+            haze: 8_000.0,
+            haze_height: 1_500.0,
+            ..clear.lighting
+        },
+        ..clear.clone()
+    };
+    let far = far_terrain(&world, eye, clear.region_radius, &clear, 20_000.0);
+    let with = render_world_with_far(&world, hazy, &far);
+    if let (Some(with), Some(without)) = (with.as_ref(), render_world_with_far(&world, clear, &far))
+    {
+        let diff = headless::compare(&with.pixels, &without.pixels, TOLERANCE);
+        assert!(
+            diff.differing_fraction > 0.1,
+            "haze changed only {:.1}% of the image",
+            diff.differing_fraction * 100.0
+        );
+    }
+    assert_frame_golden("far_terrain_in_haze", with);
+}
+
 /// **The far terrain's shader is the CPU reference** (`aggregate.rs`, block
 /// F4). A patch that is a plane of known gradient is rendered from a known
 /// direction, and the pixel at the centre of the image, whose ray is exactly

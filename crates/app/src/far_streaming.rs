@@ -84,6 +84,18 @@ impl FarQuality {
     }
 }
 
+/// How thick the air is ([`cubara_render::Lighting::haze`]): the distance
+/// over which it hides 63% of what lies behind it, in blocks. What makes the
+/// far terrain read as far (`PROPOSAL_FAR_VIEW.md` block F5). The window, the
+/// bench and screenshots all use this one value.
+pub const HAZE: f32 = 40_000.0;
+
+/// How quickly that air thins with height, in blocks: a scale height
+/// ([`cubara_render::Lighting::haze_height`]). Real air thins by `e` in about
+/// 8 km; the hazy layer near the ground, which is what hides distance, is far
+/// shallower.
+pub const HAZE_HEIGHT: f32 = 1_500.0;
+
 /// The camera's vertical field of view (`render.rs`'s projection).
 const FOV_Y: f64 = std::f64::consts::FRAC_PI_3;
 
