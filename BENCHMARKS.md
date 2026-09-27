@@ -2293,8 +2293,8 @@ The Windows rows for the gate are ⁶⁴.
 
 ⁶⁴ **The owner's gate on Windows (RTX 4060 Laptop, Vulkan), `da21d01`.** The
 same `--bench gate` as ⁶², on `main` with F1, F3a and F3b merged (F3b draws the
-far terrain only where F3c puts it in the game, so the eyes' scene is still the
-⁶² one: node counts match the M3 and Linux rows exactly). Two gate runs back to
+far terrain only where F3c puts it in the game, so the eyes' scene is still
+the one in ⁶²: node counts match the M3 and Linux rows exactly). Two gate runs back to
 back, then the orbit, uncontended. The rows are the second run:
 
 ```
