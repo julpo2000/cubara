@@ -582,7 +582,7 @@ pub fn run(
             );
             terrain.set_params(
                 &queue,
-                crate::far_streaming::to_far_params(hole, crate::far_streaming::far_top_color()),
+                crate::far_streaming::to_far_params(hole, crate::far_streaming::far_materials()),
             );
             Some(terrain)
         }

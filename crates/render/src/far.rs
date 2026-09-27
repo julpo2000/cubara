@@ -7,6 +7,7 @@
 //! not depend on the world crate (Rule 3), so a patch arrives as a
 //! [`FarPatch`] and leaves as a [`FarSlot`].
 
+use crate::aggregate::{MaskingTable, Materials, TABLE_SIZE};
 use crate::culling::{Aabb, Frustum};
 use crate::render::far_bind_group_layout;
 use glam::Vec3;
@@ -46,10 +47,38 @@ pub struct FarParams {
     /// The box the voxel rings draw themselves, `(min, max)` in blocks.
     /// Nothing of the far terrain is drawn inside it. `None`: no hole.
     pub hole: Option<([f32; 3], [f32; 3])>,
-    /// The average colour of the ground's top, in linear light
-    /// ([`crate::materials::mean_color`]).
-    pub top_color: [f32; 3],
+    /// What the ground is made of: the mean colours of its faces
+    /// ([`crate::materials::mean_color`]) and the soil's depth, for the
+    /// block-aggregate shading (`crate::aggregate`).
+    pub materials: Materials,
 }
+
+/// What the ground is made of, from the block textures: each face's texture
+/// averaged ([`crate::materials::mean_color`]), falling back to plain
+/// colours where a texture is missing, with the world's `soil_depth`
+/// (`cubara_world::SOIL_DEPTH`, which this crate cannot name).
+pub fn ground_materials(soil_depth: f32) -> Materials {
+    let mean = |name: &str, fallback: Vec3| {
+        crate::materials::mean_color(name).map_or(fallback, Vec3::from)
+    };
+    let p = PLACEHOLDER_MATERIALS;
+    Materials {
+        top: mean("grass_top", p.top),
+        side: mean("grass_side", p.side),
+        soil: mean("soil", p.soil),
+        stone: mean("stone", p.stone),
+        soil_depth,
+    }
+}
+
+/// Plain grass-and-dirt colours, for before the real ones are set.
+const PLACEHOLDER_MATERIALS: Materials = Materials {
+    top: Vec3::new(0.2, 0.4, 0.15),
+    side: Vec3::new(0.3, 0.3, 0.15),
+    soil: Vec3::new(0.3, 0.2, 0.1),
+    stone: Vec3::new(0.4, 0.4, 0.4),
+    soil_depth: 3.0,
+};
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -65,19 +94,79 @@ struct ParamsGpu {
     hole_min: [f32; 4],
     hole_max: [f32; 4],
     top_color: [f32; 4],
+    /// `w`: the soil's depth, in blocks.
+    side_color: [f32; 4],
+    soil_color: [f32; 4],
+    stone_color: [f32; 4],
 }
 
 impl ParamsGpu {
     fn new(p: FarParams) -> Self {
         // No hole: an empty box, min above max, which nothing is inside.
         let (min, max) = p.hole.unwrap_or(([f32::MAX; 3], [f32::MIN; 3]));
-        let [r, g, b] = p.top_color;
+        let m = p.materials;
         Self {
             hole_min: [min[0], min[1], min[2], 0.0],
             hole_max: [max[0], max[1], max[2], 0.0],
-            top_color: [r, g, b, 1.0],
+            top_color: m.top.extend(1.0).to_array(),
+            side_color: m.side.extend(m.soil_depth).to_array(),
+            soil_color: m.soil.extend(1.0).to_array(),
+            stone_color: m.stone.extend(1.0).to_array(),
         }
     }
+}
+
+/// The committed [`MaskingTable`] as the 3D texture `far.wgsl` samples: its
+/// first two axes as width and height, its last two stacked as depth
+/// (`axis 2 + 16 * axis 3`). That is exactly the table's own byte order, so
+/// the bytes go up as they are. Linear filtering interpolates the first three
+/// axes; the shader blends along the fourth itself, never across a stack's
+/// edge.
+fn masking_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> (wgpu::TextureView, wgpu::Sampler) {
+    let side = TABLE_SIZE as u32;
+    let size = wgpu::Extent3d {
+        width: side,
+        height: side,
+        depth_or_array_layers: side * side,
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("far-masking-table"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        MaskingTable::committed().bytes(),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(side),
+            rows_per_image: Some(side),
+        },
+        size,
+    );
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("far-masking-sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    (texture.create_view(&Default::default()), sampler)
 }
 
 /// The far terrain on the GPU: a fixed number of patch slots, and the list of
@@ -130,9 +219,10 @@ impl FarTerrain {
             0,
             bytemuck::bytes_of(&ParamsGpu::new(FarParams {
                 hole: None,
-                top_color: [0.2, 0.4, 0.15],
+                materials: PLACEHOLDER_MATERIALS,
             })),
         );
+        let (masking, masking_sampler) = masking_texture(device, queue);
 
         let grid = grid_indices();
         let indices = device.create_buffer(&wgpu::BufferDescriptor {
@@ -167,6 +257,14 @@ impl FarTerrain {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&masking),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(&masking_sampler),
                 },
             ],
         });

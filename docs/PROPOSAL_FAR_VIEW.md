@@ -272,18 +272,46 @@ So the shading is done in three layers:
   blocks one by one to within 0.004, and a case worked out by hand.
 - **A table** (`MaskingTable`, 16⁴ bytes, 64 KB, committed as
   `aggregate.table`) for the one arrangement that hides anything. It is indexed
-  by slope steepness, the lean between the axes, and the two projected-area
-  ratios, so the part that changes fast is in the coordinates and the table
-  only holds what hiding changes. A first version indexed by elevation and
-  azimuth was off by up to 0.6 at grazing angles.
+  by slope steepness `s / (1 + s)`, the lean between the axes
+  `g_B / (g_A + g_B)`, and the two projected-area ratios, so the part that
+  changes fast is in the coordinates and the table only holds what hiding
+  changes. A first version indexed by elevation and azimuth was off by up to
+  0.6 at grazing angles. Steepness and lean were first angles; as ratios they
+  cost the shader no arctangent, and are as accurate.
 - **The shader's rule** (`visible_weights`): projected areas where nothing
   hides, tops alone where every riser faces away, and the table where one axis
-  hides the other. Over 2,000 random slopes and views it is within 0.0012 of
-  the definition on average, 0.003 at the 95th percentile, and 0.18 at worst.
+  hides the other. Over 2,000 random slopes and views it is within 0.0013 of
+  the definition on average, 0.003 at the 95th percentile, and 0.25 at worst.
   The worst cases are slopes seen almost edge-on, which cover few pixels.
 
-F4 uploads the table as a texture and ports `visible_weights` and `face_light`
-into `far.wgsl`.
+**In `far.wgsl` (F4, 2026-09-27), the shading runs per vertex, not per
+fragment** (a revision of "the fragment shader ... computes" above). Quads are
+at most about 16 px across by the split rule, so the view direction barely
+turns across one, and the slope is interpolated either way. Measured at the
+gate eyes on the GTX 1060, GPU time per frame, same session:
+
+| | Plain (F3) | F4 per fragment | F4 per vertex | F4 per vertex, no arctangent |
+|---|---|---|---|---|
+| flight | 0.38 ms | 0.75 ms | 0.38 ms | 0.36 ms |
+| hill | 0.50 ms | 0.67 ms | 0.54 ms | 0.52 ms |
+| ground | 0.58 ms | 0.57 ms | 0.62 ms | 0.57 ms |
+
+(`--bench 64 --eye … --far`, High, each the typical of two or three runs,
+leaving out a first run that includes warm-up.)
+
+Per fragment it would have cost the flight eye half its frame rate. Per vertex
+and without the arctangents, it costs the same as the plain shading, to within
+the noise, and the per-fragment version and the per-vertex
+one differ on 0.2% of a golden's pixels, all on ridge lines. A test renders
+slopes of known gradient and checks the pixel against `aggregate_colour` to
+one step of 8-bit colour, through every branch and the table's texture
+layout.
+
+**A riser shows the blocks it cuts through**: the side of the surface block
+at its top, then soil to `SOIL_DEPTH`, then stone (`riser_colour`). A gentle
+slope's risers are grass-sided; a mountain face seen from far away shows the
+soil and stone of its steps, which is what reads as a mountain made of
+blocks.
 
 ### 3.4 Joining the two
 

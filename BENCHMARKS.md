@@ -191,6 +191,9 @@ frames after 200 warmup.
 | 2026-09-27 | **Gate eye: ground + far terrain (High, 262 km)** — F3c⁶⁵ | 1,940 | 819,928 voxel + 720,819 far drawn | ~1,610 | 0.340 ms | 1.018 ms | `41bdab0` |
 | 2026-09-27 | **Gate eye: hill + far terrain (High)**⁶⁵ | 869 | 436,690 voxel + 727,521 far drawn | ~1,765 | 0.280 ms | 1.013 ms | `41bdab0` |
 | 2026-09-27 | **Gate eye: flight + far terrain (High)** — sees something now⁶⁵ | 0 | 547,649 far drawn | ~2,435 | 0.167 ms | 0.734 ms | `41bdab0` |
+| 2026-09-27 | **Gate eye: ground + far terrain, block-aggregate shading (F4, High)**⁷⁰ | 1,940 | 819,928 voxel + far | ~1,572 | 0.348 ms | 1.113 ms | `feat/far-aggregate-shading` |
+| 2026-09-27 | **Gate eye: hill + far terrain, F4 (High)**⁷⁰ | 869 | 436,690 voxel + far | ~1,731 | 0.275 ms | 0.970 ms | `feat/far-aggregate-shading` |
+| 2026-09-27 | **Gate eye: flight + far terrain, F4 (High)**⁷⁰ | 0 | far only | ~2,462 | 0.166 ms | 0.747 ms | `feat/far-aggregate-shading` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -2469,3 +2472,25 @@ laptop's numbers and lower the M3's -- which is why the choice (frames or wall
 time, how long, whether the gate's single run should follow it) goes to the
 owner with these numbers rather than into the bench quietly. The rows of this
 table so far all used 200 and stay comparable with each other.
+
+⁷⁰ **Block-aggregate shading (F4) on the far terrain: no measurable cost.**
+`--bench tune --target 100000` makes every quality try and fail, so it prints
+a TRY line for each. It was run twice before (`ef4ae3d`, F3c) and twice after
+(the same base plus F4), uncontended and with the lid shut (the bench is
+headless). FPS:
+
+| Quality | ground, before → after | hill, before → after | flight, before → after |
+|---|---|---|---|
+| High | 1,621 / 1,593 → 1,572 / 1,572 | 1,797 / 1,867 → 1,731 / 1,766 | 2,450 / 2,248 → 2,462 / 2,314 |
+| Medium | 1,721 / 1,816 → 1,693 / 1,759 | 2,060 / 1,995 → 2,041 / 1,960 | 2,870 / 2,853 → 2,877 / 2,262 |
+| Low | 1,933 / 2,033 → 1,914 / 1,891 | 2,430 / 2,206 → 2,386 / 2,424 | 3,338 / 3,351 → 3,469 / 3,313 |
+| Off (unchanged code) | 2,306 / 2,492 → 2,303 / 2,506 | 3,436 / 3,518 → 2,651 / 3,035 | -- |
+
+GPU/frame at High: ground 0.572 → 0.582 ms, hill 0.518 → 0.535 ms, flight
+0.360 → 0.357 ms. The differences are the size of the Off row's, whose code
+did not change. **It gets there by shading per vertex.** The same shading
+per fragment cost the flight eye +0.37 ms, half its frame rate on every
+quality (flight at High 2,450 → 1,254 FPS), and the table's arctangents
+another 0.035 ms at ground. Both measurements are in
+`docs/PROPOSAL_FAR_VIEW.md` §3.3. The M3 is where this matters most: it met
+the gate at Low with ground at 1,090. It should be re-measured there.
