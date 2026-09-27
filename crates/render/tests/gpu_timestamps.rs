@@ -23,10 +23,7 @@ use cubara_render::{
 /// `TIMESTAMP_QUERY` -- the same skip-loudly convention
 /// `mesh_arena_integration.rs`'s `test_device()` uses.
 fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
-        ..wgpu::InstanceDescriptor::new_without_display_handle()
-    });
+    let instance = cubara_render::new_instance();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,

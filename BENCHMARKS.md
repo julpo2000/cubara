@@ -86,6 +86,10 @@ frames after 200 warmup.
 | 2026-09-27 | **Gate eye: ground + far terrain (High, 262 km)** — F3c⁶⁶ | 1,940 | 819,928 voxel + 720,819 far drawn | ~3,620 | 0.199 ms | 0.550 ms | `41bdab0` |
 | 2026-09-27 | **Gate eye: hill + far terrain (High)**⁶⁶ | 869 | 436,690 voxel + 727,521 far drawn | ~3,669 | 0.194 ms | 0.573 ms | `41bdab0` |
 | 2026-09-27 | **Gate eye: flight + far terrain (High)** — sees something now⁶⁶ | 0 | 547,649 far drawn | ~4,089 | 0.171 ms | 0.528 ms | `41bdab0` |
+| 2026-09-27 | **No indirect-call validation in release** — wgpu 30's default, 17% of CPU/frame; radius 64 (orbit)⁶⁸ | 2,219 | 901,932 (595,323 drawn) | ~3,245 | **0.213 ms** | 0.686 ms | *(this PR)* |
+| 2026-09-27 | No indirect-call validation in release — gate eye: ground + far terrain (High)⁶⁸ | 1,940 | 819,928 voxel + 720,819 far drawn | ~3,672 | **0.179 ms** | 0.445 ms | *(this PR)* |
+| 2026-09-27 | No indirect-call validation in release — gate eye: hill + far terrain (High)⁶⁸ | 869 | 436,690 voxel + 727,521 far drawn | ~3,792 | **0.177 ms** | 0.454 ms | *(this PR)* |
+| 2026-09-27 | No indirect-call validation in release — gate eye: flight + far terrain (High)⁶⁸ | 0 | 547,649 far drawn | ~4,569 | 0.154 ms | 0.453 ms | *(this PR)* |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -2368,3 +2372,51 @@ and are to be re-measured on a full charge. Earlier warm-machine runs at High
 (`PROPOSAL_FAR_VIEW.md` §6b) read ground 826–873, hill 878–1,105. For play,
 the game tunes to the monitor instead: this M3 runs its window at 60 Hz
 (footnote ⁴⁵), and `--bench tune --target 60` chose High.
+
+⁶⁸ **The orbit's CPU/frame rise, bisected -- and the one real part of it
+removed.** Windows (RTX 4060 Laptop, Vulkan), `--bench 64`, two runs per
+commit, across the window between the ⁵³ row (`39c1930`, 0.169 ms) and ⁶⁴
+(`da21d01`, 0.264 ms), all measured on the same afternoon:
+
+| Commit | What it is | CPU/frame (two runs) | Drawn nodes / draws |
+|---|---|---|---|
+| `39c1930` | ⁵³'s commit | 0.164 / 0.177 | 3,558 of 4,506 |
+| `3b52c49` | #255, caves at every level | 0.113 / 0.125 | 1,782 of 2,219 |
+| `bf5a7f4` | #263 | 0.120 / 0.117 | 1,782 |
+| `1fcd449` | **#266, bench** | **0.164 / 0.169** | 1,782 / 3,945 |
+| `9a840dd` … `260c751` | #268 – #276 | 0.169 – 0.179 | 1,782 / 3,945 |
+| `41bfbd5` | **#275, wgpu 24 → 30** | **0.216 / 0.205** | 1,782 / 3,945 |
+| `64e7d69` … `1beab09` | #277 – #288 | 0.205 – 0.224 | 1,782 / 3,945 |
+| `da21d01` | **#285, F3b** | **0.244 / 0.249** | 2,208 / 4,975 |
+
+Three steps, and only one of them is a regression:
+
+- **#266 is a measurement correction.** It moved `set_camera` and the frustum
+  build inside the timed window; that cost was always paid, and was not
+  counted. (Its GPU timestamp queries cost nothing measurable: `--gpu-timing
+  off` and `auto` agree within noise at `554b235`.)
+- **#285 is a bigger scene.** The far plane went from 2,000 blocks to 1e7, so
+  the orbit now draws nodes the far plane used to cut: 24% more of them, at
+  the same ~50 ns per draw.
+- **#275 is the real one: +20% at the same 3,945 draws.** wgpu ≥ 25 turns on
+  `InstanceFlags::VALIDATION_INDIRECT_CALL` in release builds as well -- a
+  check of every indirect draw's arguments. With it off (three alternating
+  pairs at `554b235`): 0.252 → 0.208 ms, GPU/frame unchanged.
+
+This row's change turns it off in release builds, through one
+`cubara_render::new_instance` that every path now uses; debug builds (every
+test, every CI run) keep it. The trade, and when it stops being sound
+(indirect arguments written on the GPU, #28/#32), is written at that function.
+Against `main` (`ef4ae3d`), two gate runs each and three orbit runs:
+
+```
+orbit   main 0.246-0.252 ms  ->  0.203-0.227 ms   (-15%), FPS ~3,200 -> ~3,245 (GPU-bound)
+ground  main 0.194/0.196     ->  0.180/0.181      (-8%),  FPS ~3,579 -> ~3,672
+hill    main 0.189/0.195     ->  0.178/0.176      (-8%),  FPS ~3,714 -> ~3,792
+flight  main 0.141/0.154     ->  0.142/0.166      (no voxel draws, so nothing to save)
+```
+
+The saving follows the number of indirect draws -- 4,975 in the orbit, 1,325
+and 644 at the eyes, none in flight -- which is what a per-draw check predicts.
+Linux saw the same rise after wgpu 30 (⁶³, +34%) and is expected to get the
+same back.

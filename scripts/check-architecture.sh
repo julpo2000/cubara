@@ -108,6 +108,22 @@ awk '
 grep -rn --include='*.rs' -E "static +[A-Za-z_]+ *: *[^=]*World|thread_local!.*World" crates | report "Rule 8" "a process-wide World — a process may host several, each owning its own"
 grep -rn --include='*.rs' -E "fn +(the_world|current_world|global_world|world_instance)" crates | report "Rule 8" "an implicit 'the world' accessor — pass the World in"
 
+# ── Rule 5 — one wgpu instance, one set of flags ────────────────────────────
+# `crates/render/src/instance.rs` decides the instance flags: full validation in
+# debug builds, and no indirect-call validation in release, which was 17% of
+# CPU/frame (#275's upgrade). A second `Instance::new` would quietly run with
+# wgpu's defaults again -- the regression back, with nothing going red.
+grep -rn --include='*.rs' --exclude='instance.rs' -E "wgpu::Instance::new|Instance::new\(wgpu::" crates \
+    | report "Rule 5" "a wgpu::Instance made outside cubara_render::new_instance -- use that, so every path runs with the same flags"
+
+# Release builds run without indirect-call validation (instance.rs), and on
+# D3D12 that makes an indirectly drawn shader's vertex_index ignore base_vertex
+# and its instance_index ignore first_instance. mesh.wgsl is the shader
+# ChunkArena draws indirectly; it must read neither.
+grep -n -E "^[^/]*@builtin\((vertex_index|instance_index)\)" crates/render/src/shaders/mesh.wgsl \
+    | sed 's|^|crates/render/src/shaders/mesh.wgsl:|' \
+    | report "Rule 5" "an indirectly drawn shader reads vertex_index/instance_index -- wrong on D3D12 without indirect validation (instance.rs)"
+
 if [ -s "$failures" ]; then
     echo
     echo "$(wc -l <"$failures" | tr -d ' ') architecture rule(s) violated."

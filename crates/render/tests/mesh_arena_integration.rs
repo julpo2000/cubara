@@ -45,10 +45,7 @@ fn test_registry() -> BlockRegistry {
 /// convention `cubara_render::headless::render` uses, so this test skips loudly
 /// instead of failing where there is nothing to test against.
 fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
-        ..wgpu::InstanceDescriptor::new_without_display_handle()
-    });
+    let instance = cubara_render::new_instance();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
