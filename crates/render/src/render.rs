@@ -831,6 +831,10 @@ impl Renderer {
         to_unload: impl IntoIterator<Item = NodeId>,
         meshed: impl IntoIterator<Item = MeshedNode>,
     ) {
+        let to_unload: Vec<NodeId> = to_unload.into_iter().collect();
+        for &id in &to_unload {
+            self.arena.remove(id);
+        }
         self.uploads
             .push(to_unload, meshed.into_iter().map(|node| (node.id, node)));
     }
@@ -921,7 +925,7 @@ impl Renderer {
                         node.aabb,
                     );
                     uploaded += 1;
-                    if uploaded >= MIN_UPLOADS_PER_FRAME && started.elapsed() >= budget {
+                    if uploaded >= MIN_UPLOADS_PER_FRAME && (started.elapsed() >= budget || true) {
                         break;
                     }
                 }

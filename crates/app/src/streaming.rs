@@ -77,8 +77,6 @@ fn replacements_of(node: NodeKey, visible: &HashSet<NodeKey>) -> Vec<NodeKey> {
 /// it split made the new children walls again, one search later.
 fn worth_remembering(node: NodeKey, desired: &HashSet<NodeKey>) -> bool {
     desired.contains(&node)
-        || desired.contains(&node.parent())
-        || node.children().iter().any(|c| desired.contains(c))
 }
 
 /// Whether `node` can leave the arena this frame without leaving a hole.
