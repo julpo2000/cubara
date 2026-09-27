@@ -806,8 +806,17 @@ impl WorldGen {
         // A coarse cell wears what the top block inside it would: the one
         // holding the surface is grass, not the soil or stone at its corner.
         // Judged at its corner, every distant field turned brown and grey.
+        //
+        // And the topmost cell of a column wears the surface block, whichever
+        // of its blocks the surface falls in. A cell is solid while its middle
+        // is at or under the surface, so the top one's top block can sit up to
+        // `(step - 1) / 2` blocks under it -- and judged there, a third of the
+        // distant tops wore soil, where every real column has grass on top.
+        // The cell above is air: its middle is over the surface.
+        let top_cell = step > 1 && surface < y + step + (step - 1) / 2;
+        let probe = if top_cell { surface } else { y + step - 1 };
         (self.density_at(x, y, z, surface, step) > 0.0)
-            .then(|| self.material_at(x, y + step - 1, z, surface, blocks))
+            .then(|| self.material_at(x, probe, z, surface, blocks))
     }
 
     /// The block at a world position, or `None` for air. Exposed for
@@ -1381,6 +1390,56 @@ mod tests {
                     assert_eq!(fine.get(lx, ly, lz), expected, "step 1 ({lx},{ly},{lz})");
                 }
             }
+        }
+    }
+
+    /// The top of a coarse column is the surface block, as the top of every
+    /// real column is. Seen from far away, those tops are most of what the
+    /// ground is; when a third of them wore soil (the cell's own top block
+    /// sits under the surface), the distant fields came out patched with
+    /// brown.
+    #[test]
+    fn a_coarse_columns_top_is_the_surface_block() {
+        let gen = WorldGen::new(0xCAFE);
+        let blocks = test_blocks();
+        for step in [2, 4, 8] {
+            let (mut tops, mut soil) = (0u32, 0u32);
+            for (ox, oz) in [(0, 0), (-300, 170), (500, 20), (-700, -640), (1200, 900)] {
+                let x0 = ox;
+                let z0 = oz;
+                // A node whose middle holds the surface here.
+                let surface = gen.cell_surface_height(x0, z0, step);
+                let oy = surface - 8 * step;
+                let node = gen.generate([ox, oy, oz], step, blocks);
+                for lz in 0..Chunk::SIZE {
+                    for lx in 0..Chunk::SIZE {
+                        let (x, z) = (ox + lx as i32 * step, oz + lz as i32 * step);
+                        let surface = gen.cell_surface_height(x, z, step);
+                        // The cell the height field ends in, if this node
+                        // holds it and something is left of it (a cave can
+                        // carve it away).
+                        let Some(ly) = (0..Chunk::SIZE).rev().find(|&ly| {
+                            let y = oy + ly as i32 * step;
+                            surface < y + step + (step - 1) / 2 && surface >= y + (step - 1) / 2
+                        }) else {
+                            continue;
+                        };
+                        let block = node.get(lx, ly, lz);
+                        if block == BlockId::AIR {
+                            continue;
+                        }
+                        tops += 1;
+                        if block != blocks.grass {
+                            soil += 1;
+                        }
+                    }
+                }
+            }
+            assert!(tops > 500, "step {step}: only {tops} tops checked");
+            assert_eq!(
+                soil, 0,
+                "step {step}: {soil} of {tops} coarse tops are not the surface block"
+            );
         }
     }
 
