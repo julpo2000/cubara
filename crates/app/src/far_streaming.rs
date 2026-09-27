@@ -190,6 +190,18 @@ fn draw_set(
     out
 }
 
+/// What changes on the renderer to go from drawing `drawn` to drawing `draw`:
+/// the patches that leave, and the ones that arrive. A patch in both stays
+/// where it is -- uploading it again would be work, and dropping it would be a
+/// hole.
+fn swap(drawn: &HashSet<PatchKey>, draw: &HashSet<PatchKey>) -> (Vec<PatchKey>, Vec<PatchKey>) {
+    let mut leave: Vec<PatchKey> = drawn.difference(draw).copied().collect();
+    let mut arrive: Vec<PatchKey> = draw.difference(drawn).copied().collect();
+    leave.sort();
+    arrive.sort();
+    (leave, arrive)
+}
+
 /// Which generated patches are still of use: what is drawn, what is wanted,
 /// and what decides a split -- every ancestor of a wanted patch, since its
 /// error is what split it. Drop an ancestor and the next selection no longer
@@ -375,21 +387,19 @@ impl FarStreaming {
         // Swap the drawn set, never leaving ground uncovered.
         let drawn: HashSet<PatchKey> = self.slots.keys().copied().collect();
         let draw = draw_set(&wanted, &|k| self.heights.contains_key(&k), &drawn);
-        for key in drawn.difference(&draw) {
-            if let Some(slot) = self.slots.remove(key) {
+        let (leave, arrive) = swap(&drawn, &draw);
+        for key in leave {
+            if let Some(slot) = self.slots.remove(&key) {
                 renderer.far_remove(slot);
             }
         }
-        for key in &draw {
-            if self.slots.contains_key(key) {
-                continue;
-            }
-            let Some(patch) = self.heights.get(key) else {
+        for key in arrive {
+            let Some(patch) = self.heights.get(&key) else {
                 continue;
             };
             match renderer.far_insert(to_far_patch(patch)) {
                 Some(slot) => {
-                    self.slots.insert(*key, slot);
+                    self.slots.insert(key, slot);
                 }
                 None if !self.warned_full => {
                     log::warn!(
@@ -432,6 +442,29 @@ mod tests {
         }
         assert_eq!(FarQuality::Off.lower(), FarQuality::Off);
         assert_eq!(FarQuality::BEST_FIRST[0], FarQuality::default());
+    }
+
+    /// Found by check-tests-can-fail.sh: skipping every insert survived, since
+    /// nothing short of a window reached the swap. Now it is a function.
+    #[test]
+    fn the_swap_adds_what_is_new_drops_what_is_gone_and_keeps_the_rest() {
+        let (a, b, c) = (
+            PatchKey::new(3, 0, 0),
+            PatchKey::new(3, 1, 0),
+            PatchKey::new(3, 2, 0),
+        );
+        let drawn: HashSet<_> = [a, b].into();
+        let draw: HashSet<_> = [b, c].into();
+        let (leave, arrive) = swap(&drawn, &draw);
+        assert_eq!(leave, vec![a]);
+        assert_eq!(arrive, vec![c], "a new patch was not uploaded");
+        let (leave, arrive) = swap(&draw, &draw);
+        assert!(
+            leave.is_empty() && arrive.is_empty(),
+            "an unchanged set moved"
+        );
+        let (_, arrive) = swap(&HashSet::new(), &draw);
+        assert_eq!(arrive, vec![b, c], "a fresh start uploaded nothing");
     }
 
     #[test]

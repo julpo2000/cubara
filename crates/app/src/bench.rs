@@ -576,6 +576,13 @@ pub fn run(
             for p in &patches {
                 terrain.insert(&queue, crate::far_streaming::to_far_patch(p));
             }
+            // As with the arena below: a far terrain with patches missing is
+            // not the view that was asked for, and its frame rate means nothing.
+            assert_eq!(
+                terrain.len(),
+                patches.len(),
+                "the far terrain did not fit -- the bench would measure a view with parts missing"
+            );
             terrain.set_params(
                 &queue,
                 crate::far_streaming::to_far_params(hole, crate::far_streaming::far_top_color()),
