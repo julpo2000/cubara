@@ -111,7 +111,9 @@ pub type RingSchedule = [(u32, i32)];
 /// across world positions and seeds this table wasn't measured against; not
 /// used for exactly that reason. See `BENCHMARKS.md`'s issue-#109 rows for
 /// the full `--bench 64` numbers this table produces.
-pub const DEFAULT_RING_SCHEDULE: &[(u32, i32)] = &[(0, 10), (1, 18), (2, 32), (3, 64)];
+// PROTOTYPE (band option c): voxels to 512 blocks, the far terrain from there.
+// Level 3 (8-block cells, 512 m - 1 km, 16 px each) is gone.
+pub const DEFAULT_RING_SCHEDULE: &[(u32, i32)] = &[(0, 10), (1, 18), (2, 32)];
 
 /// Every node that should be resident around `center`, across the vertical
 /// band `y_range` (in chunks, same convention as
