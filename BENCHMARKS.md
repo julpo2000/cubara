@@ -1219,6 +1219,26 @@ same additions and comparisons, and the collision sweep lost its epsilon skin
 along the way -- `move_axis` no longer nudges every bound by 1e-4 before
 flooring it, because an exact `pos <-> feet` round trip does not need the nudge.
 
+### Flight — how much of the screen is still loading (`--bench flight`)
+
+Not a frame rate. The game's own streaming and renderer fly a straight line at
+free-fly speed (24 blocks/s) in real time, paced at 60 FPS, keeping a frame
+every 0.25 s; then the same line is flown again, stopping at each kept frame
+until nothing is left to load. **Loading** is the share of pixels more than 40
+levels off the finished frame at the same eye. Work/frame is the time a frame
+spent streaming and drawing (not waiting for the display). M3, 1280×720, far
+terrain at High. Details in ⁷⁴.
+
+| Date | Change | Flight | Loading mean | Worst frame | Frames > 1% loading | Work/frame p99 | Commit |
+|---|---|---|---|---|---|---|---|
+| 2026-09-27 | before⁷⁴ | low: from (8, 120, 8) along (1, −0.15, 0.3), 20 s | 3.75% | 25.5% | 48% | 1.9 ms | `bench/flight-before` |
+| 2026-09-27 | **stand-in links, drops behind uploads, upload budget**⁷⁴ | low | **0.16%** | **3.3%** | **5%** | 2.9 ms | this PR |
+| 2026-09-27 | before⁷⁴ | high: from (8, 400, 8) along (1, −0.35, 0.3), 20 s | 1.67% | 44.1% | 16% | 2.2 ms | `bench/flight-before` |
+| 2026-09-27 | **the same three**⁷⁴ | high | **0.11%** | **5.0%** | **2%** | 2.1 ms | this PR |
+| 2026-09-27 | before⁷⁴ | down: from (8, 450, 8) along (0.4, −0.8, 0.2), 15 s | 18.97% | 97.4% | 35% | 2.0 ms | `bench/flight-before` |
+| 2026-09-27 | **the same three**⁷⁴ | down | **0.35%** | **20.8%** | **2%** | 2.7 ms | this PR |
+| 2026-09-27 | before / after⁷⁴ | up: from (8, 80, 8) along (0.4, 0.8, 0.2), 15 s | 0.00% / 0.00% | 0% / 0% | 0% / 0% | 2.0 / 2.3 ms | `bench/flight-before` / this PR |
+
 ## Detailed run logs
 
 Kept for the notable/first runs; the tables above are the quick trend view.
@@ -2494,3 +2514,44 @@ quality (flight at High 2,450 → 1,254 FPS), and the table's arctangents
 another 0.035 ms at ground. Both measurements are in
 `docs/PROPOSAL_FAR_VIEW.md` §3.3. The M3 is where this matters most: it met
 the gate at Low with ground at 1,090. It should be re-measured there.
+
+⁷⁴ **What was loading while flying, and what it was.** The owner flew around on
+2026-09-27 and saw "veel inladen". `--bench flight` (this PR) measures it:
+both passes run the game's `NodeStreaming`, `FarStreaming` and `Renderer`, the
+last pointed at a texture (`Renderer::offscreen`). The first pass starts from a
+loaded world, as a player who has been standing there does. "Before" is this
+PR with its three fixes switched back off and the measurement left as it is
+(branch `bench/flight-before`), built as a separate binary and run alternately
+with "after", battery 86–93%, not charging. Its first kept frame is the
+measurement's own zero -- the start, loaded completely -- and read 0.00% in
+every run here; flying at speed 0, so did every kept frame.
+
+Three causes, in the order they were found:
+
+1. **Unknown nodes were walls to the visibility search** (`cubara_world::visibility`).
+   Crossing a ring's edge splits nodes into children nobody has meshed yet, so a
+   curtain of unknown nodes stood across the view, and everything behind it
+   left the visible set and was unloaded until the curtain had meshed: hundreds
+   of blocks of ground turning to sky every second or so, then meshed again
+   from scratch. Now an unknown node is searched as its parent drew it (split)
+   or its children did (merged). Low: 3.75% → 0.30% loading, worst 25% → 8%.
+2. **A dropped node left before what replaced it arrived.** The renderer
+   dropped at once and uploaded paced, so a large swap left its ground undrawn
+   for as many frames as the queue took. Drops now wait in the same queue,
+   behind the uploads handed over with them (`crates/render/src/uploads.rs`).
+3. **The upload pace was 32 nodes a frame**, chosen at 1,000 FPS. At 60 Hz that
+   is under 2,000 a second, and dropping one chunk layer hands over about
+   2,400 at once: 2,387 uploads queued a frame after crossing y = 112, over a
+   second of ground at the wrong detail. Uploading is cheap -- 970 nodes
+   (4.0 MB) in 3.7 ms on the M3 -- so a frame now uploads for a quarter of the
+   last frame's time (at least 32), which is 4 ms at 60 Hz and 0.25 ms at
+   1,000 FPS. It is why Work/frame p99 rose by up to a millisecond: that is
+   the uploads, well inside a 60 Hz frame's 16.7.
+
+**What is left.** The remaining frames over 1% are the detail changing a moment
+after a chunk crossing -- the search, then the meshing of the finer nodes --
+with the coarser nodes drawn meanwhile, never nothing. The 20.8% frame
+descending is the whole ground below switching from 8-block to 4-block cells at
+once as the ring's edge sweeps down through it; flying down, the rings close in
+twice as fast as flying level (vertical distance counts double). Meshing ahead
+of the camera would cut both, and is not done here.

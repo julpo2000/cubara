@@ -336,6 +336,20 @@ impl FarStreaming {
         self.stale = false;
     }
 
+    /// Nothing generating, and the selection up to date with what has
+    /// arrived (`crate::flight`).
+    pub fn settled(&self) -> bool {
+        self.in_flight.is_empty() && !self.stale
+    }
+
+    /// Work the selection out again on the next [`update`](Self::update),
+    /// however little the eye has moved: what a finished frame at a new eye
+    /// needs, which [`RESELECT_BLOCKS`] would otherwise leave to the last
+    /// eye's.
+    pub fn reselect(&mut self) {
+        self.selected_at = None;
+    }
+
     /// Bring the far terrain in line with the camera at `eye`: take in what
     /// has been generated, work the selection out again if the eye has moved
     /// or new patches arrived, and ask for what is missing.

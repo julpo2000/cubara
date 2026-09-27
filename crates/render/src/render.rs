@@ -10,7 +10,6 @@
 //! blocks (pipeline, depth view, camera) are public so the headless
 //! bench/screenshot paths build the same scene.
 
-use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -23,6 +22,7 @@ use crate::arena::{ChunkArena, MeshedNode, NodeId};
 use crate::culling::Frustum;
 use crate::materials::{self, MeshAssets};
 use crate::scene::{SceneFrame, SceneRenderer};
+use crate::uploads::{ArenaOp, Uploads};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -38,6 +38,27 @@ const FAR_PLANE: f32 = 1.0e7;
 /// 262 km is about 1,800 (`crates/world/src/far.rs`'s measurement), plus the
 /// ones kept drawn while their replacements generate: room for twice that.
 const FAR_PATCH_CAPACITY: u32 = 4096;
+
+/// What an offscreen [`Renderer`] draws into: the format the headless
+/// screenshots and golden images use, so its pixels read back the same way.
+const OFFSCREEN_FORMAT: wgpu::TextureFormat = crate::headless::COLOR_FORMAT;
+
+fn offscreen_color(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("offscreen-color"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: OFFSCREEN_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
+}
 
 /// Depth cleared at the *far* plane, since [`reverse_z`] puts it at 0.
 pub const DEPTH_CLEAR: f64 = 0.0;
@@ -153,14 +174,15 @@ pub const fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
-/// Cap on node geometry uploads per frame. A streaming update can hand over a
+/// Node geometry uploads every frame makes, however little time
+/// [`crate::uploads::upload_budget`] leaves: what the cap used to be, so a
+/// frame never uploads less than it did. A streaming update can hand over a
 /// whole ring's worth of newly-meshed nodes at once; spreading the GPU
-/// uploads over a few frames avoids the resulting frame-time spike (nodes pop
-/// in a hair later, imperceptibly). *What* to stream is the caller's
-/// decision (`ARCHITECTURE.md` §1); this is purely about not spiking the
-/// frame while applying it, which is why it stays here rather than moving
-/// out with the streaming policy.
-const MAX_UPLOADS_PER_FRAME: usize = 32;
+/// uploads over a few frames avoids the resulting frame-time spike. *What* to
+/// stream is the caller's decision (`ARCHITECTURE.md` §1); this is purely
+/// about not spiking the frame while applying it, which is why it stays here
+/// rather than moving out with the streaming policy.
+const MIN_UPLOADS_PER_FRAME: usize = 32;
 
 /// Uniform block shared with `mesh.wgsl`: one column-major view*projection matrix.
 #[repr(C)]
@@ -482,6 +504,25 @@ pub fn gpu_driven_features(adapter: &wgpu::Adapter) -> (wgpu::Features, bool) {
     (timestamps, multi_draw)
 }
 
+/// Where a [`Renderer`]'s frames go.
+enum Target {
+    /// A window's surface, presented every frame -- the game.
+    Window {
+        window: Arc<Window>,
+        surface: wgpu::Surface<'static>,
+        config: wgpu::SurfaceConfiguration,
+    },
+    /// A texture nobody sees until it is read back
+    /// ([`Renderer::read_frame`]) -- the game's own frame, with no window, for
+    /// a measurement that must see exactly what a player would (`--bench
+    /// flight`).
+    Offscreen {
+        color: wgpu::Texture,
+        width: u32,
+        height: u32,
+    },
+}
+
 /// All GPU + window state. Created once the event loop has `resumed`.
 ///
 /// Owns no `World`, no streaming policy, no mesh-generation pool -- what to
@@ -491,11 +532,9 @@ pub fn gpu_driven_features(adapter: &wgpu::Adapter) -> (wgpu::Features, bool) {
 /// renderer rebuildable on its own: its whole vocabulary is meshes, origins,
 /// and a camera (`ARCHITECTURE.md` §1).
 pub struct Renderer {
-    window: Arc<Window>,
-    surface: wgpu::Surface<'static>,
+    target: Target,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
 
     /// The one scene-render path, shared with `--bench` and `--screenshot`.
     scene: SceneRenderer,
@@ -510,15 +549,10 @@ pub struct Renderer {
     /// patches are the caller's to choose ([`far_insert`](Self::far_insert),
     /// [`far_remove`](Self::far_remove)); this only culls and draws them.
     far: crate::far::FarTerrain,
-    /// Which node ids are currently meant to be resident (uploaded, or queued
-    /// to become so) -- lets [`drain_uploads`](Self::drain_uploads) skip a
-    /// queued upload for a node a newer [`apply_node_updates`](Self::apply_node_updates)
-    /// call already unloaded, without this crate needing to know what a node
-    /// id actually means.
-    desired: HashSet<NodeId>,
-    /// Finished meshes waiting to be uploaded, drained at most
-    /// [`MAX_UPLOADS_PER_FRAME`] per frame to avoid upload spikes.
-    upload_queue: VecDeque<MeshedNode>,
+    /// Streamed geometry waiting for its turn, drops included
+    /// ([`crate::uploads`]): drained a share of each frame's time at a time
+    /// ([`crate::uploads::upload_budget`]) to avoid upload spikes.
+    uploads: Uploads<MeshedNode>,
 
     last_frame: Instant,
     visible_chunks: usize,
@@ -628,36 +662,99 @@ impl Renderer {
         );
         surface.configure(&device, &config);
 
+        let (width, height) = (config.width, config.height);
+        let target = Target::Window {
+            window,
+            surface,
+            config,
+        };
+        Self::with_target(
+            target,
+            (device, queue, multi_draw),
+            adapter_name,
+            (format, width, height),
+            camera,
+        )
+    }
+
+    /// The same renderer with no window: every frame goes to a `width` x
+    /// `height` texture, read back with [`read_frame`](Self::read_frame).
+    /// `None` when there is no GPU to render on.
+    ///
+    /// **The game's renderer, not a copy of it.** A measurement of what a
+    /// player sees while the world streams in (`--bench flight`) has to go
+    /// through the upload pacing, the far terrain's hole and the fog exactly
+    /// as the window does; a second renderer built for the purpose would
+    /// measure itself.
+    pub fn offscreen(width: u32, height: u32, camera: CameraPose) -> Option<(Self, MeshAssets)> {
+        let instance = crate::new_instance();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        }))
+        .ok()?;
+        let adapter_name = adapter.get_info().name;
+        let (features, multi_draw) = gpu_driven_features(&adapter);
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("cubara-offscreen-device"),
+            required_features: features,
+            required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        }))
+        .ok()?;
+        let color = offscreen_color(&device, width, height);
+        Some(Self::with_target(
+            Target::Offscreen {
+                color,
+                width,
+                height,
+            },
+            (device, queue, multi_draw),
+            adapter_name,
+            (OFFSCREEN_FORMAT, width, height),
+            camera,
+        ))
+    }
+
+    /// Everything past the target: the scene, the arena, the far terrain.
+    fn with_target(
+        target: Target,
+        (device, queue, multi_draw): (wgpu::Device, wgpu::Queue, bool),
+        adapter_name: String,
+        (format, width, height): (wgpu::TextureFormat, u32, u32),
+        camera: CameraPose,
+    ) -> (Self, MeshAssets) {
         let (mesh_assets, tex_view, tex_sampler) = load_mesh_assets(&device, &queue);
         let scene = SceneRenderer::new(
             &device,
             &queue,
             format,
-            config.width,
-            config.height,
+            width,
+            height,
             &tex_view,
             &tex_sampler,
         );
 
-        let aspect = config.width as f32 / config.height as f32;
+        let aspect = width as f32 / height as f32;
         let frustum = Frustum::from_view_proj(camera.view_proj(aspect));
 
         let arena = ChunkArena::new(&device, multi_draw);
         let far = crate::far::FarTerrain::new(&device, &queue, FAR_PATCH_CAPACITY);
 
         let renderer = Self {
-            window,
-            surface,
+            target,
             device,
             queue,
-            config,
             scene,
             frustum,
             adapter_name,
             arena,
             far,
-            desired: HashSet::new(),
-            upload_queue: VecDeque::new(),
+            uploads: Uploads::new(),
             last_frame: Instant::now(),
             visible_chunks: 0,
             frames: 0,
@@ -690,14 +787,6 @@ impl Renderer {
         &self.queue
     }
 
-    /// Apply a batch of streaming updates the caller has already decided on:
-    /// drop `to_unload`'s geometry immediately, and queue `meshed`'s for
-    /// upload (paced at [`MAX_UPLOADS_PER_FRAME`] per frame by
-    /// [`drain_uploads`](Self::drain_uploads), called every [`render`](Self::render)).
-    /// This is the entire streaming surface the renderer exposes -- *which*
-    /// nodes to load/unload is the caller's decision (`ARCHITECTURE.md` §1);
-    /// an edit is no different from ordinary streaming from here, just a
-    /// single-node update.
     /// The GPU this window renders on.
     pub fn adapter_name(&self) -> &str {
         &self.adapter_name
@@ -718,72 +807,126 @@ impl Renderer {
         self.far.set_params(&self.queue, params);
     }
 
+    /// Meshes handed over and not yet uploaded: still to appear on screen.
+    pub fn uploads_pending(&self) -> usize {
+        self.uploads.len()
+    }
+
     /// Far-terrain patches drawn in the last frame.
     pub fn far_drawn(&self) -> u32 {
         self.far.drawn()
     }
 
+    /// Apply a batch of streaming updates the caller has already decided on:
+    /// queue `meshed`'s geometry for upload (paced by
+    /// [`drain_uploads`](Self::drain_uploads), called every
+    /// [`render`](Self::render)), and drop `to_unload`'s once those have gone
+    /// up -- never before, so a node and what replaces it never leave the
+    /// screen empty between them ([`crate::uploads`]). This is the entire
+    /// streaming surface the renderer exposes -- *which* nodes to load/unload
+    /// is the caller's decision (`ARCHITECTURE.md` §1); an edit is no
+    /// different from ordinary streaming from here, just a single-node update.
     pub fn apply_node_updates(
         &mut self,
         to_unload: impl IntoIterator<Item = NodeId>,
         meshed: impl IntoIterator<Item = MeshedNode>,
     ) {
-        for id in to_unload {
-            self.desired.remove(&id);
-            self.arena.remove(id);
-        }
-        for node in meshed {
-            self.desired.insert(node.id);
-            self.upload_queue.push_back(node);
-        }
+        self.uploads
+            .push(to_unload, meshed.into_iter().map(|node| (node.id, node)));
     }
 
+    /// The window this renders to. Only the game asks, and the game always
+    /// has one: an [`offscreen`](Self::offscreen) renderer is a measurement's.
     pub fn window(&self) -> &Window {
-        &self.window
+        match &self.target {
+            Target::Window { window, .. } => window,
+            Target::Offscreen { .. } => panic!("an offscreen renderer has no window"),
+        }
     }
 
     /// The surface's current size in pixels -- what screen-space layout needs.
     pub fn size(&self) -> (u32, u32) {
-        (self.config.width, self.config.height)
-    }
-
-    pub fn resize(&mut self, width: u32, height: u32) {
-        if width > 0 && height > 0 {
-            self.config.width = width;
-            self.config.height = height;
-            self.surface.configure(&self.device, &self.config);
-            self.scene
-                .resize(&self.device, self.config.width, self.config.height);
+        match &self.target {
+            Target::Window { config, .. } => (config.width, config.height),
+            Target::Offscreen { width, height, .. } => (*width, *height),
         }
     }
 
-    /// Upload queued nodes from [`apply_node_updates`](Self::apply_node_updates) —
-    /// at most [`MAX_UPLOADS_PER_FRAME`] per frame, so a caller handing over a
-    /// whole ring's worth of newly-streamed nodes at once doesn't spike the
-    /// frame time. Called every [`render`](Self::render); a node's old
-    /// geometry (if any) stays drawn until its queued replacement's turn
-    /// comes up.
-    fn drain_uploads(&mut self) {
-        puffin::profile_function!();
-        let mut uploaded = 0;
-        while uploaded < MAX_UPLOADS_PER_FRAME {
-            let Some(node) = self.upload_queue.pop_front() else {
-                break;
-            };
-            // Skip if unloaded while it waited in the queue.
-            if !self.desired.contains(&node.id) {
-                continue;
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        match &mut self.target {
+            Target::Window {
+                surface, config, ..
+            } => {
+                config.width = width;
+                config.height = height;
+                surface.configure(&self.device, config);
             }
-            self.arena.remove(node.id); // free any prior slot first
-            self.arena.insert(
-                &self.queue,
-                node.id,
-                node.origin,
-                node.scale,
-                &node.mesh,
-                node.aabb,
-            );
-            uploaded += 1;
+            Target::Offscreen {
+                color,
+                width: w,
+                height: h,
+            } => {
+                *color = offscreen_color(&self.device, width, height);
+                (*w, *h) = (width, height);
+            }
+        }
+        self.scene.resize(&self.device, width, height);
+    }
+
+    /// The last frame an [`offscreen`](Self::offscreen) renderer drew, as
+    /// pixels; `None` for a window's, which is on the screen instead.
+    pub fn read_frame(&self) -> Option<crate::headless::Frame> {
+        let Target::Offscreen {
+            color,
+            width,
+            height,
+        } = &self.target
+        else {
+            return None;
+        };
+        Some(crate::headless::read_texture(
+            &self.device,
+            &self.queue,
+            color,
+            *width,
+            *height,
+        ))
+    }
+
+    /// Upload queued nodes from [`apply_node_updates`](Self::apply_node_updates)
+    /// for as long as [`crate::uploads::upload_budget`] allows after a frame
+    /// of `last_frame` (and at least [`MIN_UPLOADS_PER_FRAME`]), so a caller
+    /// handing over a whole ring's worth of newly-streamed nodes at once
+    /// doesn't spike the frame time -- and drop the ones whose turn has come. Called every
+    /// [`render`](Self::render); a node's old geometry (if any) stays drawn
+    /// until its queued replacement's turn comes up.
+    fn drain_uploads(&mut self, last_frame: std::time::Duration) {
+        puffin::profile_function!();
+        let started = Instant::now();
+        let budget = crate::uploads::upload_budget(last_frame);
+        let mut uploaded = 0;
+        while let Some(op) = self.uploads.pop() {
+            match op {
+                ArenaOp::Insert(id, node) => {
+                    self.arena.remove(id); // free any prior slot first
+                    self.arena.insert(
+                        &self.queue,
+                        id,
+                        node.origin,
+                        node.scale,
+                        &node.mesh,
+                        node.aabb,
+                    );
+                    uploaded += 1;
+                    if uploaded >= MIN_UPLOADS_PER_FRAME && started.elapsed() >= budget {
+                        break;
+                    }
+                }
+                ArenaOp::Remove(id) => self.arena.remove(id),
+            }
         }
     }
 
@@ -813,24 +956,40 @@ impl Renderer {
         self.render_radius_blocks = render_radius_blocks;
         self.update(camera);
 
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            // Surface lost/outdated/occluded/timed out (e.g. during resize) —
-            // reconfigure and skip.
-            wgpu::CurrentSurfaceTexture::Timeout
-            | wgpu::CurrentSurfaceTexture::Occluded
-            | wgpu::CurrentSurfaceTexture::Outdated
-            | wgpu::CurrentSurfaceTexture::Lost
-            | wgpu::CurrentSurfaceTexture::Validation => {
-                self.surface.configure(&self.device, &self.config);
-                return;
+        let (frame, view) = match &self.target {
+            Target::Window {
+                surface, config, ..
+            } => {
+                let frame = match surface.get_current_texture() {
+                    wgpu::CurrentSurfaceTexture::Success(frame)
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+                    // Surface lost/outdated/occluded/timed out (e.g. during
+                    // resize) — reconfigure and skip.
+                    wgpu::CurrentSurfaceTexture::Timeout
+                    | wgpu::CurrentSurfaceTexture::Occluded
+                    | wgpu::CurrentSurfaceTexture::Outdated
+                    | wgpu::CurrentSurfaceTexture::Lost
+                    | wgpu::CurrentSurfaceTexture::Validation => {
+                        surface.configure(&self.device, config);
+                        return;
+                    }
+                };
+                let view = frame
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                (Some(frame), view)
+            }
+            Target::Offscreen { color, .. } => {
+                // A measurement reads every frame back, so each must be drawn
+                // with the lighting it was asked for -- the window lets the
+                // pipeline catch up a frame or two late instead.
+                self.scene.wait_for_lighting_rebuild();
+                (
+                    None,
+                    color.create_view(&wgpu::TextureViewDescriptor::default()),
+                )
             }
         };
-
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
 
         // CPU frustum-cull + upload the indirect draw list before the pass begins.
         let draw_count = self.arena.prepare(&self.queue, &self.frustum);
@@ -879,7 +1038,9 @@ impl Renderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        self.queue.present(frame);
+        if let Some(frame) = frame {
+            self.queue.present(frame);
+        }
 
         self.report_fps();
     }
@@ -953,7 +1114,7 @@ impl Renderer {
         } else {
             self.frame_ms * 0.9 + ms * 0.1
         };
-        self.drain_uploads();
+        self.drain_uploads(std::time::Duration::from_secs_f32(dt));
 
         let vp = camera.view_proj(self.scene.aspect());
         self.frustum = Frustum::from_view_proj(vp);

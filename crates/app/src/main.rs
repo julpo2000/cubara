@@ -17,6 +17,7 @@ mod bench;
 mod caps;
 mod capture;
 mod far_streaming;
+mod flight;
 mod game;
 mod options;
 mod screenshot;
@@ -919,6 +920,40 @@ fn main() {
             // holds this PC's frame-rate target -- by default a 60 Hz monitor's
             // -- written to its settings. What the game runs on its own, with
             // its monitor's refresh rate and its window's size.
+            // `--bench flight [--eye X,Y,Z] [--look DX,DY,DZ] [--seconds S]
+            // [--speed B] [--fps F] [--frames DIR]`: how much of the screen is
+            // still loading while flying at the game's speed.
+            bench::Target::Flight => {
+                let number = |name: &str, default: f32| {
+                    flag(name).map_or(default, |t| {
+                        t.parse().unwrap_or_else(|_| {
+                            eprintln!("{name} needs a number");
+                            std::process::exit(2);
+                        })
+                    })
+                };
+                let look = flag("--look").map_or([1.0, -0.15, 0.3], |text| {
+                    bench::parse_eye(text).unwrap_or_else(|| {
+                        eprintln!("--look needs DX,DY,DZ, e.g. --look 1,-0.15,0.3");
+                        std::process::exit(2);
+                    })
+                });
+                let flight = flight::Flight {
+                    start: eye.unwrap_or([8.0, 120.0, 8.0]),
+                    look,
+                    speed: number("--speed", flight::FLY_SPEED),
+                    seconds: number("--seconds", 20.0),
+                    fps: number("--fps", 60.0) as u32,
+                    every: number("--every", 0.25),
+                    size,
+                    quality: far_streaming::FarQuality::High,
+                };
+                match flight::fly(&flight, flag("--frames").map(std::path::Path::new)) {
+                    Some(report) => log::info!("{}", report.line()),
+                    None => log::error!("FLIGHT: no GPU to fly on"),
+                }
+                return;
+            }
             bench::Target::Tune => {
                 let target_fps = flag("--target")
                     .and_then(|t| t.parse::<u32>().ok())
