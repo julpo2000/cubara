@@ -128,7 +128,16 @@ fn vs_main(in: VsIn) -> VsOut {
     out.clip_pos = frame.view_proj * vec4<f32>(world_pos, 1.0);
     out.normal = FACE_NORMALS[face];
     out.ao = f32(ao_raw) / 3.0;
-    out.uv = vec2<f32>(u, v);
+    // PROTOTYPE (band option b): the top of a coarse cell shows one texture
+    // tile per block it stands for, not one stretched over the whole cell --
+    // so a field of 8-block cells reads as a field of blocks, and only its
+    // silhouette is coarse. Sides keep one tile per cell: a coarse riser's
+    // grass is only its top block's.
+    var uv = vec2<f32>(u, v);
+    if face == 2u {
+        uv = uv * node_origin.w;
+    }
+    out.uv = uv;
     out.layer = tex_layer;
     return out;
 }

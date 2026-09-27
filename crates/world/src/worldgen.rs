@@ -806,8 +806,15 @@ impl WorldGen {
         // A coarse cell wears what the top block inside it would: the one
         // holding the surface is grass, not the soil or stone at its corner.
         // Judged at its corner, every distant field turned brown and grey.
+        // PROTOTYPE (band option b): the topmost coarse cell of a column wears
+        // the surface block, whichever of its blocks the surface falls in.
+        // Judged at the cell's top block, a cell whose top sits a block or
+        // three under the surface wore soil, and a third of distant tops were
+        // brown -- where every real column there is grass on top.
+        let top_cell = step > 1 && surface - (y + step + (step - 1) / 2) + 1 <= 0;
+        let probe = if top_cell { surface } else { y + step - 1 };
         (self.density_at(x, y, z, surface, step) > 0.0)
-            .then(|| self.material_at(x, y + step - 1, z, surface, blocks))
+            .then(|| self.material_at(x, probe, z, surface, blocks))
     }
 
     /// The block at a world position, or `None` for air. Exposed for
