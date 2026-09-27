@@ -304,7 +304,7 @@ pub fn visible_nodes(
     let known: Vec<Option<NodeLinks>> = index
         .nodes
         .iter()
-        .map(|&n| links(n).or_else(|| stand_in(n, &links)))
+        .map(|&n| links(n).or_else(|| if n.level > 99 { stand_in(n, &links) } else { None }))
         .collect();
     let mut seen = vec![false; index.nodes.len()];
     // For each (node, sub-block, face entered by): the directions taken to get
