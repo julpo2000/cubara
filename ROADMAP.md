@@ -523,9 +523,10 @@ best one that holds **the monitor's refresh rate** on that PC, the player can
 choose otherwise in the options, and frames missing the refresh rate in play
 step it down. For the engine's own gate this reads as follows: `--bench gate`
 reports the best quality that holds 1,000 FPS at every eye. `Off` can never pass
-it, because the flight eye must see something. That reading of *"per pc … om
-toch fps doelen te halen"* is the agent's, and is put to the owner in the
-closing report rather than assumed settled.
+it, because the flight eye must see something. **Confirmed by the owner on
+2026-09-27**, asked with the numbers in front of him (Windows and Linux hold
+1,000 at High, the M3 only at Low): each machine may have its own quality, and
+the gate is met when one with the far terrain on holds 1,000 at every eye.
 
 ---
 
