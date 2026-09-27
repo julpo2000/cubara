@@ -18,7 +18,9 @@ mod caps;
 mod capture;
 mod far_streaming;
 mod game;
+mod options;
 mod screenshot;
+mod settings;
 mod streaming;
 
 use std::sync::Arc;
@@ -84,6 +86,17 @@ struct App {
     /// The far terrain beyond the voxels (`docs/PROPOSAL_FAR_VIEW.md`), same
     /// lifecycle as `streaming`.
     far: Option<far_streaming::FarStreaming>,
+    /// This PC's settings (`settings.rs`), read when the window opens.
+    settings: settings::Settings,
+    /// The options screen is open, over the pause menu.
+    options_open: bool,
+    /// A benchmark running in a child process (`--bench tune`), choosing the
+    /// far-terrain quality that holds `target_fps`.
+    tuning: Option<std::process::Child>,
+    /// The frame rate to hold: the monitor's refresh rate.
+    target_fps: u32,
+    /// Steps the quality down when frames miss the refresh rate while playing.
+    frame_watch: Option<options::FrameWatch>,
     /// A server to join instead of hosting one, from `--connect <addr>`.
     ///
     /// Acted on in `resumed`, not here: joining needs the client's registries,
@@ -188,7 +201,7 @@ fn menu_text(game: &Game) -> Option<String> {
             "-- PAUSED --\n\
              [Esc] resume\n\
              [C] play mode: {mode}\n\
-             Options -- coming soon\n\
+             [O] Options\n\
              {new_world}\n\
              Commands: press / -- /tp x y z, /give item [count], /gamemode, /seed"
         ));
@@ -242,6 +255,132 @@ impl App {
             if let Some(renderer) = self.renderer.as_ref() {
                 grab_cursor(renderer.window(), want);
             }
+        }
+    }
+
+    /// Start a benchmark in a child process -- `cubara --bench tune` at the
+    /// monitor's refresh rate and this window's size -- unless one is running.
+    /// A child rather than this process so the game keeps running while it
+    /// measures; its answer lands in the settings file and is picked up by
+    /// [`poll_tuning`](Self::poll_tuning). The game drawing at the same time
+    /// makes the answer, if anything, cautious.
+    fn start_tuning(&mut self) {
+        if self.tuning.is_some() {
+            return;
+        }
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let (w, h) = renderer.size();
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(e) => {
+                log::warn!("cannot benchmark: no path to this program ({e})");
+                return;
+            }
+        };
+        let spawned = std::process::Command::new(exe)
+            .args(["--bench", "tune", "--target", &self.target_fps.to_string()])
+            .args(["--size", &format!("{w}x{h}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(child) => {
+                log::info!(
+                    "benchmarking this PC for {} FPS in the background",
+                    self.target_fps
+                );
+                self.tuning = Some(child);
+            }
+            Err(e) => log::warn!("could not start the benchmark: {e}"),
+        }
+    }
+
+    /// Take a finished benchmark's answer: read the settings it wrote and draw
+    /// the far terrain at the quality it chose.
+    fn poll_tuning(&mut self) {
+        let Some(child) = self.tuning.as_mut() else {
+            return;
+        };
+        let Ok(Some(status)) = child.try_wait() else {
+            return;
+        };
+        self.tuning = None;
+        if !status.success() {
+            log::warn!("the benchmark did not finish ({status})");
+            return;
+        }
+        if let Some(chosen) = settings::load(&settings::settings_path()) {
+            log::info!("the benchmark chose far terrain {}", chosen.far.name());
+            self.settings = chosen;
+            self.set_far_quality(self.settings.far);
+        }
+    }
+
+    /// Draw the far terrain at `quality` from now on, and give the frame watch
+    /// time to settle before it judges the new quality.
+    fn set_far_quality(&mut self, quality: far_streaming::FarQuality) {
+        if let (Some(far), Some(renderer)) = (self.far.as_mut(), self.renderer.as_mut()) {
+            far.set_quality(quality, renderer);
+        }
+        if let Some(w) = self.frame_watch.as_mut() {
+            w.settle();
+        }
+    }
+
+    /// Frames are missing the refresh rate: one quality down, remembered for
+    /// the next start. Only for a quality the benchmark chose -- one the
+    /// player picked is theirs -- and not while a benchmark is measuring.
+    fn watch_frame(&mut self, dt: f32) {
+        if self.settings.by_hand || self.tuning.is_some() {
+            return;
+        }
+        let Some(watch) = self.frame_watch.as_mut() else {
+            return;
+        };
+        if !watch.frame(dt) || self.settings.far == far_streaming::FarQuality::Off {
+            return;
+        }
+        let lower = self.settings.far.lower();
+        log::warn!(
+            "frames are missing {} FPS: far terrain {} -> {}",
+            self.target_fps,
+            self.settings.far.name(),
+            lower.name()
+        );
+        self.settings.far = lower;
+        if let Err(e) = settings::save(&settings::settings_path(), &self.settings) {
+            log::warn!("could not save the settings: {e}");
+        }
+        self.set_far_quality(lower);
+    }
+
+    /// One key on the options screen -- which eats every key while open, as
+    /// the console does.
+    fn options_key(&mut self, code: KeyCode, pressed: bool, event: &KeyEvent) {
+        if !pressed {
+            return;
+        }
+        if code == KeyCode::Escape {
+            self.options_open = false;
+            return;
+        }
+        let Some(key) = event
+            .text
+            .as_ref()
+            .and_then(|t| t.chars().next())
+            .and_then(options::options_key)
+        else {
+            return;
+        };
+        options::apply(&mut self.settings, key);
+        if let Err(e) = settings::save(&settings::settings_path(), &self.settings) {
+            log::warn!("could not save the settings: {e}");
+        }
+        match key {
+            options::OptionsKey::Quality(q) => self.set_far_quality(q),
+            options::OptionsKey::Auto | options::OptionsKey::Benchmark => self.start_tuning(),
         }
     }
 
@@ -315,7 +454,11 @@ impl ApplicationHandler for App {
             &ores,
             move |name: &str| layers.layer_of(name),
         ));
-        self.far = Some(far_streaming::FarStreaming::new(self.game.world().seed()));
+        self.settings = settings::load(&settings::settings_path()).unwrap_or_default();
+        self.far = Some(far_streaming::FarStreaming::new(
+            self.game.world().seed(),
+            self.settings.far,
+        ));
         let mut renderer = renderer;
         renderer.set_icons(self.game.item_icons());
         self.renderer = Some(renderer);
@@ -323,6 +466,24 @@ impl ApplicationHandler for App {
         // concern, so the app owns it rather than the renderer.
         grab_cursor(&window, true);
         self.cursor_captured = true;
+
+        // The frame rate to hold is the monitor's (the owner, 2026-09-26: never
+        // below your refresh rate while playing). A PC not yet benchmarked for
+        // this monitor and GPU is benchmarked now, in the background.
+        self.target_fps = options::target_fps(
+            window
+                .current_monitor()
+                .and_then(|m| m.refresh_rate_millihertz()),
+        );
+        self.frame_watch = Some(options::FrameWatch::new(self.target_fps));
+        let gpu = self
+            .renderer
+            .as_ref()
+            .map(|r| r.adapter_name().to_string())
+            .unwrap_or_default();
+        if self.settings.needs_tuning(self.target_fps, &gpu) {
+            self.start_tuning();
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -392,6 +553,8 @@ impl ApplicationHandler for App {
                         };
                         log::info!("fullscreen: {}", next.is_some());
                         window.set_fullscreen(next);
+                    } else if self.options_open {
+                        self.options_key(code, pressed, &event);
                     } else if self.game.console().is_some() {
                         // The console eats every key while it's open -- typing
                         // "t" or "p" must not also strafe or open the panic
@@ -421,6 +584,12 @@ impl ApplicationHandler for App {
                     } else if code == KeyCode::Slash && pressed && !any_screen_open(&self.game) {
                         self.game.open_console();
                         self.follow_screen();
+                    } else if code == KeyCode::KeyO
+                        && pressed
+                        && self.game.pause_open()
+                        && !self.game.inventory_open()
+                    {
+                        self.options_open = true;
                     } else if code == KeyCode::KeyC
                         && pressed
                         && self.game.pause_open()
@@ -557,6 +726,8 @@ impl ApplicationHandler for App {
                 // A bench or furnace opens as a message from the server, which
                 // `advance` just applied -- so this is where the mouse learns.
                 self.follow_screen();
+                self.poll_tuning();
+                self.watch_frame(dt);
                 let Some(renderer) = self.renderer.as_mut() else {
                     return;
                 };
@@ -571,6 +742,9 @@ impl ApplicationHandler for App {
                     let seed = self.game.world().seed();
                     if far.seed() != seed {
                         far.reset(seed, renderer);
+                        if let Some(w) = self.frame_watch.as_mut() {
+                            w.settle();
+                        }
                     }
                     far.update(renderer, camera.eye.to_array());
                 }
@@ -593,7 +767,15 @@ impl ApplicationHandler for App {
                     gauges: self.game.furnace_gauges(),
                 });
                 let others = self.game.other_players();
-                let menu = menu_text(&self.game);
+                let menu = if self.options_open {
+                    Some(options::options_text(
+                        &self.settings,
+                        self.target_fps,
+                        self.tuning.is_some(),
+                    ))
+                } else {
+                    menu_text(&self.game)
+                };
                 renderer.render(
                     camera,
                     self.game.selected_block(),
@@ -728,23 +910,41 @@ fn main() {
         let radius = match target {
             bench::Target::Radius(radius) => radius,
             bench::Target::Gate => {
-                let view_radius = streaming::render_radius_chunks();
-                let results: Vec<_> = bench::GATE_EYES
-                    .iter()
-                    .map(|gate_eye| {
-                        log::info!("gate eye {}: {:?}", gate_eye.name, gate_eye.eye);
-                        let view = bench::View {
-                            eye: Some(gate_eye.eye),
-                            squash: Some(streaming::VERTICAL_LOD_SQUASH),
-                            // What the player sees includes the far terrain.
-                            far: true,
-                        };
-                        let outcome = bench::run(view_radius, size, view, overlay, gpu_timing, fog);
-                        (*gate_eye, outcome)
-                    })
-                    .collect();
-                let (_, line) = bench::gate_verdict(&results);
+                let tries = bench::try_qualities(1000.0, size, overlay, gpu_timing, fog);
+                let (_, line) = bench::gate_line(&tries, 1000.0);
                 log::info!("{line}");
+                return;
+            }
+            // `--bench tune [--target FPS]`: the best far-terrain quality that
+            // holds this PC's frame-rate target -- by default a 60 Hz monitor's
+            // -- written to its settings. What the game runs on its own, with
+            // its monitor's refresh rate and its window's size.
+            bench::Target::Tune => {
+                let target_fps = flag("--target")
+                    .and_then(|t| t.parse::<u32>().ok())
+                    .unwrap_or(60);
+                let tries = bench::try_qualities(target_fps as f64, size, overlay, gpu_timing, fog);
+                let far = bench::best_quality(&tries, target_fps as f64)
+                    .unwrap_or(far_streaming::FarQuality::Off);
+                let chosen = settings::Settings {
+                    far,
+                    tuned: Some(settings::Tuned {
+                        target_fps,
+                        gpu: bench::adapter_name().unwrap_or_default(),
+                    }),
+                    by_hand: false,
+                };
+                match settings::save(&settings::settings_path(), &chosen) {
+                    Ok(()) => log::info!(
+                        "TUNE: {} holds {target_fps} FPS on {}",
+                        far.name(),
+                        chosen.tuned.as_ref().map_or("", |t| t.gpu.as_str())
+                    ),
+                    Err(e) => log::error!(
+                        "TUNE: {} holds {target_fps} FPS, but the settings could not be saved: {e}",
+                        far.name()
+                    ),
+                }
                 return;
             }
         };
@@ -754,7 +954,10 @@ fn main() {
             bench::View {
                 eye,
                 squash,
-                far: args.iter().any(|a| a == "--far"),
+                far: args
+                    .iter()
+                    .any(|a| a == "--far")
+                    .then_some(far_streaming::FarQuality::High),
             },
             overlay,
             gpu_timing,

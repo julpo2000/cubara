@@ -501,6 +501,9 @@ pub struct Renderer {
     scene: SceneRenderer,
     frustum: Frustum,
 
+    /// The GPU this window renders on, by name -- what a benchmarked setting is
+    /// recorded against, so a different GPU is noticed.
+    adapter_name: String,
     /// All resident node geometry in shared buffers, drawn with one indirect submit.
     arena: ChunkArena,
     /// The far terrain beyond the voxels (`docs/PROPOSAL_FAR_VIEW.md`): its
@@ -570,6 +573,7 @@ impl Renderer {
         .expect("no suitable GPU adapter");
 
         log::info!("GPU: {:?}", adapter.get_info());
+        let adapter_name = adapter.get_info().name;
 
         let (features, multi_draw) = gpu_driven_features(&adapter);
         log::info!("multi_draw_indirect: {multi_draw}");
@@ -652,6 +656,7 @@ impl Renderer {
             config,
             scene,
             frustum,
+            adapter_name,
             arena,
             far,
             desired: HashSet::new(),
@@ -696,6 +701,11 @@ impl Renderer {
     /// nodes to load/unload is the caller's decision (`ARCHITECTURE.md` §1);
     /// an edit is no different from ordinary streaming from here, just a
     /// single-node update.
+    /// The GPU this window renders on.
+    pub fn adapter_name(&self) -> &str {
+        &self.adapter_name
+    }
+
     /// Upload a far-terrain patch; `None` when every slot is taken.
     pub fn far_insert(&mut self, patch: crate::far::FarPatch<'_>) -> Option<crate::far::FarSlot> {
         self.far.insert(&self.queue, patch)

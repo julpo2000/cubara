@@ -20,13 +20,69 @@ use cubara_world::WorldGen;
 /// (2026-09-26, `PROPOSAL_FAR_VIEW.md`).
 pub const FAR_VIEW_RADIUS: f64 = 262_144.0;
 
-/// Quads no wider than this on screen, by distance alone.
-const QUAD_PX: f64 = 16.0;
-/// ...and split further where a patch's 99th-percentile gap to its finer self
-/// would show more than this (`PROPOSAL_FAR_VIEW.md` §3.2).
-const ERROR_PX: f64 = 2.0;
-/// ...but never into quads narrower than this.
-const FLOOR_PX: f64 = 4.0;
+/// How finely the far terrain is drawn -- the per-PC choice between looks and
+/// frame rate the owner asked for (2026-09-26): picked by a benchmark to stay
+/// above the monitor's refresh rate, or by the player in the options.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FarQuality {
+    /// No far terrain: the world ends with the voxels, at 1 km.
+    Off,
+    Low,
+    Medium,
+    /// The settings `PROPOSAL_FAR_VIEW.md` §3.2 measured, and the default.
+    #[default]
+    High,
+}
+
+/// What a quality level means, in pixels on screen.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Detail {
+    /// Quads no wider than this, by distance alone.
+    quad_px: f64,
+    /// Split where a patch's 99th-percentile gap to its finer self would
+    /// show more than this (`PROPOSAL_FAR_VIEW.md` §3.2).
+    error_px: f64,
+    /// ...but never into quads narrower than this.
+    floor_px: f64,
+}
+
+impl FarQuality {
+    /// From the best-looking down: the order a benchmark tries them in.
+    pub const BEST_FIRST: [FarQuality; 4] = [Self::High, Self::Medium, Self::Low, Self::Off];
+
+    fn detail(self) -> Option<Detail> {
+        let (quad_px, error_px, floor_px) = match self {
+            Self::Off => return None,
+            Self::Low => (32.0, 6.0, 8.0),
+            Self::Medium => (16.0, 4.0, 4.0),
+            Self::High => (16.0, 2.0, 4.0),
+        };
+        Some(Detail {
+            quad_px,
+            error_px,
+            floor_px,
+        })
+    }
+
+    /// One step cheaper, or `Off` already.
+    pub fn lower(self) -> Self {
+        match self {
+            Self::High => Self::Medium,
+            Self::Medium => Self::Low,
+            Self::Low | Self::Off => Self::Off,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+        }
+    }
+}
+
 /// The camera's vertical field of view (`render.rs`'s projection).
 const FOV_Y: f64 = std::f64::consts::FRAC_PI_3;
 
@@ -35,19 +91,25 @@ const FOV_Y: f64 = std::f64::consts::FRAC_PI_3;
 /// inside one of them.
 const RESELECT_BLOCKS: f64 = 32.0;
 
-/// The view the far terrain is selected for: the measured settings of
-/// `PROPOSAL_FAR_VIEW.md` §3.2, scaled to a screen `screen_height` pixels
-/// tall, leaving `hole` to the voxels.
-pub fn far_view(eye: [f64; 3], screen_height: u32, hole: Option<Hole>) -> FarView {
+/// The view the far terrain is selected for at `quality`, scaled to a screen
+/// `screen_height` pixels tall, leaving `hole` to the voxels. `None` when the
+/// quality is `Off`.
+pub fn far_view(
+    eye: [f64; 3],
+    screen_height: u32,
+    hole: Option<Hole>,
+    quality: FarQuality,
+) -> Option<FarView> {
+    let d = quality.detail()?;
     let pixel = FOV_Y / screen_height.max(1) as f64;
-    FarView {
+    Some(FarView {
         eye,
-        split_ratio: far::split_ratio_for(QUAD_PX, screen_height.max(1) as f64, FOV_Y),
-        max_error: ERROR_PX * pixel,
-        min_quad: FLOOR_PX * pixel,
+        split_ratio: far::split_ratio_for(d.quad_px, screen_height.max(1) as f64, FOV_Y),
+        max_error: d.error_px * pixel,
+        min_quad: d.floor_px * pixel,
         radius: FAR_VIEW_RADIUS,
         hole,
-    }
+    })
 }
 
 /// The box the voxel nodes around `eye` draw themselves, in blocks
@@ -194,6 +256,7 @@ impl Pool {
 pub struct FarStreaming {
     gen: WorldGen,
     seed: u64,
+    quality: FarQuality,
     generation: u64,
     pool: Pool,
     /// Every patch generated and still of use: the ones drawn, and the ones
@@ -211,10 +274,11 @@ pub struct FarStreaming {
 }
 
 impl FarStreaming {
-    pub fn new(seed: u64) -> Self {
+    pub fn new(seed: u64, quality: FarQuality) -> Self {
         Self {
             gen: WorldGen::new(seed),
             seed,
+            quality,
             generation: 0,
             pool: Pool::new(),
             heights: HashMap::new(),
@@ -230,6 +294,17 @@ impl FarStreaming {
     /// The seed the far terrain is generated from.
     pub fn seed(&self) -> u64 {
         self.seed
+    }
+
+    /// Draw at a different quality from now on: every patch is dropped and
+    /// the selection starts again, since a patch's heights do not depend on
+    /// it but which patches are wanted does.
+    pub fn set_quality(&mut self, quality: FarQuality, renderer: &mut Renderer) {
+        if quality != self.quality {
+            let seed = self.seed;
+            self.quality = quality;
+            self.reset(seed, renderer);
+        }
     }
 
     /// A different world -- New World, a load, joining a server: drop every
@@ -275,7 +350,13 @@ impl FarStreaming {
         self.selected_at = Some(eye64);
         self.stale = false;
 
-        let view = far_view(eye64, renderer.size().1, Some(hole));
+        let Some(view) = far_view(eye64, renderer.size().1, Some(hole), self.quality) else {
+            // Off: nothing beyond the voxels.
+            for (_, slot) in self.slots.drain() {
+                renderer.far_remove(slot);
+            }
+            return;
+        };
         let wanted = far::select(&view, |k| self.heights.get(&k).map(|p| p.error));
 
         // Ask for what is missing, nearest first: the ground under the eye
@@ -328,6 +409,30 @@ impl FarStreaming {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each step down is cheaper and never better: a coarser error bound, a
+    /// coarser floor, quads no finer -- so stepping down when frames are
+    /// missed can only help.
+    #[test]
+    fn every_step_down_is_cheaper() {
+        let mut q = FarQuality::High;
+        while q != FarQuality::Off {
+            let lower = q.lower();
+            let (a, b) = (q.detail().unwrap(), lower.detail());
+            if let Some(b) = b {
+                assert!(
+                    b.error_px > a.error_px || b.floor_px > a.floor_px,
+                    "{q:?} -> {lower:?}"
+                );
+                assert!(
+                    b.error_px >= a.error_px && b.floor_px >= a.floor_px && b.quad_px >= a.quad_px
+                );
+            }
+            q = lower;
+        }
+        assert_eq!(FarQuality::Off.lower(), FarQuality::Off);
+        assert_eq!(FarQuality::BEST_FIRST[0], FarQuality::default());
+    }
 
     #[test]
     fn ancestors_climb_one_level_at_a_time() {
@@ -408,13 +513,25 @@ mod tests {
     /// The same numbers the far terrain module measured (`far.rs`, §3.2).
     #[test]
     fn the_view_uses_the_measured_settings() {
-        let v = far_view([0.0; 3], 1080, None);
         let pixel = FOV_Y / 1080.0;
-        assert!((v.max_error / pixel - ERROR_PX).abs() < 1e-9);
-        assert!((v.min_quad / pixel - FLOOR_PX).abs() < 1e-9);
-        let quad_angle = 1.0 / (v.split_ratio * far::PATCH_QUADS as f64);
-        assert!((quad_angle / pixel - QUAD_PX).abs() < 1e-6);
-        assert_eq!(v.radius, FAR_VIEW_RADIUS);
+        for q in FarQuality::BEST_FIRST {
+            let Some(v) = far_view([0.0; 3], 1080, None, q) else {
+                assert_eq!(q, FarQuality::Off, "only Off draws nothing");
+                continue;
+            };
+            let d = q.detail().unwrap();
+            assert!((v.max_error / pixel - d.error_px).abs() < 1e-9);
+            assert!((v.min_quad / pixel - d.floor_px).abs() < 1e-9);
+            let quad_angle = 1.0 / (v.split_ratio * far::PATCH_QUADS as f64);
+            assert!((quad_angle / pixel - d.quad_px).abs() < 1e-6);
+            assert_eq!(v.radius, FAR_VIEW_RADIUS);
+        }
+        // High is what `PROPOSAL_FAR_VIEW.md` §3.2 measured.
+        let high = FarQuality::High.detail().unwrap();
+        assert_eq!(
+            (high.quad_px, high.error_px, high.floor_px),
+            (16.0, 2.0, 4.0)
+        );
     }
 
     /// What is kept between selections is enough to make the same selection
@@ -428,7 +545,13 @@ mod tests {
         let gen = WorldGen::new(0x005E_ED00_00C0_FFEE);
         let view_at = |eye: [f64; 3]| FarView {
             radius: 20_000.0,
-            ..far_view(eye, 720, Some(voxel_hole(eye.map(|v| v as f32))))
+            ..far_view(
+                eye,
+                720,
+                Some(voxel_hole(eye.map(|v| v as f32))),
+                FarQuality::High,
+            )
+            .unwrap()
         };
         let mut heights: HashMap<PatchKey, PatchHeights> = HashMap::new();
         let converge = |view: &FarView, heights: &mut HashMap<PatchKey, PatchHeights>| loop {

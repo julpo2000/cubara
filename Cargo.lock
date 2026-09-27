@@ -460,6 +460,8 @@ dependencies = [
  "log",
  "pollster",
  "puffin",
+ "ron",
+ "serde",
  "wgpu",
  "winit",
 ]

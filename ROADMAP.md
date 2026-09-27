@@ -510,6 +510,23 @@ each at the full view distance and each at 1,000 FPS or more on both machines.
 The criterion's command changes in the proposal's block F1, *before* the view
 distance grows, so the gate never measures less than the game draws.
 
+**Quality per PC, the owner's call, 2026-09-26/27.** The far terrain at full
+quality put the M3 under 1,000 FPS from the ground and the hill. The owner's
+answer was not to pick one setting for everyone: *"zorg dat er een benchmark
+gedaan wordt en dat er meerdere opties zijn. zo kan je per pc instellen wat het
+beste is om toch fps doelen te halen. de gebruikers kunnen dan ook kiezen of ze
+performance of looks willen optimaliseren"*, and then: *"het mooiste zou zijn
+als er een autobenchmark draait op een gegeven moment, die zorgt dat je game
+nooit onder je maximale refresh rate van je monitor komt tijdens het spelen."*
+So the far terrain has qualities (Off, Low, Medium, High). A benchmark picks the
+best one that holds **the monitor's refresh rate** on that PC, the player can
+choose otherwise in the options, and frames missing the refresh rate in play
+step it down. For the engine's own gate this reads as follows: `--bench gate`
+reports the best quality that holds 1,000 FPS at every eye. `Off` can never pass
+it, because the flight eye must see something. That reading of *"per pc … om
+toch fps doelen te halen"* is the agent's, and is put to the owner in the
+closing report rather than assumed settled.
+
 ---
 
 ## Where the existing open issues land

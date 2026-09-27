@@ -411,6 +411,39 @@ terrain puts several triangles in each pixel. The fix for that is geometry
 that is coarser along the line of sight than across it, which is a bigger
 change. Windows has not been measured yet.
 
+## §6c Quality per PC (the owner's answer to §6b)
+
+The owner chose not to pick one setting for every machine: a benchmark decides
+per PC, the player can choose looks or frame rate, and the frame rate to hold
+is the monitor's refresh rate (`ROADMAP.md` has his words). What was built:
+
+| Quality | Quads (distance) | Height bound | Floor | Measured on the hill eye (§3.2) |
+|---|---|---|---|---|
+| High | 16 px | 2 px | 4 px | p99 2.72 px |
+| Medium | 16 px | 4 px | 4 px | p99 3.39 px |
+| Low | 32 px | 6 px | 8 px | coarser |
+| Off | the voxels only, 1 km | | | |
+
+- **The benchmark** (`cubara --bench tune --target <fps>`) runs the three gate
+  eyes at each quality, best first, and keeps the first that holds the target
+  at all of them. It writes the answer to `saves/settings.ron`, with the target
+  and the GPU it was measured for.
+- **The game** reads that file at start. If this PC has not been benchmarked
+  for its monitor's refresh rate and GPU, the game runs the benchmark itself in
+  a child process and switches quality when the answer lands.
+- **In play**, a frame waiting for the display takes a whole number of
+  refreshes, so a missed refresh shows as a frame of about twice the budget.
+  When a fifth of the frames in three seconds miss, the quality steps down one
+  level and the file remembers it. It never steps up: a frame waiting on the
+  display cannot tell how much faster it could have been, so finding headroom
+  is the benchmark's job.
+- **The options** (pause menu, O): keys 1–4 pick a quality, which is then the
+  player's own, so no benchmark or step-down overrules it. A gives the choice
+  back to the benchmark, and B runs it now.
+- **The gate** (`--bench gate`) reports the best quality that holds 1,000 FPS
+  at every eye. `Off` can never pass it, because the flight eye must see
+  something.
+
 ## §7 How it is checked
 
 - **Geometric error:** a unit test that every drawn far-terrain quad projects to

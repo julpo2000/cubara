@@ -32,3 +32,6 @@ env_logger.workspace = true
 # puffin scope macros compile to near-nothing unless scopes are enabled at runtime.
 puffin.workspace = true
 image.workspace = true
+# Per-PC settings (`settings.rs`), in the same format as the rest of the data.
+serde.workspace = true
+ron.workspace = true

@@ -97,9 +97,14 @@ pub fn run(path: &str, view: Option<View>, menu: Option<String>) {
                 min: min.map(|c| (c * 16) as f64),
                 max: max.map(|c| (c * 16) as f64),
             };
-            let view =
-                crate::far_streaming::far_view(v.eye.map(|c| c as f64), v.size.1, Some(hole));
-            far = cubara_world::far::build(&cubara_world::WorldGen::new(world.seed()), &view);
+            // This PC's quality, as the game would draw it.
+            let quality = crate::settings::load(&crate::settings::settings_path())
+                .unwrap_or_default()
+                .far;
+            let eye = v.eye.map(|c| c as f64);
+            if let Some(view) = crate::far_streaming::far_view(eye, v.size.1, Some(hole), quality) {
+                far = cubara_world::far::build(&cubara_world::WorldGen::new(world.seed()), &view);
+            }
             far_params = Some(crate::far_streaming::to_far_params(
                 hole,
                 crate::far_streaming::far_top_color(),
