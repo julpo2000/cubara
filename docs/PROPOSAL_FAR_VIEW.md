@@ -226,6 +226,45 @@ what makes the distance look like blocks without a block being drawn.
 The CPU brute-force check in 3.1 is what keeps this honest: generate the actual
 staircase, render its faces' areas and lighting by counting, and compare.
 
+**Revised 2026-09-27, measured while building the reference
+(`crates/render/src/aggregate.rs`).** "Area-weighted, visibility-weighted" is
+the right idea, but the obvious formula for it is wrong. Weighting each face by
+its projected area (area times the cosine to the eye, for faces turned toward
+it) is exact only while every riser faces the eye. When the risers along one
+axis face the eye and those along the other face away, the steps along the
+second axis drop away from the eye and hide what is behind them. What they hide
+depends on how the steps along the two axes interleave, not on the areas.
+
+| Slope | Seen from | Risers' share, projected areas | Risers' share, counted |
+|---|---|---|---|
+| 0.1 along both axes | along its contours, 2° up | 0.67 | 0.05 |
+| 0.5 along both axes | along its contours, 2° up | 0.91 | 0.24 |
+| 1 along x, -0.4 along z | 35° up, 45° azimuth | 0.29 | 0.52 |
+
+The first row is a gentle hill seen side-on from far away, which is most of what
+the far terrain is. Projected areas would draw it two-thirds soil. The counted
+answer, derived by hand as well as measured, is 95% grass.
+
+So the shading is done in three layers:
+
+- **The definition** (`reference_weights`): walk lines across a real
+  staircase and add up what the eye sees along them. It matches rays cast at the
+  blocks one by one to within 0.004, and a case worked out by hand.
+- **A table** (`MaskingTable`, 16⁴ bytes, 64 KB, committed as
+  `aggregate.table`) for the one arrangement that hides anything. It is indexed
+  by slope steepness, the lean between the axes, and the two projected-area
+  ratios, so the part that changes fast is in the coordinates and the table
+  only holds what hiding changes. A first version indexed by elevation and
+  azimuth was off by up to 0.6 at grazing angles.
+- **The shader's rule** (`visible_weights`): projected areas where nothing
+  hides, tops alone where every riser faces away, and the table where one axis
+  hides the other. Over 2,000 random slopes and views it is within 0.0012 of
+  the definition on average, 0.003 at the 95th percentile, and 0.18 at worst.
+  The worst cases are slopes seen almost edge-on, which cover few pixels.
+
+F4 uploads the table as a texture and ports `visible_weights` and `face_light`
+into `far.wgsl`.
+
 ### 3.4 Joining the two
 
 - The far terrain starts where the voxel rings end. It is drawn after the voxels
@@ -283,6 +322,14 @@ staircase, render its faces' areas and lighting by counting, and compare.
 
 Both come with images, not questions in the abstract.
 
+**2026-09-26: the owner handed both back.** Asked about these two in the Linux
+session, he said *"voor de graphics moet je ff kijken dat het er goed
+uitziet"*: we are to judge from the images ourselves that it looks right. On
+the Mac the same day he asked for the smart approach to be worked out rather
+than brought to him (*"ik zou ff kijken wat hier slim is"*). So the haze and
+the band are settled from images by whoever builds F5 and F6, the images still
+go in the PR for him to see, and the tests still pin what was chosen.
+
 ## §6 Plan, in order
 
 | # | Block | Why here |
@@ -301,8 +348,9 @@ Both come with images, not questions in the abstract.
 - **Geometric error:** a unit test that every drawn far-terrain quad projects to
   at most *k* px from each gate eye. It is a pure function, with no GPU.
 - **Colour:** a unit test that aggregate shading matches brute-force block
-  counting, within a tolerance, over a grid of slopes, view directions and sun
-  directions.
+  counting, within a tolerance, over slopes, view directions and sun
+  directions. Built in `aggregate.rs`, with its bounds, and with a test that
+  the projected-area mix fails them (3.3).
 - **Silhouette:** the probe's peak and plain, drawn by the far terrain within
   one pixel of their true height at every distance. Today's rings fail this
   from 1 km (§2A), so it is a test that can fail.
