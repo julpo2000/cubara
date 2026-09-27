@@ -174,6 +174,9 @@ frames after 200 warmup.
 | 2026-09-26 | **Gate eye: ground** (y = 40), full view distance — the owner's criterion since today⁶³ | 1,940 | 819,928 (167,988 drawn) | ~2,380 | 0.266 ms | 0.797 ms | `ea67f2b` |
 | 2026-09-26 | **Gate eye: hill** (y = 300), full view distance⁶³ | 869 | 436,690 (102,664 drawn) | ~3,439 | 0.173 ms | 0.687 ms | `ea67f2b` |
 | 2026-09-26 | **Gate eye: flight** (y = 3,000) — nothing in view yet⁶³ | 0 | 0 | -- | -- | -- | `ea67f2b` |
+| 2026-09-27 | **Gate eye: ground + far terrain (High, 262 km)** — F3c⁶⁵ | 1,940 | 819,928 voxel + 720,819 far drawn | ~1,610 | 0.340 ms | 1.018 ms | `41bdab0` |
+| 2026-09-27 | **Gate eye: hill + far terrain (High)**⁶⁵ | 869 | 436,690 voxel + 727,521 far drawn | ~1,765 | 0.280 ms | 1.013 ms | `41bdab0` |
+| 2026-09-27 | **Gate eye: flight + far terrain (High)** — sees something now⁶⁵ | 0 | 547,649 far drawn | ~2,435 | 0.167 ms | 0.734 ms | `41bdab0` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -2324,3 +2327,15 @@ It points the same way as Linux's unexplained +34% (⁶³), and wgpu 24 → 30
 (#275) is again the one render-path change in the window. Two machines now
 show it; it has not been bisected.
 
+⁶⁵ **The far terrain on Linux (GTX 1060 Max-Q, Vulkan, NVIDIA 580.178.04),
+`41bdab0` (#289, F3c).** Measured by the Linux session with the lid closed; the
+bench renders offscreen and needs no display. `--bench gate`: **met at High**,
+the best-looking far-terrain quality, on the first try. GPU/frame, which works
+on this backend: ground 0.573 ms, hill 0.531, flight 0.362. Against ⁶³ on the
+same machine without the far terrain: ground 2,380 → 1,610 FPS (−32%, GPU
+0.363 → 0.573 ms), hill 3,439 → 1,765 (−49%, GPU 0.235 → 0.531 ms). So the far
+terrain costs about 0.2–0.3 ms of GPU a frame here, and the weakest discrete GPU
+of the three machines holds High with 1.6× headroom at its worst eye.
+`--bench tune --target 60` chose High as well. Building the patches took
+17–22 s single-threaded on this CPU (i7-8750H), against 4–5 s on the M3; that is
+one-shot bench cost, and the game streams them on worker threads.
