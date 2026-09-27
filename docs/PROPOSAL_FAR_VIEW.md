@@ -245,6 +245,26 @@ The first row is a gentle hill seen side-on from far away, which is most of what
 the far terrain is. Projected areas would draw it two-thirds soil. The counted
 answer, derived by hand as well as measured, is 95% grass.
 
+**The view along the contours, by hand.** Take a slope of *g* < 1 along both
+axes, seen from just above the ground straight along its contour lines. A line
+of sight along a contour runs diagonally through the columns and alternates
+between two diagonals of cells. Their smooth heights differ by *g*, so after
+rounding to whole blocks the second diagonal is one block higher than the first
+on a fraction *g* of the lines, and level with it on the rest. A ray that skims
+the ground stops at the first of the highest columns it reaches:
+
+- on a line with no steps, every ray lands on a top;
+- on a line with steps, the highest columns take half the line's length. A ray
+  sinking below their top level lands on a step's top if it is over one at that
+  moment, which happens half the time, and otherwise on the riser of the next
+  step.
+
+So the risers' share is *g*/2: 0.05 for the gentle hill, where projected areas
+give 0.67. The facing risers are almost all hidden, because each one stands
+directly behind a step down along the other axis that is just as high. This
+case is a test (`a_slope_seen_along_its_contours_matches_the_hand_count`),
+and it is the second check on the reference, independent of the ray caster.
+
 So the shading is done in three layers:
 
 - **The definition** (`reference_weights`): walk lines across a real
